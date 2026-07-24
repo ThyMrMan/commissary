@@ -45,7 +45,9 @@ logger = setup_logging(_log_level, _log_path)
 
 # App version — single source of truth for backup metadata, system-info, update check, etc.
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
-_SOULSYNC_BASE_VERSION = "3.1.5"
+# Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
+# _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
+_SOULSYNC_BASE_VERSION = "1.0.0"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -17725,7 +17727,9 @@ def _automatic_wishlist_cleanup_after_db_update():
     return _cleanup_wishlist_after_db_update(logger=logger)
 
 # ── Update detection ─────────────────────────────────────────────
-_GITHUB_REPO = "Nezreka/SoulSync"
+# Points at this fork (not upstream Nezreka/SoulSync) so update checks compare
+# against releases/commits tagged/pushed here, matching _SOULSYNC_BASE_VERSION.
+_GITHUB_REPO = "ThyMrMan/soul-sync-thymrman-customized"
 _update_cache = {'latest_sha': None, 'last_check': 0, 'error': None}
 _UPDATE_CHECK_INTERVAL = 3600  # 1 hour
 

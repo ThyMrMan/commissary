@@ -3482,8 +3482,11 @@ function closeHelperSearch() {
 const WHATS_NEW = {
     // Convention: keep only the CURRENT release here, plus a single brief
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
-    '3.1.5': [
-        { date: 'July 2026 · 3.1.5' },
+    // 1.0.0 = this fork's baseline release — the content below is upstream's
+    // real 3.1.5 changelog, relabeled as the starting point for this fork's
+    // own version tracking (see _SOULSYNC_BASE_VERSION in web_server.py).
+    '1.0.0': [
+        { date: 'July 2026 · 1.0.0' },
         { title: 'Chat, best in class', desc: 'join ANY public Soulseek room — a rooms rail with a full room browser, not just the SoulSync room. The user list got a real overhaul (roles, sorting, local mute), you can browse any user\'s shared files and download right from chat, search your message history, copy any message, and the composer was redesigned.' },
         { title: 'Choose your discography source (ragnarlotus)', desc: 'a new Library Discography Source setting decides which metadata source paints library artists\' discographies — your primary, automatic fallback, or a specific source. An artist a source genuinely doesn\'t know no longer reads as an error.' },
         { title: 'Other sources on the discography (#1067)', desc: 'a view option on artist pages that appends releases OTHER metadata sources know but your current view doesn\'t — slotted into the real Albums/EPs/Singles sections, marked with their source, each downloadable (Download Discography includes them too). Off by default, purely additive.' },
@@ -3524,7 +3527,7 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "3.1.5: the chat + discography release",
+        title: "1.0.0: the chat + discography release",
         description: "chat goes best-in-class (any public room, user shares, history search), you choose which source paints your discographies — and see what the others know — the wishlist learns artists and smarter retries, Fix All runs in the background, and multi-user gets a security hardening pass.",
         features: [
             "chat, best in class: join ANY public soulseek room via a rooms rail + full room browser, a real user list (roles, sorting, local mute), browse any user's shared files and download them right from chat, search your message history, copy any message, and a redesigned composer",
