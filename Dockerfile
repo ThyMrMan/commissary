@@ -1,0 +1,156 @@
+# SoulSync WebUI Dockerfile
+# Multi-architecture support for AMD64 and ARM64
+
+FROM node:24-slim AS webui-builder
+
+WORKDIR /app/webui
+
+COPY webui/package.json webui/package-lock.json ./
+RUN npm ci
+
+COPY webui/ ./
+RUN npm run build
+
+# Stage 1: Builder — install Python dependencies with compilation tools
+FROM python:3.11-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libc6-dev \
+    libffi-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create virtualenv and install dependencies
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# yt-dlp must track YouTube faster than its stable channel ships — stable can
+# lag months behind a breaking YouTube change while extraction is broken
+# ("Requested format is not available"). Build images with the NIGHTLY channel.
+# COMMIT_SHA is referenced in the RUN so CI's layer cache (cache-from: gha)
+# busts on every new commit — otherwise this layer could pin a stale "nightly"
+# for months, silently defeating its purpose.
+ARG COMMIT_SHA=""
+RUN echo "yt-dlp nightly for build ${COMMIT_SHA}" && \
+    pip install --no-cache-dir -U --pre "yt-dlp[default]"
+
+# Stage 2: Runtime — only runtime dependencies, no build tools
+FROM python:3.11-slim
+
+# Build-time commit SHA for update detection
+ARG COMMIT_SHA=""
+ENV SOULSYNC_COMMIT_SHA=${COMMIT_SHA}
+
+# Copy pre-built virtualenv from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Set working directory
+WORKDIR /app
+
+# Install runtime-only system dependencies (no gcc/build tools).
+# unzip is needed by the Deno installer below.
+# flac: the Corrupt File Detector's preferred decode test (`flac -t` also
+# verifies the STREAMINFO MD5 — catches damage that still decodes; #1000).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    gosu \
+    ffmpeg \
+    flac \
+    libchromaprint-tools \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Deno — JavaScript runtime for yt-dlp. YouTube gates its downloadable formats
+# behind JS challenges (nsig); without a JS runtime, yt-dlp's extraction is
+# deprecated and streams / music-video downloads fail with "Requested format
+# is not available". Deno is yt-dlp's default-enabled runtime; the official
+# installer auto-detects amd64/arm64. `deno --version` fails the build early
+# if the install ever breaks.
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh && \
+    deno --version
+
+# Create non-root user for security
+RUN useradd --create-home --shell /bin/bash --uid 1000 soulsync
+
+# Copy application code with ownership baked in.
+# Using `COPY --chown` instead of `COPY` + `chown -R /app` avoids an
+# extra image layer that duplicates the entire /app tree just to flip
+# ownership bits — Docker layers are immutable, so chown -R rewrites
+# every file into a new layer. On a clean repo that's small; if any
+# bulky workspace file slips in (e.g. auto-downloaded ffmpeg binaries
+# in tools/), it gets counted twice in the image. Cin caught this on
+# 2026-05-08 — see the .dockerignore comment for the same incident.
+COPY --chown=soulsync:soulsync . .
+COPY --chown=soulsync:soulsync --from=webui-builder /app/webui/static/dist /app/webui/static/dist
+
+# Create runtime mount-point directories the app expects to exist.
+# NOTE: /app/data is for database FILES, /app/database is the Python package
+# NOTE: /app/Staging is required even though most users bind-mount it —
+# the entrypoint mkdir runs early and is gated by `set -e`, so a missing
+# pre-baked directory would crash the container into a restart loop on
+# rootless Docker/Podman where in-container "root" can't write to /app.
+# Pre-baking the dir here makes the entrypoint mkdir a guaranteed no-op.
+# NOTE: /app/Stream is the transient single-file streaming cache used by
+# the basic-search "Play" flow (cleared per use, never persistent). It's
+# created lazily by `core/streaming/prepare.py` via `os.makedirs`, which
+# fails silently on rootless Docker where the soulsync UID can't write
+# to /app — playback then errors out with no obvious cause. Pre-baking
+# at build time (when the layer is owned by root) avoids that path.
+# NOTE: /app/storage is the PRIVATE album-bundle staging area for the
+# torrent / usenet whole-release flow (download_source.album_bundle_staging_path
+# defaults to 'storage/album_bundle_staging'). Like /app/Stream it's created
+# lazily at runtime via mkdir(parents=True); without pre-baking it owned by
+# soulsync, the album-bundle copy fails with "[Errno 13] Permission denied:
+# 'storage'" because /app itself is root-owned and the soulsync UID can't
+# create a top-level dir there.
+RUN mkdir -p /app/config /app/data /app/logs /app/downloads /app/Transfer /app/Staging /app/Stream /app/storage /app/MusicVideos /app/scripts && \
+    chown soulsync:soulsync /app/config /app/data /app/logs /app/downloads /app/Transfer /app/Staging /app/Stream /app/storage /app/MusicVideos /app/scripts
+
+# Create defaults directory and copy template files
+# These will be used by entrypoint.sh to initialize empty volumes
+RUN mkdir -p /defaults && \
+    cp /app/config/config.example.json /defaults/config.json && \
+    cp /app/config/settings.py /defaults/settings.py && \
+    chmod 644 /defaults/config.json /defaults/settings.py
+
+# Create volume mount points
+# NOTE: Changed /app/database to /app/data to avoid overwriting Python package
+VOLUME ["/app/config", "/app/data", "/app/logs", "/app/downloads", "/app/Transfer", "/app/MusicVideos", "/app/scripts"]
+
+# Copy and set up entrypoint script
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Note: Don't switch to soulsync user yet - entrypoint needs root to change UIDs
+# The entrypoint script will switch to soulsync after setting up permissions
+
+# Expose port
+EXPOSE 8008
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8008/ || exit 1
+
+# Set environment variables
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV DATABASE_PATH=/app/data/music_library.db
+# The video side's DB + its poster-asset store (assets.default_root derives from
+# this path) MUST live in the persisted volume too — without it, every container
+# recreate wiped video_library.db (watchlists, collections, overlays, issues,
+# the YouTube ownership ledger).
+ENV VIDEO_DATABASE_PATH=/app/data/video_library.db
+ENV PUID=1000
+ENV PGID=1000
+ENV UMASK=022
+
+# Set entrypoint and default command
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["gunicorn", "-c", "gunicorn.conf.py", "wsgi:application"]

@@ -1,0 +1,1293 @@
+"""Shared pytest fixtures for SoulSync WebSocket tests.
+
+Creates a minimal Flask+SocketIO app that replicates the relevant
+endpoints and event handlers without importing the full web_server.py
+(which would try to initialize Spotify, Soulseek, Plex, etc.)."""
+
+# ── TEST-DATABASE ISOLATION — MUST run before any other import ─────────────
+# Force every MusicDatabase()/get_database() call in the suite onto a throwaway
+# temp database so a test can NEVER open or write the real
+# database/music_library.db. MusicDatabase resolves its default path from
+# os.environ['DATABASE_PATH'] (see database/music_database.py); setting it here,
+# at conftest import (before any test module loads), redirects ALL default-path
+# DB access to /tmp.
+#
+# Why this is non-negotiable: tests exercise modules (e.g. album_mbid_cache)
+# that call get_database() with no path → the real DB. Running those writers
+# against the live DB over a WSL-mounted Windows drive corrupted a user's
+# library. This guarantees it can't recur — tests get their own disposable DB.
+#
+# The VIDEO side has the SAME hazard: VideoDatabase()/get_video_db() with no
+# path resolves from os.environ['VIDEO_DATABASE_PATH'] (see
+# database/video_database.py) → the real database/video_library.db, and its
+# enrichment threads WRITE. A blueprint/handler test that opened the default
+# VideoDatabase corrupted the real video library once — same WSL/NTFS + WAL
+# trap. So redirect VIDEO_DATABASE_PATH to /tmp here too, before any import.
+import os as _os
+import tempfile as _tempfile
+import atexit as _atexit
+import shutil as _shutil
+
+if not _os.environ.get('SOULSYNC_TEST_DB_READY'):
+    _TEST_DB_DIR = _tempfile.mkdtemp(prefix='soulsync-testdb-')
+    _os.environ['DATABASE_PATH'] = _os.path.join(_TEST_DB_DIR, 'test_music_library.db')
+    _os.environ['VIDEO_DATABASE_PATH'] = _os.path.join(_TEST_DB_DIR, 'test_video_library.db')
+    # The REAL config/config.json has the same hazard as the real DBs: with the
+    # test music DB empty, config_manager "migrates" from config.json — so the
+    # developer's live Plex/Jellyfin/slskd credentials leak into the suite and
+    # tests that resolve the active video server CONNECT TO THE REAL PLEX
+    # (caught live: collections sync ran against it; it also makes local runs
+    # diverge from CI, which has no config.json). Point config resolution at a
+    # path that doesn't exist → pure defaults, exactly like CI.
+    _os.environ['SOULSYNC_CONFIG_PATH'] = _os.path.join(_TEST_DB_DIR, 'test_config.json')
+    _os.environ['SOULSYNC_TEST_DB_READY'] = '1'
+    _atexit.register(lambda: _shutil.rmtree(_TEST_DB_DIR, ignore_errors=True))
+
+import copy
+import os as _os
+import pytest
+import tempfile as _tempfile2
+import threading
+import time
+from flask import Flask, jsonify
+from flask_socketio import SocketIO, join_room, leave_room
+
+
+def symlinks_supported() -> bool:
+    """True when the host can create symlinks (often false on Windows without Developer Mode)."""
+    try:
+        with _tempfile2.TemporaryDirectory() as d:
+            target = _os.path.join(d, "target")
+            link = _os.path.join(d, "link")
+            with open(target, "w", encoding="utf-8"):
+                pass
+            _os.symlink("target", link)
+            return _os.path.islink(link) and _os.readlink(link) == "target"
+    except (OSError, NotImplementedError):
+        return False
+
+
+requires_symlinks = pytest.mark.skipif(
+    not symlinks_supported(),
+    reason="host OS cannot create symlinks (common on Windows without Developer Mode)",
+)
+
+
+# ---------------------------------------------------------------------------
+# Fake state that mirrors the real web_server.py module-level globals
+# ---------------------------------------------------------------------------
+
+_DEFAULT_STATUS_CACHE = {
+    'metadata_source': {'connected': True, 'response_time': 12.5, 'source': 'spotify'},
+    'spotify': {'connected': True, 'authenticated': True, 'rate_limited': False, 'rate_limit': None, 'post_ban_cooldown': None},
+    'media_server': {'connected': True, 'response_time': 8.1, 'type': 'plex'},
+    'soulseek': {'connected': True, 'response_time': 5.3, 'source': 'soulseek'},
+}
+
+_DEFAULT_WATCHLIST_STATE = {
+    'count': 7,
+    'next_run_in_seconds': 3600,
+}
+
+# Phase 2: Dashboard state defaults
+_DEFAULT_SYSTEM_STATS = {
+    'active_downloads': 2,
+    'finished_downloads': 15,
+    'download_speed': '1.2 MB/s',
+    'active_syncs': 1,
+    'uptime': '2:30:00',
+    'memory_usage': '45.2%',
+}
+
+_DEFAULT_DB_STATS = {
+    'artists': 350,
+    'albums': 1200,
+    'tracks': 14500,
+    'database_size_mb': 48.75,
+    'server_source': 'plex',
+    'last_full_refresh': '2026-03-01T12:00:00',
+}
+
+_DEFAULT_WISHLIST_COUNT = {
+    'count': 5,
+}
+
+# Phase 3: Enrichment worker state defaults
+_ENRICHMENT_COMMON = {
+    'enabled': True, 'running': True, 'paused': False, 'idle': False,
+    'current_item': {'name': 'Pink Floyd', 'type': 'artist'},
+    'stats': {'matched': 10, 'not_found': 2, 'pending': 50, 'errors': 0},
+    'progress': {
+        'artists': {'matched': 10, 'total': 50, 'percent': 20},
+        'albums': {'matched': 0, 'total': 100, 'percent': 0},
+        'tracks': {'matched': 0, 'total': 500, 'percent': 0},
+    }
+}
+
+_DEFAULT_ENRICHMENT_STATUS = {
+    'musicbrainz': copy.deepcopy(_ENRICHMENT_COMMON),
+    'audiodb': copy.deepcopy(_ENRICHMENT_COMMON),
+    'deezer': copy.deepcopy(_ENRICHMENT_COMMON),
+    'jiosaavn': copy.deepcopy(_ENRICHMENT_COMMON),
+    'spotify-enrichment': {**copy.deepcopy(_ENRICHMENT_COMMON), 'authenticated': True},
+    'itunes-enrichment': copy.deepcopy(_ENRICHMENT_COMMON),
+    'hydrabase': {
+        'enabled': True, 'running': True, 'paused': False,
+        'queue_size': 12, 'stats': {'sent': 100, 'dropped': 2, 'errors': 0},
+    },
+    'repair': {
+        'enabled': True, 'running': True, 'paused': False, 'idle': False,
+        'current_item': {'name': 'song.mp3', 'type': 'track'},
+        'stats': {'scanned': 50, 'repaired': 3, 'skipped': 10, 'errors': 0, 'pending': 150},
+        'progress': {
+            'tracks': {'checked': 50, 'total': 200, 'percent': 25, 'repaired': 3},
+        }
+    },
+}
+
+# Phase 4: Tool progress state defaults
+_DEFAULT_STREAM_STATE = {
+    "status": "loading", "progress": 45,
+    "track_info": {"artist": "Pink Floyd", "title": "Comfortably Numb"},
+    "error_message": None,
+}
+
+_DEFAULT_DUPLICATE_CLEANER_STATE = {
+    "status": "running", "phase": "Scanning...", "progress": 50,
+    "files_scanned": 500, "total_files": 1000, "duplicates_found": 10,
+    "deleted": 5, "space_freed": 52428800, "error_message": "",
+}
+
+_DEFAULT_RETAG_STATE = {
+    "status": "running", "phase": "Retagging...", "progress": 25,
+    "current_track": "song.mp3", "total_tracks": 200, "processed": 50,
+    "error_message": "",
+}
+
+_DEFAULT_DB_UPDATE_STATE = {
+    "status": "running", "phase": "Updating...", "progress": 40,
+    "current_item": "Pink Floyd", "processed": 40, "total": 100,
+    "error_message": "", "removed_artists": 0, "removed_albums": 0, "removed_tracks": 0,
+}
+
+_DEFAULT_METADATA_STATE = {
+    "status": "running", "current_artist": "Pink Floyd",
+    "processed": 10, "total": 50, "percentage": 20.0,
+    "successful": 9, "failed": 1, "started_at": None, "completed_at": None,
+    "error": None, "refresh_interval_days": 30,
+}
+
+_DEFAULT_LOGS_ACTIVITIES = [
+    {"icon": "\U0001f3b5", "title": "Download Complete", "subtitle": "Artist - Song", "time": "Now"},
+]
+
+# Phase 5: Sync/Discovery/Scan state defaults
+_DEFAULT_SYNC_STATES = {
+    'test-playlist-1': {
+        'status': 'syncing',
+        'progress': {
+            'total_tracks': 11, 'matched_tracks': 5, 'failed_tracks': 1,
+            'progress': 45, 'current_step': 'Matching...', 'current_track': 'Test Song',
+        },
+        'playlist_id': 'test-playlist-1', 'playlist_name': 'Test Playlist',
+    },
+    # Phase 6: Platform-specific sync IDs
+    'tidal_test-tidal-1': {
+        'status': 'syncing',
+        'progress': {
+            'total_tracks': 8, 'matched_tracks': 3, 'failed_tracks': 0,
+            'progress': 37, 'current_step': 'Matching...', 'current_track': 'Tidal Song',
+        },
+        'playlist_id': 'tidal_test-tidal-1', 'playlist_name': 'Tidal Test Playlist',
+    },
+    'youtube_test-yt-hash': {
+        'status': 'syncing',
+        'progress': {
+            'total_tracks': 10, 'matched_tracks': 4, 'failed_tracks': 1,
+            'progress': 50, 'current_step': 'Matching...', 'current_track': 'YT Song',
+        },
+        'playlist_id': 'youtube_test-yt-hash', 'playlist_name': 'YouTube Test Playlist',
+    },
+    'beatport_sync_test-bp-hash_1234': {
+        'status': 'syncing',
+        'progress': {
+            'total_tracks': 15, 'matched_tracks': 7, 'failed_tracks': 2,
+            'progress': 60, 'current_step': 'Matching...', 'current_track': 'BP Song',
+        },
+        'playlist_id': 'beatport_sync_test-bp-hash_1234', 'playlist_name': 'Beatport Test Chart',
+    },
+    'listenbrainz_test-lb-mbid': {
+        'status': 'syncing',
+        'progress': {
+            'total_tracks': 12, 'matched_tracks': 6, 'failed_tracks': 0,
+            'progress': 50, 'current_step': 'Matching...', 'current_track': 'LB Song',
+        },
+        'playlist_id': 'listenbrainz_test-lb-mbid', 'playlist_name': 'ListenBrainz Test Playlist',
+    },
+}
+
+_DEFAULT_DISCOVERY_STATES = {
+    'tidal': {
+        'test-tidal-1': {
+            'phase': 'discovering', 'status': 'running',
+            'discovery_progress': 50, 'spotify_matches': 5, 'spotify_total': 10,
+            'discovery_results': [
+                {'tidal_track': {'name': 'Song A', 'artists': ['Artist A']},
+                 'status': 'found', 'status_class': 'found',
+                 'spotify_data': {'name': 'Song A', 'artists': ['Artist A'], 'album': 'Album A'},
+                 'spotify_id': 'sp1', 'manual_match': False},
+            ],
+        }
+    },
+    'youtube': {
+        'test-yt-hash': {
+            'phase': 'discovering', 'status': 'running',
+            'discovery_progress': 30, 'spotify_matches': 3, 'spotify_total': 10,
+            'discovery_results': [
+                {'index': 0, 'yt_track': 'Song B', 'yt_artist': 'Artist B',
+                 'status': 'Found', 'status_class': 'found',
+                 'spotify_track': 'Song B', 'spotify_artist': 'Artist B',
+                 'spotify_album': 'Album B'},
+            ],
+        }
+    },
+    'beatport': {},
+    'listenbrainz': {},
+}
+
+_DEFAULT_WATCHLIST_SCAN_STATE = {
+    'status': 'scanning',
+    'current_artist_name': 'Pink Floyd', 'current_album': 'Dark Side',
+    'current_track_name': 'Money',
+    'current_artist_image_url': '', 'current_album_image_url': '',
+    'current_phase': 'scanning', 'recent_wishlist_additions': [],
+}
+
+_DEFAULT_MEDIA_SCAN_STATE = {
+    'is_scanning': True, 'status': 'scanning',
+    'progress_message': 'Scanning library...',
+}
+
+_DEFAULT_WISHLIST_STATS = {
+    'is_auto_processing': False,
+    'next_run_in_seconds': 120,
+}
+
+_status_cache = copy.deepcopy(_DEFAULT_STATUS_CACHE)
+watchlist_state = copy.deepcopy(_DEFAULT_WATCHLIST_STATE)
+download_batches = {}   # batch_id -> {phase, tasks, ...}
+tasks_lock = threading.Lock()
+
+# Phase 2: Dashboard state
+system_stats = copy.deepcopy(_DEFAULT_SYSTEM_STATS)
+activity_feed = []
+activity_feed_lock = threading.Lock()
+db_stats = copy.deepcopy(_DEFAULT_DB_STATS)
+wishlist_count = copy.deepcopy(_DEFAULT_WISHLIST_COUNT)
+
+# Phase 3: Enrichment worker state
+enrichment_status = copy.deepcopy(_DEFAULT_ENRICHMENT_STATUS)
+
+# Phase 4: Tool progress state
+stream_state = copy.deepcopy(_DEFAULT_STREAM_STATE)
+duplicate_cleaner_state = copy.deepcopy(_DEFAULT_DUPLICATE_CLEANER_STATE)
+retag_state = copy.deepcopy(_DEFAULT_RETAG_STATE)
+db_update_state = copy.deepcopy(_DEFAULT_DB_UPDATE_STATE)
+metadata_update_state = copy.deepcopy(_DEFAULT_METADATA_STATE)
+logs_activities = copy.deepcopy(_DEFAULT_LOGS_ACTIVITIES)
+
+# Phase 5: Sync/Discovery/Scan state
+sync_states = copy.deepcopy(_DEFAULT_SYNC_STATES)
+sync_lock = threading.Lock()
+discovery_states = copy.deepcopy(_DEFAULT_DISCOVERY_STATES)
+watchlist_scan_state = copy.deepcopy(_DEFAULT_WATCHLIST_SCAN_STATE)
+media_scan_state = copy.deepcopy(_DEFAULT_MEDIA_SCAN_STATE)
+wishlist_stats_state = copy.deepcopy(_DEFAULT_WISHLIST_STATS)
+
+
+# ---------------------------------------------------------------------------
+# Helpers (same signatures as real web_server.py)
+# ---------------------------------------------------------------------------
+
+def _build_status_payload():
+    return {
+        'metadata_source': dict(_status_cache['metadata_source']),
+        'spotify': dict(_status_cache['spotify']),
+        'media_server': dict(_status_cache['media_server']),
+        'soulseek': dict(_status_cache['soulseek']),
+        'active_media_server': _status_cache['media_server'].get('type', 'plex'),
+    }
+
+
+def _build_watchlist_count_payload():
+    return {
+        'success': True,
+        'count': watchlist_state['count'],
+        'next_run_in_seconds': watchlist_state['next_run_in_seconds'],
+    }
+
+
+def _build_batch_status_data(batch_id, batch):
+    """Simplified version — real one is ~200 lines."""
+    return {
+        'phase': batch.get('phase', 'downloading'),
+        'tasks': batch.get('tasks', []),
+        'active_count': batch.get('active_count', 0),
+        'max_concurrent': batch.get('max_concurrent', 3),
+        'playlist_id': batch.get('playlist_id', ''),
+        'playlist_name': batch.get('playlist_name', ''),
+    }
+
+
+# Phase 2 helpers
+
+def _build_system_stats():
+    return dict(system_stats)
+
+
+def _build_activity_feed_payload():
+    with activity_feed_lock:
+        return {'activities': list(activity_feed[-10:][::-1])}
+
+
+def _build_db_stats():
+    return dict(db_stats)
+
+
+def _build_wishlist_count_payload():
+    return dict(wishlist_count)
+
+
+# Phase 3 helpers
+
+def _build_enrichment_status(worker_name):
+    return copy.deepcopy(enrichment_status.get(worker_name, {}))
+
+ENRICHMENT_WORKERS = [
+    'musicbrainz', 'audiodb', 'deezer', 'jiosaavn',
+    'spotify-enrichment', 'itunes-enrichment',
+    'hydrabase', 'repair',
+]
+
+ENRICHMENT_ENDPOINTS = {
+    'musicbrainz': '/api/enrichment/musicbrainz/status',
+    'audiodb': '/api/enrichment/audiodb/status',
+    'deezer': '/api/enrichment/deezer/status',
+    'jiosaavn': '/api/enrichment/jiosaavn/status',
+    'spotify-enrichment': '/api/enrichment/spotify/status',
+    'itunes-enrichment': '/api/enrichment/itunes/status',
+    'hydrabase': '/api/hydrabase-worker/status',
+    'repair': '/api/repair/status',
+}
+
+# Phase 4 helpers
+
+TOOL_NAMES = [
+    'stream', 'duplicate-cleaner',
+    'retag', 'db-update', 'metadata', 'logs',
+]
+
+TOOL_ENDPOINTS = {
+    'stream': '/api/stream/status',
+    'duplicate-cleaner': '/api/duplicate-cleaner/status',
+    'retag': '/api/retag/status',
+    'db-update': '/api/database/update/status',
+    'metadata': '/api/metadata/status',
+    'logs': '/api/logs',
+}
+
+
+def _build_stream_status():
+    return {
+        "status": stream_state["status"],
+        "progress": stream_state["progress"],
+        "track_info": stream_state["track_info"],
+        "error_message": stream_state["error_message"],
+    }
+
+
+def _build_duplicate_cleaner_status():
+    state_copy = duplicate_cleaner_state.copy()
+    state_copy["space_freed_mb"] = duplicate_cleaner_state["space_freed"] / (1024 * 1024)
+    return state_copy
+
+
+def _build_retag_status():
+    return dict(retag_state)
+
+
+def _build_db_update_status():
+    return dict(db_update_state)
+
+
+def _build_metadata_status():
+    state_copy = metadata_update_state.copy()
+    if state_copy.get('started_at'):
+        state_copy['started_at'] = state_copy['started_at'].isoformat()
+    if state_copy.get('completed_at'):
+        state_copy['completed_at'] = state_copy['completed_at'].isoformat()
+    return {"success": True, "status": state_copy}
+
+
+def _build_logs():
+    recent = logs_activities[-50:][::-1]
+    formatted = []
+    for a in recent:
+        ts = a.get('time', 'Unknown')
+        icon = a.get('icon', '\u2022')
+        title = a.get('title', 'Activity')
+        sub = a.get('subtitle', '')
+        formatted.append(f"[{ts}] {icon} {title} - {sub}" if sub else f"[{ts}] {icon} {title}")
+    if not formatted:
+        formatted = ["No recent activity.", "Sync and download operations..."]
+    return {'logs': formatted}
+
+
+def _build_tool_status(tool_name):
+    """Dispatcher that returns the correct status payload for any tool."""
+    builders = {
+        'stream': _build_stream_status,
+        'duplicate-cleaner': _build_duplicate_cleaner_status,
+        'retag': _build_retag_status,
+        'db-update': _build_db_update_status,
+        'metadata': _build_metadata_status,
+        'logs': _build_logs,
+    }
+    return builders[tool_name]()
+
+
+# Phase 5 helpers
+
+SYNC_ENDPOINTS = {
+    'sync': '/api/sync/status/test-playlist-1',
+    # Phase 6: Platform-specific sync endpoints (use generic sync status)
+    'tidal_sync': '/api/sync/status/tidal_test-tidal-1',
+    'youtube_sync': '/api/sync/status/youtube_test-yt-hash',
+    'beatport_sync': '/api/sync/status/beatport_sync_test-bp-hash_1234',
+    'listenbrainz_sync': '/api/sync/status/listenbrainz_test-lb-mbid',
+}
+
+DISCOVERY_ENDPOINTS = {
+    'tidal': '/api/tidal/discovery/status/test-tidal-1',
+    'youtube': '/api/youtube/discovery/status/test-yt-hash',
+}
+
+SCAN_ENDPOINTS = {
+    'watchlist': '/api/watchlist/scan/status',
+    'media': '/api/scan/status',
+    'wishlist_stats': '/api/wishlist/stats',
+}
+
+
+def _build_sync_status(playlist_id):
+    with sync_lock:
+        state = sync_states.get(playlist_id, {})
+        return dict(state) if state else {'status': 'not_found'}
+
+
+def _build_discovery_status(platform, pid):
+    states = discovery_states.get(platform, {})
+    state = states.get(pid, {})
+    if not state:
+        return {'error': 'Not found'}
+    return {
+        'phase': state.get('phase'),
+        'status': state.get('status', 'unknown'),
+        'progress': state.get('discovery_progress', 0),
+        'spotify_matches': state.get('spotify_matches', 0),
+        'spotify_total': state.get('spotify_total', 0),
+        'results': state.get('discovery_results', []),
+        'complete': state.get('phase') == 'discovered',
+    }
+
+
+def _build_watchlist_scan_status():
+    return {"success": True, **watchlist_scan_state}
+
+
+def _build_media_scan_status():
+    return {"success": True, "status": dict(media_scan_state)}
+
+
+def _build_wishlist_stats():
+    return dict(wishlist_stats_state)
+
+
+# Shared reference for socketio — set during test_app fixture
+_test_socketio = None
+
+
+def add_activity_item(icon, title, subtitle, time_ago="Now", show_toast=True):
+    """Mirrors web_server.py's add_activity_item with instant toast push."""
+    activity_item = {
+        'icon': icon,
+        'title': title,
+        'subtitle': subtitle,
+        'time': time_ago,
+        'timestamp': time.time(),
+        'show_toast': show_toast,
+    }
+    with activity_feed_lock:
+        activity_feed.append(activity_item)
+        if len(activity_feed) > 20:
+            activity_feed.pop(0)
+
+    # Instant toast push via WebSocket
+    if show_toast and _test_socketio is not None:
+        try:
+            _test_socketio.emit('dashboard:toast', activity_item)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def test_app():
+    """Create a minimal Flask + SocketIO app that mirrors Phase 1+2 endpoints."""
+    global _test_socketio
+
+    app = Flask(__name__)
+    app.config['TESTING'] = True
+    app.start_time = time.time()
+    socketio = SocketIO(app, async_mode='threading', cors_allowed_origins='*')
+    _test_socketio = socketio
+
+    # --- Phase 1 HTTP endpoints ---
+
+    @app.route('/status')
+    def get_status():
+        return jsonify(_build_status_payload())
+
+    @app.route('/api/watchlist/count')
+    def get_watchlist_count_endpoint():
+        return jsonify(_build_watchlist_count_payload())
+
+    @app.route('/api/download_status/batch')
+    def get_batched_download_statuses():
+        from flask import request
+        requested_ids = request.args.getlist('batch_ids')
+        response = {'batches': {}}
+        with tasks_lock:
+            target = {bid: b for bid, b in download_batches.items()
+                      if not requested_ids or bid in requested_ids}
+            for bid, batch in target.items():
+                response['batches'][bid] = _build_batch_status_data(bid, batch)
+        response['metadata'] = {
+            'total_batches': len(response['batches']),
+            'requested_batch_ids': requested_ids,
+            'timestamp': time.time(),
+        }
+        return jsonify(response)
+
+    # --- Phase 2 HTTP endpoints ---
+
+    @app.route('/api/system/stats')
+    def get_system_stats():
+        try:
+            return jsonify(_build_system_stats())
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/activity/feed')
+    def get_activity_feed():
+        try:
+            return jsonify(_build_activity_feed_payload())
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/activity/toasts')
+    def get_recent_toasts():
+        try:
+            current_time = time.time()
+            with activity_feed_lock:
+                recent_toasts = [
+                    a for a in activity_feed
+                    if a.get('show_toast', True) and
+                       (current_time - a.get('timestamp', 0)) <= 10
+                ]
+            return jsonify({'toasts': recent_toasts})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/database/stats')
+    def get_database_stats():
+        try:
+            return jsonify(_build_db_stats())
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    @app.route('/api/wishlist/count')
+    def get_wishlist_count_api():
+        try:
+            return jsonify(_build_wishlist_count_payload())
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+
+    # --- Phase 3 HTTP endpoints (enrichment workers) ---
+
+    @app.route('/api/enrichment/musicbrainz/status')
+    def musicbrainz_status():
+        return jsonify(_build_enrichment_status('musicbrainz'))
+
+    @app.route('/api/enrichment/audiodb/status')
+    def audiodb_status():
+        return jsonify(_build_enrichment_status('audiodb'))
+
+    @app.route('/api/enrichment/deezer/status')
+    def deezer_status():
+        return jsonify(_build_enrichment_status('deezer'))
+
+    @app.route('/api/enrichment/spotify/status')
+    def spotify_enrichment_status():
+        return jsonify(_build_enrichment_status('spotify-enrichment'))
+
+    @app.route('/api/enrichment/itunes/status')
+    def itunes_enrichment_status():
+        return jsonify(_build_enrichment_status('itunes-enrichment'))
+
+    @app.route('/api/hydrabase-worker/status')
+    def hydrabase_worker_status():
+        return jsonify(_build_enrichment_status('hydrabase'))
+
+    @app.route('/api/repair/status')
+    def repair_status():
+        return jsonify(_build_enrichment_status('repair'))
+
+    # --- Phase 4 HTTP endpoints (tool progress) ---
+
+    @app.route('/api/stream/status')
+    def stream_status_endpoint():
+        return jsonify(_build_stream_status())
+
+    @app.route('/api/duplicate-cleaner/status')
+    def duplicate_cleaner_status_endpoint():
+        return jsonify(_build_duplicate_cleaner_status())
+
+    @app.route('/api/retag/status')
+    def retag_status_endpoint():
+        return jsonify(_build_retag_status())
+
+    @app.route('/api/database/update/status')
+    def db_update_status_endpoint():
+        return jsonify(_build_db_update_status())
+
+    @app.route('/api/metadata/status')
+    def metadata_status_endpoint():
+        return jsonify(_build_metadata_status())
+
+    @app.route('/api/logs')
+    def logs_endpoint():
+        return jsonify(_build_logs())
+
+    # --- Phase 5 HTTP endpoints (sync/discovery/scan) ---
+
+    @app.route('/api/sync/status/<playlist_id>')
+    def sync_status_endpoint(playlist_id):
+        status = _build_sync_status(playlist_id)
+        if status.get('status') == 'not_found':
+            return jsonify({'error': 'Sync not found'}), 404
+        return jsonify(status)
+
+    @app.route('/api/tidal/discovery/status/<playlist_id>')
+    def tidal_discovery_status_endpoint(playlist_id):
+        return jsonify(_build_discovery_status('tidal', playlist_id))
+
+    @app.route('/api/youtube/discovery/status/<url_hash>')
+    def youtube_discovery_status_endpoint(url_hash):
+        return jsonify(_build_discovery_status('youtube', url_hash))
+
+    @app.route('/api/beatport/discovery/status/<url_hash>')
+    def beatport_discovery_status_endpoint(url_hash):
+        return jsonify(_build_discovery_status('beatport', url_hash))
+
+    @app.route('/api/listenbrainz/discovery/status/<playlist_mbid>')
+    def listenbrainz_discovery_status_endpoint(playlist_mbid):
+        return jsonify(_build_discovery_status('listenbrainz', playlist_mbid))
+
+    @app.route('/api/watchlist/scan/status')
+    def watchlist_scan_status_endpoint():
+        return jsonify(_build_watchlist_scan_status())
+
+    @app.route('/api/scan/status')
+    def media_scan_status_endpoint():
+        return jsonify(_build_media_scan_status())
+
+    @app.route('/api/wishlist/stats')
+    def wishlist_stats_endpoint():
+        return jsonify(_build_wishlist_stats())
+
+    # --- Phase 1 WebSocket background emitters ---
+
+    def _emit_service_status_loop():
+        while True:
+            socketio.sleep(10)
+            try:
+                socketio.emit('status:update', _build_status_payload())
+            except Exception:
+                pass
+
+    def _emit_watchlist_count_loop():
+        while True:
+            socketio.sleep(30)
+            try:
+                socketio.emit('watchlist:count', _build_watchlist_count_payload())
+            except Exception:
+                pass
+
+    def _emit_download_status_loop():
+        while True:
+            socketio.sleep(2)
+            try:
+                with tasks_lock:
+                    for bid, batch in download_batches.items():
+                        try:
+                            socketio.emit('downloads:batch_update', {
+                                'batch_id': bid,
+                                'data': _build_batch_status_data(bid, batch),
+                            }, room=f'batch:{bid}')
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+    # --- Phase 2 WebSocket background emitters ---
+
+    def _emit_system_stats_loop():
+        while True:
+            socketio.sleep(10)
+            try:
+                socketio.emit('dashboard:stats', _build_system_stats())
+            except Exception:
+                pass
+
+    def _emit_activity_feed_loop():
+        while True:
+            socketio.sleep(5)
+            try:
+                socketio.emit('dashboard:activity', _build_activity_feed_payload())
+            except Exception:
+                pass
+
+    def _emit_db_stats_loop():
+        while True:
+            socketio.sleep(30)
+            try:
+                socketio.emit('dashboard:db_stats', _build_db_stats())
+            except Exception:
+                pass
+
+    def _emit_wishlist_count_ws_loop():
+        while True:
+            socketio.sleep(30)
+            try:
+                socketio.emit('dashboard:wishlist_count', _build_wishlist_count_payload())
+            except Exception:
+                pass
+
+    # Note: Toasts emit instantly from add_activity_item() — no timer needed
+
+    # --- Phase 3 WebSocket background emitter ---
+
+    def _emit_enrichment_status_loop():
+        while True:
+            socketio.sleep(2)
+            for name in ENRICHMENT_WORKERS:
+                try:
+                    status = _build_enrichment_status(name)
+                    if status:
+                        socketio.emit(f'enrichment:{name}', status)
+                except Exception:
+                    pass
+
+    # --- Phase 4 WebSocket background emitter ---
+
+    def _emit_tool_progress_loop():
+        while True:
+            socketio.sleep(1)
+            for name in TOOL_NAMES:
+                try:
+                    status = _build_tool_status(name)
+                    if status:
+                        socketio.emit(f'tool:{name}', status)
+                except Exception:
+                    pass
+
+    # --- Phase 5 WebSocket background emitters ---
+
+    def _emit_sync_progress_loop():
+        while True:
+            socketio.sleep(1)
+            try:
+                with sync_lock:
+                    for pid, state in list(sync_states.items()):
+                        try:
+                            socketio.emit('sync:progress', {
+                                'playlist_id': pid, **state
+                            }, room=f'sync:{pid}')
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+    def _emit_discovery_progress_loop():
+        while True:
+            socketio.sleep(1)
+            for platform in ['tidal', 'youtube', 'beatport', 'listenbrainz']:
+                try:
+                    states_dict = discovery_states.get(platform, {})
+                    for pid, state in list(states_dict.items()):
+                        try:
+                            phase = state.get('phase', '')
+                            if phase in ('', 'idle'):
+                                continue
+                            payload = {
+                                'platform': platform,
+                                'id': pid,
+                                'phase': state.get('phase'),
+                                'status': state.get('status', 'unknown'),
+                                'progress': state.get('discovery_progress', 0),
+                                'discovery_progress': state.get('discovery_progress', {}),
+                                'spotify_matches': state.get('spotify_matches', 0),
+                                'spotify_total': state.get('spotify_total', 0),
+                                'results': state.get('discovery_results', state.get('results', [])),
+                                'complete': state.get('phase') == 'discovered',
+                            }
+                            socketio.emit('discovery:progress', payload, room=f'discovery:{pid}')
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+    def _emit_scan_status_loop():
+        while True:
+            socketio.sleep(2)
+            try:
+                socketio.emit('scan:watchlist', {"success": True, **watchlist_scan_state})
+            except Exception:
+                pass
+            try:
+                socketio.emit('scan:media', {"success": True, "status": dict(media_scan_state)})
+            except Exception:
+                pass
+            try:
+                socketio.emit('wishlist:stats', dict(wishlist_stats_state))
+            except Exception:
+                pass
+
+    # --- Socket.IO event handlers ---
+
+    @socketio.on('connect')
+    def handle_connect():
+        pass
+
+    @socketio.on('disconnect')
+    def handle_disconnect():
+        pass
+
+    @socketio.on('downloads:subscribe')
+    def handle_download_subscribe(data):
+        batch_ids = data.get('batch_ids', [])
+        for bid in batch_ids:
+            join_room(f'batch:{bid}')
+
+    @socketio.on('downloads:unsubscribe')
+    def handle_download_unsubscribe(data):
+        batch_ids = data.get('batch_ids', [])
+        for bid in batch_ids:
+            leave_room(f'batch:{bid}')
+
+    # Phase 5 subscribe/unsubscribe handlers
+    @socketio.on('sync:subscribe')
+    def handle_sync_subscribe(data):
+        for pid in data.get('playlist_ids', []):
+            join_room(f'sync:{pid}')
+
+    @socketio.on('sync:unsubscribe')
+    def handle_sync_unsubscribe(data):
+        for pid in data.get('playlist_ids', []):
+            leave_room(f'sync:{pid}')
+
+    @socketio.on('discovery:subscribe')
+    def handle_discovery_subscribe(data):
+        for pid in data.get('ids', []):
+            join_room(f'discovery:{pid}')
+
+    @socketio.on('discovery:unsubscribe')
+    def handle_discovery_unsubscribe(data):
+        for pid in data.get('ids', []):
+            leave_room(f'discovery:{pid}')
+
+    # Start emitters (Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5)
+    socketio.start_background_task(_emit_service_status_loop)
+    socketio.start_background_task(_emit_watchlist_count_loop)
+    socketio.start_background_task(_emit_download_status_loop)
+    socketio.start_background_task(_emit_system_stats_loop)
+    socketio.start_background_task(_emit_activity_feed_loop)
+    socketio.start_background_task(_emit_db_stats_loop)
+    socketio.start_background_task(_emit_wishlist_count_ws_loop)
+    socketio.start_background_task(_emit_enrichment_status_loop)
+    socketio.start_background_task(_emit_tool_progress_loop)
+    socketio.start_background_task(_emit_sync_progress_loop)
+    socketio.start_background_task(_emit_discovery_progress_loop)
+    socketio.start_background_task(_emit_scan_status_loop)
+
+    return app, socketio
+
+
+@pytest.fixture
+def flask_client(test_app):
+    """Plain Flask test client (HTTP only)."""
+    app, _socketio = test_app
+    return app.test_client()
+
+
+@pytest.fixture
+def socketio_client(test_app):
+    """Socket.IO test client (connects via WebSocket)."""
+    app, socketio = test_app
+    return socketio.test_client(app)
+
+
+@pytest.fixture
+def shared_state():
+    """Provide direct references to the mutable state dicts AND helper functions.
+
+    Using this fixture avoids import-path mismatches between pytest's
+    auto-discovered conftest module and explicit ``from tests.conftest import …``."""
+    return {
+        # Phase 1 state
+        'status_cache': _status_cache,
+        'watchlist_state': watchlist_state,
+        'download_batches': download_batches,
+        'tasks_lock': tasks_lock,
+        'build_status_payload': _build_status_payload,
+        'build_watchlist_count_payload': _build_watchlist_count_payload,
+        'build_batch_status_data': _build_batch_status_data,
+        # Phase 2 state
+        'system_stats': system_stats,
+        'activity_feed': activity_feed,
+        'activity_feed_lock': activity_feed_lock,
+        'db_stats': db_stats,
+        'wishlist_count': wishlist_count,
+        'build_system_stats': _build_system_stats,
+        'build_activity_feed_payload': _build_activity_feed_payload,
+        'build_db_stats': _build_db_stats,
+        'build_wishlist_count_payload_ws': _build_wishlist_count_payload,
+        'add_activity_item': add_activity_item,
+        # Phase 3 state
+        'enrichment_status': enrichment_status,
+        'build_enrichment_status': _build_enrichment_status,
+        'enrichment_workers': ENRICHMENT_WORKERS,
+        'enrichment_endpoints': ENRICHMENT_ENDPOINTS,
+        # Phase 4 state
+        'stream_state': stream_state,
+        'duplicate_cleaner_state': duplicate_cleaner_state,
+        'retag_state': retag_state,
+        'db_update_state': db_update_state,
+        'metadata_update_state': metadata_update_state,
+        'logs_activities': logs_activities,
+        'build_tool_status': _build_tool_status,
+        'build_stream_status': _build_stream_status,
+        'build_duplicate_cleaner_status': _build_duplicate_cleaner_status,
+        'build_retag_status': _build_retag_status,
+        'build_db_update_status': _build_db_update_status,
+        'build_metadata_status': _build_metadata_status,
+        'build_logs': _build_logs,
+        'tool_names': TOOL_NAMES,
+        'tool_endpoints': TOOL_ENDPOINTS,
+        # Phase 5 state
+        'sync_states': sync_states,
+        'sync_lock': sync_lock,
+        'discovery_states': discovery_states,
+        'watchlist_scan_state': watchlist_scan_state,
+        'media_scan_state': media_scan_state,
+        'build_sync_status': _build_sync_status,
+        'build_discovery_status': _build_discovery_status,
+        'build_watchlist_scan_status': _build_watchlist_scan_status,
+        'build_media_scan_status': _build_media_scan_status,
+        'wishlist_stats_state': wishlist_stats_state,
+        'build_wishlist_stats': _build_wishlist_stats,
+        'sync_endpoints': SYNC_ENDPOINTS,
+        'discovery_endpoints': DISCOVERY_ENDPOINTS,
+        'scan_endpoints': SCAN_ENDPOINTS,
+    }
+
+
+@pytest.fixture(autouse=True, scope='session')
+def _inert_youtube_date_enricher():
+    """Neuter the YouTube date-enricher SINGLETON for the whole suite.
+
+    Several video endpoints fire-and-forget `get_youtube_date_enricher().enqueue(...)`
+    on every channel/follow request. Any endpoint test that doesn't stub it spawns
+    the REAL background thread, which then makes LIVE yt-dlp/InnerTube requests to
+    YouTube for the test's fake channel ids and writes to the shared default video
+    DB — concurrently with whatever test runs next (caught live: CI stderr full of
+    'ERROR: [youtube:tab] UC1/videos', and order-dependent KeyError failures in
+    tests/video/test_youtube_tracking.py). Tests are not allowed to reach the
+    network or share background writers — same rule as the DB/config isolation
+    above.
+
+    The singleton becomes a real enricher whose enqueue is a no-op (never spawns
+    the thread), so pause()/resume()/stats() keep their real shapes for the
+    status endpoints. Tests that exercise real enrichment construct
+    YoutubeDateEnricher(db_factory=...) directly and are unaffected.
+    """
+    import core.video.youtube_enrichment as yt_enrich
+
+    class _InertYoutubeEnricher(yt_enrich.YoutubeDateEnricher):
+        def enqueue(self, channel_id, title=None):
+            return None
+
+    with yt_enrich._enricher_lock:
+        yt_enrich._enricher = _InertYoutubeEnricher()
+    yield
+
+
+@pytest.fixture(autouse=True, scope='session')
+def _inert_video_enrichment_engine():
+    """Pre-build the video enrichment engine singleton WITHOUT starting its
+    worker threads.
+
+    get_video_enrichment_engine() lazily constructs the engine AND
+    start_all()s its whole daemon fleet (TMDB/TVDB matcher workers + the
+    RYD/SponsorBlock/fanart/OpenSubtitles/... backfill workers) on first use.
+    The first test to touch any enrichment-adjacent endpoint therefore spawned
+    background threads that ran for the REST of the suite: real network
+    calls, writes to the shared default video DB, and stray time.sleep calls
+    + ERROR logs that failed completely unrelated tests (CI: 'video backfill
+    opensubtitles loop error' erupting inside test_config_save_retry).
+    Same hermeticity rule as the YouTube date enricher above.
+
+    The singleton becomes a REAL engine bound to the isolated session temp DB
+    — every status/breakdown endpoint keeps working — just never started.
+    Tests that want a specific engine still monkeypatch the getter or set
+    engine._engine themselves; reset_state below re-installs this one between
+    tests so a test-local engine can't leak forward.
+    """
+    import core.video.enrichment.engine as eng_mod
+    from core.video.enrichment.clients import build_clients
+    from database.video_database import VideoDatabase
+
+    db = VideoDatabase()          # env-redirected isolated session temp DB
+    engine = eng_mod.VideoEnrichmentEngine(db, build_clients(db))
+    with eng_mod._lock:
+        eng_mod._engine = engine
+    yield engine
+
+
+@pytest.fixture(autouse=True, scope='session')
+def _inert_video_download_monitor():
+    """Pre-mark the video download monitor as started so no test can spawn it.
+
+    ensure_started() launches a daemon thread on the first grab-shaped call
+    (the /youtube/download endpoint, manual grabs, ...). In the suite that
+    thread then lives FOREVER, and its loop calls the LIVE db_provider —
+    get_video_db() — which resolves to whichever per-test database happens to
+    be installed at that moment: it re-queues orphans, pumps youtube workers,
+    and mutates rows in other tests' databases. Caught on camera by the
+    self-describing assert in test_youtube_episode_parity: 'youtube recovery:
+    re-queued 0 orphan(s), started 3 worker(s)' fired mid-test and called the
+    test's stubbed start_next_queued three extra times. Same hermeticity rule
+    as the enrichment fleet above; production is untouched (the flag is only
+    pre-set inside pytest).
+    """
+    import core.video.download_monitor as monitor
+    with monitor._lock:
+        monitor._started = True
+    yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _inert_music_disk_guard():
+    """Pin the music min-free-disk guard OFF for the whole suite.
+
+    music_has_room() probes the REAL filesystem's free space (rule 3b: CI
+    runner fill varies run to run) on every DownloadOrchestrator.download().
+    Tests of the guard itself monkeypatch the probe and reset the override.
+    """
+    import core.disk_guard as dg
+    dg._floor_override = 0.0
+    yield
+    dg._floor_override = None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _video_db_lazy_create_tripwire():
+    """Name the poisoner: log a full stack whenever get_video_db() LAZILY
+    CREATES the module-global VideoDatabase during the suite.
+
+    Tests that want a DB install their own (`videoapi._video_db = db`); the
+    lazy-create branch firing mid-suite means some code path — usually a
+    daemon thread outliving its test — reached for the global after a test's
+    teardown set it to None. That freshly-created instance then shadows the
+    NEXT test's install (the split-brain phantom: a setting written on the
+    test's handle reads back empty through the endpoint). The stack printed
+    here is the culprit, thread name included. Diagnostic only: behavior is
+    unchanged, and the env redirects above make the created DB a temp one.
+    """
+    import io
+    import threading
+    import traceback
+
+    import api.video as videoapi
+
+    orig = videoapi.get_video_db
+
+    def traced():
+        if videoapi._video_db is None:
+            buf = io.StringIO()
+            traceback.print_stack(file=buf)
+            print("\n[video-db tripwire] get_video_db() LAZY-CREATE on thread %r:\n%s"
+                  % (threading.current_thread().name, buf.getvalue()), flush=True)
+        return orig()
+
+    videoapi.get_video_db = traced
+    try:
+        yield
+    finally:
+        videoapi.get_video_db = orig
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _video_db_assignment_tripwire():
+    """Log EVERY assignment to api.video._video_db — one compact line with the
+    currently-running test, the assigning caller, and the thread.
+
+    The split-brain phantom's smoking gun (caught by the parity test's
+    diagnostic assert) is _video_db pointing at a DIFFERENT VideoDatabase than
+    the one the test's own fixture just installed, with the lazy-create path
+    proven silent — so some test-side code ASSIGNS the global out of turn.
+    Modules accept a __class__ swap to a ModuleType subclass, which lets us
+    hook attribute assignment without touching production code."""
+    import os
+    import threading
+    import traceback
+
+    import api.video as videoapi
+
+    base = type(videoapi)
+
+    class _TracedModule(base):
+        def __setattr__(self, name, value):
+            if name == "_video_db":
+                frames = traceback.extract_stack(limit=4)[:-1]
+                caller = " <- ".join("%s:%s" % (os.path.basename(f.filename), f.lineno)
+                                     for f in reversed(frames))
+                print("[assign tripwire] _video_db=%s thread=%r test=%r via %s"
+                      % ("None" if value is None else hex(id(value)),
+                         threading.current_thread().name,
+                         os.environ.get("PYTEST_CURRENT_TEST", "?"), caller),
+                      flush=True)
+            super().__setattr__(name, value)
+
+    videoapi.__class__ = _TracedModule
+    try:
+        yield
+    finally:
+        videoapi.__class__ = base
+
+
+@pytest.fixture(autouse=True)
+def reset_state(_inert_video_enrichment_engine, _inert_video_download_monitor):
+    """Reset all mutable state between tests."""
+    # Video enrichment engine: re-install the inert (never-started) singleton
+    # so an engine a previous test set never leaks into the next one.
+    import core.video.enrichment.engine as _eng_mod
+    _eng_mod._engine = _inert_video_enrichment_engine
+    # slskd search throttle: ONE process-wide reservation window shared by the
+    # music + video sides (core.slskd_throttle). Left alone, reservations
+    # accumulate across the whole pytest session — once 35 pile up, every
+    # later test that touches a search path sleeps REAL minutes waiting for
+    # its slot (the suite appears to hang around the test_v* files). Wipe it
+    # between tests like any other module-global.
+    from core.slskd_throttle import _reset_for_tests
+    _reset_for_tests()
+    # Enrichment status TTL cache (core.enrichment.api): a cached stats dict
+    # must never leak into the next test's registry (same service id, new fake).
+    from core.enrichment.api import _invalidate_status_cache
+    _invalidate_status_cache()
+    # Reset to defaults
+    _status_cache.clear()
+    _status_cache.update(copy.deepcopy(_DEFAULT_STATUS_CACHE))
+    watchlist_state.clear()
+    watchlist_state.update(copy.deepcopy(_DEFAULT_WATCHLIST_STATE))
+    download_batches.clear()
+    # Phase 2 resets
+    system_stats.clear()
+    system_stats.update(copy.deepcopy(_DEFAULT_SYSTEM_STATS))
+    with activity_feed_lock:
+        activity_feed.clear()
+    db_stats.clear()
+    db_stats.update(copy.deepcopy(_DEFAULT_DB_STATS))
+    wishlist_count.clear()
+    wishlist_count.update(copy.deepcopy(_DEFAULT_WISHLIST_COUNT))
+    # Phase 3 resets
+    enrichment_status.clear()
+    enrichment_status.update(copy.deepcopy(_DEFAULT_ENRICHMENT_STATUS))
+    # Phase 4 resets
+    stream_state.clear()
+    stream_state.update(copy.deepcopy(_DEFAULT_STREAM_STATE))
+    duplicate_cleaner_state.clear()
+    duplicate_cleaner_state.update(copy.deepcopy(_DEFAULT_DUPLICATE_CLEANER_STATE))
+    retag_state.clear()
+    retag_state.update(copy.deepcopy(_DEFAULT_RETAG_STATE))
+    db_update_state.clear()
+    db_update_state.update(copy.deepcopy(_DEFAULT_DB_UPDATE_STATE))
+    metadata_update_state.clear()
+    metadata_update_state.update(copy.deepcopy(_DEFAULT_METADATA_STATE))
+    logs_activities.clear()
+    logs_activities.extend(copy.deepcopy(_DEFAULT_LOGS_ACTIVITIES))
+    # Phase 5 resets
+    sync_states.clear()
+    sync_states.update(copy.deepcopy(_DEFAULT_SYNC_STATES))
+    discovery_states.clear()
+    discovery_states.update(copy.deepcopy(_DEFAULT_DISCOVERY_STATES))
+    watchlist_scan_state.clear()
+    watchlist_scan_state.update(copy.deepcopy(_DEFAULT_WATCHLIST_SCAN_STATE))
+    media_scan_state.clear()
+    media_scan_state.update(copy.deepcopy(_DEFAULT_MEDIA_SCAN_STATE))
+    wishlist_stats_state.clear()
+    wishlist_stats_state.update(copy.deepcopy(_DEFAULT_WISHLIST_STATS))
+    yield
+    # Cleanup after test
+    _status_cache.clear()
+    _status_cache.update(copy.deepcopy(_DEFAULT_STATUS_CACHE))
+    watchlist_state.clear()
+    watchlist_state.update(copy.deepcopy(_DEFAULT_WATCHLIST_STATE))
+    download_batches.clear()
+    system_stats.clear()
+    system_stats.update(copy.deepcopy(_DEFAULT_SYSTEM_STATS))
+    with activity_feed_lock:
+        activity_feed.clear()
+    db_stats.clear()
+    db_stats.update(copy.deepcopy(_DEFAULT_DB_STATS))
+    wishlist_count.clear()
+    wishlist_count.update(copy.deepcopy(_DEFAULT_WISHLIST_COUNT))
+    enrichment_status.clear()
+    enrichment_status.update(copy.deepcopy(_DEFAULT_ENRICHMENT_STATUS))
+    stream_state.clear()
+    stream_state.update(copy.deepcopy(_DEFAULT_STREAM_STATE))
+    duplicate_cleaner_state.clear()
+    duplicate_cleaner_state.update(copy.deepcopy(_DEFAULT_DUPLICATE_CLEANER_STATE))
+    retag_state.clear()
+    retag_state.update(copy.deepcopy(_DEFAULT_RETAG_STATE))
+    db_update_state.clear()
+    db_update_state.update(copy.deepcopy(_DEFAULT_DB_UPDATE_STATE))
+    metadata_update_state.clear()
+    metadata_update_state.update(copy.deepcopy(_DEFAULT_METADATA_STATE))
+    logs_activities.clear()
+    logs_activities.extend(copy.deepcopy(_DEFAULT_LOGS_ACTIVITIES))
+    # Phase 5 resets
+    sync_states.clear()
+    sync_states.update(copy.deepcopy(_DEFAULT_SYNC_STATES))
+    discovery_states.clear()
+    discovery_states.update(copy.deepcopy(_DEFAULT_DISCOVERY_STATES))
+    watchlist_scan_state.clear()
+    watchlist_scan_state.update(copy.deepcopy(_DEFAULT_WATCHLIST_SCAN_STATE))
+    media_scan_state.clear()
+    media_scan_state.update(copy.deepcopy(_DEFAULT_MEDIA_SCAN_STATE))
+    wishlist_stats_state.clear()
+    wishlist_stats_state.update(copy.deepcopy(_DEFAULT_WISHLIST_STATS))

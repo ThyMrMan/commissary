@@ -1,0 +1,85 @@
+import type {
+  DownloadMissingAlbumWorkflowInput,
+  WishlistAlbumWorkflowInput,
+} from '@/platform/workflows/album-workflows';
+import type { IssueDomainBridge } from '@/routes/issues/-issues.types';
+
+import type { ShellProfileContext, ShellRouteDefinition, ShellPageId } from './bridge';
+
+declare global {
+  interface Window {
+    showToast?: (message: string, type?: string, durationOrContext?: number | string) => void;
+    showConfirmDialog?: (options?: {
+      title?: string;
+      message?: string;
+      confirmText?: string;
+      cancelText?: string;
+      destructive?: boolean;
+    }) => Promise<boolean>;
+    SoulSyncIssueDomain?: IssueDomainBridge;
+    SoulSyncWorkflowActions?: {
+      openDownloadMissingAlbum: (input: DownloadMissingAlbumWorkflowInput) => void | Promise<void>;
+      openAddToWishlistAlbum: (input: WishlistAlbumWorkflowInput) => void | Promise<void>;
+      notify?: (message: string, type?: string) => void;
+    };
+    SoulSyncWebRouter?: {
+      routeManifest: ShellRouteDefinition[];
+      getCurrentPath: () => string;
+      resolvePageId: (pathname: string) => ShellPageId | null;
+      navigateToPage: (
+        pageId: ShellPageId,
+        options?: {
+          replace?: boolean;
+          artistId?: string | number;
+          artistSource?: string | null;
+          artistName?: string;
+          labelId?: string | number;
+          labelName?: string;
+        },
+      ) => Promise<boolean>;
+    };
+    SoulSyncWebShellBridge?: {
+      getCurrentProfileContext: () => ShellProfileContext | null;
+      isPageAllowed: (pageId: ShellPageId) => boolean;
+      getProfileHomePage: () => ShellPageId;
+      resolveLegacyPath: (pathname: string) => ShellPageId | null;
+      setActivePageChrome: (pageId: ShellPageId) => void;
+      activateLegacyPath: (pathname: string) => void;
+      navigateToArtistDetail: (
+        artistId: string | number,
+        artistName: string,
+        sourceOverride?: string | null,
+        options?: {
+          skipRouteChange?: boolean;
+        },
+      ) => void;
+      navigateToLabelDetail: (
+        labelId: string,
+        labelName: string,
+        options?: {
+          skipRouteChange?: boolean;
+        },
+      ) => void;
+      cancelSimilarArtistsLoad: () => void;
+      showReactHost: (pageId: ShellPageId) => void;
+      playLibraryTrack: (
+        track: {
+          id: string | number;
+          title: string;
+          file_path: string;
+          bitrate?: string | number | null;
+          artist_id?: string | number | null;
+          album_id?: string | number | null;
+          _stats_image?: string | null;
+        },
+        albumTitle: string,
+        artistName: string,
+      ) => void | Promise<void>;
+      startStream: (searchResult: Record<string, unknown>) => void | Promise<void>;
+      showLoadingOverlay: (message?: string) => void;
+      hideLoadingOverlay: () => void;
+    };
+  }
+}
+
+export {};

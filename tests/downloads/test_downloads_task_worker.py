@@ -1,0 +1,826 @@
+"""Tests for core/downloads/task_worker.py — per-task download worker."""
+
+from __future__ import annotations
+
+import pytest
+
+from core.downloads import task_worker as tw
+from core.runtime_state import download_batches, download_tasks
+
+
+@pytest.fixture(autouse=True)
+def reset_state():
+    download_tasks.clear()
+    download_batches.clear()
+    yield
+    download_tasks.clear()
+    download_batches.clear()
+
+
+# ---------------------------------------------------------------------------
+# Fakes
+# ---------------------------------------------------------------------------
+
+class _Recorder:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, name):
+        def _inner(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            return None
+        return _inner
+
+
+class _FakeClient:
+    """Stub download orchestrator. `mode` defaults to non-hybrid.
+    Per-source stubs passed via ``subclients`` are surfaced through
+    ``client(name)`` (the registry-backed accessor on the real
+    orchestrator); plain attrs (hybrid_order, hybrid_primary, etc.)
+    are set as attributes so getattr() lookups still resolve them."""
+    _CLIENT_NAMES = {'soulseek', 'youtube', 'tidal', 'qobuz', 'hifi',
+                     'deezer_dl', 'lidarr', 'soundcloud', 'torrent', 'usenet'}
+
+    def __init__(self, results=None, mode='soulseek', subclients=None):
+        self._results = results if results is not None else []
+        self.mode = mode
+        self.search_calls = []
+        self.exclude_calls = []  # exclude_sources arg per search() call
+        self._client_map = {}
+        for k, v in (subclients or {}).items():
+            if k in self._CLIENT_NAMES:
+                self._client_map[k] = v
+            else:
+                # config-style attrs (hybrid_order, hybrid_primary, etc.)
+                setattr(self, k, v)
+
+    def client(self, name):
+        return self._client_map.get(name)
+
+    async def search(self, query, timeout=30, exclude_sources=None):
+        self.search_calls.append((query, timeout))
+        self.exclude_calls.append(exclude_sources)
+        return (self._results, None)
+
+
+class _FakeMatchEngine:
+    def __init__(self, queries=None):
+        self._queries = queries or []
+
+    def generate_download_queries(self, track):
+        return list(self._queries)
+
+
+def _sync_run_async(coro):
+    """Drain a coroutine on a fresh loop."""
+    import asyncio
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def _build_deps(
+    *,
+    soulseek=None,
+    matching=None,
+    try_source_reuse=lambda *a, **kw: False,
+    store_batch_source=None,
+    try_staging_match=lambda *a, **kw: False,
+    get_valid_candidates=lambda r, t, q: [],
+    attempt_download_with_candidates=lambda *a, **kw: False,
+    on_download_completed=None,
+    recover_worker_slot=None,
+):
+    rec = _Recorder()
+    return tw.TaskWorkerDeps(
+        download_orchestrator=soulseek or _FakeClient(),
+        matching_engine=matching or _FakeMatchEngine(),
+        run_async=_sync_run_async,
+        try_source_reuse=try_source_reuse,
+        store_batch_source=store_batch_source or rec('store_batch_source'),
+        try_staging_match=try_staging_match,
+        get_valid_candidates=get_valid_candidates,
+        attempt_download_with_candidates=attempt_download_with_candidates,
+        on_download_completed=on_download_completed or rec('on_download_completed'),
+        recover_worker_slot=recover_worker_slot or rec('recover_worker_slot'),
+    ), rec
+
+
+def _seed_task(task_id='t1', status='pending', track_info=None, **extra):
+    download_tasks[task_id] = {
+        'status': status,
+        'track_info': track_info if track_info is not None else {
+            'id': 'sp-1', 'name': 'Money', 'artists': ['Pink Floyd'],
+            'album': 'DSOTM', 'duration_ms': 383000,
+        },
+        **extra,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Early-return guards
+# ---------------------------------------------------------------------------
+
+def test_missing_task_frees_batch_slot():
+    # A worker dispatched for a task that was deleted before it ran (cleanup /
+    # dedup / atomic cancel) must FREE the reserved batch slot via
+    # on_download_completed, not just return. Otherwise active_count leaks: the
+    # slot was reserved at dispatch and never released, the next queued task never
+    # starts, and the batch wedges in 'downloading' forever (the reported jam).
+    deps, rec = _build_deps()
+    tw.download_track_worker('absent', 'b1', deps)
+    assert ('on_download_completed', ('b1', 'absent', False), {}) in rec.calls
+
+
+def test_missing_task_without_batch_returns_silently():
+    # No batch → no reserved slot to free → nothing to call.
+    deps, rec = _build_deps()
+    tw.download_track_worker('absent', None, deps)
+    assert rec.calls == []
+
+
+def test_cancelled_v2_task_returns_without_completion_callback():
+    """V2 tasks (with playlist_id) handle worker slot freeing themselves."""
+    _seed_task(status='cancelled', playlist_id='pl1')
+    deps, rec = _build_deps()
+    tw.download_track_worker('t1', 'b1', deps)
+    # NOT called — V2 system frees its own slots
+    assert ('on_download_completed', ('b1', 't1', False), {}) not in rec.calls
+
+
+def test_cancelled_legacy_task_calls_completion_callback():
+    """Legacy tasks (no playlist_id) need on_download_completed to free slot."""
+    _seed_task(status='cancelled')  # no playlist_id
+    deps, rec = _build_deps()
+    tw.download_track_worker('t1', 'b1', deps)
+    assert ('on_download_completed', ('b1', 't1', False), {}) in rec.calls
+
+
+def test_cancelled_no_batch_id_just_returns():
+    _seed_task(status='cancelled')
+    deps, rec = _build_deps()
+    tw.download_track_worker('t1', None, deps)
+    # Nothing called — no batch to notify
+    assert rec.calls == []
+
+
+def test_legacy_cancel_completion_runs_outside_tasks_lock():
+    """Regression: the legacy-cancel completion callback MUST run outside
+    tasks_lock. tasks_lock is non-reentrant, and on_download_completed re-acquires
+    it — calling it in-lock deadlocked the worker WHILE HOLDING the global lock,
+    freezing all downloads. We prove the lock is free when the callback fires by
+    having the callback try to acquire it: on the buggy (in-lock) version the
+    worker still holds it, so this times out to False; with the fix it's free."""
+    from core.runtime_state import tasks_lock
+
+    _seed_task(status='cancelled')  # no playlist_id → legacy path
+
+    acquired = []
+
+    def _cb(batch_id, task_id, success):
+        got = tasks_lock.acquire(timeout=2)
+        acquired.append(got)
+        if got:
+            tasks_lock.release()
+
+    deps, _ = _build_deps(on_download_completed=_cb)
+    tw.download_track_worker('t1', 'b1', deps)
+
+    assert acquired == [True]   # callback ran AND the lock was not held by the worker
+
+
+# ---------------------------------------------------------------------------
+# Source reuse + staging shortcuts
+# ---------------------------------------------------------------------------
+
+def test_source_reuse_hit_records_filename_and_returns():
+    _seed_task()
+
+    def _reuse_hit(task_id, batch_id, track):
+        download_tasks[task_id]['filename'] = 'reused.flac'
+        download_tasks[task_id]['username'] = 'u1'
+        return True
+
+    rec = _Recorder()
+    deps, _ = _build_deps(
+        try_source_reuse=_reuse_hit,
+        store_batch_source=rec('store_batch_source'),
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    assert ('store_batch_source', ('b1', 'u1', 'reused.flac'), {}) in rec.calls
+
+
+def test_source_reuse_hit_skips_store_when_no_filename():
+    """Reuse returns True but doesn't write filename → no store call."""
+    _seed_task()
+    rec = _Recorder()
+    deps, _ = _build_deps(
+        try_source_reuse=lambda *a, **kw: True,
+        store_batch_source=rec('store_batch_source'),
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    assert rec.calls == []  # neither store nor on_complete
+
+
+def test_staging_match_hit_returns_immediately():
+    _seed_task()
+    rec = _Recorder()
+    deps, _ = _build_deps(
+        try_staging_match=lambda *a, **kw: True,
+        store_batch_source=rec('store_batch_source'),
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    assert rec.calls == []
+
+
+def test_private_torrent_album_staging_miss_skips_per_track_search():
+    _seed_task(track_info={
+        'id': 'sp-1', 'name': 'Money Trees', 'artists': ['Kendrick Lamar'],
+        'album': 'good kid, m.A.A.d city (Deluxe)', 'duration_ms': 387000,
+    })
+    download_batches['b1'] = {
+        'album_bundle_private_staging': True,
+        'album_bundle_state': 'staged',
+        'album_bundle_source': 'torrent',
+    }
+    client = _FakeClient(results=['should-not-search'], mode='torrent')
+    rec = _Recorder()
+    deps, _ = _build_deps(
+        soulseek=client,
+        matching=_FakeMatchEngine(queries=['Kendrick Lamar Money Trees']),
+        try_staging_match=lambda *a, **kw: False,
+        on_download_completed=rec('done'),
+    )
+
+    tw.download_track_worker('t1', 'b1', deps)
+
+    assert client.search_calls == []
+    assert download_tasks['t1']['status'] == 'not_found'
+    assert 'staged torrent album release' in download_tasks['t1']['error_message']
+    assert ('done', ('b1', 't1', False), {}) in rec.calls
+
+
+def test_private_usenet_album_staging_miss_skips_per_track_search():
+    # Usenet keeps the short-circuit (the #743 change is Soulseek-only):
+    # per-track NZB search re-adds the same release, so the staged release
+    # stays authoritative.
+    _seed_task(track_info={
+        'id': 'sp-1', 'name': 'Song', 'artists': ['Artist'],
+        'album': 'Album', 'duration_ms': 180000,
+    })
+    download_batches['b1'] = {
+        'album_bundle_private_staging': True,
+        'album_bundle_state': 'staged',
+        'album_bundle_source': 'usenet',
+    }
+    client = _FakeClient(results=['should-not-search'], mode='usenet')
+    rec = _Recorder()
+    deps, _ = _build_deps(
+        soulseek=client,
+        matching=_FakeMatchEngine(queries=['Artist Song']),
+        try_staging_match=lambda *a, **kw: False,
+        on_download_completed=rec('done'),
+    )
+
+    tw.download_track_worker('t1', 'b1', deps)
+
+    assert client.search_calls == []
+    assert download_tasks['t1']['status'] == 'not_found'
+    assert 'staged usenet album release' in download_tasks['t1']['error_message']
+    assert ('done', ('b1', 't1', False), {}) in rec.calls
+
+
+def test_private_soulseek_album_staging_miss_falls_through_to_per_track_search():
+    # #743: a track the album needs but that wasn't in the staged Soulseek
+    # folder must NOT be short-circuited to not_found — it falls through to the
+    # normal per-track Soulseek search (unlike torrent/usenet). Even with
+    # album_bundle_partial unset (folder fully downloaded, just incomplete),
+    # Soulseek now always falls through.
+    _seed_task(track_info={
+        'id': 'sp-1', 'name': 'Song', 'artists': ['Artist'],
+        'album': 'Album', 'duration_ms': 180000,
+    })
+    download_batches['b1'] = {
+        'album_bundle_private_staging': True,
+        'album_bundle_state': 'staged',
+        'album_bundle_source': 'soulseek',
+    }
+    client = _FakeClient(results=[], mode='soulseek')
+    deps, _ = _build_deps(
+        soulseek=client,
+        matching=_FakeMatchEngine(queries=['Artist Song']),
+        try_staging_match=lambda *a, **kw: False,
+    )
+
+    tw.download_track_worker('t1', 'b1', deps)
+
+    assert client.search_calls                       # per-track search actually ran
+    assert download_tasks['t1']['status'] == 'not_found'   # nothing found, but via search
+    assert 'staged soulseek album release' not in download_tasks['t1']['error_message']
+
+
+def test_private_hybrid_first_soulseek_album_staging_miss_falls_through_to_per_track_search():
+    # Same as above but Soulseek is FIRST in a hybrid chain. The miss must fall
+    # through to per-track search, which (in hybrid) can then reach later
+    # sources — exactly the cross-source fallback #743 asks for.
+    _seed_task(track_info={
+        'id': 'sp-1', 'name': 'Song', 'artists': ['Artist'],
+        'album': 'Album', 'duration_ms': 180000,
+    })
+    download_batches['b1'] = {
+        'album_bundle_private_staging': True,
+        'album_bundle_state': 'staged',
+        'album_bundle_source': 'soulseek',
+    }
+    client = _FakeClient(
+        results=[],
+        mode='hybrid',
+        subclients={'hybrid_order': ['soulseek', 'hifi']},
+    )
+    deps, _ = _build_deps(
+        soulseek=client,
+        matching=_FakeMatchEngine(queries=['Artist Song']),
+        try_staging_match=lambda *a, **kw: False,
+    )
+
+    tw.download_track_worker('t1', 'b1', deps)
+
+    assert client.search_calls                       # per-track search ran (not short-circuited)
+    assert download_tasks['t1']['status'] == 'not_found'
+    assert 'staged soulseek album release' not in download_tasks['t1']['error_message']
+
+
+def test_partial_private_hybrid_first_soulseek_album_staging_miss_allows_per_track_search():
+    _seed_task(track_info={
+        'id': 'sp-1', 'name': 'Song', 'artists': ['Artist'],
+        'album': 'Album', 'duration_ms': 180000,
+    })
+    download_batches['b1'] = {
+        'album_bundle_private_staging': True,
+        'album_bundle_state': 'staged',
+        'album_bundle_source': 'soulseek',
+        'album_bundle_partial': True,
+    }
+    client = _FakeClient(
+        results=[],
+        mode='hybrid',
+        subclients={'hybrid_order': ['soulseek', 'hifi']},
+    )
+    deps, _ = _build_deps(
+        soulseek=client,
+        matching=_FakeMatchEngine(queries=['Artist Song']),
+        try_staging_match=lambda *a, **kw: False,
+    )
+
+    tw.download_track_worker('t1', 'b1', deps)
+
+    assert client.search_calls
+    assert download_tasks['t1']['status'] == 'not_found'
+    assert 'staged soulseek album release' not in download_tasks['t1']['error_message']
+
+
+# ---------------------------------------------------------------------------
+# Search loop happy path
+# ---------------------------------------------------------------------------
+
+def test_first_query_success_returns_after_storing_source():
+    _seed_task()
+    rec = _Recorder()
+
+    def _attempt_success(task_id, candidates, track, batch_id, **kwargs):
+        download_tasks[task_id]['filename'] = 'song.flac'
+        download_tasks[task_id]['username'] = 'u1'
+        return True
+
+    deps, _ = _build_deps(
+        soulseek=_FakeClient(results=['raw1', 'raw2']),
+        matching=_FakeMatchEngine(queries=['Pink Floyd Money']),
+        get_valid_candidates=lambda r, t, q: [{'username': 'u1', 'filename': 'song.flac'}],
+        attempt_download_with_candidates=_attempt_success,
+        store_batch_source=rec('store'),
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    assert ('store', ('b1', 'u1', 'song.flac'), {}) in rec.calls
+    assert download_tasks['t1']['status'] == 'searching'
+
+
+def test_torrent_mode_uses_album_release_after_track_queries():
+    _seed_task(track_info={
+        'id': 'sp-1', 'name': 'Money', 'artists': ['Pink Floyd'],
+        'album': 'The Dark Side of the Moon', 'duration_ms': 383000,
+    })
+    client = _FakeClient(results=[], mode='torrent')
+    rec = _Recorder()
+    deps, _ = _build_deps(
+        soulseek=client,
+        matching=_FakeMatchEngine(queries=['Pink Floyd Money']),
+        on_download_completed=rec('done'),
+    )
+
+    tw.download_track_worker('t1', 'b1', deps)
+
+    assert client.search_calls[0][0] == 'Pink Floyd Money'
+    assert client.search_calls[-1][0] == 'Pink Floyd The Dark Side of the Moon'
+
+
+def test_no_results_marks_not_found_and_calls_completion():
+    _seed_task()
+    rec = _Recorder()
+    deps, _ = _build_deps(
+        soulseek=_FakeClient(results=[]),
+        matching=_FakeMatchEngine(queries=['q1']),
+        on_download_completed=rec('done'),
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    assert download_tasks['t1']['status'] == 'not_found'
+    assert 'No match found' in download_tasks['t1']['error_message']
+    assert ('done', ('b1', 't1', False), {}) in rec.calls
+
+
+def test_results_but_no_valid_candidates_stores_raw_for_review():
+    """Each query that returns results contributes top 20 to cached_candidates.
+    With legacy fallback queries (track-only, cleaned), multiple queries fire."""
+    _seed_task()
+    deps, _ = _build_deps(
+        soulseek=_FakeClient(results=[f'raw{i}' for i in range(30)]),
+        matching=_FakeMatchEngine(queries=['q1']),
+        get_valid_candidates=lambda r, t, q: [],  # nothing passes filter
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    # Status: not_found
+    assert download_tasks['t1']['status'] == 'not_found'
+    # Raw results stored (top 20 PER query that returned results)
+    assert len(download_tasks['t1']['cached_candidates']) >= 20
+    assert len(download_tasks['t1']['cached_candidates']) % 20 == 0  # multiple of 20
+
+
+def test_attempt_download_failure_falls_through_to_next_query():
+    _seed_task()
+    deps, _ = _build_deps(
+        soulseek=_FakeClient(results=['r1']),
+        matching=_FakeMatchEngine(queries=['q1', 'q2']),
+        get_valid_candidates=lambda r, t, q: [{'x': 1}],  # both queries get candidates
+        attempt_download_with_candidates=lambda *a, **kw: False,  # but download fails
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    # Both queries tried, failed → not_found
+    assert download_tasks['t1']['status'] == 'not_found'
+
+
+# ---------------------------------------------------------------------------
+# Cancellation mid-flight
+# ---------------------------------------------------------------------------
+
+def test_cancellation_mid_query_returns_without_completion():
+    _seed_task()
+    rec = _Recorder()
+
+    def _cancel_during_search(query, timeout=30, exclude_sources=None):
+        download_tasks['t1']['status'] = 'cancelled'
+
+        async def _empty():
+            return ([], None)
+        return _empty()
+
+    sk = _FakeClient(results=[])
+    sk.search = _cancel_during_search
+
+    deps, _ = _build_deps(
+        soulseek=sk,
+        matching=_FakeMatchEngine(queries=['q1']),
+        on_download_completed=rec('done'),
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    # No completion callback (cancellation prevents it)
+    assert ('done', ('b1', 't1', False), {}) not in rec.calls
+
+
+# ---------------------------------------------------------------------------
+# Hybrid fallback
+# ---------------------------------------------------------------------------
+
+def test_hybrid_fallback_tries_secondary_sources():
+    _seed_task()
+    youtube_client = _FakeClient(results=['yt-r1'])
+    sk = _FakeClient(
+        results=[],  # primary source returns nothing
+        mode='hybrid',
+        subclients={
+            'hybrid_order': ['soulseek', 'youtube'],
+            'soulseek': _FakeClient(results=[]),
+            'youtube': youtube_client,
+            'tidal': None, 'qobuz': None, 'hifi': None, 'deezer_dl': None,
+        },
+    )
+
+    def _attempt_yt_success(task_id, candidates, track, batch_id, **kwargs):
+        return True
+
+    deps, _ = _build_deps(
+        soulseek=sk,
+        matching=_FakeMatchEngine(queries=['q1']),
+        get_valid_candidates=lambda r, t, q: [{'x': 1}] if r else [],
+        attempt_download_with_candidates=_attempt_yt_success,
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    # YouTube was searched
+    assert len(youtube_client.search_calls) >= 1
+
+
+def test_hybrid_fallback_skipped_when_mode_not_hybrid():
+    _seed_task()
+    yt = _FakeClient(results=['r1'])
+    sk = _FakeClient(
+        results=[], mode='soulseek',  # not hybrid
+        subclients={'youtube': yt},
+    )
+    deps, _ = _build_deps(
+        soulseek=sk,
+        matching=_FakeMatchEngine(queries=['q1']),
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    # Fallback didn't run — youtube never searched
+    assert yt.search_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Cached-first quarantine retry: walk already-found candidates before any
+# re-search; never re-search a source whose candidates are spent (only switch
+# to a not-yet-searched source). See task_worker cached-first phase.
+# ---------------------------------------------------------------------------
+
+class _Cand:
+    def __init__(self, username, filename):
+        self.username = username
+        self.filename = filename
+
+
+def test_quarantine_retry_tries_cached_candidates_without_searching():
+    _seed_task(
+        _quarantine_retry=True,
+        cached_candidates=[_Cand('peerA', 'f1.flac'), _Cand('peerB', 'f2.flac')],
+        used_sources={'peerA_f1.flac'},  # peerA already tried
+    )
+    attempted = []
+
+    def _attempt(task_id, candidates, track, batch_id, **kwargs):
+        attempted.append([getattr(c, 'filename', None) for c in candidates])
+        return True
+
+    sk = _FakeClient(results=['should-not-be-used'])
+    deps, _ = _build_deps(
+        soulseek=sk,
+        matching=_FakeMatchEngine(queries=['q1']),
+        attempt_download_with_candidates=_attempt,
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    # No search performed — cached candidates used directly.
+    assert sk.search_calls == []
+    # Only the unused candidate (peerB) was passed to attempt.
+    assert attempted == [['f2.flac']]
+
+
+def test_quarantine_retry_skips_cached_from_exhausted_source():
+    # hifi is budget-exhausted; its cached candidate must be skipped, soulseek's tried.
+    _seed_task(
+        _quarantine_retry=True,
+        cached_candidates=[_Cand('hifi', 'h.flac'), _Cand('peerB', 'f2.flac')],
+        used_sources=set(),
+        exhausted_download_sources={'hifi'},
+    )
+    attempted = []
+
+    def _attempt(task_id, candidates, track, batch_id, **kwargs):
+        attempted.append([getattr(c, 'username', None) for c in candidates])
+        return True
+
+    sk = _FakeClient(results=['x'])
+    deps, _ = _build_deps(
+        soulseek=sk,
+        matching=_FakeMatchEngine(queries=['q1']),
+        attempt_download_with_candidates=_attempt,
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    assert sk.search_calls == []
+    assert attempted == [['peerB']]  # hifi candidate excluded
+
+
+# A track_info that yields exactly the engine queries (no artist → no
+# first-word legacy query; name equals a query → track-only query dedupes away),
+# so the generated query set is deterministic for cached-first assertions.
+_SOLO_TRACK = {'id': 'sp-1', 'name': 'Solo', 'artists': [],
+               'album': 'A', 'duration_ms': 1000}
+
+
+def test_quarantine_retry_searches_unsearched_query_without_excluding_source():
+    # Cache spent + 'Solo' already searched, but 'q2' is NOT yet searched. The
+    # retry must search q2 against the SAME source (no source-level exclusion) so
+    # every query is exhausted per source before the chain switches sources
+    # (lazy multi-query retry).
+    _seed_task(
+        track_info=dict(_SOLO_TRACK),
+        _quarantine_retry=True,
+        cached_candidates=[_Cand('peerA', 'f1.flac')],
+        used_sources={'peerA_f1.flac'},
+        searched_queries={'Solo'},
+    )
+    sk = _FakeClient(results=[], mode='hybrid',
+                     subclients={'hybrid_order': ['soulseek', 'hifi']})
+    deps, _ = _build_deps(
+        soulseek=sk,
+        matching=_FakeMatchEngine(queries=['Solo', 'q2']),
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    # Only q2 was searched — 'Solo' skipped because its candidates were cached.
+    assert [c[0] for c in sk.search_calls] == ['q2']
+    # Soulseek NOT excluded: the not-yet-searched query still hits it.
+    assert all((not ex) or 'soulseek' not in ex for ex in sk.exclude_calls)
+
+
+def test_quarantine_retry_skips_already_searched_query_no_research():
+    # The only generated query is already searched and cache spent → it is NOT
+    # re-searched (its candidates live in cache). This is the wasteful repeat the
+    # cached-first design removes.
+    _seed_task(
+        track_info=dict(_SOLO_TRACK),
+        _quarantine_retry=True,
+        cached_candidates=[_Cand('peerA', 'f1.flac')],
+        used_sources={'peerA_f1.flac'},
+        searched_queries={'Solo'},
+    )
+    sk = _FakeClient(results=[], mode='hybrid',
+                     subclients={'hybrid_order': ['soulseek', 'hifi']})
+    deps, _ = _build_deps(
+        soulseek=sk,
+        matching=_FakeMatchEngine(queries=['Solo']),
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    assert sk.search_calls == []  # 'Solo' not re-searched
+
+
+def test_quarantine_retry_still_excludes_budget_exhausted_source():
+    # A source whose per-source budget is spent (exhaustive mode) stays excluded
+    # so the chain falls through to the next source.
+    _seed_task(
+        _quarantine_retry=True,
+        cached_candidates=[],
+        searched_queries=set(),
+        exhausted_download_sources={'soulseek'},
+    )
+    sk = _FakeClient(results=[], mode='hybrid',
+                     subclients={'hybrid_order': ['soulseek', 'hifi']})
+    deps, _ = _build_deps(
+        soulseek=sk,
+        matching=_FakeMatchEngine(queries=['q1']),
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    assert sk.search_calls
+    assert all(ex and 'soulseek' in ex for ex in sk.exclude_calls)
+
+
+def test_search_records_searched_queries():
+    # Every query the worker actually runs is recorded so a later quarantine
+    # retry can skip re-searching it.
+    _seed_task(status='pending')
+    sk = _FakeClient(results=['r1'])
+    deps, _ = _build_deps(
+        soulseek=sk,
+        matching=_FakeMatchEngine(queries=['q1']),
+        get_valid_candidates=lambda r, t, q: [],  # no candidates → loop completes
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    assert 'q1' in download_tasks['t1'].get('searched_queries', set())
+
+
+def test_non_quarantine_run_resets_searched_queries():
+    # A fresh / dead-connection retry starts a new search generation: the stale
+    # searched-query memory is cleared so every query can be searched again.
+    _seed_task(
+        track_info=dict(_SOLO_TRACK),
+        cached_candidates=[],
+        searched_queries={'stale-q'},
+    )
+    sk = _FakeClient(results=[])
+    deps, _ = _build_deps(
+        soulseek=sk,
+        matching=_FakeMatchEngine(queries=['Solo']),
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    sq = download_tasks['t1'].get('searched_queries', set())
+    assert 'stale-q' not in sq   # stale generation cleared
+    assert 'Solo' in sq          # current generation recorded fresh
+
+
+def test_non_quarantine_run_ignores_cached_first_and_searches():
+    # A fresh (non-quarantine) run must NOT use cached-first — it searches.
+    _seed_task(
+        cached_candidates=[_Cand('peerA', 'f1.flac')],
+        used_sources=set(),
+    )
+    sk = _FakeClient(results=[])
+    deps, _ = _build_deps(
+        soulseek=sk,
+        matching=_FakeMatchEngine(queries=['q1']),
+        attempt_download_with_candidates=lambda *a, **kw: False,
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    assert sk.search_calls  # searched, did not short-circuit on cache
+
+
+# ---------------------------------------------------------------------------
+# Top-level exception path
+# ---------------------------------------------------------------------------
+
+def test_critical_exception_marks_failed_and_calls_completion():
+    _seed_task()
+    rec = _Recorder()
+
+    def _broken_engine(track):
+        raise RuntimeError("matching engine dead")
+
+    me = _FakeMatchEngine()
+    me.generate_download_queries = _broken_engine
+
+    deps, _ = _build_deps(
+        matching=me,
+        on_download_completed=rec('done'),
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    assert download_tasks['t1']['status'] == 'failed'
+    assert 'Unexpected error during download' in download_tasks['t1']['error_message']
+    assert ('done', ('b1', 't1', False), {}) in rec.calls
+
+
+def test_critical_exception_with_completion_failure_attempts_recovery():
+    _seed_task()
+    rec = _Recorder()
+
+    def _broken_engine(track):
+        raise RuntimeError("dead")
+
+    def _broken_completion(*a, **kw):
+        raise RuntimeError("completion dead")
+
+    me = _FakeMatchEngine()
+    me.generate_download_queries = _broken_engine
+
+    deps, _ = _build_deps(
+        matching=me,
+        on_download_completed=_broken_completion,
+        recover_worker_slot=rec('recover'),
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    # Recovery attempted after completion callback failed
+    assert ('recover', ('b1', 't1'), {}) in rec.calls
+
+
+# ---------------------------------------------------------------------------
+# Query generation edge cases
+# ---------------------------------------------------------------------------
+
+def test_artist_starting_with_the_uses_second_word():
+    """Legacy fallback: 'The Beatles' → first_word becomes 'Beatles'."""
+    _seed_task(track_info={
+        'id': 'sp1', 'name': 'Help', 'artists': ['The Beatles'],
+        'album': 'Help', 'duration_ms': 100000,
+    })
+    sk = _FakeClient(results=[])
+    deps, _ = _build_deps(soulseek=sk, matching=_FakeMatchEngine(queries=[]))
+    tw.download_track_worker('t1', 'b1', deps)
+    # Searched queries should contain 'Help Beatles' (track + second word)
+    queries = [q for q, _ in sk.search_calls]
+    assert any('Beatles' in q for q in queries)
+
+
+def test_track_with_parens_generates_cleaned_variant():
+    """`Money (Remastered)` → also tries `Money` as fallback query."""
+    _seed_task(track_info={
+        'id': 'sp1', 'name': 'Money (Remastered)', 'artists': ['Pink Floyd'],
+        'album': 'DSOTM', 'duration_ms': 100000,
+    })
+    sk = _FakeClient(results=[])
+    deps, _ = _build_deps(soulseek=sk, matching=_FakeMatchEngine(queries=[]))
+    tw.download_track_worker('t1', 'b1', deps)
+    queries = [q for q, _ in sk.search_calls]
+    # Cleaned variant included
+    assert 'Money' in queries
+
+
+def test_duplicate_queries_deduplicated_case_insensitive():
+    """Generated + legacy queries dedupe by lowercase."""
+    _seed_task(track_info={
+        'id': 'sp1', 'name': 'X', 'artists': ['Y'],
+        'album': '', 'duration_ms': 0,
+    })
+    sk = _FakeClient(results=[])
+    deps, _ = _build_deps(
+        soulseek=sk,
+        # Engine generates same query as legacy 'track-only' fallback
+        matching=_FakeMatchEngine(queries=['x', 'X']),
+    )
+    tw.download_track_worker('t1', 'b1', deps)
+    # 'x' and 'X' dedupe to one search per case-insensitive match
+    queries_lower = [q.lower() for q, _ in sk.search_calls]
+    assert queries_lower.count('x') == 1

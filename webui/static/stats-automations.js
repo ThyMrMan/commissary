@@ -1,0 +1,6126 @@
+// ── Import File Tab ──────────────────────────────────────────────────
+
+let _importFileState = {
+    rawText: '',
+    fileName: '',
+    fileType: '',      // 'csv' or 'text'
+    headers: [],       // CSV column headers
+    rows: [],          // raw parsed rows (arrays for csv, strings for text)
+    columnMap: {},     // { columnIndex: 'track_name' | 'artist_name' | 'album_name' | 'duration' | 'skip' }
+    parsedTracks: []   // final [{track_name, artist_name, album_name, duration_ms}]
+};
+
+function _initImportFileTab() {
+    const dropzone = document.getElementById('import-file-dropzone');
+    const fileInput = document.getElementById('import-file-input');
+    if (!dropzone || !fileInput) return;
+
+    dropzone.addEventListener('click', () => fileInput.click());
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('drag-over'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag-over'));
+    dropzone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dropzone.classList.remove('drag-over');
+        const file = e.dataTransfer.files[0];
+        if (file) _importFileRead(file);
+    });
+    fileInput.addEventListener('change', () => {
+        if (fileInput.files[0]) _importFileRead(fileInput.files[0]);
+        fileInput.value = '';
+    });
+
+    // Enable/disable import button based on playlist name
+    const nameInput = document.getElementById('import-file-playlist-name');
+    if (nameInput) {
+        nameInput.addEventListener('input', () => {
+            const btn = document.getElementById('import-file-import-btn');
+            if (btn) btn.disabled = !nameInput.value.trim();
+        });
+    }
+}
+
+function _importFileRead(file) {
+    const ext = file.name.split('.').pop().toLowerCase();
+    if (!['csv', 'tsv', 'txt', 'm3u', 'm3u8'].includes(ext)) {
+        showToast('Unsupported file type. Use CSV, TSV, TXT, M3U, or M3U8.', 'error');
+        return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+        _importFileState.rawText = e.target.result;
+        _importFileState.fileName = file.name;
+        _importFileState.fileType = (ext === 'm3u' || ext === 'm3u8') ? 'm3u'
+                                  : (ext === 'txt') ? 'text' : 'csv';
+        _importFileParseAndPreview();
+    };
+    reader.readAsText(file);
+}
+
+function _importFileDetectDelimiter(firstLine) {
+    const tab = (firstLine.match(/\t/g) || []).length;
+    const semi = (firstLine.match(/;/g) || []).length;
+    const comma = (firstLine.match(/,/g) || []).length;
+    if (tab >= comma && tab >= semi && tab > 0) return '\t';
+    if (semi >= comma && semi > 0) return ';';
+    return ',';
+}
+
+function _importFileParseCsv(text, delimiter) {
+    const lines = text.split(/\r?\n/).filter(l => l.trim());
+    if (lines.length < 2) return { headers: [], rows: [] };
+
+    // Parse CSV with basic quote handling
+    function parseLine(line) {
+        const result = [];
+        let current = '';
+        let inQuotes = false;
+        for (let i = 0; i < line.length; i++) {
+            const ch = line[i];
+            if (ch === '"') {
+                if (inQuotes && i + 1 < line.length && line[i + 1] === '"') {
+                    current += '"';
+                    i++;
+                } else {
+                    inQuotes = !inQuotes;
+                }
+            } else if (ch === delimiter && !inQuotes) {
+                result.push(current.trim());
+                current = '';
+            } else {
+                current += ch;
+            }
+        }
+        result.push(current.trim());
+        return result;
+    }
+
+    const headers = parseLine(lines[0]);
+    const rows = [];
+    for (let i = 1; i < lines.length; i++) {
+        const row = parseLine(lines[i]);
+        if (row.some(cell => cell)) rows.push(row);
+    }
+    return { headers, rows };
+}
+
+// Parse an M3U / M3U8 playlist into track objects. Handles both the simple form
+// (one media path per line) and the extended form (#EXTINF:<secs>,<artist> - <title>
+// followed by the path). SoulSync's own export is extended M3U and replaces the path
+// of an un-located track with a "# MISSING: ..." comment — those are exactly the
+// tracks a user imports to go match/download, so a pending #EXTINF is flushed even
+// when no path line follows it. Returns { tracks, playlistName }.
+function _importFileParseM3u(text) {
+    const lines = (text || '').split(/\r?\n/);
+    const tracks = [];
+    let playlistName = '';
+    let pending = null;   // { duration_ms, artist, title } from the last #EXTINF
+
+    function splitArtistTitle(s) {
+        const i = s.indexOf(' - ');
+        return i !== -1
+            ? { artist: s.slice(0, i).trim(), title: s.slice(i + 3).trim() }
+            : { artist: '', title: s.trim() };
+    }
+    function pushTrack(artist, title, duration_ms) {
+        if (!title && !artist) return;
+        tracks.push({ track_name: title || '', artist_name: artist || '', album_name: '', duration_ms: duration_ms || 0 });
+    }
+    function flushPending() {
+        if (pending) { pushTrack(pending.artist, pending.title, pending.duration_ms); pending = null; }
+    }
+
+    for (const raw of lines) {
+        const line = raw.trim();
+        if (!line) continue;
+        if (line.charAt(0) === '#') {
+            if (/^#EXTINF:/i.test(line)) {
+                flushPending();   // a prior #EXTINF whose path was missing still counts
+                const rest = line.slice(8);                 // after "#EXTINF:"
+                const comma = rest.indexOf(',');
+                const secs = parseFloat(comma === -1 ? rest : rest.slice(0, comma));
+                const meta = comma === -1 ? '' : rest.slice(comma + 1).trim();
+                const { artist, title } = splitArtistTitle(meta);
+                pending = { duration_ms: (!isNaN(secs) && secs > 0) ? Math.round(secs * 1000) : 0, artist, title };
+            } else if (/^#PLAYLIST:/i.test(line)) {
+                playlistName = line.slice(line.indexOf(':') + 1).trim();
+            }
+            // ignore #EXTM3U, #GENERATED, "# MISSING:", #EXTALB, and other directives
+            continue;
+        }
+        // A non-# line is a media path/URL — the entry for the pending #EXTINF, if any.
+        if (pending && (pending.title || pending.artist)) {
+            pushTrack(pending.artist, pending.title, pending.duration_ms);
+            pending = null;
+        } else {
+            // Simple M3U with no #EXTINF: derive artist/title from the file name.
+            pending = null;
+            const base = (line.split(/[\\/]/).pop() || line).replace(/\.[^.]+$/, '');
+            const { artist, title } = splitArtistTitle(base);
+            pushTrack(artist, title, 0);
+        }
+    }
+    flushPending();   // trailing #EXTINF with no following path
+    return { tracks, playlistName };
+}
+
+function _importFileAutoMapColumns(headers) {
+    const map = {};
+    const lowerHeaders = headers.map(h => h.toLowerCase().trim());
+
+    const trackPatterns = ['track_name', 'track name', 'track', 'title', 'song', 'song_name', 'song name', 'name'];
+    const artistPatterns = ['artist_name', 'artist name', 'artist', 'artists', 'performer'];
+    const albumPatterns = ['album_name', 'album name', 'album'];
+    const durationPatterns = ['duration', 'duration_ms', 'length', 'time'];
+
+    function findMatch(patterns) {
+        for (const p of patterns) {
+            const idx = lowerHeaders.indexOf(p);
+            if (idx !== -1 && !(idx in map)) return idx;
+        }
+        return -1;
+    }
+
+    const trackIdx = findMatch(trackPatterns);
+    if (trackIdx !== -1) map[trackIdx] = 'track_name';
+
+    const artistIdx = findMatch(artistPatterns);
+    if (artistIdx !== -1) map[artistIdx] = 'artist_name';
+
+    const albumIdx = findMatch(albumPatterns);
+    if (albumIdx !== -1) map[albumIdx] = 'album_name';
+
+    const durIdx = findMatch(durationPatterns);
+    if (durIdx !== -1) map[durIdx] = 'duration';
+
+    return map;
+}
+
+function _importFileParseAndPreview() {
+    const state = _importFileState;
+    const text = state.rawText;
+
+    if (state.fileType === 'm3u') {
+        // M3U/M3U8 is self-describing — no column mapping or order/separator needed.
+        const { tracks, playlistName } = _importFileParseM3u(text);
+        state.rows = tracks;            // already track objects
+        state.headers = [];
+        state.columnMap = {};
+        state.m3uPlaylistName = playlistName || '';
+    } else if (state.fileType === 'text') {
+        // Plain text: one track per line
+        const lines = text.split(/\r?\n/).filter(l => l.trim());
+        state.rows = lines;
+        state.headers = [];
+        state.columnMap = {};
+    } else {
+        // CSV/TSV
+        const firstLine = text.split(/\r?\n/)[0] || '';
+        const delimiter = _importFileDetectDelimiter(firstLine);
+        const { headers, rows } = _importFileParseCsv(text, delimiter);
+        state.headers = headers;
+        state.rows = rows;
+        state.columnMap = _importFileAutoMapColumns(headers);
+    }
+
+    _importFileBuildTracks();
+    _importFileRenderPreview();
+}
+
+function _importFileBuildTracks() {
+    const state = _importFileState;
+    state.parsedTracks = [];
+
+    if (state.fileType === 'm3u') {
+        // Tracks were already parsed by _importFileParseM3u; just copy them through.
+        state.parsedTracks = state.rows.map(t => ({
+            track_name: t.track_name || '',
+            artist_name: t.artist_name || '',
+            album_name: t.album_name || '',
+            duration_ms: t.duration_ms || 0
+        }));
+    } else if (state.fileType === 'text') {
+        const orderEl = document.getElementById('import-file-text-order');
+        const sepEl = document.getElementById('import-file-text-separator');
+        const order = orderEl ? orderEl.value : 'artist-title';
+        const sep = sepEl ? sepEl.value : ' - ';
+
+        for (const line of state.rows) {
+            const parts = line.split(sep);
+            if (parts.length >= 2) {
+                const a = parts[0].trim();
+                const b = parts.slice(1).join(sep).trim();
+                state.parsedTracks.push({
+                    track_name: order === 'artist-title' ? b : a,
+                    artist_name: order === 'artist-title' ? a : b,
+                    album_name: '',
+                    duration_ms: 0
+                });
+            } else {
+                // Can't split — treat whole line as track name
+                state.parsedTracks.push({
+                    track_name: line.trim(),
+                    artist_name: '',
+                    album_name: '',
+                    duration_ms: 0
+                });
+            }
+        }
+    } else {
+        // CSV mapped
+        const map = state.columnMap;
+        const trackCol = Object.keys(map).find(k => map[k] === 'track_name');
+        const artistCol = Object.keys(map).find(k => map[k] === 'artist_name');
+        const albumCol = Object.keys(map).find(k => map[k] === 'album_name');
+        const durCol = Object.keys(map).find(k => map[k] === 'duration');
+
+        for (const row of state.rows) {
+            const track = trackCol !== undefined ? (row[trackCol] || '') : '';
+            const artist = artistCol !== undefined ? (row[artistCol] || '') : '';
+            const album = albumCol !== undefined ? (row[albumCol] || '') : '';
+            let dur = durCol !== undefined ? (row[durCol] || '') : '';
+
+            // Parse duration: could be ms, seconds, or mm:ss
+            let durationMs = 0;
+            if (dur) {
+                dur = dur.trim();
+                if (dur.includes(':')) {
+                    const parts = dur.split(':');
+                    durationMs = (parseInt(parts[0]) * 60 + parseInt(parts[1] || 0)) * 1000;
+                } else {
+                    const num = parseFloat(dur);
+                    durationMs = num > 10000 ? num : num * 1000; // assume ms if > 10000, else seconds
+                }
+                if (isNaN(durationMs)) durationMs = 0;
+            }
+
+            state.parsedTracks.push({
+                track_name: track,
+                artist_name: artist,
+                album_name: album,
+                duration_ms: durationMs
+            });
+        }
+    }
+}
+
+function _importFileRenderPreview() {
+    const state = _importFileState;
+    const validTracks = state.parsedTracks.filter(t => t.track_name || t.artist_name);
+
+    // Show/hide sections
+    document.getElementById('import-file-upload-zone').style.display = 'none';
+    document.getElementById('import-file-preview-section').style.display = '';
+
+    // File info
+    document.getElementById('import-file-name-label').textContent = state.fileName;
+    document.getElementById('import-file-track-count').textContent = `${validTracks.length} track${validTracks.length !== 1 ? 's' : ''} parsed`;
+
+    // Show format controls based on file type
+    document.getElementById('import-file-text-format').style.display = state.fileType === 'text' ? '' : 'none';
+    document.getElementById('import-file-column-mapping').style.display = state.fileType === 'csv' ? '' : 'none';
+
+    // Render column mapping for CSV
+    if (state.fileType === 'csv') {
+        _importFileRenderColumnMapping();
+    }
+
+    // Pre-fill playlist name: prefer the M3U's own #PLAYLIST: directive, else the filename.
+    const nameInput = document.getElementById('import-file-playlist-name');
+    if (nameInput && !nameInput.value) {
+        nameInput.value = (state.fileType === 'm3u' && state.m3uPlaylistName)
+            ? state.m3uPlaylistName
+            : state.fileName.replace(/\.[^.]+$/, '');
+    }
+    // Update button state
+    const btn = document.getElementById('import-file-import-btn');
+    if (btn) btn.disabled = !nameInput.value.trim();
+
+    // Render preview table
+    const tbody = document.getElementById('import-file-preview-tbody');
+    tbody.innerHTML = '';
+
+    state.parsedTracks.forEach((t, i) => {
+        const valid = !!(t.track_name || t.artist_name);
+        const tr = document.createElement('tr');
+        if (!valid) tr.classList.add('invalid-row');
+        tr.innerHTML = `
+            <td>${i + 1}</td>
+            <td>${_esc(t.track_name)}</td>
+            <td>${_esc(t.artist_name)}</td>
+            <td>${_esc(t.album_name)}</td>
+        `;
+        tbody.appendChild(tr);
+    });
+}
+
+function _importFileRenderColumnMapping() {
+    const state = _importFileState;
+    const container = document.getElementById('import-file-mapping-selects');
+    container.innerHTML = '';
+
+    const options = ['skip', 'track_name', 'artist_name', 'album_name', 'duration'];
+    const optLabels = { skip: 'Skip', track_name: 'Track', artist_name: 'Artist', album_name: 'Album', duration: 'Duration' };
+
+    state.headers.forEach((header, idx) => {
+        const mapped = state.columnMap[idx] || 'skip';
+        const wrap = document.createElement('div');
+        wrap.className = 'import-file-col-map';
+        if (mapped === 'track_name') wrap.classList.add('mapped-track');
+        else if (mapped === 'artist_name') wrap.classList.add('mapped-artist');
+        else if (mapped === 'album_name') wrap.classList.add('mapped-album');
+
+        const label = document.createElement('span');
+        label.className = 'import-file-col-label';
+        label.textContent = header;
+        label.title = header;
+
+        const sel = document.createElement('select');
+        sel.className = 'import-file-select';
+        options.forEach(o => {
+            const opt = document.createElement('option');
+            opt.value = o;
+            opt.textContent = optLabels[o];
+            if (o === mapped) opt.selected = true;
+            sel.appendChild(opt);
+        });
+        sel.addEventListener('change', () => {
+            if (sel.value === 'skip') {
+                delete state.columnMap[idx];
+            } else {
+                // Remove this mapping from any other column
+                for (const k of Object.keys(state.columnMap)) {
+                    if (state.columnMap[k] === sel.value) delete state.columnMap[k];
+                }
+                state.columnMap[idx] = sel.value;
+            }
+            _importFileBuildTracks();
+            _importFileRenderPreview();
+        });
+
+        wrap.appendChild(label);
+        wrap.appendChild(sel);
+        container.appendChild(wrap);
+    });
+}
+
+function importFileReparse() {
+    _importFileBuildTracks();
+    _importFileRenderPreview();
+}
+
+function importFileClear() {
+    _importFileState = {
+        rawText: '', fileName: '', fileType: '',
+        headers: [], rows: [], columnMap: {}, parsedTracks: []
+    };
+    document.getElementById('import-file-upload-zone').style.display = '';
+    document.getElementById('import-file-preview-section').style.display = 'none';
+    document.getElementById('import-file-playlist-name').value = '';
+    document.getElementById('import-file-preview-tbody').innerHTML = '';
+}
+
+function importFileSubmit() {
+    const nameInput = document.getElementById('import-file-playlist-name');
+    const name = nameInput ? nameInput.value.trim() : '';
+    if (!name) {
+        showToast('Please enter a playlist name.', 'error');
+        nameInput && nameInput.focus();
+        return;
+    }
+
+    const tracks = _importFileState.parsedTracks.filter(t => t.track_name || t.artist_name);
+    if (!tracks.length) {
+        showToast('No valid tracks to import.', 'error');
+        return;
+    }
+
+    // Use a unique ID based on timestamp so multiple imports don't collide
+    const sourceId = `file_${Date.now()}`;
+
+    mirrorPlaylist('file', sourceId, name, tracks, {
+        description: `Imported from ${_importFileState.fileName}`,
+        owner: 'local'
+    });
+
+    showToast(`Imported "${name}" with ${tracks.length} tracks`, 'success');
+    importFileClear();
+
+    // Switch to mirrored tab so user sees the result
+    const mirroredBtn = document.querySelector('.sync-tab-button[data-tab="mirrored"]');
+    if (mirroredBtn) {
+        mirroredBtn.click();
+        // Reload mirrored playlists to show the new one
+        setTimeout(() => loadMirroredPlaylists(), 500);
+    }
+}
+
+// ── Mirrored Playlists ────────────────────────────────────────────────
+
+let mirroredPlaylistsLoaded = false;
+// Auto-Sync state + functions moved to webui/static/auto-sync.js; declared
+// as globals there so the older mirrored-playlist render path below can
+// still reach `mirroredPipelinePollers`, `runMirroredPlaylistPipeline`,
+// `editMirroredSourceRef`, `getMirroredSourceRef`, and `pollMirroredPipelineStatus`.
+
+/**
+ * Fire-and-forget helper: send parsed playlist data to be mirrored on the backend.
+ */
+function mirrorPlaylist(source, sourceId, name, tracks, metadata = {}) {
+    const normalizedTracks = tracks.map(t => ({
+        track_name: t.track_name || t.name || '',
+        artist_name: t.artist_name || (Array.isArray(t.artists) ? (typeof t.artists[0] === 'object' ? t.artists[0].name : t.artists[0]) : t.artists || ''),
+        album_name: t.album_name || (typeof t.album === 'object' ? (t.album && t.album.name) : t.album) || '',
+        duration_ms: t.duration_ms || 0,
+        image_url: t.image_url || (t.album && typeof t.album === 'object' && t.album.images && t.album.images[0] ? t.album.images[0].url : null),
+        source_track_id: t.source_track_id || t.id || t.spotify_track_id || '',
+        extra_data: t.extra_data || null
+    }));
+
+    fetch('/api/mirror-playlist', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            source,
+            source_playlist_id: String(sourceId),
+            name,
+            tracks: normalizedTracks,
+            description: metadata.description || '',
+            owner: metadata.owner || '',
+            image_url: metadata.image_url || ''
+        })
+    }).then(r => r.json()).then(data => {
+        if (data.success) console.log(`Mirrored ${source} playlist: ${name} (${normalizedTracks.length} tracks)`);
+    }).catch(err => console.warn('Mirror save failed:', err));
+}
+
+/**
+ * Load and render all mirrored playlists into the Mirrored tab.
+ */
+async function loadMirroredPlaylists() {
+    const container = document.getElementById('mirrored-playlist-container');
+    if (!container) return;
+    container.innerHTML = `<div class="playlist-placeholder">Loading mirrored playlists...</div>`;
+
+    try {
+        const res = await fetch('/api/mirrored-playlists');
+        const playlists = await res.json();
+        if (playlists.error) throw new Error(playlists.error);
+
+        if (!playlists.length) {
+            container.innerHTML = `<div class="playlist-placeholder">Playlists you parse from any service will appear here as persistent backups.</div>`;
+            return;
+        }
+
+        container.innerHTML = '';
+        playlists.forEach(p => renderMirroredCard(p, container));
+        mirroredPlaylistsLoaded = true;
+
+        // Hydrate discovery states from backend (survives page refresh)
+        await hydrateMirroredDiscoveryStates();
+    } catch (err) {
+        container.innerHTML = `<div class="playlist-placeholder">Error loading mirrored playlists: ${err.message}</div>`;
+    }
+}
+
+function renderMirroredCard(p, container) {
+    const ago = timeAgo(p.updated_at || p.mirrored_at);
+    const hash = `mirrored_${p.id}`;
+    const pipelineState = p.pipeline_state || null;
+    const pipelinePhase = pipelineState && pipelineState.status === 'running' ? 'pipeline_running'
+        : pipelineState && pipelineState.status === 'finished' ? 'pipeline_complete'
+        : pipelineState && (pipelineState.status === 'error' || pipelineState.status === 'skipped') ? 'pipeline_error'
+        : null;
+    const state = youtubePlaylistStates[hash] || (pipelinePhase ? {
+        phase: pipelinePhase,
+        pipeline_status: pipelineState.status,
+        pipeline_progress: pipelineState.progress || 0,
+        pipeline_phase: pipelineState.phase || '',
+        pipeline_error: pipelineState.error || '',
+        pipeline_log: pipelineState.log || [],
+        pipeline_result: pipelineState.result || null,
+    } : null);
+    const phase = state ? state.phase : null;
+    const sourceRef = getMirroredSourceRef(p);
+
+    // Build phase indicator
+    let phaseHtml = '';
+    if (phase === 'pipeline_running') {
+        const pct = state.pipeline_progress || state.progress || 0;
+        const label = state.pipeline_phase || state.phase_label || 'Pipeline running';
+        phaseHtml = `<span style="color:#38bdf8;">${_esc(label)} ${pct}%</span>`;
+    } else if (phase === 'pipeline_complete') {
+        phaseHtml = `<span style="color:#22c55e;">Pipeline complete</span>`;
+    } else if (phase === 'pipeline_error') {
+        phaseHtml = `<span style="color:#ef4444;">Pipeline error</span>`;
+    } else if (phase === 'discovering') {
+        const pct = state.discoveryProgress || state.discovery_progress || 0;
+        phaseHtml = `<span style="color:#a78bfa;">Discovering ${pct}%</span>`;
+    } else if (phase === 'discovered') {
+        const matches = state.spotifyMatches || state.spotify_matches || 0;
+        const total = state.spotify_total || p.track_count;
+        phaseHtml = `<span style="color:#22c55e;">Discovered ${matches}/${total}</span>`;
+    } else if (phase === 'syncing' || phase === 'sync_complete') {
+        phaseHtml = `<span style="color:#3b82f6;">${phase === 'syncing' ? 'Syncing...' : 'Synced'}</span>`;
+    } else if (phase === 'downloading') {
+        phaseHtml = `<span style="color:#f59e0b;">Downloading...</span>`;
+    } else if (phase === 'download_complete') {
+        phaseHtml = `<span style="color:#22c55e;">Downloaded</span>`;
+    }
+
+    const sourceIcons = { spotify: '🎵', tidal: '🌊', youtube: '▶', beatport: '🎛', file: '📄' };
+    const srcIcon = sourceIcons[p.source] || '📋';
+
+    // Discovery ratio
+    const disc = p.discovered_count || 0;
+    const tot = p.total_count || p.track_count || 0;
+    let ratioHtml = '';
+    if (disc > 0) {
+        const complete = disc >= tot;
+        const srcName = typeof currentMusicSourceName !== 'undefined' ? currentMusicSourceName : 'metadata';
+        ratioHtml = `<span class="discovery-ratio${complete ? ' complete' : ''}">${disc}/${tot} discovered on ${srcName}</span>`;
+    }
+
+    const card = document.createElement('div');
+    card.className = 'mirrored-playlist-card';
+    card.id = `mirrored-card-${p.id}`;
+    card.innerHTML = `
+        <div class="source-icon ${_escAttr(p.source)}">${srcIcon}</div>
+        <div class="mirrored-card-info">
+            <div class="card-name">${_esc(p.display_name || p.name)}</div>
+            ${p.custom_name ? `<div class="card-original-name" title="Original (upstream) playlist name — still tracked">↳ ${_esc(p.name)}</div>` : ''}
+            <div class="card-meta">
+                <span class="source-badge ${_escAttr(p.source)}">${_esc(p.source)}</span>
+                <span>${p.track_count} tracks</span>
+                <span>Mirrored ${ago}</span>
+                ${ratioHtml}
+                ${phaseHtml}
+            </div>
+        </div>
+        ${disc > 0 ? `<button class="mirrored-card-clear" onclick="event.stopPropagation(); clearMirroredDiscovery(${p.id}, '${_escJs(p.name)}')" title="Clear discovery data">↺</button>` : ''}
+        <button class="mirrored-card-pipeline" onclick="event.stopPropagation(); runMirroredPlaylistPipeline(${p.id}, '${_escJs(p.name)}')" title="Refresh, discover, sync, and queue missing tracks">Auto-Sync</button>
+        <button class="mirrored-card-rename" onclick="event.stopPropagation(); editMirroredCustomName(${p.id}, '${_escJs(p.name)}', '${_escJs(p.custom_name || '')}')" title="Rename (changes the name shown here and used when syncing)">✏️</button>
+        <button class="mirrored-card-link" onclick="event.stopPropagation(); editMirroredSourceRef(${p.id}, '${_escJs(p.name)}', '${_escJs(p.source)}', '${_escJs(sourceRef)}')" title="Edit original playlist link">🔗</button>
+        <button class="mirrored-card-export" onclick="event.stopPropagation(); exportMirroredPlaylist(${p.id}, '${_escJs(p.display_name || p.name)}')" title="Export to ListenBrainz / JSPF">📤</button>
+        <button class="mirrored-card-delete" onclick="event.stopPropagation(); deleteMirroredPlaylist(${p.id}, '${_escJs(p.name)}')" title="Delete mirror">✕</button>
+    `;
+    card.addEventListener('click', () => {
+        const st = youtubePlaylistStates[hash];
+        // Treat as non-fresh if phase is set, or if a poller/discovery modal exists
+        const hasActiveDiscovery = activeYouTubePollers[hash] || document.getElementById(`youtube-discovery-modal-${hash}`);
+        if (st && ((st.phase && st.phase !== 'fresh') || hasActiveDiscovery)) {
+            if (st.phase === 'downloading' || st.phase === 'download_complete') {
+                // Open download modal directly (follows Tidal/YouTube card click pattern)
+                const spotifyPlaylistId = st.convertedSpotifyPlaylistId;
+                if (spotifyPlaylistId && activeDownloadProcesses[spotifyPlaylistId]) {
+                    // Modal already exists — just show it
+                    const process = activeDownloadProcesses[spotifyPlaylistId];
+                    if (process.modalElement) {
+                        if (process.status === 'complete') {
+                            showToast('Showing previous results. Close this modal to start a new analysis.', 'info');
+                        }
+                        process.modalElement.style.display = 'flex';
+                    }
+                } else if (spotifyPlaylistId) {
+                    // Need to rehydrate the download modal
+                    rehydrateMirroredDownloadModal(hash, st);
+                } else {
+                    // No converted playlist ID yet, fall back to discovery modal
+                    openYouTubeDiscoveryModal(hash);
+                }
+            } else {
+                openYouTubeDiscoveryModal(hash);
+                if (st.phase === 'discovering' && !activeYouTubePollers[hash]) {
+                    startYouTubeDiscoveryPolling(hash);
+                }
+            }
+        } else {
+            openMirroredPlaylistModal(p.id);
+        }
+    });
+    container.appendChild(card);
+
+    if (pipelineState && pipelineState.status === 'running' && !mirroredPipelinePollers[hash]) {
+        pollMirroredPipelineStatus(p.id, p.name);
+    }
+}
+
+// ── Playlist export to ListenBrainz / JSPF (#903) ───────────────────────────
+// Export button on the mirrored-playlist card -> pick a destination -> background job
+// resolves each track to a MusicBrainz recording MBID (cache/DB/file/MusicBrainz) and either
+// downloads the .jspf or pushes the playlist straight to ListenBrainz, with live status on the card.
+function exportMirroredPlaylist(playlistId, name) {
+    const existing = document.getElementById('pl-export-modal');
+    if (existing) existing.remove();
+    const overlay = document.createElement('div');
+    overlay.id = 'pl-export-modal';
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);';
+    overlay.innerHTML = `
+        <div style="width:420px;max-width:92vw;background:linear-gradient(135deg,rgba(26,26,30,0.98),rgba(18,18,22,0.99));border:1px solid rgba(var(--accent-rgb),0.25);border-radius:18px;padding:22px;box-shadow:0 18px 50px rgba(0,0,0,0.55);">
+            <div style="font-size:16px;font-weight:700;color:#fff;margin-bottom:4px;">Export playlist</div>
+            <div style="font-size:13px;color:rgba(255,255,255,0.55);margin-bottom:18px;">${_esc(name)} → ListenBrainz</div>
+            <button class="pl-export-choice" data-mode="push" style="width:100%;text-align:left;margin-bottom:10px;padding:13px 15px;border-radius:12px;border:1px solid rgba(var(--accent-rgb),0.35);background:rgba(var(--accent-rgb),0.12);color:#fff;cursor:pointer;">
+                <div style="font-weight:600;">Sync to ListenBrainz</div>
+                <div style="font-size:12px;color:rgba(255,255,255,0.55);">Create the playlist directly on your ListenBrainz account (needs your LB token).</div>
+            </button>
+            <button class="pl-export-choice" data-mode="download" style="width:100%;text-align:left;margin-bottom:10px;padding:13px 15px;border-radius:12px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.04);color:#fff;cursor:pointer;">
+                <div style="font-weight:600;">Download .jspf file</div>
+                <div style="font-size:12px;color:rgba(255,255,255,0.55);">Save a JSPF playlist you can upload to ListenBrainz manually.</div>
+            </button>
+            <button class="pl-export-choice" data-mode="spotify" style="width:100%;text-align:left;margin-bottom:10px;padding:13px 15px;border-radius:12px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.04);color:#fff;cursor:pointer;">
+                <div style="font-weight:600;">Sync to Spotify</div>
+                <div style="font-size:12px;color:rgba(255,255,255,0.55);">Create a Spotify playlist in your account (the first time, you'll grant permission to create playlists).</div>
+            </button>
+            <button class="pl-export-choice" data-mode="deezer" style="width:100%;text-align:left;margin-bottom:16px;padding:13px 15px;border-radius:12px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.04);color:#fff;cursor:pointer;">
+                <div style="font-weight:600;">Sync to Deezer</div>
+                <div style="font-size:12px;color:rgba(255,255,255,0.55);">Create a Deezer playlist from this list (uses your Deezer login).</div>
+            </button>
+            <div style="font-size:11.5px;color:rgba(255,255,255,0.4);line-height:1.5;">Tracks are matched by ID (MusicBrainz for ListenBrainz/JSPF; the stored Spotify/Deezer ID for those). Tracks without a match can't be included — you'll see how many made it. Renaming/re-syncing can reset play counts on the destination.</div>
+            <label style="display:flex;align-items:flex-start;gap:8px;margin-top:12px;font-size:12px;color:rgba(255,255,255,0.6);cursor:pointer;">
+                <input type="checkbox" id="pl-export-backfill" style="margin-top:2px;flex-shrink:0;accent-color:rgb(var(--accent-rgb));">
+                <span><b style="color:rgba(255,255,255,0.75);">Match missing tracks</b> (Spotify/Deezer) — search the service for tracks with no known ID. Slower, and only confident matches are added.</span>
+            </label>
+            <div style="text-align:right;margin-top:14px;"><button onclick="document.getElementById('pl-export-modal').remove()" style="background:none;border:none;color:rgba(255,255,255,0.5);cursor:pointer;font-size:13px;">Cancel</button></div>
+        </div>`;
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+    overlay.querySelectorAll('.pl-export-choice').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const mode = btn.dataset.mode;
+            // Gated service button (not connected) → nudge to Settings instead of a doomed export.
+            if (btn.dataset.disconnected) {
+                const dest = mode[0].toUpperCase() + mode.slice(1);
+                overlay.remove();
+                _setExportStatus(playlistId, `<span style="color:#f59e0b;">Connect ${dest} in Settings → Connections to export here</span>`, 9000);
+                return;
+            }
+            const bfEl = overlay.querySelector('#pl-export-backfill');
+            const backfill = !!(bfEl && bfEl.checked);
+            overlay.remove();
+            _startPlaylistExport(playlistId, mode, name, backfill);
+        });
+    });
+    document.body.appendChild(overlay);
+
+    // Gate Spotify/Deezer on connection (cheap token/ARL check — no live verify). Disconnected
+    // services grey out + nudge to Settings rather than letting the export fail with "not connected".
+    fetch('/api/discover/your-albums/sources').then(r => r.json()).then(data => {
+        const connected = (data && data.connected) || [];
+        overlay.querySelectorAll('.pl-export-choice[data-mode]').forEach(btn => {
+            const m = btn.dataset.mode;
+            if ((m === 'spotify' || m === 'deezer') && !connected.includes(m)) {
+                btn.dataset.disconnected = '1';
+                btn.style.opacity = '0.5';
+                const hint = btn.querySelector('div:last-child');
+                if (hint) hint.innerHTML = `<span style="color:#f59e0b;">Not connected</span> — set up ${m[0].toUpperCase() + m.slice(1)} in Settings → Connections first.`;
+            }
+        });
+    }).catch(() => {});
+}
+
+async function _startPlaylistExport(playlistId, mode, name, backfill) {
+    _setExportStatus(playlistId, `<span style="color:#a78bfa;">Starting export…</span>`);
+    try {
+        // Spotify/Deezer go to the service endpoint; ListenBrainz/JSPF keep the LB one.
+        const isService = (mode === 'spotify' || mode === 'deezer');
+        const url = isService
+            ? `/api/playlists/${playlistId}/export/service/${mode}`
+            : `/api/playlists/${playlistId}/export/listenbrainz`;
+        const resp = await fetch(url, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: isService ? JSON.stringify({ backfill: !!backfill }) : JSON.stringify({ mode }),
+        });
+        const data = await resp.json();
+        // Spotify export needs a one-time write-permission grant. Surface a clickable link (a
+        // direct user click avoids popup-blocking; window.open after this await would be blocked)
+        // and tell the user to retry once they've authorized.
+        if (data.needs_auth && data.auth_url) {
+            _setExportStatus(playlistId, `<span style="color:#f59e0b;">Spotify needs permission to create playlists — <a href="${data.auth_url}" target="_blank" rel="noopener" style="color:#38bdf8;text-decoration:underline;">authorize</a>, then click Export again.</span>`, 20000);
+            return;
+        }
+        if (!data.success || !data.job_id) {
+            _setExportStatus(playlistId, `<span style="color:#ef4444;">${_esc(data.error || 'Export failed to start')}</span>`);
+            return;
+        }
+        _pollPlaylistExport(data.job_id, playlistId, mode, name);
+    } catch (e) {
+        _setExportStatus(playlistId, `<span style="color:#ef4444;">Export error</span>`);
+    }
+}
+
+async function _pollPlaylistExport(jobId, playlistId, mode, name) {
+    try {
+        const resp = await fetch(`/api/playlists/export/status/${jobId}`);
+        const data = await resp.json();
+        const job = data.job || {};
+        const st = job.stats || {};
+        if (job.phase === 'resolving') {
+            const pct = job.total ? Math.round(100 * (job.done || 0) / job.total) : 0;
+            _setExportStatus(playlistId, `<span style="color:#38bdf8;">Matching ${job.done || 0}/${job.total || 0} (${pct}%)${st.resolved != null ? ` · ${st.resolved} matched` : ''}</span>`);
+        } else if (job.phase === 'pushing') {
+            const dest = (mode === 'spotify' || mode === 'deezer') ? (mode[0].toUpperCase() + mode.slice(1)) : 'ListenBrainz';
+            _setExportStatus(playlistId, `<span style="color:#a78bfa;">Pushing to ${dest}…</span>`);
+        } else if (job.phase === 'done') {
+            // Spotify/Deezer export: report added + unmatched and link the new playlist.
+            if (mode === 'spotify' || mode === 'deezer') {
+                const dest = mode[0].toUpperCase() + mode.slice(1);
+                const push = job.push || {};
+                const cov = `${st.resolved || 0} added${st.from_search ? ` (${st.from_search} matched live)` : ''}${st.unmatched ? ` · ${st.unmatched} not on ${dest}` : ''}`;
+                const link = push.url ? ` <a href="${push.url}" target="_blank" style="color:#38bdf8;">open</a>` : '';
+                _setExportStatus(playlistId, `<span style="color:#22c55e;">Exported to ${dest} · ${cov}</span>${link}`, 12000);
+                if (typeof showToast === 'function') showToast(`Playlist exported to ${dest} (${cov})`, 'success');
+                return;
+            }
+            const sum = job.summary || {};
+            const cov = `${sum.included || 0}/${sum.total || 0} matched${sum.skipped ? ` · ${sum.skipped} unmatched` : ''}`;
+            if (mode === 'download') {
+                window.location = `/api/playlists/export/download/${jobId}`;
+                _setExportStatus(playlistId, `<span style="color:#22c55e;">Downloaded · ${cov}</span>`, 8000);
+            } else {
+                const url = (job.push && job.push.playlist_url) || '';
+                _setExportStatus(playlistId, `<span style="color:#22c55e;">Synced to ListenBrainz · ${cov}</span>` + (url ? ` <a href="${url}" target="_blank" style="color:#38bdf8;">view</a>` : ''), 12000);
+                if (typeof showToast === 'function') showToast(`Playlist synced to ListenBrainz (${cov})`, 'success');
+            }
+            return;
+        } else if (job.phase === 'error') {
+            _setExportStatus(playlistId, `<span style="color:#ef4444;">${_esc(job.error || 'Export failed')}</span>`, 10000);
+            return;
+        }
+        setTimeout(() => _pollPlaylistExport(jobId, playlistId, mode, name), 1000);
+    } catch (e) {
+        setTimeout(() => _pollPlaylistExport(jobId, playlistId, mode, name), 2000);
+    }
+}
+
+function _setExportStatus(playlistId, html, autoHideMs) {
+    // Inject into the card's existing .card-meta line (same approach as the pipeline phase
+    // indicator) so the status sits inline and never disrupts the card's flex row.
+    const card = document.getElementById(`mirrored-card-${playlistId}`);
+    if (!card) return;
+    const meta = card.querySelector('.card-meta');
+    if (!meta) return;
+    let span = meta.querySelector('.export-status-span');
+    if (!span) {
+        span = document.createElement('span');
+        span.className = 'export-status-span';
+        meta.appendChild(span);
+    }
+    span.innerHTML = html;
+    if (autoHideMs) setTimeout(() => { if (span && span.parentNode) span.remove(); }, autoHideMs);
+}
+
+function updateMirroredCardPhase(urlHash, phase) {
+    // Update the state phase (updateYouTubeCardPhase skips this for mirrored playlists due to no cardElement)
+    const state = youtubePlaylistStates[urlHash];
+    if (state) state.phase = phase;
+
+    // Extract the numeric ID from urlHash (e.g., 'mirrored_3' → '3')
+    const mirroredId = urlHash.replace('mirrored_', '');
+    const card = document.getElementById(`mirrored-card-${mirroredId}`);
+    if (!card) return;
+
+    const metaEl = card.querySelector('.card-meta');
+    if (!metaEl) return;
+
+    // Remove old phase indicator
+    const oldPhase = metaEl.querySelector('span[style]');
+    if (oldPhase) oldPhase.remove();
+
+    // Add new phase indicator
+    let phaseHtml = '';
+    switch (phase) {
+        case 'pipeline_running':
+            const pipelineProgress = state?.pipeline_progress || 0;
+            const pipelinePhase = state?.pipeline_phase || 'Pipeline running';
+            phaseHtml = `<span style="color:#38bdf8;">${_esc(pipelinePhase)} ${pipelineProgress}%</span>`;
+            break;
+        case 'pipeline_complete':
+            phaseHtml = `<span style="color:#22c55e;">Pipeline complete</span>`;
+            break;
+        case 'pipeline_error':
+            phaseHtml = `<span style="color:#ef4444;">Pipeline error</span>`;
+            break;
+        case 'discovering':
+            phaseHtml = `<span style="color:#a78bfa;">Discovering...</span>`;
+            break;
+        case 'discovered':
+            const matches = state?.spotifyMatches || state?.spotify_matches || 0;
+            const total = state?.spotify_total || 0;
+            phaseHtml = `<span style="color:#22c55e;">Discovered ${matches}/${total}</span>`;
+            break;
+        case 'syncing':
+            phaseHtml = `<span style="color:#3b82f6;">Syncing...</span>`;
+            break;
+        case 'sync_complete':
+            phaseHtml = `<span style="color:#3b82f6;">Synced</span>`;
+            break;
+        case 'downloading':
+            phaseHtml = `<span style="color:#f59e0b;">Downloading...</span>`;
+            break;
+        case 'download_complete':
+            phaseHtml = `<span style="color:#22c55e;">Downloaded</span>`;
+            break;
+    }
+    if (phaseHtml) {
+        metaEl.insertAdjacentHTML('beforeend', phaseHtml);
+    }
+}
+
+async function rehydrateMirroredDownloadModal(urlHash, state) {
+    try {
+        if (!state || !state.playlist) {
+            showToast('Cannot open download modal - invalid playlist data', 'error');
+            return;
+        }
+
+        console.log(`💧 [Rehydration] Rehydrating mirrored download modal for: ${state.playlist.name}`);
+
+        // Get discovery results from backend if not already loaded
+        let discoveryRes = state.discoveryResults || state.discovery_results;
+        if (!discoveryRes || discoveryRes.length === 0) {
+            console.log(`🔍 Fetching discovery results from backend for mirrored playlist: ${urlHash}`);
+            const stateResponse = await fetch(`/api/youtube/state/${urlHash}`);
+            if (stateResponse.ok) {
+                const fullState = await stateResponse.json();
+                state.discovery_results = fullState.discovery_results;
+                state.discoveryResults = fullState.discovery_results;
+                state.convertedSpotifyPlaylistId = fullState.converted_spotify_playlist_id;
+                state.download_process_id = fullState.download_process_id;
+                discoveryRes = fullState.discovery_results;
+                console.log(`✅ Loaded ${discoveryRes?.length || 0} discovery results from backend`);
+            } else {
+                showToast('Error loading playlist data', 'error');
+                return;
+            }
+        }
+
+        // Extract Spotify tracks from discovery results
+        const spotifyTracks = (discoveryRes || [])
+            .filter(r => r.spotify_data || (r.spotify_track && r.status_class === 'found'))
+            .map(r => {
+                if (r.spotify_data) return r.spotify_data;
+                const albumData = r.spotify_album || 'Unknown Album';
+                return {
+                    id: r.spotify_id || 'unknown',
+                    name: r.spotify_track || 'Unknown Track',
+                    artists: r.spotify_artist ? [r.spotify_artist] : ['Unknown Artist'],
+                    album: typeof albumData === 'object' ? albumData : { name: albumData, album_type: 'album', images: [] },
+                    duration_ms: 0
+                };
+            });
+
+        if (spotifyTracks.length === 0) {
+            showToast('No Spotify matches found for download', 'error');
+            return;
+        }
+
+        const virtualPlaylistId = state.convertedSpotifyPlaylistId;
+        const playlistName = state.playlist.name;
+
+        // Create the download modal
+        await openDownloadMissingModalForYouTube(virtualPlaylistId, playlistName, spotifyTracks);
+
+        // If we have a download process ID, set up the modal for the running/complete state
+        if (state.download_process_id) {
+            const process = activeDownloadProcesses[virtualPlaylistId];
+            if (process) {
+                process.status = state.phase === 'download_complete' ? 'complete' : 'running';
+                process.batchId = state.download_process_id;
+
+                const beginBtn = document.getElementById(`begin-analysis-btn-${virtualPlaylistId}`);
+                const cancelBtn = document.getElementById(`cancel-all-btn-${virtualPlaylistId}`);
+
+                if (state.phase === 'downloading') {
+                    if (beginBtn) beginBtn.style.display = 'none';
+                    if (cancelBtn) cancelBtn.style.display = 'inline-block';
+
+                    // Start polling for live updates
+                    startModalDownloadPolling(virtualPlaylistId);
+                    console.log(`🔄 Started polling for active mirrored download: ${state.download_process_id}`);
+                } else if (state.phase === 'download_complete') {
+                    if (beginBtn) beginBtn.style.display = 'none';
+                    if (cancelBtn) cancelBtn.style.display = 'none';
+                    console.log(`✅ Showing completed mirrored download results: ${state.download_process_id}`);
+
+                    // Fetch final results to populate the modal
+                    try {
+                        const response = await fetch(`/api/playlists/${state.download_process_id}/download_status`);
+                        if (response.ok) {
+                            const data = await response.json();
+                            if (data.phase === 'complete' && data.tasks) {
+                                updateCompletedModalResults(virtualPlaylistId, data);
+                            }
+                        }
+                    } catch (err) {
+                        console.warn('Could not load completed download results:', err);
+                    }
+                }
+            }
+        }
+
+        console.log(`✅ Successfully rehydrated mirrored download modal for: ${state.playlist.name}`);
+    } catch (error) {
+        console.error('❌ Error rehydrating mirrored download modal:', error);
+        showToast('Error opening download modal', 'error');
+    }
+}
+
+async function hydrateMirroredDiscoveryStates() {
+    try {
+        const res = await fetch('/api/mirrored-playlists/discovery-states');
+        const data = await res.json();
+        if (data.error || !data.states || data.states.length === 0) return;
+
+        console.log(`Hydrating ${data.states.length} mirrored discovery states`);
+
+        for (const s of data.states) {
+            const hash = s.url_hash;
+
+            youtubePlaylistStates[hash] = {
+                playlist: s.playlist,
+                phase: s.phase,
+                discovery_results: s.discovery_results || [],
+                discoveryResults: s.discovery_results || [],
+                discovery_progress: s.discovery_progress || 0,
+                discoveryProgress: s.discovery_progress || 0,
+                spotify_matches: s.spotify_matches || 0,
+                spotifyMatches: s.spotify_matches || 0,
+                spotify_total: s.spotify_total || 0,
+                status: s.status || '',
+                url: s.playlist?.url || '',
+                sync_playlist_id: null,
+                converted_spotify_playlist_id: s.converted_spotify_playlist_id,
+                convertedSpotifyPlaylistId: s.converted_spotify_playlist_id,
+                download_process_id: s.download_process_id,
+                created_at: Date.now() / 1000,
+                last_accessed: Date.now() / 1000,
+                discovery_future: null,
+                sync_progress: {},
+                is_mirrored_playlist: true,
+                mirrored_source: s.playlist?.source || ''
+            };
+
+            // Update the card to reflect the current phase
+            const card = document.getElementById(`mirrored-card-${s.playlist_id}`);
+            if (card) {
+                const metaEl = card.querySelector('.card-meta');
+                if (metaEl) {
+                    // Remove old phase span and add new one
+                    const oldPhase = metaEl.querySelector('span[style]');
+                    if (oldPhase) oldPhase.remove();
+
+                    if (s.phase === 'discovering') {
+                        metaEl.insertAdjacentHTML('beforeend', `<span style="color:#a78bfa;">Discovering ${s.discovery_progress || 0}%</span>`);
+                    } else if (s.phase === 'discovered') {
+                        metaEl.insertAdjacentHTML('beforeend', `<span style="color:#22c55e;">Discovered ${s.spotify_matches || 0}/${s.spotify_total || 0}</span>`);
+                    } else if (s.phase === 'syncing' || s.phase === 'sync_complete') {
+                        metaEl.insertAdjacentHTML('beforeend', `<span style="color:#3b82f6;">${s.phase === 'syncing' ? 'Syncing...' : 'Synced'}</span>`);
+                    } else if (s.phase === 'downloading') {
+                        metaEl.insertAdjacentHTML('beforeend', `<span style="color:#f59e0b;">Downloading...</span>`);
+                    } else if (s.phase === 'download_complete') {
+                        metaEl.insertAdjacentHTML('beforeend', `<span style="color:#22c55e;">Downloaded</span>`);
+                    }
+                }
+            }
+
+            // Resume polling if discovery is in progress
+            if (s.phase === 'discovering' && !activeYouTubePollers[hash]) {
+                startYouTubeDiscoveryPolling(hash);
+            }
+        }
+    } catch (err) {
+        console.warn('Failed to hydrate mirrored discovery states:', err);
+    }
+}
+
+function timeAgo(dateStr) {
+    if (!dateStr) return '';
+    // Handle ISO formats: "Z" suffix, "+00:00" offset, or bare (assume UTC)
+    let ts = dateStr;
+    if (!ts.includes('Z') && !ts.includes('+') && !ts.includes('-', 10)) ts += 'Z';
+    const diff = Date.now() - new Date(ts).getTime();
+    const secs = Math.floor(diff / 1000);
+    if (secs < 5) return 'just now';
+    if (secs < 60) return `${secs}s ago`;
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    const days = Math.floor(hrs / 24);
+    if (days < 30) return `${days}d ago`;
+    return `${Math.floor(days / 30)}mo ago`;
+}
+
+/**
+ * Open modal showing all tracks in a mirrored playlist.
+ */
+async function openMirroredPlaylistModal(playlistId) {
+    showLoadingOverlay('Loading mirrored playlist...');
+    try {
+        const res = await fetch(`/api/mirrored-playlists/${playlistId}`);
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+
+        hideLoadingOverlay();
+
+        // Remove any existing modal
+        const old = document.getElementById('mirrored-track-modal');
+        if (old) old.remove();
+
+        const overlay = document.createElement('div');
+        overlay.id = 'mirrored-track-modal';
+        overlay.className = 'mirrored-modal-overlay';
+
+        const tracks = data.tracks || [];
+        const source = data.source || 'unknown';
+        const sourceRef = getMirroredSourceRef(data);
+        const sourceIcons = { spotify: '🎵', spotify_public: '🎵', tidal: '🌊', youtube: '▶', beatport: '🎛', deezer: '🎧', qobuz: '♫' };
+        const sourceLabels = { spotify: 'Spotify', spotify_public: 'Spotify', tidal: 'Tidal', youtube: 'YouTube', beatport: 'Beatport', deezer: 'Deezer', qobuz: 'Qobuz' };
+        const sourceIcon = sourceIcons[source] || '📋';
+        const srcLabel = sourceLabels[source] || source;
+
+        // Hero artwork: playlist cover → first track with art → gradient fallback.
+        const heroArt = data.image_url || (tracks.find(t => t.image_url) || {}).image_url || '';
+
+        // Total runtime for the meta line.
+        const totalMs = tracks.reduce((sum, t) => sum + (t.duration_ms || 0), 0);
+        const totalMin = Math.round(totalMs / 60000);
+        const totalLabel = totalMin >= 60 ? `${Math.floor(totalMin / 60)} hr ${totalMin % 60} min` : `${totalMin} min`;
+
+        const trackRows = tracks.map(t => {
+            const dur = t.duration_ms ? `${Math.floor(t.duration_ms / 60000)}:${String(Math.floor((t.duration_ms % 60000) / 1000)).padStart(2, '0')}` : '';
+            const art = t.image_url
+                ? `<img class="mm-row-art" src="${_escAttr(t.image_url)}" loading="lazy" onerror="this.onerror=null;this.classList.add('mm-art-empty');this.removeAttribute('src');">`
+                : `<span class="mm-row-art mm-art-empty"></span>`;
+            return `<div class="mm-row">
+                <span class="mm-row-pos">${t.position}</span>
+                ${art}
+                <div class="mm-row-main">
+                    <span class="mm-row-title">${_esc(t.track_name)}</span>
+                    <span class="mm-row-artist">${_esc(t.artist_name)}</span>
+                </div>
+                <span class="mm-row-album">${_esc(t.album_name || '')}</span>
+                <span class="mm-row-dur">${dur}</span>
+            </div>`;
+        }).join('');
+
+        const heroCover = heroArt
+            ? `<div class="mm-cover" style="background-image:url('${_escAttr(heroArt)}')"></div>`
+            : `<div class="mm-cover mm-cover-empty ${_escAttr(source)}">${sourceIcon}</div>`;
+
+        overlay.innerHTML = `
+            <div class="mirrored-modal">
+                <div class="mm-hero">
+                    ${heroArt ? `<div class="mm-hero-bg" style="background-image:url('${_escAttr(heroArt)}')"></div>` : ''}
+                    <div class="mm-hero-content">
+                        ${heroCover}
+                        <div class="mm-hero-info">
+                            <span class="mm-eyebrow">Mirrored Playlist</span>
+                            <h2 class="mm-title">${_esc(data.name)}</h2>
+                            <div class="mm-meta">
+                                <span class="mm-source-pill ${_escAttr(source)}">${_esc(srcLabel)}</span>
+                                ${data.owner ? `<span class="mm-meta-item">${_esc(data.owner)}</span><span class="mm-dot">&middot;</span>` : ''}
+                                <span class="mm-meta-item">${tracks.length} tracks</span>
+                                ${totalMs ? `<span class="mm-dot">&middot;</span><span class="mm-meta-item">${totalLabel}</span>` : ''}
+                                <span class="mm-dot">&middot;</span>
+                                <span class="mm-meta-item">Mirrored ${timeAgo(data.updated_at || data.mirrored_at)}</span>
+                            </div>
+                        </div>
+                    </div>
+                    <button class="mm-close" onclick="closeMirroredModal()" aria-label="Close">&times;</button>
+                </div>
+                <div class="mm-list">
+                    <div class="mm-list-head">
+                        <span>#</span><span></span><span>Title</span><span>Album</span><span class="mm-col-dur">Time</span>
+                    </div>
+                    ${trackRows || '<div class="mm-empty">No tracks in this mirror yet.</div>'}
+                </div>
+                <div class="mm-actions">
+                    <button class="mm-btn mm-btn-danger" onclick="closeMirroredModal(); deleteMirroredPlaylist(${playlistId}, '${_escJs(data.name)}')">Delete Mirror</button>
+                    <div class="mm-actions-right">
+                        <button class="mm-btn mm-btn-ghost" onclick="editMirroredSourceRef(${playlistId}, '${_escJs(data.name)}', '${_escJs(source)}', '${_escJs(sourceRef)}')">Edit Source</button>
+                        <button class="mm-btn mm-btn-secondary" onclick="runMirroredPlaylistPipeline(${playlistId}, '${_escJs(data.name)}')">Auto-Sync</button>
+                        <button class="mm-btn mm-btn-ghost" onclick="closeMirroredModal()">Close</button>
+                        <button class="mm-btn mm-btn-primary" onclick="discoverMirroredPlaylist(${playlistId})">Discover</button>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        overlay.addEventListener('click', e => { if (e.target === overlay) closeMirroredModal(); });
+        document.body.appendChild(overlay);
+    } catch (err) {
+        hideLoadingOverlay();
+        showToast(`Error: ${err.message}`, 'error');
+    }
+}
+
+function closeMirroredModal() {
+    const m = document.getElementById('mirrored-track-modal');
+    if (m) m.remove();
+}
+
+/**
+ * Delete a mirrored playlist after confirmation.
+ */
+async function clearMirroredDiscovery(playlistId, name) {
+    if (!await showConfirmDialog({ title: 'Clear Discovery Data', message: `Clear discovery data for "${name}"? You can re-discover afterwards to get updated cover art.` })) return;
+    try {
+        const res = await fetch(`/api/mirrored-playlists/${playlistId}/clear-discovery`, { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+            showToast(`Cleared discovery for ${name} (${data.cleared} tracks)`, 'success');
+            // Signal cancellation to any running worker, then clear state
+            const hash = `mirrored_${playlistId}`;
+            if (youtubePlaylistStates[hash]) {
+                youtubePlaylistStates[hash].phase = 'cancelled';
+            }
+            delete youtubePlaylistStates[hash];
+            const staleModal = document.getElementById(`youtube-discovery-modal-${hash}`);
+            if (staleModal) staleModal.remove();
+            loadMirroredPlaylists();
+        } else {
+            showToast(data.error || 'Failed to clear discovery', 'error');
+        }
+    } catch (err) {
+        showToast(`Error: ${err.message}`, 'error');
+    }
+}
+
+// ==================== Discovery Pool Modal ====================
+
+let _discoveryPoolOverlay = null;
+let _discoveryPoolData = null;
+let _discoveryPoolView = 'categories'; // 'categories' | 'failed' | 'matched'
+let _discoveryPoolPlaylistFilter = null;
+
+async function loadDiscoveryPoolStats() {
+    try {
+        const res = await fetch('/api/discovery-pool');
+        const data = await res.json();
+        const matchedEl = document.getElementById('discovery-pool-matched-count');
+        const failedEl = document.getElementById('discovery-pool-failed-count');
+        if (matchedEl) matchedEl.textContent = data.stats.matched || 0;
+        if (failedEl) failedEl.textContent = data.stats.failed || 0;
+    } catch (e) { }
+}
+
+async function openDiscoveryPoolModal(playlistId = null) {
+    _discoveryPoolPlaylistFilter = playlistId;
+    _discoveryPoolView = 'categories';
+
+    // Fetch pool data
+    let url = '/api/discovery-pool';
+    if (playlistId) url += `?playlist_id=${playlistId}`;
+    try {
+        const res = await fetch(url);
+        _discoveryPoolData = await res.json();
+    } catch (err) {
+        showToast('Failed to load discovery pool', 'error');
+        return;
+    }
+
+    // Remove existing overlay if present
+    if (_discoveryPoolOverlay) _discoveryPoolOverlay.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'discovery-pool-overlay';
+    overlay.onclick = (e) => { if (e.target === overlay) closeDiscoveryPoolModal(); };
+
+    const playlistOptions = (_discoveryPoolData.playlists || [])
+        .map(p => `<option value="${p.id}" ${playlistId == p.id ? 'selected' : ''}>${_esc(p.name)}</option>`)
+        .join('');
+
+    const failedCount = _discoveryPoolData.stats.failed || 0;
+    const matchedCount = _discoveryPoolData.stats.matched || 0;
+
+    overlay.innerHTML = `
+        <div class="modal-container playlist-modal">
+            <div class="playlist-modal-header">
+                <div class="playlist-header-content">
+                    <h2>Discovery Pool</h2>
+                    <div class="playlist-quick-info">
+                        <span class="playlist-track-count" id="pool-header-matched">${matchedCount} Matched</span>
+                        <span class="playlist-owner ${failedCount > 0 ? 'pool-header-failed-highlight' : ''}" id="pool-header-failed">${failedCount} Failed</span>
+                        <select class="pool-playlist-filter" onchange="filterDiscoveryPool(this.value)">
+                            <option value="">All Playlists</option>
+                            ${playlistOptions}
+                        </select>
+                    </div>
+                </div>
+                <span class="playlist-modal-close" onclick="closeDiscoveryPoolModal()">&times;</span>
+            </div>
+
+            <div class="playlist-modal-body">
+                <div class="pool-category-grid" id="pool-category-grid">
+                    <div class="pool-category-card failed" onclick="showPoolList('failed')">
+                        <div class="pool-category-fallback failed"></div>
+                        <div class="pool-category-overlay"></div>
+                        <div class="pool-category-content">
+                            <div class="pool-category-icon">&#9888;</div>
+                            <div class="pool-category-count failed" id="pool-cat-failed-count">${failedCount}</div>
+                            <div class="pool-category-label">tracks need attention</div>
+                        </div>
+                        <div class="pool-category-top-bar failed"></div>
+                    </div>
+                    <div class="pool-category-card matched" onclick="showPoolList('matched')">
+                        <div class="pool-category-fallback matched" id="pool-matched-bg"></div>
+                        <div class="pool-category-overlay"></div>
+                        <div class="pool-category-content">
+                            <div class="pool-category-icon">&#10003;</div>
+                            <div class="pool-category-count matched" id="pool-cat-matched-count">${matchedCount}</div>
+                            <div class="pool-category-label">cached matches</div>
+                        </div>
+                        <div class="pool-category-top-bar matched"></div>
+                    </div>
+                </div>
+
+                <div class="pool-list-view" id="pool-list-view" style="display: none;">
+                    <div class="pool-list-header">
+                        <button class="pool-back-btn" onclick="showPoolCategories()">&larr; Back</button>
+                        <span class="pool-list-title" id="pool-list-title"></span>
+                        <input type="text" class="pool-list-search" id="pool-list-search" placeholder="Filter tracks..." oninput="renderPoolList()">
+                    </div>
+                    <div class="pool-list-content" id="pool-list-content"></div>
+                </div>
+            </div>
+
+            <div class="playlist-modal-footer">
+                <div class="playlist-modal-footer-left"></div>
+                <div class="playlist-modal-footer-right">
+                    <button class="playlist-modal-btn playlist-modal-btn-secondary" onclick="closeDiscoveryPoolModal()">Close</button>
+                </div>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(overlay);
+    overlay.style.display = 'flex';
+    _discoveryPoolOverlay = overlay;
+
+    // Build matched mosaic if images available
+    _buildPoolMatchedMosaic();
+}
+
+function _buildPoolMatchedMosaic() {
+    const entries = _discoveryPoolData.matched || [];
+    const images = [];
+    for (const e of entries) {
+        const md = e.matched_data || {};
+        if (md.image_url && images.indexOf(md.image_url) === -1) {
+            images.push(md.image_url);
+            if (images.length >= 20) break;
+        }
+    }
+    const bgEl = document.getElementById('pool-matched-bg');
+    if (!bgEl || images.length < 4) return; // keep fallback gradient
+
+    // Build mosaic rows similar to wishlist
+    bgEl.innerHTML = '';
+    bgEl.className = 'wishlist-mosaic-background';
+    const rows = 4;
+    const imgPerRow = Math.ceil(images.length / rows) * 2; // duplicate for seamless loop
+    for (let r = 0; r < rows; r++) {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'wishlist-mosaic-row-wrapper';
+        const row = document.createElement('div');
+        row.className = 'wishlist-mosaic-row' + (r % 2 === 1 ? ' scroll-right' : '');
+        row.style.setProperty('--speed', (25 + r * 5) + 's');
+        row.style.animationDelay = (r * 0.15) + 's';
+        for (let i = 0; i < imgPerRow; i++) {
+            const img = images[(i + r * 3) % images.length];
+            const tile = document.createElement('div');
+            tile.className = 'wishlist-mosaic-tile';
+            tile.innerHTML = `<div class="wishlist-mosaic-image" style="background-image: url('${img}')"></div>`;
+            row.appendChild(tile);
+        }
+        wrapper.appendChild(row);
+        bgEl.appendChild(wrapper);
+    }
+}
+
+function closeDiscoveryPoolModal() {
+    if (_discoveryPoolOverlay) {
+        _discoveryPoolOverlay.remove();
+        _discoveryPoolOverlay = null;
+    }
+    _discoveryPoolData = null;
+    // Refresh dashboard stats
+    loadDiscoveryPoolStats();
+}
+
+// ── Wing It Pool ───────────────────────────────────────────────────────────
+// Lists tracks Wing It auto-matched on a best-effort guess (extra_data
+// wing_it_fallback flag). They count as 'discovered' so the Discovery Pool hides
+// them — this is the only place to review + re-match the guesses. Re-match reuses
+// the Discovery Pool's openPoolFixModal / /api/discovery-pool/fix (same track id);
+// a manual match drops the row from here on the next refresh.
+let _wingItPoolOverlay = null;
+let _wingItPoolData = null;
+let _wingItPoolView = 'categories';   // 'categories' | 'attention' | 'matched'
+let _wingItPoolPlaylistFilter = null;
+
+async function openWingItPoolModal(playlistId = null) {
+    _wingItPoolPlaylistFilter = playlistId;
+    _wingItPoolView = 'categories';
+    let url = '/api/wing-it-pool';
+    if (playlistId) url += `?playlist_id=${playlistId}`;
+    try {
+        const res = await fetch(url);
+        _wingItPoolData = await res.json();
+    } catch (err) {
+        showToast('Failed to load Wing It pool', 'error');
+        return;
+    }
+    if (_wingItPoolOverlay) _wingItPoolOverlay.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'wing-it-pool-overlay';
+    overlay.onclick = (e) => { if (e.target === overlay) closeWingItPoolModal(); };
+
+    const playlistOptions = (_wingItPoolData.playlists || [])
+        .map(p => `<option value="${p.id}" ${playlistId == p.id ? 'selected' : ''}>${_esc(p.name)}</option>`)
+        .join('');
+    const attentionCount = (_wingItPoolData.tracks || []).length;
+    const matchedCount = (_wingItPoolData.matched || []).length;
+
+    overlay.innerHTML = `
+        <div class="modal-container playlist-modal">
+            <div class="playlist-modal-header">
+                <div class="playlist-header-content">
+                    <h2>Wing It Pool</h2>
+                    <div class="playlist-quick-info">
+                        <span class="playlist-owner ${attentionCount > 0 ? 'pool-header-failed-highlight' : ''}" id="wing-it-header-attention">${attentionCount} to review</span>
+                        <span class="playlist-track-count" id="wing-it-header-matched">${matchedCount} resolved</span>
+                        <select class="pool-playlist-filter" onchange="filterWingItPool(this.value)">
+                            <option value="">All Playlists</option>
+                            ${playlistOptions}
+                        </select>
+                    </div>
+                </div>
+                <span class="playlist-modal-close" onclick="closeWingItPoolModal()">&times;</span>
+            </div>
+
+            <div class="playlist-modal-body">
+                <div class="pool-category-grid" id="wing-it-category-grid">
+                    <div class="pool-category-card failed" onclick="showWingItList('attention')">
+                        <div class="pool-category-fallback failed"></div>
+                        <div class="pool-category-overlay"></div>
+                        <div class="pool-category-content">
+                            <div class="pool-category-icon">&#9889;</div>
+                            <div class="pool-category-count failed" id="wing-it-cat-attention-count">${attentionCount}</div>
+                            <div class="pool-category-label">guesses to review</div>
+                        </div>
+                        <div class="pool-category-top-bar failed"></div>
+                    </div>
+                    <div class="pool-category-card matched" onclick="showWingItList('matched')">
+                        <div class="pool-category-fallback matched"></div>
+                        <div class="pool-category-overlay"></div>
+                        <div class="pool-category-content">
+                            <div class="pool-category-icon">&#10003;</div>
+                            <div class="pool-category-count matched" id="wing-it-cat-matched-count">${matchedCount}</div>
+                            <div class="pool-category-label">resolved manually</div>
+                        </div>
+                        <div class="pool-category-top-bar matched"></div>
+                    </div>
+                </div>
+
+                <div class="pool-list-view" id="wing-it-list-view" style="display: none;">
+                    <div class="pool-list-header">
+                        <button class="pool-back-btn" onclick="showWingItCategories()">&larr; Back</button>
+                        <span class="pool-list-title" id="wing-it-list-title"></span>
+                        <input type="text" class="pool-list-search" id="wing-it-list-search" placeholder="Filter tracks..." oninput="renderWingItPoolList()">
+                    </div>
+                    <div class="pool-list-content" id="wing-it-list-content"></div>
+                </div>
+            </div>
+
+            <div class="playlist-modal-footer">
+                <div class="playlist-modal-footer-left"></div>
+                <div class="playlist-modal-footer-right">
+                    <button class="playlist-modal-btn playlist-modal-btn-secondary" onclick="closeWingItPoolModal()">Close</button>
+                </div>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(overlay);
+    overlay.style.display = 'flex';
+    _wingItPoolOverlay = overlay;
+}
+
+function showWingItList(view) {
+    _wingItPoolView = view;
+    const grid = document.getElementById('wing-it-category-grid');
+    const listView = document.getElementById('wing-it-list-view');
+    const title = document.getElementById('wing-it-list-title');
+    const search = document.getElementById('wing-it-list-search');
+    if (grid) grid.style.display = 'none';
+    if (listView) listView.style.display = 'block';
+    if (title) title.textContent = view === 'matched'
+        ? '✓ Resolved Wing It guesses' : '⚡ Guesses to review';
+    if (search) search.value = '';
+    renderWingItPoolList();
+}
+
+function showWingItCategories() {
+    _wingItPoolView = 'categories';
+    const grid = document.getElementById('wing-it-category-grid');
+    const listView = document.getElementById('wing-it-list-view');
+    if (grid) grid.style.display = 'grid';
+    if (listView) listView.style.display = 'none';
+}
+
+function _wingItMatchedName(t) {
+    try {
+        const md = JSON.parse(t.extra_data || '{}').matched_data || {};
+        return md.name || '';
+    } catch (e) { return ''; }
+}
+
+function renderWingItPoolList() {
+    const container = document.getElementById('wing-it-list-content');
+    if (!container || !_wingItPoolData) return;
+
+    const searchEl = document.getElementById('wing-it-list-search');
+    const query = (searchEl ? searchEl.value : '').toLowerCase().trim();
+    const isMatched = _wingItPoolView === 'matched';
+    let tracks = (isMatched ? _wingItPoolData.matched : _wingItPoolData.tracks) || [];
+    if (query) {
+        tracks = tracks.filter(t =>
+            (t.track_name || '').toLowerCase().includes(query) ||
+            (t.artist_name || '').toLowerCase().includes(query) ||
+            (t.playlist_name || '').toLowerCase().includes(query)
+        );
+    }
+    if (tracks.length === 0) {
+        const emptyMsg = isMatched
+            ? 'No resolved Wing It tracks yet — ones you Fix here will land in this list.'
+            : 'No Wing It guesses to review.';
+        container.innerHTML = query
+            ? '<div class="pool-empty">No tracks match your filter.</div>'
+            : `<div class="pool-empty">${emptyMsg}</div>`;
+        return;
+    }
+    container.innerHTML = tracks.map(t => {
+        if (isMatched) {
+            const matchedName = _wingItMatchedName(t);
+            return `
+                <div class="pool-track-row pool-matched">
+                    <div class="pool-track-info">
+                        <div class="pool-track-name">${_esc(t.track_name)}</div>
+                        <div class="pool-track-meta">
+                            <span class="pool-track-artist">${_esc(t.artist_name)}</span>
+                            ${matchedName ? `<span class="pool-track-arrow">&rarr;</span><span class="pool-match-name">${_esc(matchedName)}</span>` : ''}
+                            <span class="pool-track-playlist-badge">${_esc(t.playlist_name)}</span>
+                        </div>
+                    </div>
+                    <button class="pool-rematch-btn" onclick="openPoolFixModal(${t.id}, '${_escJs(t.track_name)}', '${_escJs(t.artist_name)}')" title="Change this match">Re-match</button>
+                </div>
+            `;
+        }
+        return `
+            <div class="pool-track-row pool-failed">
+                <div class="pool-track-info">
+                    <div class="pool-track-name">${_esc(t.track_name)}</div>
+                    <div class="pool-track-meta">
+                        <span class="pool-track-artist">${_esc(t.artist_name)}</span>
+                        <span class="pool-track-playlist-badge">${_esc(t.playlist_name)}</span>
+                    </div>
+                </div>
+                <button class="playlist-modal-btn playlist-modal-btn-primary pool-fix-btn" onclick="openPoolFixModal(${t.id}, '${_escJs(t.track_name)}', '${_escJs(t.artist_name)}')">Fix Match</button>
+            </div>
+        `;
+    }).join('');
+}
+
+async function filterWingItPool(playlistId) {
+    _wingItPoolPlaylistFilter = playlistId || null;
+    let url = '/api/wing-it-pool';
+    if (playlistId) url += `?playlist_id=${playlistId}`;
+    try {
+        const res = await fetch(url);
+        _wingItPoolData = await res.json();
+    } catch (e) {
+        showToast('Failed to filter Wing It pool', 'error');
+        return;
+    }
+    _updateWingItHeaderCounts();
+    if (_wingItPoolView === 'categories') return;
+    renderWingItPoolList();
+}
+
+function _updateWingItHeaderCounts() {
+    if (!_wingItPoolData) return;
+    const a = (_wingItPoolData.tracks || []).length;
+    const m = (_wingItPoolData.matched || []).length;
+    const aEl = document.getElementById('wing-it-header-attention');
+    const mEl = document.getElementById('wing-it-header-matched');
+    const aCat = document.getElementById('wing-it-cat-attention-count');
+    const mCat = document.getElementById('wing-it-cat-matched-count');
+    if (aEl) { aEl.textContent = `${a} to review`; aEl.classList.toggle('pool-header-failed-highlight', a > 0); }
+    if (mEl) mEl.textContent = `${m} resolved`;
+    if (aCat) aCat.textContent = a;
+    if (mCat) mCat.textContent = m;
+}
+
+// Re-fetch + re-render the open Wing It pool (used after a Fix Match resolves a track).
+function refreshWingItPool() {
+    filterWingItPool(_wingItPoolPlaylistFilter || '');
+}
+
+function closeWingItPoolModal() {
+    if (_wingItPoolOverlay) {
+        _wingItPoolOverlay.remove();
+        _wingItPoolOverlay = null;
+    }
+    _wingItPoolData = null;
+}
+
+function showPoolCategories() {
+    _discoveryPoolView = 'categories';
+    const grid = document.getElementById('pool-category-grid');
+    const list = document.getElementById('pool-list-view');
+    if (grid) grid.style.display = '';
+    if (list) list.style.display = 'none';
+}
+
+function showPoolList(category) {
+    _discoveryPoolView = category;
+    const grid = document.getElementById('pool-category-grid');
+    const list = document.getElementById('pool-list-view');
+    if (grid) grid.style.display = 'none';
+    if (list) list.style.display = '';
+
+    const titleEl = document.getElementById('pool-list-title');
+    if (titleEl) titleEl.textContent = category === 'failed' ? 'Failed Tracks' : 'Matched Tracks';
+
+    // Clear search filter when switching views
+    const searchEl = document.getElementById('pool-list-search');
+    if (searchEl) searchEl.value = '';
+
+    renderPoolList();
+}
+
+async function filterDiscoveryPool(playlistId) {
+    _discoveryPoolPlaylistFilter = playlistId || null;
+    let url = '/api/discovery-pool';
+    if (playlistId) url += `?playlist_id=${playlistId}`;
+    try {
+        const res = await fetch(url);
+        _discoveryPoolData = await res.json();
+        // Update header counts
+        _updatePoolHeaderCounts();
+        // Update category card counts
+        const failedCountEl = document.getElementById('pool-cat-failed-count');
+        const matchedCountEl = document.getElementById('pool-cat-matched-count');
+        if (failedCountEl) failedCountEl.textContent = _discoveryPoolData.stats.failed || 0;
+        if (matchedCountEl) matchedCountEl.textContent = _discoveryPoolData.stats.matched || 0;
+        // If viewing a list, refresh it
+        if (_discoveryPoolView === 'failed' || _discoveryPoolView === 'matched') {
+            renderPoolList();
+        }
+    } catch (err) {
+        showToast('Failed to filter discovery pool', 'error');
+    }
+}
+
+function _updatePoolHeaderCounts() {
+    if (!_discoveryPoolData) return;
+    const failedCount = _discoveryPoolData.stats.failed || 0;
+    const matchedCount = _discoveryPoolData.stats.matched || 0;
+    const matchedEl = document.getElementById('pool-header-matched');
+    const failedEl = document.getElementById('pool-header-failed');
+    if (matchedEl) matchedEl.textContent = `${matchedCount} Matched`;
+    if (failedEl) {
+        failedEl.textContent = `${failedCount} Failed`;
+        failedEl.classList.toggle('pool-header-failed-highlight', failedCount > 0);
+    }
+}
+
+function renderPoolList() {
+    const container = document.getElementById('pool-list-content');
+    if (!container || !_discoveryPoolData) return;
+
+    // Client-side search filter
+    const searchEl = document.getElementById('pool-list-search');
+    const query = (searchEl ? searchEl.value : '').toLowerCase().trim();
+
+    if (_discoveryPoolView === 'failed') {
+        let tracks = _discoveryPoolData.failed || [];
+        if (query) {
+            tracks = tracks.filter(t =>
+                (t.track_name || '').toLowerCase().includes(query) ||
+                (t.artist_name || '').toLowerCase().includes(query) ||
+                (t.playlist_name || '').toLowerCase().includes(query)
+            );
+        }
+        if (tracks.length === 0) {
+            container.innerHTML = query
+                ? '<div class="pool-empty">No failed tracks match your filter.</div>'
+                : '<div class="pool-empty">No failed discoveries. All tracks matched successfully.</div>';
+            return;
+        }
+        container.innerHTML = tracks.map(t => `
+            <div class="pool-track-row pool-failed">
+                <div class="pool-track-info">
+                    <div class="pool-track-name">${_esc(t.track_name)}</div>
+                    <div class="pool-track-meta">
+                        <span class="pool-track-artist">${_esc(t.artist_name)}</span>
+                        <span class="pool-track-playlist-badge">${_esc(t.playlist_name)}</span>
+                    </div>
+                </div>
+                <button class="playlist-modal-btn playlist-modal-btn-primary pool-fix-btn" onclick="openPoolFixModal(${t.id}, '${_escJs(t.track_name)}', '${_escJs(t.artist_name)}')">Fix Match</button>
+            </div>
+        `).join('');
+    } else {
+        let entries = _discoveryPoolData.matched || [];
+        if (query) {
+            entries = entries.filter(e => {
+                const md = e.matched_data || {};
+                const matchedName = md.name || '';
+                return (e.original_title || '').toLowerCase().includes(query) ||
+                    (e.original_artist || '').toLowerCase().includes(query) ||
+                    matchedName.toLowerCase().includes(query);
+            });
+        }
+        if (entries.length === 0) {
+            container.innerHTML = query
+                ? '<div class="pool-empty">No matched tracks match your filter.</div>'
+                : '<div class="pool-empty">No cached discovery matches yet.</div>';
+            return;
+        }
+        container.innerHTML = entries.map(e => {
+            const md = e.matched_data || {};
+            const matchedArtists = (md.artists || []).map(a => typeof a === 'string' ? a : (a.name || '')).join(', ');
+            const conf = Math.round((e.confidence || 0) * 100);
+            const confClass = conf >= 80 ? 'high' : (conf >= 70 ? 'mid' : 'low');
+            const album = md.album || {};
+            const albumImages = (typeof album === 'object' && album.images) ? album.images : [];
+            const imgUrl = md.image_url || (albumImages.length > 0 ? albumImages[0].url || '' : '');
+            return `
+                <div class="pool-track-row pool-matched">
+                    ${imgUrl ? `<img class="pool-match-image" src="${_esc(imgUrl)}" alt="" onerror="this.style.display='none'" />` : '<div class="pool-match-image-placeholder"></div>'}
+                    <div class="pool-track-info">
+                        <div class="pool-track-name">${_esc(e.original_title)}</div>
+                        <div class="pool-track-meta">
+                            <span class="pool-track-artist">${_esc(e.original_artist)}</span>
+                            <span class="pool-track-arrow">&rarr;</span>
+                            <span class="pool-match-name">${_esc(md.name || '?')}</span>
+                            <span class="pool-match-provider">${_esc(e.provider)}</span>
+                        </div>
+                    </div>
+                    <span class="pool-confidence-badge ${confClass}">${conf}%</span>
+                    <span class="pool-use-count">${e.use_count}&times;</span>
+                    <button class="pool-rematch-btn" onclick="rematchPoolCacheEntry(${e.id}, '${_escJs(e.original_title)}', '${_escJs(e.original_artist)}')" title="Rematch this track">Rematch</button>
+                    <button class="pool-remove-btn" onclick="removePoolCacheEntry(${e.id})" title="Remove cached match">&times;</button>
+                </div>
+            `;
+        }).join('');
+    }
+}
+
+function rematchPoolCacheEntry(cacheId, originalTitle, originalArtist) {
+    // Open the fix modal in "rematch" mode — saves to cache instead of mirrored tracks
+    openPoolRematchModal(cacheId, originalTitle, originalArtist);
+}
+
+function openPoolRematchModal(cacheId, trackName, artistName) {
+    // Reuses the fix modal UI but saves via the rematch endpoint
+    let fixOverlay = document.getElementById('pool-fix-overlay');
+    if (fixOverlay) fixOverlay.remove();
+
+    fixOverlay = document.createElement('div');
+    fixOverlay.className = 'pool-fix-overlay';
+    fixOverlay.id = 'pool-fix-overlay';
+    fixOverlay.addEventListener('mousedown', (e) => {
+        if (e.target === fixOverlay) {
+            e.preventDefault();
+            closePoolFixModal();
+        }
+    });
+
+    fixOverlay.innerHTML = `
+        <div class="pool-fix-modal" onmousedown="event.stopPropagation()">
+            <div class="pool-fix-header">
+                <h2>Rematch Track</h2>
+                <button class="pool-fix-close" onclick="closePoolFixModal()" title="Close">✕</button>
+            </div>
+            <div class="pool-fix-body">
+                <div class="pool-fix-source">
+                    <div class="pool-fix-source-label">Current Match</div>
+                    <div class="pool-fix-source-row">
+                        <span class="pool-fix-source-title">${_esc(trackName)}</span>
+                        <span class="pool-fix-source-sep">—</span>
+                        <span class="pool-fix-source-artist">${_esc(artistName)}</span>
+                    </div>
+                </div>
+                <div class="pool-fix-search">
+                    <div class="pool-fix-input-row">
+                        <div class="pool-fix-input-wrap">
+                            <label for="pool-fix-track-input">Track</label>
+                            <input type="text" id="pool-fix-track-input" placeholder="Track name" value="${_escAttr(trackName)}">
+                        </div>
+                        <div class="pool-fix-input-wrap">
+                            <label for="pool-fix-artist-input">Artist</label>
+                            <input type="text" id="pool-fix-artist-input" placeholder="Artist name" value="${_escAttr(artistName)}">
+                        </div>
+                        <button class="pool-fix-search-btn" onclick="searchPoolFix()">Search</button>
+                    </div>
+                </div>
+                <div class="pool-fix-results-area">
+                    <div id="pool-fix-results" class="pool-fix-results-list">
+                        <div class="pool-fix-empty">Searching...</div>
+                    </div>
+                </div>
+            </div>
+            <div class="pool-fix-footer">
+                <button class="pool-fix-cancel" onclick="closePoolFixModal()">Cancel</button>
+            </div>
+        </div>
+    `;
+
+    // Store rematch context
+    fixOverlay.dataset.mode = 'rematch';
+    fixOverlay.dataset.cacheId = cacheId;
+    fixOverlay.dataset.originalTitle = trackName;
+    fixOverlay.dataset.originalArtist = artistName;
+    document.body.appendChild(fixOverlay);
+
+    const trackInput = fixOverlay.querySelector('#pool-fix-track-input');
+    const artistInput = fixOverlay.querySelector('#pool-fix-artist-input');
+    const enterHandler = (e) => { if (e.key === 'Enter') searchPoolFix(); };
+    trackInput.addEventListener('keypress', enterHandler);
+    artistInput.addEventListener('keypress', enterHandler);
+    trackInput.focus();
+    trackInput.select();
+
+    setTimeout(() => searchPoolFix(), 500);
+}
+
+async function removePoolCacheEntry(entryId) {
+    if (!await showConfirmDialog({ title: 'Remove Cache Entry', message: 'Remove this cached match? The track will be re-discovered fresh next time.' })) return;
+    try {
+        const res = await fetch(`/api/discovery-pool/cache/${entryId}`, { method: 'DELETE' });
+        const data = await res.json();
+        if (data.success) {
+            showToast('Cache entry removed', 'success');
+            filterDiscoveryPool(_discoveryPoolPlaylistFilter || '');
+        } else {
+            showToast(data.error || 'Failed to remove', 'error');
+        }
+    } catch (err) {
+        showToast(`Error: ${err.message}`, 'error');
+    }
+}
+
+// --- Pool Fix Sub-Modal ---
+
+function openPoolFixModal(trackId, trackName, artistName) {
+    // Create sub-modal overlay inside the pool modal
+    let fixOverlay = document.getElementById('pool-fix-overlay');
+    if (fixOverlay) fixOverlay.remove();
+
+    fixOverlay = document.createElement('div');
+    fixOverlay.className = 'pool-fix-overlay';
+    fixOverlay.id = 'pool-fix-overlay';
+
+    // Only close on click to the overlay itself — use a dedicated close zone
+    // to prevent accidental dismissal when clicking near inputs
+    fixOverlay.addEventListener('mousedown', (e) => {
+        if (e.target === fixOverlay) {
+            e.preventDefault(); // Prevent stealing focus from inputs
+            closePoolFixModal();
+        }
+    });
+
+    fixOverlay.innerHTML = `
+        <div class="pool-fix-modal" onmousedown="event.stopPropagation()">
+            <div class="pool-fix-header">
+                <h2>Fix Track Match</h2>
+                <button class="pool-fix-close" onclick="closePoolFixModal()" title="Close">✕</button>
+            </div>
+            <div class="pool-fix-body">
+                <div class="pool-fix-source">
+                    <div class="pool-fix-source-label">Original Track</div>
+                    <div class="pool-fix-source-row">
+                        <span class="pool-fix-source-title">${_esc(trackName)}</span>
+                        <span class="pool-fix-source-sep">—</span>
+                        <span class="pool-fix-source-artist">${_esc(artistName)}</span>
+                    </div>
+                </div>
+                <div class="pool-fix-search">
+                    <div class="pool-fix-input-row">
+                        <div class="pool-fix-input-wrap">
+                            <label for="pool-fix-track-input">Track</label>
+                            <input type="text" id="pool-fix-track-input" placeholder="Track name" value="${_escAttr(trackName)}">
+                        </div>
+                        <div class="pool-fix-input-wrap">
+                            <label for="pool-fix-artist-input">Artist</label>
+                            <input type="text" id="pool-fix-artist-input" placeholder="Artist name" value="${_escAttr(artistName)}">
+                        </div>
+                        <button class="pool-fix-search-btn" onclick="searchPoolFix()">Search</button>
+                    </div>
+                </div>
+                <div class="pool-fix-results-area">
+                    <div id="pool-fix-results" class="pool-fix-results-list">
+                        <div class="pool-fix-empty">Searching...</div>
+                    </div>
+                </div>
+            </div>
+            <div class="pool-fix-footer">
+                <button class="pool-fix-cancel" onclick="closePoolFixModal()">Cancel</button>
+            </div>
+        </div>
+    `;
+
+    fixOverlay.dataset.trackId = trackId;
+    document.body.appendChild(fixOverlay);
+
+    // Add enter key support
+    const trackInput = fixOverlay.querySelector('#pool-fix-track-input');
+    const artistInput = fixOverlay.querySelector('#pool-fix-artist-input');
+    const enterHandler = (e) => { if (e.key === 'Enter') searchPoolFix(); };
+    trackInput.addEventListener('keypress', enterHandler);
+    artistInput.addEventListener('keypress', enterHandler);
+
+    // Focus the track input
+    trackInput.focus();
+    trackInput.select();
+
+    // Auto-search after a delay
+    setTimeout(() => searchPoolFix(), 500);
+}
+
+function closePoolFixModal() {
+    const fixOverlay = document.getElementById('pool-fix-overlay');
+    if (fixOverlay) fixOverlay.remove();
+}
+
+async function searchPoolFix() {
+    const trackInput = document.getElementById('pool-fix-track-input');
+    const artistInput = document.getElementById('pool-fix-artist-input');
+    const resultsContainer = document.getElementById('pool-fix-results');
+    if (!trackInput || !resultsContainer) return;
+
+    const trackVal = trackInput.value.trim();
+    const artistVal = artistInput.value.trim();
+    if (!trackVal && !artistVal) {
+        resultsContainer.innerHTML = '<div class="pool-fix-empty">Enter a search term</div>';
+        return;
+    }
+
+    resultsContainer.innerHTML = '<div class="pool-fix-empty"><div class="pool-fix-spinner"></div>Searching...</div>';
+
+    try {
+        const params = new URLSearchParams();
+        if (trackVal) params.set('track', trackVal);
+        if (artistVal) params.set('artist', artistVal);
+        params.set('limit', '20');
+        const res = await fetch(`/api/spotify/search_tracks?${params.toString()}`);
+        const data = await res.json().catch(() => ({}));
+
+        // Surface the real failure instead of masking every error (auth, 500, an
+        // upstream connection abort) as a bland "No results found".
+        if (!res.ok || data.error) {
+            const msg = data.error || res.statusText || `request failed (${res.status})`;
+            resultsContainer.innerHTML = `<div class="pool-fix-empty">Search error: ${_esc(msg)}</div>`;
+            return;
+        }
+
+        const tracks = data.tracks || [];
+        if (tracks.length === 0) {
+            resultsContainer.innerHTML = '<div class="pool-fix-empty">No results found</div>';
+            return;
+        }
+
+        resultsContainer.innerHTML = tracks.map((track) => {
+            const artists = (track.artists || []).join(', ');
+            const duration = track.duration_ms ? formatDuration(track.duration_ms) : '';
+            const albumText = track.album ? ` · ${_esc(track.album)}` : '';
+            return `
+                <div class="pool-fix-result" onclick='selectPoolFixTrack(${JSON.stringify(track).replace(/'/g, "&#39;")})'>
+                    <div class="pool-fix-result-main">
+                        <div class="pool-fix-result-title">${_esc(track.name || 'Unknown')}</div>
+                        <div class="pool-fix-result-meta">${_esc(artists)}${albumText}</div>
+                    </div>
+                    ${duration ? `<div class="pool-fix-result-dur">${duration}</div>` : ''}
+                </div>
+            `;
+        }).join('');
+    } catch (err) {
+        resultsContainer.innerHTML = `<div class="pool-fix-empty">Search failed: ${_esc(err.message)}</div>`;
+    }
+}
+
+async function selectPoolFixTrack(track) {
+    const fixOverlay = document.getElementById('pool-fix-overlay');
+    if (!fixOverlay) return;
+
+    // Confirm selection
+    const artists = (track.artists || []).join(', ');
+    if (!await showConfirmDialog({ title: 'Confirm Match', message: `Match to "${track.name}" by ${artists}?`, confirmText: 'Confirm' })) return;
+
+    const isRematch = fixOverlay.dataset.mode === 'rematch';
+
+    try {
+        let res, data;
+        if (isRematch) {
+            // Rematch mode: save new match to discovery cache
+            res = await fetch('/api/discovery-pool/rematch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    cache_id: parseInt(fixOverlay.dataset.cacheId),
+                    original_title: fixOverlay.dataset.originalTitle,
+                    original_artist: fixOverlay.dataset.originalArtist,
+                    spotify_track: track,
+                }),
+            });
+            data = await res.json();
+        } else {
+            // Normal fix mode: save to mirrored track
+            const trackId = parseInt(fixOverlay.dataset.trackId);
+            res = await fetch('/api/discovery-pool/fix', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    track_id: trackId,
+                    spotify_track: track,
+                }),
+            });
+            data = await res.json();
+        }
+
+        if (data.success) {
+            showToast(`Matched: ${track.name}`, 'success');
+            closePoolFixModal();
+            // Refresh whichever pool the fix was launched from (Discovery or Wing It).
+            if (typeof _wingItPoolOverlay !== 'undefined' && _wingItPoolOverlay) {
+                refreshWingItPool();
+            } else {
+                filterDiscoveryPool(_discoveryPoolPlaylistFilter || '');
+            }
+        } else {
+            showToast(data.error || 'Failed to fix track', 'error');
+        }
+    } catch (err) {
+        showToast(`Error: ${err.message}`, 'error');
+    }
+}
+
+async function deleteMirroredPlaylist(playlistId, name) {
+    if (!await showConfirmDialog({ title: 'Delete Playlist', message: `Delete mirrored playlist "${name}"?`, confirmText: 'Delete', destructive: true })) return;
+    try {
+        const res = await fetch(`/api/mirrored-playlists/${playlistId}`, { method: 'DELETE' });
+        const data = await res.json();
+        if (data.success) {
+            showToast(`Deleted mirror: ${name}`, 'success');
+            loadMirroredPlaylists();
+        } else {
+            showToast(data.error || 'Failed to delete', 'error');
+        }
+    } catch (err) {
+        showToast(`Error: ${err.message}`, 'error');
+    }
+}
+
+/**
+ * Launch the existing discovery modal for a mirrored playlist by creating
+ * a temporary entry in youtubePlaylistStates and reusing openYouTubeDiscoveryModal.
+ */
+async function discoverMirroredPlaylist(playlistId) {
+    closeMirroredModal();
+    const tempHash = `mirrored_${playlistId}`;
+
+    // If state already exists (discovery in progress or completed), just reopen the modal
+    const existingState = youtubePlaylistStates[tempHash];
+    const hasActiveDiscovery = activeYouTubePollers[tempHash] || document.getElementById(`youtube-discovery-modal-${tempHash}`);
+    if (existingState && (existingState.phase !== 'fresh' || hasActiveDiscovery)) {
+        openYouTubeDiscoveryModal(tempHash);
+        // Resume polling if discovery is in progress but poller stopped
+        if (existingState.phase === 'discovering' && !activeYouTubePollers[tempHash]) {
+            startYouTubeDiscoveryPolling(tempHash);
+        }
+        return;
+    }
+
+    showLoadingOverlay('Preparing discovery...');
+    try {
+        // Register the mirrored playlist on the backend so the YouTube discovery pipeline can find it
+        const prepRes = await fetch(`/api/mirrored-playlists/${playlistId}/prepare-discovery`, { method: 'POST' });
+        const prepData = await prepRes.json();
+        if (prepData.error) throw new Error(prepData.error);
+
+        // Also fetch the full data for the frontend state
+        const res = await fetch(`/api/mirrored-playlists/${playlistId}`);
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        hideLoadingOverlay();
+
+        // Build tracks in the format the discovery modal expects
+        const tracks = (data.tracks || []).map(t => ({
+            id: t.source_track_id || `mirrored_${t.id}`,
+            name: t.track_name,
+            artists: [t.artist_name],
+            album: t.album_name || '',
+            duration_ms: t.duration_ms || 0
+        }));
+
+        // Check if backend returned cached results
+        if (prepData.from_cache) {
+            // Fetch the pre-populated status from the backend
+            const statusRes = await fetch(`/api/youtube/discovery/status/${tempHash}`);
+            const statusData = await statusRes.json();
+            if (statusData.error) throw new Error(statusData.error);
+
+            youtubePlaylistStates[tempHash] = {
+                playlist: {
+                    name: data.name,
+                    tracks: tracks,
+                    track_count: tracks.length
+                },
+                phase: statusData.phase || 'discovered',
+                discovery_results: statusData.results || [],
+                discoveryResults: statusData.results || [],
+                discovery_progress: statusData.progress || 100,
+                spotify_matches: statusData.spotify_matches || 0,
+                spotifyMatches: statusData.spotify_matches || 0,
+                spotify_total: tracks.length,
+                status: statusData.status || 'complete',
+                url: `mirrored://${data.source}/${data.source_playlist_id}`,
+                sync_playlist_id: null,
+                converted_spotify_playlist_id: null,
+                download_process_id: null,
+                created_at: Date.now() / 1000,
+                last_accessed: Date.now() / 1000,
+                discovery_future: null,
+                sync_progress: {},
+                is_mirrored_playlist: true,
+                mirrored_source: data.source
+            };
+
+            const cached = prepData.cached_matches || 0;
+            const total = prepData.total_tracks || tracks.length;
+            showToast(`Loaded ${cached}/${total} cached discovery results`, 'success');
+        } else {
+            // No cached data — fresh state
+            youtubePlaylistStates[tempHash] = {
+                playlist: {
+                    name: data.name,
+                    tracks: tracks,
+                    track_count: tracks.length
+                },
+                phase: 'fresh',
+                discovery_results: [],
+                discovery_progress: 0,
+                spotify_matches: 0,
+                spotify_total: tracks.length,
+                status: 'parsed',
+                url: `mirrored://${data.source}/${data.source_playlist_id}`,
+                sync_playlist_id: null,
+                converted_spotify_playlist_id: null,
+                download_process_id: null,
+                created_at: Date.now() / 1000,
+                last_accessed: Date.now() / 1000,
+                discovery_future: null,
+                sync_progress: {},
+                is_mirrored_playlist: true,
+                mirrored_source: data.source
+            };
+        }
+
+        openYouTubeDiscoveryModal(tempHash);
+    } catch (err) {
+        hideLoadingOverlay();
+        showToast(`Error: ${err.message}`, 'error');
+    }
+}
+
+// ===============================
+// AUTOMATIONS — Visual Builder
+// ===============================
+
+async function retryFailedMirroredDiscovery(urlHash) {
+    // Extract playlist ID from url_hash (format: "mirrored_<id>")
+    const playlistId = urlHash.replace('mirrored_', '');
+    try {
+        const res = await fetch(`/api/mirrored-playlists/${playlistId}/retry-failed-discovery`, { method: 'POST' });
+        const data = await res.json();
+        if (data.error) {
+            showToast(`Error: ${data.error}`, 'error');
+            return;
+        }
+        if (data.retry_count === 0) {
+            showToast('All tracks already found!', 'success');
+            return;
+        }
+
+        // Update frontend state to discovering
+        const state = youtubePlaylistStates[urlHash];
+        if (state) {
+            state.phase = 'discovering';
+            state.status = 'discovering';
+            state.discovery_progress = 0;
+            // #815: stamp a baseline so the completion toast can report how many
+            // of these retried tracks were newly found (not just overall matched).
+            state._retryDiscovery = {
+                matchesBefore: state.spotify_matches || 0,
+                retryCount: data.retry_count,
+            };
+        }
+
+        // Update modal buttons to show discovering state
+        updateYouTubeModalButtons(urlHash, 'discovering');
+
+        // Start polling for progress
+        startYouTubeDiscoveryPolling(urlHash);
+
+        showToast(`Retrying ${data.retry_count} failed tracks...`, 'info');
+    } catch (err) {
+        showToast(`Error retrying discovery: ${err.message}`, 'error');
+    }
+}
+
+let _autoBlocks = null; // cached block definitions from /api/automations/blocks
+let _autoBuilder = { editId: null, when: null, do: null, then: [], isSystem: false };
+
+// Builder context — lets the SAME builder functions drive either the music
+// automation page or the (isolated) video automation page. Default = music, so
+// existing music behaviour is byte-identical. The video page swaps in its own
+// element ids + the video-scoped blocks endpoint + owned_by tagging before
+// opening, so a video automation is built with video triggers/actions and never
+// leaks onto the music page. Only one builder is open at a time, so a single
+// shared context is safe.
+const _AUTO_CTX_MUSIC = {
+    ids: {
+        listView: 'automations-list-view', builderView: 'automations-builder-view',
+        name: 'builder-name', group: 'builder-group-name', groupList: 'builder-group-list',
+        sidebar: 'builder-sidebar', canvas: 'builder-canvas',
+    },
+    blocksUrl: '/api/automations/blocks',
+    ownedBy: null,
+    onSaved: function () { return loadAutomations(); },
+};
+const _AUTO_CTX_VIDEO = {
+    ids: {
+        listView: 'vauto-list-view', builderView: 'vauto-builder-view',
+        name: 'vauto-builder-name', group: 'vauto-builder-group-name', groupList: 'vauto-builder-group-list',
+        sidebar: 'vauto-builder-sidebar', canvas: 'vauto-builder-canvas',
+    },
+    blocksUrl: '/api/video/automations/blocks',
+    ownedBy: 'video',
+    // Reloads the video automations list after a save (video-automations.js
+    // exposes this; falls back to a no-op if the video page isn't loaded).
+    onSaved: function () { return window._reloadVideoAutomations ? window._reloadVideoAutomations() : null; },
+};
+let _autoBuilderCtx = _AUTO_CTX_MUSIC;
+
+
+// ── Video Automation Hub content ─────────────────────────────────────────────
+// The video page reuses this hub builder; these are the video-side datasets.
+// IMPORTANT: video pipelines/recipes deliberately DON'T recreate what the
+// system automations already run (watchlist scans, wishlist processors,
+// nightly overlays/collections) — duplicating those would double-download.
+// They cover alerts, event-driven chains, and maintenance the system rows
+// don't schedule.
+const VIDEO_HUB_GROUPS = [
+    {
+        id: 'v-download-alerts', icon: '📥', name: 'Download Alerts',
+        desc: 'Know the moment anything lands, fails, or needs manual import — movies, episodes and YouTube alike.',
+        category: 'Alerts', badge: '3 automations', color: '#ef4444',
+        steps: [
+            { label: 'Landed', icon: '✅', type: 'notify' },
+            { label: 'Failed', icon: '❌', type: 'notify' },
+            { label: 'Manual Import', icon: '⚠️', type: 'notify' },
+        ],
+        automations: [
+            { name: 'Alert — Video Downloaded', trigger_type: 'video_download_completed', trigger_config: {}, action_type: 'notify_only', action_config: {}, then_actions: [], group_name: 'Download Alerts', needs_notify: true },
+            { name: 'Alert — Download Failed', trigger_type: 'video_download_failed', trigger_config: {}, action_type: 'notify_only', action_config: {}, then_actions: [], group_name: 'Download Alerts', needs_notify: true },
+            { name: 'Alert — Needs Manual Import', trigger_type: 'video_import_failed', trigger_config: {}, action_type: 'notify_only', action_config: {}, then_actions: [], group_name: 'Download Alerts', needs_notify: true },
+        ]
+    },
+    {
+        id: 'v-maintenance-guardian', icon: '🛡️', name: 'Maintenance Guardian',
+        desc: 'Weekly library health sweep: run every enabled maintenance job, get pinged only when something CRITICAL surfaces.',
+        category: 'Maintenance', badge: '2 automations', color: '#f59e0b',
+        steps: [
+            { label: 'Weekly Sweep', icon: '🔧', type: 'action' },
+            { label: 'Critical Alert', icon: '🔴', type: 'notify' },
+        ],
+        automations: [
+            { name: 'Guardian — Weekly Sweep', trigger_type: 'weekly_time', trigger_config: { days: ['sunday'], time: '05:00' }, action_type: 'video_run_repair_job', action_config: { job_id: 'all' }, then_actions: [], group_name: 'Maintenance Guardian' },
+            { name: 'Guardian — Critical Finding', trigger_type: 'video_repair_finding_created', trigger_config: { conditions: [{ field: 'severity', operator: 'equals', value: 'critical' }] }, action_type: 'notify_only', action_config: {}, then_actions: [], group_name: 'Maintenance Guardian', needs_notify: true },
+        ]
+    },
+    {
+        id: 'v-post-scan-studio', icon: '🎨', name: 'Post-Scan Studio Refresh',
+        desc: 'Event-driven presentation: the instant new media is read into SoulSync, re-apply overlays, then sync collections — no waiting for the nightly runs.',
+        category: 'Sync', badge: '2 automations', color: '#8b5cf6',
+        steps: [
+            { label: 'DB Updated', icon: '🗄️', type: 'action' },
+            { label: 'Overlays', icon: '🎨', type: 'action' },
+            { label: 'Collections', icon: '🗂️', type: 'action' },
+        ],
+        automations: [
+            { name: 'Studio — Overlays After Update', trigger_type: 'video_database_update_completed', trigger_config: {}, action_type: 'video_apply_overlays', action_config: {}, then_actions: [{ type: 'fire_signal', config: { signal_name: 'v_overlays_done' } }], group_name: 'Post-Scan Studio Refresh' },
+            { name: 'Studio — Collections After Overlays', trigger_type: 'signal_received', trigger_config: { signal_name: 'v_overlays_done' }, action_type: 'video_sync_collections', action_config: {}, then_actions: [], group_name: 'Post-Scan Studio Refresh' },
+        ]
+    },
+    {
+        id: 'v-upgrade-watch', icon: '📈', name: 'Upgrade Watch',
+        desc: 'Quality upgrades on autopilot: hunt below-cutoff copies weekly and get told whenever a better copy replaces an old one.',
+        category: 'Discovery', badge: '2 automations', color: '#22c55e',
+        steps: [
+            { label: 'Hunt Upgrades', icon: '🔍', type: 'action' },
+            { label: 'Replaced!', icon: '📈', type: 'notify' },
+        ],
+        automations: [
+            { name: 'Upgrade — Weekly Hunt', trigger_type: 'weekly_time', trigger_config: { days: ['wednesday'], time: '04:00' }, action_type: 'video_run_repair_job', action_config: { job_id: 'quality_upgrade' }, then_actions: [], group_name: 'Upgrade Watch' },
+            { name: 'Upgrade — Landed', trigger_type: 'video_upgrade_completed', trigger_config: {}, action_type: 'notify_only', action_config: {}, then_actions: [], group_name: 'Upgrade Watch', needs_notify: true },
+        ]
+    },
+];
+
+const VIDEO_HUB_RECIPES = [
+    {
+        id: 'v-channel-alert', icon: '📡', name: 'Channel Drop Alert', desc: 'Discord ping when a specific YouTube channel\'s video finishes downloading. Condition on the channel name.',
+        category: 'Alerts', difficulty: 'beginner', when: { type: 'video_download_completed', config: { conditions: [{ field: 'channel', operator: 'contains', value: '' }] } }, do: { type: 'notify_only', config: {} }, then: [{ type: 'discord_webhook', config: {} }],
+        note: 'Fill in the channel name in the WHEN condition (e.g. "Gamers Nexus").'
+    },
+    {
+        id: 'v-movie-landed', icon: '🎬', name: 'Movie Landed Notify', desc: 'Get notified when a MOVIE (not episodes/YouTube) finishes — condition kind equals movie.',
+        category: 'Alerts', difficulty: 'beginner', when: { type: 'video_download_completed', config: { conditions: [{ field: 'kind', operator: 'equals', value: 'movie' }] } }, do: { type: 'notify_only', config: {} }, then: []
+    },
+    {
+        id: 'v-import-failed-alert', icon: '⚠️', name: 'Manual Import Alert', desc: 'A file downloaded but couldn\'t be placed (sample, wrong episode, not an upgrade). Know immediately instead of finding it on the Import page a week later.',
+        category: 'Alerts', difficulty: 'beginner', when: { type: 'video_import_failed', config: {} }, do: { type: 'notify_only', config: {} }, then: []
+    },
+    {
+        id: 'v-critical-finding', icon: '🔴', name: 'Critical Maintenance Alert', desc: 'Page yourself when a maintenance job raises a CRITICAL finding (e.g. mass-missing YouTube files — a drive may be down).',
+        category: 'Maintenance', difficulty: 'beginner', when: { type: 'video_repair_finding_created', config: { conditions: [{ field: 'severity', operator: 'equals', value: 'critical' }] } }, do: { type: 'notify_only', config: {} }, then: []
+    },
+    {
+        id: 'v-monthly-ghosts', icon: '👻', name: 'Monthly Ghost Cleanup', desc: 'Run the YouTube Ghost Files check on the 1st of every month, even if the job\'s own daily toggle is off.',
+        category: 'Maintenance', difficulty: 'beginner', when: { type: 'monthly_time', config: { time: '05:00', day_of_month: 1 } }, do: { type: 'video_run_repair_job', config: { job_id: 'youtube_ghosts' } }, then: []
+    },
+    {
+        id: 'v-scan-chain', icon: '🎨', name: 'Overlays After Every Scan', desc: 'Skip the wait for the nightly run: re-apply overlays the moment the video database updates.',
+        category: 'Chains', difficulty: 'intermediate', when: { type: 'video_database_update_completed', config: {} }, do: { type: 'video_apply_overlays', config: {} }, then: []
+    },
+    {
+        id: 'v-wishlist-webhook', icon: '🌐', name: 'Wishlist Feed Webhook', desc: 'POST every wishlist addition to any URL — feed a dashboard, a bot, or your own scripts.',
+        category: 'Chains', difficulty: 'intermediate', when: { type: 'video_wishlist_item_added', config: {} }, do: { type: 'notify_only', config: {} }, then: [{ type: 'webhook', config: {} }]
+    },
+    {
+        id: 'v-follow-confirm', icon: '👁️', name: 'Follow Confirmation', desc: 'A Telegram nudge whenever a show/channel is followed — handy on shared servers to see what the household queues up.',
+        category: 'Discovery', difficulty: 'beginner', when: { type: 'video_watchlist_added', config: {} }, do: { type: 'notify_only', config: {} }, then: [{ type: 'telegram', config: {} }]
+    },
+    {
+        id: 'v-upgrade-notify', icon: '📈', name: 'Upgrade Landed Notify', desc: 'Every time a better copy replaces an old one, get told what upgraded and to what quality.',
+        category: 'Discovery', difficulty: 'beginner', when: { type: 'video_upgrade_completed', config: {} }, do: { type: 'notify_only', config: {} }, then: []
+    },
+    {
+        id: 'v-watched-cleanup', icon: '🍿', name: 'Weekly Watched Cleanup', desc: 'Every Sunday, flag movies you watched 30+ days ago for cleanup — approve on the Tools page and the files move to the recycle bin.',
+        category: 'Maintenance', difficulty: 'beginner', when: { type: 'weekly_time', config: { days: ['sunday'], time: '06:00' } }, do: { type: 'video_run_repair_job', config: { job_id: 'watched_cleanup' } }, then: [],
+        note: 'Tune the "watched N days ago" threshold on the job\'s cog (Tools → Library Maintenance).'
+    },
+    {
+        id: 'v-maintenance-digest', icon: '🔧', name: 'Maintenance Scan Digest', desc: 'One message per maintenance scan with how many findings it raised — the calm alternative to per-finding alerts.',
+        category: 'Maintenance', difficulty: 'beginner', when: { type: 'video_repair_scan_completed', config: {} }, do: { type: 'notify_only', config: {} }, then: []
+    },
+];
+
+const VIDEO_HUB_GUIDES = [
+    {
+        id: 'v-discord-setup', icon: '📢', title: 'Get Discord Alerts for Video Downloads', subtitle: 'Webhook notifications for anything that lands or fails.', difficulty: 'beginner',
+        steps: [
+            'In Discord, open your channel\'s settings → <strong>Integrations → Webhooks</strong>, create one and copy the URL.',
+            'Go to <strong>Automations → New Automation</strong> on the video side.',
+            'Set WHEN to <strong>Video Downloaded</strong> (or Download Failed / Import Failed).',
+            'Set DO to <strong>Notify Only</strong>, THEN to <strong>Discord Webhook</strong>, and paste the URL.',
+            'Use {title}, {kind}, {quality} and {channel} in the message template.',
+        ], relatedRecipes: ['v-channel-alert', 'v-movie-landed']
+    },
+    {
+        id: 'v-filter-events', icon: '🎯', title: 'Filter Events with Conditions', subtitle: 'One trigger, only the events you care about.', difficulty: 'beginner',
+        steps: [
+            'Per-item triggers (Video Downloaded, Finding Raised, Wishlist Added) support conditions.',
+            'Condition on <strong>kind</strong>: equals <code>movie</code>, <code>show</code> or <code>youtube</code> to scope the media type.',
+            'Condition on <strong>channel</strong> to watch one YouTube channel, or <strong>title</strong> for one show.',
+            'Condition on <strong>severity</strong> equals <code>critical</code> for maintenance alerts that matter.',
+            'No conditions = fire on everything. Start filtered — you can always loosen.',
+        ], relatedRecipes: ['v-channel-alert', 'v-critical-finding']
+    },
+    {
+        id: 'v-extend-system', icon: '⚙️', title: 'Extend the System Automations (Don\'t Duplicate Them)', subtitle: 'The scans and processors already run — hook onto them instead of re-creating them.', difficulty: 'intermediate',
+        steps: [
+            'The System section already scans watchlists and drains wishlists on schedules. <strong>Don\'t deploy copies</strong> — that double-downloads.',
+            'To get notified about them: edit the system automation and add a THEN notification directly.',
+            'To chain your own step after one: trigger on its completion event (e.g. <strong>Video Database Updated</strong>).',
+            'To change cadence: edit the system automation\'s interval — no new automation needed.',
+        ], relatedRecipes: ['v-scan-chain', 'v-maintenance-digest']
+    },
+    {
+        id: 'v-maintenance-autopilot', icon: '🔧', title: 'Library Maintenance on Autopilot', subtitle: 'Repair jobs + event alerts = a self-auditing library.', difficulty: 'intermediate',
+        steps: [
+            'Enable the maintenance jobs you want on <strong>Tools → Library Maintenance</strong> (each has its own interval).',
+            'Add a <strong>Maintenance Finding Raised</strong> automation with a severity condition for alerts.',
+            'Use the <strong>Run Maintenance Job</strong> action for extra cadences (e.g. monthly ghost cleanup) or event-driven runs.',
+            'Approve findings from the Tools page — automations only surface them, you stay in control.',
+        ], relatedRecipes: ['v-critical-finding', 'v-monthly-ghosts', 'v-maintenance-digest']
+    },
+    {
+        id: 'v-signals', icon: '⚡', title: 'Chain Video Automations with Signals', subtitle: 'fire_signal / signal_received work the same on the video side.', difficulty: 'advanced',
+        steps: [
+            'Add a THEN action → <strong>Fire Signal</strong> to the first automation (e.g. <code>v_overlays_done</code>).',
+            'Create a second automation with WHEN → <strong>Signal Received</strong> for that name.',
+            'Chains cap at 5 levels and cycles are auto-detected — same engine as music.',
+            'Event trigger → action → signal → action is the pattern behind the Post-Scan Studio Refresh pipeline.',
+        ], relatedRecipes: ['v-scan-chain']
+    },
+];
+
+const VIDEO_HUB_TIPS = [
+    { icon: '🎯', title: 'Scope with kind', body: 'Every download event carries <strong>kind</strong>: <code>movie</code>, <code>show</code> or <code>youtube</code>. One condition turns a firehose trigger into exactly the alerts you want.', tag: 'Filtering' },
+    { icon: '⚙️', title: 'Notify on System Runs Directly', body: 'Want a ping when the nightly overlay run finishes? Add a THEN notification to the system automation itself — you don\'t need a separate automation for it.', tag: 'Basics' },
+    { icon: '🔁', title: 'Scans Won\'t Spam You', body: 'Wishlist/watchlist events fire only for genuinely NEW items. The 6-hourly channel scan re-checking known videos stays silent — condition-free triggers are safe to alert on.', tag: 'Safety' },
+    { icon: '🔴', title: 'Critical Means Critical', body: 'Maintenance findings carry a severity. <code>critical</code> is reserved for things like mass-missing files (a drive may be down) — a severity condition gives you a quiet pager.', tag: 'Filtering' },
+    { icon: '📅', title: 'Monthly Schedules Exist', body: 'The Monthly Schedule trigger runs on a chosen day of the month — right for deep maintenance that\'s overkill weekly.', tag: 'Scheduling' },
+    { icon: '🚫', title: 'Don\'t Re-Deploy the Processors', body: 'The wishlist processors already run hourly as system automations. A second copy means double downloads — extend or re-schedule the system row instead.', tag: 'Safety' },
+    { icon: '🧪', title: 'Test with Notify Only', body: 'Point a new trigger at <strong>Notify Only</strong> first. You\'ll see exactly when it fires — then swap in the real action.', tag: 'Testing' },
+    { icon: '⚡', title: 'Events Beat Timers', body: 'Chaining on completion events (Video Database Updated → Apply Overlays) reacts in seconds and never runs pointlessly — prefer them over guessing with staggered clocks.', tag: 'Power' },
+];
+
+const VIDEO_HUB_REFERENCE = {
+    triggers: [
+        {
+            group: 'Time-Based', items: [
+                { type: 'schedule', label: 'Schedule', desc: 'Repeating interval (e.g., every 6 hours)' },
+                { type: 'daily_time', label: 'Daily Time', desc: 'Every day at a specific time' },
+                { type: 'weekly_time', label: 'Weekly Time', desc: 'Specific days + time' },
+                { type: 'monthly_time', label: 'Monthly Schedule', desc: 'Once a month on a chosen day' },
+            ]
+        },
+        {
+            group: 'Download Events', items: [
+                { type: 'video_download_completed', label: 'Video Downloaded', desc: 'A movie/episode/YouTube video landed in the library (kind/title/channel/quality conditions)' },
+                { type: 'video_download_failed', label: 'Video Download Failed', desc: 'A download gave up after retries (item returns to the wishlist)' },
+                { type: 'video_import_failed', label: 'Video Import Failed', desc: 'Downloaded fine but couldn\'t be placed — waiting on the Import page' },
+                { type: 'video_upgrade_completed', label: 'Quality Upgrade Landed', desc: 'A better copy REPLACED an existing library file' },
+                { type: 'video_batch_complete', label: 'Video Download Batch Done', desc: 'The download queue just drained' },
+            ]
+        },
+        {
+            group: 'Library Events', items: [
+                { type: 'video_library_scan_completed', label: 'Video Library Scan Done', desc: 'The media server finished rescanning' },
+                { type: 'video_database_update_completed', label: 'Video Database Updated', desc: 'SoulSync finished reading the server into its database' },
+                { type: 'video_collections_synced', label: 'Collections Synced', desc: 'A collections sync pass finished' },
+                { type: 'video_overlays_applied', label: 'Overlays Applied', desc: 'An overlay apply pass finished' },
+            ]
+        },
+        {
+            group: 'Maintenance Events', items: [
+                { type: 'video_repair_finding_created', label: 'Maintenance Finding Raised', desc: 'A repair job raised a NEW finding (job/type/severity/title conditions)' },
+                { type: 'video_repair_scan_completed', label: 'Maintenance Scan Done', desc: 'A repair job finished a scan (with finding counts)' },
+            ]
+        },
+        {
+            group: 'Watchlist & Wishlist', items: [
+                { type: 'video_wishlist_item_added', label: 'Video Wishlist Item Added', desc: 'Something new joined the wishlist (refresh re-adds stay silent)' },
+                { type: 'video_watchlist_added', label: 'Video Watchlist Follow', desc: 'A show/person/channel/playlist was followed' },
+                { type: 'video_watchlist_removed', label: 'Video Watchlist Unfollow', desc: 'A follow was removed' },
+            ]
+        },
+        {
+            group: 'Special', items: [
+                { type: 'app_started', label: 'App Started', desc: 'SoulSync just started up' },
+                { type: 'signal_received', label: 'Signal Received', desc: 'Another automation fired a named signal' },
+                { type: 'webhook_received', label: 'Webhook Received', desc: 'External POST to /api/v1/request' },
+            ]
+        },
+    ],
+    actions: [
+        {
+            group: 'Watchlist Scans (fill the wishlist)', items: [
+                { type: 'video_scan_watchlist_people', label: 'Scan Watchlist People', desc: 'Wishlist followed people\'s filmographies' },
+                { type: 'video_scan_watchlist_studios', label: 'Scan Watchlist Studios', desc: 'Wishlist followed studios\' films' },
+                { type: 'video_scan_watchlist_channels', label: 'Scan Watchlist Channels', desc: 'Wishlist new uploads from followed channels' },
+                { type: 'video_scan_watchlist_playlists', label: 'Scan Watchlist Playlists', desc: 'Mirror followed playlists into the wishlist' },
+                { type: 'video_add_airing_episodes', label: 'Wishlist Today\'s Airings', desc: 'Sonarr-style: queue every episode airing today' },
+                { type: 'video_refresh_airing_schedules', label: 'Refresh Airing Schedules', desc: 'Re-pull TMDB air dates for followed shows' },
+            ]
+        },
+        {
+            group: 'Wishlist Processors (drain it)', items: [
+                { type: 'video_process_movie_wishlist', label: 'Process Movie Wishlist', desc: 'Search + download wished movies' },
+                { type: 'video_process_episode_wishlist', label: 'Process Episode Wishlist', desc: 'Search + download wished episodes' },
+                { type: 'video_process_youtube_wishlist', label: 'Process YouTube Wishlist', desc: 'Download wished YouTube videos (yt-dlp)' },
+            ]
+        },
+        {
+            group: 'Library', items: [
+                { type: 'video_scan_server', label: 'Scan Video Server', desc: 'Ask the server to index new downloads, wait for it' },
+                { type: 'video_update_database', label: 'Update Video Database', desc: 'Read the server\'s library into SoulSync' },
+                { type: 'video_deep_scan_movies', label: 'Deep Scan Movies', desc: 'Full movie-library reconcile' },
+                { type: 'video_deep_scan_tv', label: 'Deep Scan TV', desc: 'Full TV-library reconcile' },
+            ]
+        },
+        {
+            group: 'Studio & Maintenance', items: [
+                { type: 'video_apply_overlays', label: 'Apply Overlays', desc: 'Render + push enabled overlay templates' },
+                { type: 'video_sync_collections', label: 'Sync Collections', desc: 'Resolve + push every enabled collection' },
+                { type: 'video_run_repair_job', label: 'Run Maintenance Job', desc: 'Force-run one (or all enabled) Library Maintenance jobs' },
+                { type: 'video_clean_plex_images', label: 'Clean Up Plex Images', desc: 'Clear stale cached artwork' },
+                { type: 'video_clean_youtube_episodes', label: 'Clean Old YouTube Episodes', desc: 'Per-channel retention windows' },
+                { type: 'video_full_cleanup', label: 'Full Cleanup', desc: 'Queue/import/search-history sweep' },
+                { type: 'video_backup_database', label: 'Backup Database', desc: 'Timestamped video_library.db backup' },
+            ]
+        },
+        {
+            group: 'Other', items: [
+                { type: 'notify_only', label: 'Notify Only', desc: 'No action — just trigger THEN notifications. Great for testing.' },
+            ]
+        },
+    ],
+    // filled by _hubReference() — AUTO_HUB_REFERENCE is defined further down
+    thenActions: null,
+};
+
+// Side-aware hub data: the video page reuses the same hub builder against its
+// own datasets. ONE switch — everything downstream reads through these.
+function _hubIsVideo() { return document.body.getAttribute('data-side') === 'video'; }
+function _hubGroups() { return _hubIsVideo() ? VIDEO_HUB_GROUPS : AUTO_HUB_GROUPS; }
+function _hubRecipes() { return _hubIsVideo() ? VIDEO_HUB_RECIPES : AUTO_HUB_RECIPES; }
+function _hubGuides() { return _hubIsVideo() ? VIDEO_HUB_GUIDES : AUTO_HUB_GUIDES; }
+function _hubTips() { return _hubIsVideo() ? VIDEO_HUB_TIPS : AUTO_HUB_TIPS; }
+function _hubReference() {
+    if (!_hubIsVideo()) return AUTO_HUB_REFERENCE;
+    // THEN actions are generic — share the music reference's list.
+    return { ...VIDEO_HUB_REFERENCE, thenActions: AUTO_HUB_REFERENCE.thenActions };
+}
+
+// Resolve a builder element through the active context (music vs video ids).
+function _bEl(key) { return document.getElementById(_autoBuilderCtx.ids[key]); }
+
+// Route a card's edit/cog to the right builder based on the active side, so a
+// video card opens the VIDEO builder (on the video page) instead of hijacking
+// the hidden music page's builder.
+function editAutomation(id) {
+    if (document.body.getAttribute('data-side') === 'video') return showVideoAutomationBuilder(id);
+    return showAutomationBuilder(id);
+}
+
+let _autoMirroredPlaylists = null; // cached mirrored playlist list
+let _autoSpotifyAuthenticated = false; // whether Spotify is authed (for refresh filtering)
+
+const _autoIcons = {
+    schedule: '\u23F1\uFE0F', daily_time: '\u{1F570}\uFE0F', weekly_time: '\uD83D\uDCC5', app_started: '\uD83D\uDE80', track_downloaded: '\u2B07\uFE0F', batch_complete: '\u2705',
+    watchlist_new_release: '\uD83D\uDD14', playlist_synced: '\uD83D\uDD04',
+    playlist_changed: '\u270F\uFE0F',
+    process_wishlist: '\uD83D\uDCCB', scan_watchlist: '\uD83D\uDC41\uFE0F',
+    scan_library: '\uD83D\uDD04', refresh_mirrored: '\uD83D\uDCC2', sync_playlist: '\uD83D\uDD01',
+    discover_playlist: '\uD83D\uDD0D', discovery_completed: '\uD83D\uDD0D',
+    notify_only: '\uD83D\uDD14', discord_webhook: '\uD83D\uDCAC', pushbullet: '\uD83D\uDD14', telegram: '\u2709\uFE0F', webhook: '\uD83C\uDF10',
+    signal_received: '\u26A1', fire_signal: '\u26A1', run_script: '\uD83D\uDCBB',
+    // Phase 3
+    wishlist_processing_completed: '\u2705', watchlist_scan_completed: '\u2705',
+    database_update_completed: '\uD83D\uDDC4\uFE0F', download_failed: '\u274C',
+    download_quarantined: '\u26A0\uFE0F', wishlist_item_added: '\u2795',
+    watchlist_artist_added: '\uD83D\uDC64', watchlist_artist_removed: '\uD83D\uDC64',
+    import_completed: '\uD83D\uDCE5', mirrored_playlist_created: '\uD83D\uDCC2',
+    quality_scan_completed: '\uD83D\uDCCA', duplicate_scan_completed: '\uD83D\uDDC2\uFE0F', library_scan_completed: '\uD83D\uDCE1',
+    start_database_update: '\uD83D\uDDC4\uFE0F', run_duplicate_cleaner: '\uD83D\uDDC2\uFE0F',
+    clear_quarantine: '\uD83D\uDDD1\uFE0F', cleanup_wishlist: '\uD83E\uDDF9',
+    update_discovery_pool: '\uD83E\uDDED', start_quality_scan: '\uD83D\uDCCA',
+    backup_database: '\uD83D\uDCBE',
+    refresh_beatport_cache: '\uD83C\uDFB5',
+    clean_search_history: '\uD83D\uDDD1\uFE0F',
+    clean_completed_downloads: '\u2705',
+    full_cleanup: '\uD83E\uDDF9',
+    playlist_pipeline: '\uD83D\uDE80',
+    // Video side
+    video_scan_library: '\uD83C\uDFAC', video_scan_server: '\uD83D\uDD04', video_update_database: '\uD83D\uDDC4\uFE0F', video_update_database_hourly: '\uD83D\uDDC4\uFE0F',
+    video_add_airing_episodes: '\uD83D\uDCFA', video_deep_scan_movies: '\uD83C\uDFAC', video_deep_scan_tv: '\uD83D\uDCFA',
+    video_scan_watchlist_people: '\uD83C\uDFAD', video_scan_watchlist_channels: '\uD83D\uDCE1',
+    video_scan_watchlist_playlists: '\uD83C\uDFB5', video_scan_watchlist_studios: '\uD83C\uDFAC',
+    video_process_movie_wishlist: '\uD83C\uDFAC', video_process_episode_wishlist: '\uD83D\uDCFA',
+    video_process_youtube_wishlist: '\u2B07\uFE0F',
+    video_refresh_airing_schedules: '\uD83D\uDDD3\uFE0F', video_clean_youtube_episodes: '\uD83E\uDDF9',
+    video_reenrich_stale: '\uD83D\uDD04',
+    video_clean_search_history: '\uD83D\uDDD1\uFE0F', video_clean_completed_downloads: '\u2705',
+    video_full_cleanup: '\uD83E\uDDF9', video_backup_database: '\uD83D\uDCBE',
+    video_apply_overlays: '\uD83C\uDFA8', video_clean_plex_images: '\uD83D\uDDBC\uFE0F',
+    video_sync_collections: '\uD83D\uDDC2\uFE0F',
+    // Arr-parity acquisition automations (P1/P5/P6)
+    video_rss_sync: '\uD83D\uDCE1', video_seeding_sweep: '\uD83C\uDF31',
+    video_import_lists: '\uD83D\uDCE5',
+    // Video event triggers + maintenance action
+    monthly_time: '\uD83D\uDCC5',
+    video_batch_complete: '\u2705', video_library_scan_completed: '\uD83D\uDCE1',
+    video_download_completed: '\u2B07\uFE0F', video_download_failed: '\u274C',
+    video_import_failed: '\u26A0\uFE0F', video_upgrade_completed: '\uD83D\uDCC8',
+    video_repair_finding_created: '\uD83D\uDD27', video_repair_scan_completed: '\uD83D\uDD27',
+    video_wishlist_item_added: '\u2795', video_watchlist_added: '\uD83D\uDC41\uFE0F',
+    video_watchlist_removed: '\uD83D\uDEAB', video_collections_synced: '\uD83D\uDDC2\uFE0F',
+    video_overlays_applied: '\uD83C\uDFA8', video_database_update_completed: '\uD83D\uDDC4\uFE0F',
+    video_run_repair_job: '\uD83D\uDD27',
+};
+
+// --- Inspiration Templates ---
+// --- Automation Hub Data ---
+
+// ── Automation Hub: One-Click Pipeline Groups ──
+const AUTO_HUB_GROUPS = [
+    {
+        id: 'playlist-pipeline', icon: '🚀', name: 'Playlist Pipeline (All-in-One)',
+        desc: 'Single automation that runs the full playlist lifecycle: refresh → discover → sync → download missing. No signal wiring needed.',
+        category: 'Sync', badge: '1 automation', color: '#8b5cf6',
+        steps: [
+            { label: 'Refresh', icon: '🔄', type: 'action' },
+            { label: 'Discover', icon: '🔍', type: 'action' },
+            { label: 'Sync', icon: '🔗', type: 'action' },
+            { label: 'Download', icon: '📥', type: 'action' },
+        ],
+        automations: [
+            { name: 'Playlist Pipeline', trigger_type: 'schedule', trigger_config: { interval: 6, unit: 'hours' }, action_type: 'playlist_pipeline', action_config: { all: true }, then_actions: [], group_name: 'Playlist Pipeline' },
+        ]
+    },
+    {
+        id: 'new-music-pipeline', icon: '🚀', name: 'New Music Pipeline',
+        desc: 'Full hands-free new music workflow. Scans your watchlist for releases, downloads them, cleans up, and notifies you.',
+        category: 'Discovery', badge: '4 automations', color: '#f97316',
+        steps: [
+            { label: 'Scan Artists', icon: '🔍', type: 'action' },
+            { label: 'Download', icon: '📥', type: 'action' },
+            { label: 'Cleanup', icon: '🧹', type: 'action' },
+            { label: 'Notify', icon: '🔔', type: 'notify' },
+        ],
+        automations: [
+            { name: 'New Music — Scan Watchlist', trigger_type: 'schedule', trigger_config: { interval: 12, unit: 'hours' }, action_type: 'scan_watchlist', action_config: {}, then_actions: [{ type: 'fire_signal', config: { signal_name: 'nm_scanned' } }], group_name: 'New Music Pipeline' },
+            { name: 'New Music — Download', trigger_type: 'signal_received', trigger_config: { signal_name: 'nm_scanned' }, action_type: 'process_wishlist', action_config: {}, then_actions: [{ type: 'fire_signal', config: { signal_name: 'nm_downloaded' } }], group_name: 'New Music Pipeline' },
+            { name: 'New Music — Cleanup', trigger_type: 'signal_received', trigger_config: { signal_name: 'nm_downloaded' }, action_type: 'full_cleanup', action_config: {}, then_actions: [{ type: 'fire_signal', config: { signal_name: 'nm_cleaned' } }], group_name: 'New Music Pipeline' },
+            { name: 'New Music — Notify', trigger_type: 'signal_received', trigger_config: { signal_name: 'nm_cleaned' }, action_type: 'notify_only', action_config: {}, then_actions: [], group_name: 'New Music Pipeline', needs_notify: true },
+        ]
+    },
+    {
+        id: 'nightly-ops', icon: '🌙', name: 'Nightly Operations',
+        desc: 'Staggered overnight maintenance: scan, download, cleanup, and backup while you sleep.',
+        category: 'Maintenance', badge: '4 automations', color: '#8b5cf6',
+        steps: [
+            { label: '1AM Scan', icon: '🔍', type: 'action' },
+            { label: '2AM Download', icon: '📥', type: 'action' },
+            { label: '3AM Cleanup', icon: '🧹', type: 'action' },
+            { label: '4AM Backup', icon: '💾', type: 'action' },
+        ],
+        automations: [
+            { name: 'Nightly — 1AM Scan', trigger_type: 'daily_time', trigger_config: { time: '01:00' }, action_type: 'scan_watchlist', action_config: {}, then_actions: [], group_name: 'Nightly Operations' },
+            { name: 'Nightly — 2AM Download', trigger_type: 'daily_time', trigger_config: { time: '02:00' }, action_type: 'process_wishlist', action_config: {}, then_actions: [], group_name: 'Nightly Operations' },
+            { name: 'Nightly — 3AM Cleanup', trigger_type: 'daily_time', trigger_config: { time: '03:00' }, action_type: 'full_cleanup', action_config: {}, then_actions: [], group_name: 'Nightly Operations' },
+            { name: 'Nightly — 4AM Backup', trigger_type: 'daily_time', trigger_config: { time: '04:00' }, action_type: 'backup_database', action_config: {}, then_actions: [], group_name: 'Nightly Operations' },
+        ]
+    },
+    {
+        id: 'download-monitor', icon: '📊', name: 'Download Monitor',
+        desc: 'Stay informed about your downloads. Get notified on failures, quarantined files, and completed batches.',
+        category: 'Alerts', badge: '3 automations', color: '#ef4444',
+        steps: [
+            { label: 'Failures', icon: '❌', type: 'notify' },
+            { label: 'Quarantine', icon: '⚠️', type: 'notify' },
+            { label: 'Complete', icon: '✅', type: 'notify' },
+        ],
+        automations: [
+            { name: 'Alert — Download Failed', trigger_type: 'download_failed', trigger_config: {}, action_type: 'notify_only', action_config: {}, then_actions: [], group_name: 'Download Monitor', needs_notify: true },
+            { name: 'Alert — File Quarantined', trigger_type: 'download_quarantined', trigger_config: {}, action_type: 'notify_only', action_config: {}, then_actions: [], group_name: 'Download Monitor', needs_notify: true },
+            { name: 'Alert — Batch Complete', trigger_type: 'batch_complete', trigger_config: {}, action_type: 'notify_only', action_config: {}, then_actions: [], group_name: 'Download Monitor', needs_notify: true },
+        ]
+    },
+    {
+        id: 'library-guardian', icon: '🛡️', name: 'Library Guardian',
+        desc: 'Protect your library quality. After scans, runs quality checks and notifies you of any issues found.',
+        category: 'Maintenance', badge: '2 automations', color: '#f59e0b',
+        steps: [
+            { label: 'Quality Scan', icon: '✅', type: 'action' },
+            { label: 'Notify', icon: '🔔', type: 'notify' },
+        ],
+        automations: [
+            { name: 'Guardian — Quality Check', trigger_type: 'library_scan_completed', trigger_config: {}, action_type: 'start_quality_scan', action_config: {}, then_actions: [{ type: 'fire_signal', config: { signal_name: 'guardian_quality_done' } }], group_name: 'Library Guardian' },
+            { name: 'Guardian — Notify', trigger_type: 'signal_received', trigger_config: { signal_name: 'guardian_quality_done' }, action_type: 'notify_only', action_config: {}, then_actions: [], group_name: 'Library Guardian', needs_notify: true },
+        ]
+    },
+    {
+        id: 'startup-recovery', icon: '⚡', name: 'Startup Recovery',
+        desc: 'Self-heal after a restart. Scans your library, processes pending wishlist items, and cleans up automatically.',
+        category: 'Maintenance', badge: '3 automations', color: '#14b8a6',
+        steps: [
+            { label: 'Scan Library', icon: '📚', type: 'action' },
+            { label: 'Process Wishlist', icon: '📥', type: 'action' },
+            { label: 'Cleanup', icon: '🧹', type: 'action' },
+        ],
+        automations: [
+            { name: 'Startup — Scan Library', trigger_type: 'app_started', trigger_config: {}, action_type: 'scan_library', action_config: {}, then_actions: [{ type: 'fire_signal', config: { signal_name: 'startup_scanned' } }], group_name: 'Startup Recovery' },
+            { name: 'Startup — Process Wishlist', trigger_type: 'signal_received', trigger_config: { signal_name: 'startup_scanned' }, action_type: 'process_wishlist', action_config: {}, then_actions: [{ type: 'fire_signal', config: { signal_name: 'startup_processed' } }], group_name: 'Startup Recovery' },
+            { name: 'Startup — Cleanup', trigger_type: 'signal_received', trigger_config: { signal_name: 'startup_processed' }, action_type: 'full_cleanup', action_config: {}, then_actions: [], group_name: 'Startup Recovery' },
+        ]
+    },
+    {
+        id: 'import-pipeline', icon: '📦', name: 'Import Pipeline',
+        desc: 'After importing files, automatically scans your library, runs a quality check, and notifies you when complete.',
+        category: 'Maintenance', badge: '3 automations', color: '#a855f7',
+        steps: [
+            { label: 'Scan Library', icon: '📚', type: 'action' },
+            { label: 'Quality Check', icon: '✅', type: 'action' },
+            { label: 'Notify', icon: '🔔', type: 'notify' },
+        ],
+        automations: [
+            { name: 'Import — Scan Library', trigger_type: 'import_completed', trigger_config: {}, action_type: 'scan_library', action_config: {}, then_actions: [{ type: 'fire_signal', config: { signal_name: 'import_scanned' } }], group_name: 'Import Pipeline' },
+            { name: 'Import — Quality Check', trigger_type: 'signal_received', trigger_config: { signal_name: 'import_scanned' }, action_type: 'start_quality_scan', action_config: {}, then_actions: [{ type: 'fire_signal', config: { signal_name: 'import_quality_done' } }], group_name: 'Import Pipeline' },
+            { name: 'Import — Notify', trigger_type: 'signal_received', trigger_config: { signal_name: 'import_quality_done' }, action_type: 'notify_only', action_config: {}, then_actions: [], group_name: 'Import Pipeline', needs_notify: true },
+        ]
+    },
+    {
+        id: 'weekly-deep-clean', icon: '✨', name: 'Weekly Deep Clean',
+        desc: 'Comprehensive weekly sweep: find duplicates, check quality, clean up, back up, and report results.',
+        category: 'Maintenance', badge: '5 automations', color: '#ec4899',
+        steps: [
+            { label: 'Duplicates', icon: '📋', type: 'action' },
+            { label: 'Quality', icon: '✅', type: 'action' },
+            { label: 'Cleanup', icon: '🧹', type: 'action' },
+            { label: 'Backup', icon: '💾', type: 'action' },
+            { label: 'Notify', icon: '🔔', type: 'notify' },
+        ],
+        automations: [
+            { name: 'Deep Clean — Duplicates', trigger_type: 'weekly_time', trigger_config: { days: ['sunday'], time: '02:00' }, action_type: 'run_duplicate_cleaner', action_config: {}, then_actions: [{ type: 'fire_signal', config: { signal_name: 'dc_dedup_done' } }], group_name: 'Weekly Deep Clean' },
+            { name: 'Deep Clean — Quality', trigger_type: 'signal_received', trigger_config: { signal_name: 'dc_dedup_done' }, action_type: 'start_quality_scan', action_config: {}, then_actions: [{ type: 'fire_signal', config: { signal_name: 'dc_quality_done' } }], group_name: 'Weekly Deep Clean' },
+            { name: 'Deep Clean — Cleanup', trigger_type: 'signal_received', trigger_config: { signal_name: 'dc_quality_done' }, action_type: 'full_cleanup', action_config: {}, then_actions: [{ type: 'fire_signal', config: { signal_name: 'dc_cleanup_done' } }], group_name: 'Weekly Deep Clean' },
+            { name: 'Deep Clean — Backup', trigger_type: 'signal_received', trigger_config: { signal_name: 'dc_cleanup_done' }, action_type: 'backup_database', action_config: {}, then_actions: [{ type: 'fire_signal', config: { signal_name: 'dc_backup_done' } }], group_name: 'Weekly Deep Clean' },
+            { name: 'Deep Clean — Notify', trigger_type: 'signal_received', trigger_config: { signal_name: 'dc_backup_done' }, action_type: 'notify_only', action_config: {}, then_actions: [], group_name: 'Weekly Deep Clean', needs_notify: true },
+        ]
+    },
+    {
+        id: 'beatport-fresh', icon: '🎧', name: 'Beatport Fresh',
+        desc: 'Keep your Beatport charts and playlists up to date with a daily cache refresh.',
+        category: 'Discovery', badge: '1 automation', color: '#84cc16',
+        steps: [
+            { label: 'Refresh Cache', icon: '🔄', type: 'action' },
+        ],
+        automations: [
+            { name: 'Beatport — Daily Refresh', trigger_type: 'daily_time', trigger_config: { time: '05:00' }, action_type: 'refresh_beatport_cache', action_config: {}, then_actions: [], group_name: 'Beatport Fresh' },
+        ]
+    },
+];
+
+const AUTO_HUB_RECIPES = [
+    // Sync & Playlists
+    {
+        id: 'spotify-auto-sync', icon: '\uD83D\uDD01', name: 'Spotify Playlist Auto-Sync', desc: 'Refresh all mirrored playlists every 6 hours to keep them in sync with Spotify.',
+        category: 'Sync', difficulty: 'beginner', when: { type: 'schedule', config: { interval: 6, unit: 'hours' } }, do: { type: 'refresh_mirrored', config: {} }, then: []
+    },
+    {
+        id: 'release-radar-pipeline', icon: '\uD83D\uDCE1', name: 'Release Radar Pipeline', desc: 'Every Friday, refresh mirrored playlists, discover new tracks, then sync. Chain 3 automations for a full pipeline.',
+        category: 'Sync', difficulty: 'intermediate', when: { type: 'weekly_time', config: { days: ['friday'], time: '18:00' } }, do: { type: 'refresh_mirrored', config: {} }, then: [],
+        chain: ['Refresh Mirrored', 'Discover Playlist', 'Sync Playlist'], note: 'Create 3 separate automations and chain them with signals for the full pipeline.'
+    },
+    {
+        id: 'discover-weekly-grab', icon: '\uD83C\uDFB5', name: 'Discover Weekly Grab', desc: 'Every Monday, refresh your mirrored Discover Weekly to capture the new playlist before Spotify replaces it.',
+        category: 'Sync', difficulty: 'beginner', when: { type: 'weekly_time', config: { days: ['monday'], time: '08:00' } }, do: { type: 'refresh_mirrored', config: {} }, then: []
+    },
+    {
+        id: 'playlist-change-watcher', icon: '\uD83D\uDD14', name: 'Playlist Change Watcher', desc: 'Get a Discord notification whenever any tracked playlist changes.',
+        category: 'Sync', difficulty: 'beginner', when: { type: 'playlist_changed', config: {} }, do: { type: 'notify_only', config: {} }, then: [{ type: 'discord_webhook', config: {} }]
+    },
+    {
+        id: 'new-mirror-discovery', icon: '\uD83D\uDD0D', name: 'New Mirror Auto-Discovery', desc: 'Automatically discover tracks when you mirror a new playlist.',
+        category: 'Sync', difficulty: 'beginner', when: { type: 'mirrored_playlist_created', config: {} }, do: { type: 'discover_playlist', config: {} }, then: []
+    },
+    // New Music Discovery
+    {
+        id: 'complete-new-release', icon: '\uD83D\uDE80', name: 'Complete New Release Pipeline', desc: 'Full hands-free chain: scan watchlist \u2192 process wishlist \u2192 quality scan \u2192 notify. Requires 3 automations linked by signals.',
+        category: 'Discovery', difficulty: 'advanced', when: { type: 'schedule', config: { interval: 12, unit: 'hours' } }, do: { type: 'scan_watchlist', config: {} }, then: [{ type: 'fire_signal', config: { signal_name: 'watchlist_done' } }],
+        chain: ['Scan Watchlist', '\u26A1 watchlist_done', 'Process Wishlist', '\u26A1 wishlist_done', 'Quality Scan', 'Discord'],
+        note: 'Create 3 automations: (1) Schedule\u2192Scan Watchlist\u2192fire watchlist_done, (2) Signal watchlist_done\u2192Process Wishlist\u2192fire wishlist_done, (3) Signal wishlist_done\u2192Quality Scan\u2192Discord.'
+    },
+    {
+        id: 'new-release-monitor', icon: '\uD83D\uDD14', name: 'New Release Monitor', desc: 'Scan your watchlist for new releases every 12 hours.',
+        category: 'Discovery', difficulty: 'beginner', when: { type: 'schedule', config: { interval: 12, unit: 'hours' } }, do: { type: 'scan_watchlist', config: {} }, then: []
+    },
+    {
+        id: 'artist-watch-alert', icon: '\uD83C\uDFA4', name: 'Artist Watch Alert', desc: 'Get a Telegram notification when you add a new artist to your watchlist.',
+        category: 'Discovery', difficulty: 'beginner', when: { type: 'watchlist_artist_added', config: {} }, do: { type: 'notify_only', config: {} }, then: [{ type: 'telegram', config: {} }]
+    },
+    {
+        id: 'discovery-pool-refresh', icon: '\uD83C\uDF10', name: 'Discovery Pool Refresh', desc: 'Refresh the discovery pool every night at 2 AM with fresh recommendations.',
+        category: 'Discovery', difficulty: 'beginner', when: { type: 'daily_time', config: { time: '02:00' } }, do: { type: 'update_discovery_pool', config: {} }, then: []
+    },
+    {
+        id: 'nightly-wishlist', icon: '\uD83C\uDF19', name: 'Nightly Wishlist Processor', desc: 'Process your wishlist at 3 AM every night while you sleep.',
+        category: 'Discovery', difficulty: 'beginner', when: { type: 'daily_time', config: { time: '03:00' } }, do: { type: 'process_wishlist', config: {} }, then: []
+    },
+    // Library Maintenance
+    {
+        id: 'full-library-maintenance', icon: '\uD83E\uDDF9', name: 'Full Library Maintenance', desc: 'Run full cleanup every Saturday at 5 AM \u2014 dedup, quarantine, wishlist tidy.',
+        category: 'Maintenance', difficulty: 'intermediate', when: { type: 'weekly_time', config: { days: ['saturday'], time: '05:00' } }, do: { type: 'full_cleanup', config: {} }, then: []
+    },
+    {
+        id: 'post-batch-cleanup', icon: '\uD83E\uDDF9', name: 'Post-Batch Cleanup', desc: 'Run a full cleanup after any batch download completes.',
+        category: 'Maintenance', difficulty: 'beginner', when: { type: 'batch_complete', config: {} }, do: { type: 'full_cleanup', config: {} }, then: []
+    },
+    {
+        id: 'weekly-db-backup', icon: '\uD83D\uDCBE', name: 'Weekly Database Backup', desc: 'Back up your database every Sunday at 4 AM.',
+        category: 'Maintenance', difficulty: 'beginner', when: { type: 'weekly_time', config: { days: ['sunday'], time: '04:00' } }, do: { type: 'backup_database', config: {} }, then: []
+    },
+    {
+        id: 'quality-assurance', icon: '\u2705', name: 'Quality Assurance Pipeline', desc: 'After a library scan completes, run a quality scan and fire a signal when done.',
+        category: 'Maintenance', difficulty: 'intermediate', when: { type: 'library_scan_completed', config: {} }, do: { type: 'start_quality_scan', config: {} }, then: [{ type: 'fire_signal', config: { signal_name: 'quality_done' } }]
+    },
+    {
+        id: 'import-cleanup', icon: '\uD83D\uDCE5', name: 'Import Cleanup', desc: 'Automatically scan the library after an import completes to keep things tidy.',
+        category: 'Maintenance', difficulty: 'intermediate', when: { type: 'import_completed', config: {} }, do: { type: 'scan_library', config: {} }, then: []
+    },
+    // Notifications & Alerts
+    {
+        id: 'download-failure-alert', icon: '\u274C', name: 'Download Failure Alert', desc: 'Get notified via Discord when a download fails.',
+        category: 'Alerts', difficulty: 'beginner', when: { type: 'download_failed', config: {} }, do: { type: 'notify_only', config: {} }, then: [{ type: 'discord_webhook', config: {} }]
+    },
+    {
+        id: 'quarantine-alert', icon: '\u26A0\uFE0F', name: 'Quarantine Alert', desc: 'Get a Pushbullet alert when a file is quarantined.',
+        category: 'Alerts', difficulty: 'beginner', when: { type: 'download_quarantined', config: {} }, do: { type: 'notify_only', config: {} }, then: [{ type: 'pushbullet', config: {} }]
+    },
+    {
+        id: 'batch-complete-notify', icon: '\uD83C\uDFC1', name: 'Batch Complete Notification', desc: 'Get a Telegram message when a batch download finishes.',
+        category: 'Alerts', difficulty: 'beginner', when: { type: 'batch_complete', config: {} }, do: { type: 'notify_only', config: {} }, then: [{ type: 'telegram', config: {} }]
+    },
+    // Power User Chains
+    {
+        id: 'full-hands-free', icon: '\uD83E\uDD16', name: 'Full Hands-Free Pipeline', desc: 'The ultimate automation chain: scan \u2192 process \u2192 download \u2192 clean \u2192 notify. Requires 5 automations linked by signals.',
+        category: 'Chains', difficulty: 'advanced', when: { type: 'schedule', config: { interval: 12, unit: 'hours' } }, do: { type: 'scan_watchlist', config: {} }, then: [{ type: 'fire_signal', config: { signal_name: 'scan_done' } }],
+        chain: ['Scan Watchlist', '\u26A1 scan_done', 'Process Wishlist', '\u26A1 process_done', 'Full Cleanup', '\u26A1 cleanup_done', 'Quality Scan', 'Discord'],
+        note: 'Build 4-5 automations, each firing a signal for the next step. Start small and add stages.'
+    },
+    {
+        id: 'staggered-nightly', icon: '\uD83C\uDF03', name: 'Staggered Nightly Pipeline', desc: 'Spread tasks across the night: 1 AM scan, 2 AM process, 3 AM cleanup, 4 AM backup.',
+        category: 'Chains', difficulty: 'intermediate', when: { type: 'daily_time', config: { time: '01:00' } }, do: { type: 'scan_watchlist', config: {} }, then: [],
+        chain: ['1:00 Scan', '2:00 Process', '3:00 Cleanup', '4:00 Backup'],
+        note: 'Create 4 daily_time automations at staggered hours. No signals needed \u2014 just timing.'
+    },
+];
+
+const AUTO_HUB_GUIDES = [
+    {
+        id: 'auto-sync-playlists', icon: '\uD83D\uDD01', title: 'Auto-Sync Your Spotify Playlists', subtitle: 'Mirror a Spotify playlist and schedule automatic refreshes.', difficulty: 'beginner',
+        steps: [
+            'Go to the <strong>Playlists</strong> page and find a Spotify playlist you want to track.',
+            'Click <strong>Mirror Playlist</strong> to create a local copy.',
+            'Go to <strong>Automations</strong> and click <strong>New Automation</strong>.',
+            'Set WHEN to <strong>Schedule \u2192 Every 6 hours</strong>.',
+            'Set DO to <strong>Refresh Mirrored Playlists</strong>.',
+            'Save and enable \u2014 your playlist will now stay in sync automatically.'
+        ], relatedRecipes: ['spotify-auto-sync', 'discover-weekly-grab']
+    },
+    {
+        id: 'discord-download-alerts', icon: '\uD83D\uDCE2', title: 'Get Discord Alerts for Downloads', subtitle: 'Set up Discord webhook notifications for download events.', difficulty: 'beginner',
+        steps: [
+            'In Discord, go to your channel\'s settings \u2192 <strong>Integrations \u2192 Webhooks</strong>.',
+            'Create a webhook and copy the URL.',
+            'In SoulSync, go to <strong>Settings \u2192 Notifications</strong> and paste the Discord webhook URL.',
+            'Go to <strong>Automations \u2192 New Automation</strong>.',
+            'Set WHEN to <strong>Download Failed</strong> (or any event), DO to <strong>Notify Only</strong>, THEN to <strong>Discord</strong>.'
+        ], relatedRecipes: ['download-failure-alert', 'batch-complete-notify']
+    },
+    {
+        id: 'hands-free-pipeline', icon: '\uD83E\uDD16', title: 'Build a Hands-Free Library Pipeline', subtitle: 'Chain watchlist scanning, wishlist processing, and cleanup with signals.', difficulty: 'intermediate',
+        steps: [
+            'Create Automation 1: <strong>Schedule (12h) \u2192 Scan Watchlist</strong>, THEN fire signal <code>scan_done</code>.',
+            'Create Automation 2: <strong>Signal scan_done \u2192 Process Wishlist</strong>, THEN fire signal <code>process_done</code>.',
+            'Create Automation 3: <strong>Signal process_done \u2192 Full Cleanup</strong>.',
+            'Enable all three automations.',
+            'Test by manually running Automation 1 \u2014 watch the chain execute.',
+            'Add a THEN notification (Discord/Telegram) to the last automation for completion alerts.',
+            'Adjust the schedule interval based on how often you want new music checked.'
+        ], relatedRecipes: ['complete-new-release', 'full-hands-free']
+    },
+    {
+        id: 'signal-chains', icon: '\u26A1', title: 'Set Up Signal Chains', subtitle: 'Use fire_signal and signal_received to link automations together.', difficulty: 'advanced',
+        steps: [
+            'Understand the concept: <strong>fire_signal</strong> is a THEN action that emits a named signal. <strong>signal_received</strong> is a WHEN trigger that listens for it.',
+            'In your first automation, add a THEN action \u2192 <strong>Fire Signal</strong> and name it (e.g., <code>step1_done</code>).',
+            'Create a second automation with WHEN \u2192 <strong>Signal Received</strong> \u2192 signal name <code>step1_done</code>.',
+            'The second automation will fire automatically when the first one completes.',
+            'Chain up to 5 levels deep (safety limit). SoulSync detects cycles automatically.',
+            'Use descriptive signal names like <code>watchlist_scanned</code> or <code>cleanup_finished</code>.'
+        ], relatedRecipes: ['quality-assurance', 'complete-new-release']
+    },
+    {
+        id: 'nightly-maintenance', icon: '\uD83C\uDF19', title: 'Schedule Nightly Maintenance', subtitle: 'Set up backup, cleanup, and quality scans to run overnight.', difficulty: 'intermediate',
+        steps: [
+            'Create a <strong>Daily Time (04:00) \u2192 Backup Database</strong> automation.',
+            'Create a <strong>Weekly Time (Saturday, 05:00) \u2192 Full Cleanup</strong> automation.',
+            'Create a <strong>Daily Time (02:00) \u2192 Update Discovery Pool</strong> automation.',
+            'Stagger times by at least 1 hour to avoid resource contention.',
+            'Add Discord/Telegram notifications to any you want alerts for.'
+        ], relatedRecipes: ['weekly-db-backup', 'full-library-maintenance', 'staggered-nightly']
+    },
+];
+
+const AUTO_HUB_TIPS = [
+    { icon: '\u26A1', title: 'Signal Chaining 101', body: '<strong>fire_signal</strong> (a THEN action) emits a named event. <strong>signal_received</strong> (a WHEN trigger) listens for it. This lets you chain automations: when one finishes, the next starts automatically.', tag: 'Signals' },
+    { icon: '\u23F0', title: 'Stagger Your Schedules', body: 'If you have multiple timed automations, space them at least 1 hour apart. Running scan, process, and cleanup at the same time creates resource contention and can slow everything down.', tag: 'Performance' },
+    { icon: '\uD83C\uDFAF', title: 'Use Conditions to Filter', body: 'Add conditions to event triggers to only fire on specific artists, formats, or quality levels. For example, trigger only when a downloaded track\'s artist matches "Radiohead".', tag: 'Filtering' },
+    { icon: '\uD83D\uDCC1', title: 'Group Related Automations', body: 'Use the Group dropdown when creating automations to organize them. Groups like "Nightly", "Notifications", or "Pipeline" make it easy to find and manage related automations.', tag: 'Organization' },
+    { icon: '\uD83D\uDD04', title: 'Avoid Chain Loops', body: 'SoulSync has built-in cycle detection, but it\'s good practice to design signal names carefully. If A fires signal X and B listens for X and fires Y, make sure nothing fires X again downstream.', tag: 'Safety' },
+    { icon: '\uD83D\uDCDA', title: 'Stack THEN Actions', body: 'Each automation supports up to 3 THEN actions. Combine notification channels (Discord + Telegram) with a fire_signal to both notify yourself and trigger the next automation.', tag: 'Power' },
+    { icon: '\u2699\uFE0F', title: 'System vs Custom', body: 'System automations handle core tasks like Spotify enrichment and are managed automatically. Create custom automations to extend their behavior \u2014 trigger on their completion events.', tag: 'Basics' },
+    { icon: '\uD83E\uDDEA', title: 'Test with Notify Only', body: 'Set DO to <strong>Notify Only</strong> when testing a new trigger. You\'ll see when it fires without any side effects. Once you\'re confident in the timing, switch to the real action.', tag: 'Testing' },
+];
+
+const AUTO_HUB_REFERENCE = {
+    triggers: [
+        {
+            group: 'Time-Based', items: [
+                { type: 'schedule', label: 'Schedule', desc: 'Repeating interval (e.g., every 6 hours)' },
+                { type: 'daily_time', label: 'Daily Time', desc: 'Every day at a specific time (e.g., 03:00)' },
+                { type: 'weekly_time', label: 'Weekly Time', desc: 'Specific days + time (e.g., Saturday at 05:00)' },
+            ]
+        },
+        {
+            group: 'Download Events', items: [
+                { type: 'track_downloaded', label: 'Track Downloaded', desc: 'Fires when a single track download completes' },
+                { type: 'batch_complete', label: 'Batch Complete', desc: 'Fires when a batch download job finishes' },
+                { type: 'download_failed', label: 'Download Failed', desc: 'Fires when a download fails or errors out' },
+                { type: 'download_quarantined', label: 'File Quarantined', desc: 'Fires when a downloaded file is quarantined for quality issues' },
+            ]
+        },
+        {
+            group: 'Watchlist & Wishlist', items: [
+                { type: 'watchlist_new_release', label: 'New Release Found', desc: 'Fires when a watched artist has a new release' },
+                { type: 'watchlist_scan_completed', label: 'Watchlist Scan Done', desc: 'Fires after a full watchlist scan completes' },
+                { type: 'watchlist_artist_added', label: 'Artist Watched', desc: 'Fires when a new artist is added to the watchlist' },
+                { type: 'watchlist_artist_removed', label: 'Artist Unwatched', desc: 'Fires when an artist is removed from the watchlist' },
+                { type: 'wishlist_item_added', label: 'Wishlist Item Added', desc: 'Fires when a new item is added to the wishlist' },
+                { type: 'wishlist_processing_completed', label: 'Wishlist Processed', desc: 'Fires after the wishlist processor completes a run' },
+            ]
+        },
+        {
+            group: 'Playlists', items: [
+                { type: 'playlist_synced', label: 'Playlist Synced', desc: 'Fires when a playlist sync operation completes' },
+                { type: 'playlist_changed', label: 'Playlist Changed', desc: 'Fires when a tracked playlist has changes detected' },
+                { type: 'mirrored_playlist_created', label: 'Playlist Mirrored', desc: 'Fires when a new mirrored playlist is created' },
+                { type: 'discovery_completed', label: 'Discovery Complete', desc: 'Fires when playlist discovery finishes' },
+            ]
+        },
+        {
+            group: 'Library & System', items: [
+                { type: 'app_started', label: 'App Started', desc: 'Fires once when SoulSync starts up' },
+                { type: 'import_completed', label: 'Import Complete', desc: 'Fires when a library import operation finishes' },
+                { type: 'library_scan_completed', label: 'Library Scan Done', desc: 'Fires after a full library scan completes' },
+                { type: 'quality_scan_completed', label: 'Quality Scan Done', desc: 'Fires when a quality scan finishes' },
+                { type: 'duplicate_scan_completed', label: 'Duplicate Scan Done', desc: 'Fires when the duplicate scanner finishes' },
+                { type: 'database_update_completed', label: 'Database Updated', desc: 'Fires after a database update operation' },
+            ]
+        },
+        {
+            group: 'Signals', items: [
+                { type: 'signal_received', label: 'Signal Received', desc: 'Fires when a named signal is emitted by another automation\'s fire_signal THEN action' },
+            ]
+        },
+    ],
+    actions: [
+        {
+            group: 'Downloads & Sync', items: [
+                { type: 'playlist_pipeline', label: 'Playlist Pipeline', desc: 'Full lifecycle: refresh → discover → sync → download missing' },
+                { type: 'process_wishlist', label: 'Process Wishlist', desc: 'Download all pending wishlist items' },
+                { type: 'refresh_mirrored', label: 'Refresh Mirrored', desc: 'Refresh all mirrored playlists from their sources' },
+                { type: 'sync_playlist', label: 'Sync Playlist', desc: 'Sync a specific playlist to your library' },
+                { type: 'discover_playlist', label: 'Discover Playlist', desc: 'Run track discovery on mirrored playlists' },
+                { type: 'scan_watchlist', label: 'Scan Watchlist', desc: 'Check watched artists for new releases' },
+                { type: 'update_discovery_pool', label: 'Update Discovery', desc: 'Refresh the discovery pool with new recommendations' },
+            ]
+        },
+        {
+            group: 'Library Tools', items: [
+                { type: 'scan_library', label: 'Scan Library', desc: 'Full scan of local music library files' },
+                { type: 'start_quality_scan', label: 'Quality Scan', desc: 'Check library tracks for quality issues' },
+                { type: 'start_database_update', label: 'Update Database', desc: 'Run a database update/maintenance operation' },
+                { type: 'backup_database', label: 'Backup Database', desc: 'Create a backup of the music database' },
+            ]
+        },
+        {
+            group: 'Cleanup', items: [
+                { type: 'full_cleanup', label: 'Full Cleanup', desc: 'Run all cleanup tasks: dedup, quarantine, wishlist tidy' },
+                { type: 'run_duplicate_cleaner', label: 'Duplicate Cleaner', desc: 'Find and handle duplicate tracks' },
+                { type: 'clear_quarantine', label: 'Clear Quarantine', desc: 'Remove all quarantined files' },
+                { type: 'cleanup_wishlist', label: 'Clean Wishlist', desc: 'Remove completed/invalid wishlist items' },
+                { type: 'clean_search_history', label: 'Clean Search History', desc: 'Clear old search history entries' },
+                { type: 'clean_completed_downloads', label: 'Clean Downloads', desc: 'Remove completed download records' },
+            ]
+        },
+        {
+            group: 'Other', items: [
+                { type: 'notify_only', label: 'Notify Only', desc: 'No action \u2014 just trigger THEN notifications. Great for testing.' },
+            ]
+        },
+    ],
+    thenActions: [
+        {
+            group: 'Notifications', items: [
+                { type: 'discord_webhook', label: 'Discord Webhook', desc: 'Send a message to a Discord channel via webhook' },
+                { type: 'telegram', label: 'Telegram', desc: 'Send a message to a Telegram chat via bot' },
+                { type: 'pushbullet', label: 'Pushbullet', desc: 'Send a push notification via Pushbullet' },
+            ]
+        },
+        {
+            group: 'Chaining', items: [
+                { type: 'fire_signal', label: 'Fire Signal', desc: 'Emit a named signal that other automations can listen for with signal_received' },
+            ]
+        },
+    ],
+};
+
+// --- Load & Render List ---
+
+// Drag-and-drop state
+let _autoDragState = null;
+let _autoDragEnterCount = 0;
+let _autoDragExpandTimer = null;
+
+function _buildAutomationSection(id, label, automations, useGrid, options = {}) {
+    const groupName = options.groupName || null;
+    const isProtected = options.isProtected || false; // System, Hub sections
+
+    const section = document.createElement('div');
+    section.className = 'automations-section';
+    if (isProtected) section.classList.add('section-protected');
+    section.id = id;
+    if (groupName) section.dataset.groupName = groupName;
+    const collapsed = localStorage.getItem('auto_section_' + id) === '1';
+    if (collapsed) section.classList.add('collapsed');
+
+    const header = document.createElement('div');
+    header.className = 'automations-section-header';
+
+    // Group header actions (rename, bulk toggle, delete) — only for user groups
+    let actionsHtml = '';
+    if (groupName && !isProtected) {
+        const enabledCount = automations.filter(a => a.enabled).length;
+        const allEnabled = enabledCount === automations.length;
+        actionsHtml = `
+            <div class="section-actions" onclick="event.stopPropagation();">
+                <button class="section-action-btn" title="${allEnabled ? 'Disable all' : 'Enable all'}" onclick="_bulkToggleGroup('${_escJs(groupName)}', ${allEnabled})">
+                    ${allEnabled ? '⏸' : '▶'}
+                </button>
+                <button class="section-action-btn" title="Rename group" onclick="_startRenameGroup('${_escJs(groupName)}', this)">
+                    ✏️
+                </button>
+                <button class="section-action-btn section-action-danger" title="Delete group" onclick="_deleteGroup('${_escJs(groupName)}')">
+                    🗑️
+                </button>
+            </div>
+        `;
+    }
+
+    header.innerHTML = `
+        <span class="section-chevron">&#9660;</span>
+        <span class="section-label">${label}</span>
+        <span class="section-count">${automations.length}</span>
+        ${actionsHtml}
+        <span class="section-line"></span>
+    `;
+    header.onclick = (e) => {
+        if (e.target.closest('.section-actions')) return;
+        section.classList.toggle('collapsed');
+        localStorage.setItem('auto_section_' + id, section.classList.contains('collapsed') ? '1' : '0');
+    };
+
+    const body = document.createElement('div');
+    body.className = 'automations-section-body';
+
+    // Drop zone setup (not for protected sections)
+    if (!isProtected) {
+        const dropGroupName = groupName; // null for "My Automations"
+        body.addEventListener('dragover', (e) => {
+            if (!_autoDragState) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            body.classList.add('drop-target');
+        });
+        body.addEventListener('dragenter', (e) => {
+            if (!_autoDragState) return;
+            _autoDragEnterCount++;
+            body.classList.add('drop-target');
+            // Expand collapsed sections on drag-hover
+            if (section.classList.contains('collapsed')) {
+                _autoDragExpandTimer = setTimeout(() => {
+                    section.classList.remove('collapsed');
+                }, 500);
+            }
+        });
+        body.addEventListener('dragleave', (e) => {
+            if (!_autoDragState) return;
+            _autoDragEnterCount--;
+            if (_autoDragEnterCount <= 0) {
+                _autoDragEnterCount = 0;
+                body.classList.remove('drop-target');
+                if (_autoDragExpandTimer) { clearTimeout(_autoDragExpandTimer); _autoDragExpandTimer = null; }
+            }
+        });
+        body.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            body.classList.remove('drop-target');
+            _autoDragEnterCount = 0;
+            if (!_autoDragState) return;
+            const draggedId = _autoDragState.id;
+            const fromGroup = _autoDragState.groupName;
+            if (fromGroup === dropGroupName) return; // Same group, no-op
+            try {
+                const res = await fetch('/api/automations/' + draggedId, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ group_name: dropGroupName })
+                });
+                const data = await res.json();
+                if (data.error) throw new Error(data.error);
+                showToast(dropGroupName ? `Moved to "${dropGroupName}"` : 'Moved to My Automations', 'success');
+                await loadAutomations();
+            } catch (err) { showToast('Error: ' + err.message, 'error'); }
+        });
+    }
+
+    const container = document.createElement('div');
+    container.className = useGrid ? 'automations-grid' : 'automations-user-list';
+    automations.forEach(a => container.appendChild(renderAutomationCard(a)));
+    body.appendChild(container);
+    section.appendChild(header);
+    section.appendChild(body);
+    return section;
+}
+
+/**
+ * Delete a group — ungroups all automations (moves to My Automations).
+ */
+async function _deleteGroup(groupName) {
+    // Collect automation IDs in this group
+    const ids = [];
+    document.querySelectorAll(`.automations-section[data-group-name="${groupName}"] .automation-card`).forEach(card => {
+        if (card.dataset.id) ids.push(parseInt(card.dataset.id));
+    });
+
+    if (ids.length === 0) { await loadAutomations(); return; }
+
+    // Show choice dialog — ungroup or delete all
+    const choice = await _showDeleteGroupDialog(groupName, ids.length);
+    if (!choice) return;
+
+    try {
+        if (choice === 'ungroup') {
+            const res = await fetch('/api/automations/group', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ automation_ids: ids, group_name: null })
+            });
+            const data = await res.json();
+            if (data.error) throw new Error(data.error);
+            showToast(`Dissolved group "${groupName}" — ${data.updated} automations moved to My Automations`, 'success');
+        } else if (choice === 'delete_all') {
+            // Delete each automation
+            let deleted = 0;
+            for (const id of ids) {
+                try {
+                    const res = await fetch('/api/automations/' + id, { method: 'DELETE' });
+                    const data = await res.json();
+                    if (data.success) deleted++;
+                } catch (e) {}
+            }
+            showToast(`Deleted group "${groupName}" and ${deleted} automation${deleted !== 1 ? 's' : ''}`, 'success');
+        }
+        await loadAutomations();
+    } catch (err) { showToast('Error: ' + err.message, 'error'); }
+}
+
+function _showDeleteGroupDialog(groupName, count) {
+    return new Promise((resolve) => {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.style.display = 'flex';
+        overlay.onclick = (e) => { if (e.target === overlay) { overlay.remove(); resolve(null); } };
+
+        overlay.innerHTML = `
+            <div class="delete-group-dialog">
+                <div class="delete-group-icon">🗑️</div>
+                <h3 class="delete-group-title">Delete Group "${groupName}"</h3>
+                <p class="delete-group-message">This group contains ${count} automation${count !== 1 ? 's' : ''}. What would you like to do?</p>
+                <div class="delete-group-actions">
+                    <button class="delete-group-btn delete-group-keep" id="dg-ungroup">
+                        Keep Automations — move to My Automations
+                    </button>
+                    <button class="delete-group-btn delete-group-remove" id="dg-delete">
+                        Delete Everything — remove group and all ${count} automation${count !== 1 ? 's' : ''}
+                    </button>
+                    <button class="delete-group-btn delete-group-cancel" id="dg-cancel">
+                        Cancel
+                    </button>
+                </div>
+            </div>
+        `;
+
+        overlay.querySelector('#dg-ungroup').onclick = () => { overlay.remove(); resolve('ungroup'); };
+        overlay.querySelector('#dg-delete').onclick = () => { overlay.remove(); resolve('delete_all'); };
+        overlay.querySelector('#dg-cancel').onclick = () => { overlay.remove(); resolve(null); };
+
+        document.addEventListener('keydown', function esc(e) {
+            if (e.key === 'Escape') { overlay.remove(); resolve(null); document.removeEventListener('keydown', esc); }
+        });
+
+        document.body.appendChild(overlay);
+    });
+}
+
+/**
+ * Rename a group — inline edit on the section header label.
+ */
+function _startRenameGroup(groupName, btnEl) {
+    const section = btnEl.closest('.automations-section');
+    const labelEl = section?.querySelector('.section-label');
+    if (!labelEl) return;
+
+    const input = document.createElement('input');
+    input.className = 'section-rename-input';
+    input.value = groupName;
+    input.onclick = (e) => e.stopPropagation();
+
+    const originalText = labelEl.textContent;
+    labelEl.textContent = '';
+    labelEl.appendChild(input);
+    input.focus();
+    input.select();
+
+    const finish = async (save) => {
+        const newName = input.value.trim();
+        input.removeEventListener('blur', blurHandler);
+        if (!save || !newName || newName === groupName) {
+            labelEl.textContent = originalText;
+            return;
+        }
+
+        const ids = [];
+        section.querySelectorAll('.automation-card').forEach(card => {
+            if (card.dataset.id) ids.push(parseInt(card.dataset.id));
+        });
+
+        try {
+            const res = await fetch('/api/automations/group', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ automation_ids: ids, group_name: newName })
+            });
+            const data = await res.json();
+            if (data.error) throw new Error(data.error);
+            showToast(`Renamed to "${newName}"`, 'success');
+            await loadAutomations();
+        } catch (err) {
+            showToast('Error: ' + err.message, 'error');
+            labelEl.textContent = originalText;
+        }
+    };
+
+    input.addEventListener('keydown', (e) => {
+        e.stopPropagation();
+        if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+        if (e.key === 'Escape') { finish(false); }
+    });
+    const blurHandler = () => finish(true);
+    input.addEventListener('blur', blurHandler);
+}
+
+/**
+ * Bulk toggle all automations in a group.
+ */
+async function _bulkToggleGroup(groupName, currentlyAllEnabled) {
+    const ids = [];
+    document.querySelectorAll(`.automations-section[data-group-name="${groupName}"] .automation-card`).forEach(card => {
+        if (card.dataset.id) ids.push(parseInt(card.dataset.id));
+    });
+    if (ids.length === 0) return;
+
+    const targetEnabled = !currentlyAllEnabled;
+    try {
+        const res = await fetch('/api/automations/bulk-toggle', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ automation_ids: ids, enabled: targetEnabled })
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        showToast(`${targetEnabled ? 'Enabled' : 'Disabled'} ${data.updated} automations`, 'success');
+        await loadAutomations();
+    } catch (err) { showToast('Error: ' + err.message, 'error'); }
+}
+
+// --- Global per-side automations master toggle (the big pause switch) ---
+// It gates whether ANYTHING runs on a side: scheduled slots are skipped (their
+// schedule stays alive) and event triggers are dropped. Individual enabled
+// switches are untouched, so un-pausing restores exactly what the user had.
+// Manual "Run now" still executes. Shared by the music page (side='music')
+// and the video automations page (side='video', video-automations.js).
+async function renderAutomationsMasterToggle(host, side) {
+    if (!host) return;
+    let enabled = side !== 'video';   // optimistic defaults: music on, video off
+    try {
+        const res = await fetch('/api/automations/master');
+        const data = await res.json();
+        if (data && typeof data[side] === 'boolean') enabled = data[side];
+    } catch (e) { /* keep the default */ }
+    const old = host.querySelector('.auto-master-toggle');
+    if (old) old.remove();
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'auto-master-toggle' + (enabled ? ' on' : '');
+    btn.title = enabled
+        ? 'Automations are live. Click to pause every scheduled and event run on this side — individual switches keep their state, and manual Run still works.'
+        : 'Automations are paused: nothing runs on a schedule or event. Individual switches keep their state, and manual Run still works.';
+    btn.innerHTML = '<span class="auto-master-sw"></span><span class="auto-master-label">' +
+        (enabled ? 'Automations on' : 'Automations paused') + '</span>';
+    btn.onclick = async () => {
+        btn.disabled = true;
+        try {
+            const res = await fetch('/api/automations/master', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ side, enabled: !enabled }),
+            });
+            const data = await res.json();
+            if (!data || !data.success) throw new Error((data && data.error) || 'failed');
+            showToast((side === 'video' ? 'Video' : 'Music') + ' automations ' +
+                (!enabled ? 'resumed' : 'paused'), !enabled ? 'success' : 'info');
+        } catch (e) {
+            showToast('Couldn’t update the master switch' + (e && e.message ? ': ' + e.message : ''), 'error');
+        }
+        renderAutomationsMasterToggle(host, side);
+    };
+    host.prepend(btn);
+}
+
+async function loadAutomations() {
+    const list = document.getElementById('automations-list');
+    const empty = document.getElementById('automations-empty');
+    const statsBar = document.getElementById('automations-stats');
+    if (!list || !empty) return;
+    try {
+        const res = await fetch('/api/automations');
+        const payload = await res.json();
+        if (payload.error) throw new Error(payload.error);
+        // Hide video-app automations on the MUSIC page: they live in the shared automation
+        // engine (music_library.db, owned_by='video') but belong to the separate video
+        // automations page. Pure no-op for anyone without the video side — they have no such rows.
+        const automations = (Array.isArray(payload) ? payload : []).filter(a => a.owned_by !== 'video');
+        if (!automations.length) {
+            list.innerHTML = ''; empty.style.display = '';
+            if (statsBar) { statsBar.innerHTML = ''; renderAutomationsMasterToggle(statsBar, 'music'); }
+            return;
+        }
+        empty.style.display = 'none';
+        list.innerHTML = '';
+
+        const systemAutos = automations.filter(a => a.is_system);
+        const userAutos = automations.filter(a => !a.is_system);
+
+        if (systemAutos.length) {
+            list.appendChild(_buildAutomationSection('auto-section-system', 'System', systemAutos, true, { isProtected: true }));
+        }
+
+        // Automation Hub section
+        list.appendChild(_buildAutomationHub());
+
+        // User automations — split by group
+        const groups = [...new Set(userAutos.filter(a => a.group_name).map(a => a.group_name))].sort();
+        const ungrouped = userAutos.filter(a => !a.group_name);
+        groups.forEach(g => {
+            const groupAutos = userAutos.filter(a => a.group_name === g);
+            if (groupAutos.length) {
+                list.appendChild(_buildAutomationSection('auto-section-group-' + g.replace(/\W+/g, '_'), '\uD83D\uDCC1 ' + g, groupAutos, true, { groupName: g }));
+            }
+        });
+        if (ungrouped.length) {
+            list.appendChild(_buildAutomationSection('auto-section-custom', 'My Automations', ungrouped, true));
+        }
+
+        // Stats summary bar
+        if (statsBar) {
+            const total = automations.length;
+            const active = automations.filter(a => a.enabled).length;
+            const sys = systemAutos.length;
+            const custom = userAutos.length;
+            statsBar.innerHTML = `
+                <span class="auto-stat"><strong>${active}</strong> Active</span>
+                <span class="auto-stat"><strong>${sys}</strong> System</span>
+                <span class="auto-stat"><strong>${custom}</strong> Custom</span>
+            `;
+            renderAutomationsMasterToggle(statsBar, 'music');
+        }
+
+        // Filter bar — show when 6+ automations
+        _initAutoFilterBar(automations);
+        // Catch up on current automation progress
+        try {
+            const progRes = await fetch('/api/automations/progress');
+            const progData = await progRes.json();
+            if (!progData.error) updateAutomationProgressFromData(progData);
+        } catch (e) { }
+    } catch (err) {
+        list.innerHTML = ''; empty.style.display = '';
+        if (statsBar) statsBar.innerHTML = '';
+    }
+}
+
+// --- Automation Hub ---
+
+function _buildAutomationHub() {
+    const section = document.createElement('div');
+    section.className = 'automations-section';
+    section.id = 'auto-section-hub';
+    const collapsed = localStorage.getItem('auto_section_auto-section-hub') === '1';
+    if (collapsed) section.classList.add('collapsed');
+    const header = document.createElement('div');
+    header.className = 'automations-section-header';
+    header.innerHTML = `
+        <span class="section-chevron">&#9660;</span>
+        <span class="section-label">Automation Hub</span>
+        <span class="section-count">${_hubGroups().length} pipelines · ${_hubRecipes().length} recipes</span>
+        <span class="section-line"></span>
+    `;
+    header.onclick = () => {
+        section.classList.toggle('collapsed');
+        localStorage.setItem('auto_section_auto-section-hub', section.classList.contains('collapsed') ? '1' : '0');
+    };
+    const body = document.createElement('div');
+    body.className = 'automations-section-body';
+
+    const activeTab = localStorage.getItem('auto_hub_tab') || 'pipelines';
+    const tabs = [
+        { id: 'pipelines', label: 'Pipelines' },
+        { id: 'recipes', label: 'Singles' },
+        { id: 'guides', label: 'Quick Start' },
+        { id: 'tips', label: 'Tips' },
+        { id: 'reference', label: 'Reference' },
+    ];
+
+    const tabBar = document.createElement('div');
+    tabBar.className = 'auto-hub-tabs';
+    tabs.forEach(t => {
+        const btn = document.createElement('button');
+        btn.className = 'auto-hub-tab' + (t.id === activeTab ? ' active' : '');
+        btn.textContent = t.label;
+        btn.dataset.tab = t.id;
+        btn.onclick = (e) => { e.stopPropagation(); _switchHubTab(t.id, body); };
+        tabBar.appendChild(btn);
+    });
+    body.appendChild(tabBar);
+
+    // Build all tab contents
+    const pipelinesPane = _buildHubPipelines();
+    pipelinesPane.id = 'auto-hub-pane-pipelines';
+    pipelinesPane.className = 'auto-hub-tab-content' + (activeTab === 'pipelines' ? ' active' : '');
+    body.appendChild(pipelinesPane);
+
+    const recipesPane = _buildHubRecipes();
+    recipesPane.id = 'auto-hub-pane-recipes';
+    recipesPane.className = 'auto-hub-tab-content' + (activeTab === 'recipes' ? ' active' : '');
+    body.appendChild(recipesPane);
+
+    const guidesPane = _buildHubGuides();
+    guidesPane.id = 'auto-hub-pane-guides';
+    guidesPane.className = 'auto-hub-tab-content' + (activeTab === 'guides' ? ' active' : '');
+    body.appendChild(guidesPane);
+
+    const tipsPane = _buildHubTips();
+    tipsPane.id = 'auto-hub-pane-tips';
+    tipsPane.className = 'auto-hub-tab-content' + (activeTab === 'tips' ? ' active' : '');
+    body.appendChild(tipsPane);
+
+    const refPane = _buildHubReference();
+    refPane.id = 'auto-hub-pane-reference';
+    refPane.className = 'auto-hub-tab-content' + (activeTab === 'reference' ? ' active' : '');
+    body.appendChild(refPane);
+
+    section.appendChild(header);
+    section.appendChild(body);
+    return section;
+}
+
+function _switchHubTab(tabId, bodyEl) {
+    const container = bodyEl || document.querySelector('#auto-section-hub .automations-section-body');
+    if (!container) return;
+    container.querySelectorAll('.auto-hub-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tabId));
+    container.querySelectorAll('.auto-hub-tab-content').forEach(p => p.classList.toggle('active', p.id === 'auto-hub-pane-' + tabId));
+    localStorage.setItem('auto_hub_tab', tabId);
+}
+
+function _buildHubPipelines() {
+    const pane = document.createElement('div');
+
+    const intro = document.createElement('div');
+    intro.className = 'auto-hub-pipeline-intro';
+    intro.innerHTML = 'One-click deployment — each pipeline creates multiple linked automations that work together.';
+    pane.appendChild(intro);
+
+    const grid = document.createElement('div');
+    grid.className = 'auto-hub-pipeline-grid';
+
+    _hubGroups().forEach(group => {
+        const card = document.createElement('div');
+        card.className = 'auto-hub-pipeline-card';
+        card.style.setProperty('--pipeline-color', group.color);
+
+        // Pipeline flow visualization
+        const stepsHtml = group.steps.map((step, i) => {
+            const nodeClass = step.type === 'notify' ? 'pipeline-node-notify' : 'pipeline-node-action';
+            return (i > 0 ? '<span class="pipeline-connector"></span>' : '') +
+                `<div class="pipeline-node ${nodeClass}">
+                    <span class="pipeline-node-icon">${step.icon}</span>
+                    <span class="pipeline-node-label">${step.label}</span>
+                </div>`;
+        }).join('');
+
+        card.innerHTML = `
+            <div class="pipeline-card-top">
+                <span class="pipeline-card-icon">${group.icon}</span>
+                <div class="pipeline-card-title-row">
+                    <div class="pipeline-card-name">${group.name}</div>
+                    <span class="pipeline-card-badge">${group.badge}</span>
+                </div>
+            </div>
+            <div class="pipeline-card-desc">${group.desc}</div>
+            <div class="pipeline-flow">${stepsHtml}</div>
+            <div class="pipeline-card-footer">
+                <button class="pipeline-deploy-btn" onclick="event.stopPropagation(); deployHubGroup('${group.id}')">Deploy Pipeline</button>
+            </div>
+        `;
+
+        card.addEventListener('click', (e) => {
+            if (e.target.closest('.pipeline-deploy-btn')) return;
+            showPipelineDetail(group.id);
+        });
+
+        grid.appendChild(card);
+    });
+
+    pane.appendChild(grid);
+    return pane;
+}
+
+function showPipelineDetail(groupId) {
+    const group = _hubGroups().find(g => g.id === groupId);
+    if (!group) return;
+
+    // Build automation detail list
+    const autoDetails = group.automations.map((auto, i) => {
+        const triggerLabel = _autoFormatTrigger(auto.trigger_type, auto.trigger_config);
+        const actionLabel = _autoFormatAction(auto.action_type);
+        const thenLabels = auto.then_actions.map(t => {
+            if (t.type === 'fire_signal') return `⚡ Signal: ${t.config.signal_name}`;
+            return _autoFormatNotify(t.type);
+        });
+        if (auto.needs_notify) thenLabels.push('🔔 Your notification');
+
+        return `
+            <div class="pipeline-detail-auto" style="--step-color: ${group.color}">
+                <div class="pipeline-detail-step-num">${i + 1}</div>
+                <div class="pipeline-detail-step-body">
+                    <div class="pipeline-detail-step-name">${auto.name}</div>
+                    <div class="pipeline-detail-step-flow">
+                        <span class="pipeline-detail-tag when">WHEN</span>
+                        <span class="pipeline-detail-tag-value">${_esc(triggerLabel)}</span>
+                        <span class="pipeline-detail-tag do">DO</span>
+                        <span class="pipeline-detail-tag-value">${_esc(actionLabel)}</span>
+                        ${thenLabels.length ? `<span class="pipeline-detail-tag then">THEN</span><span class="pipeline-detail-tag-value">${thenLabels.map(t => _esc(t)).join(', ')}</span>` : ''}
+                    </div>
+                </div>
+            </div>`;
+    }).join('');
+
+    // Build flow diagram
+    const flowHtml = group.steps.map((step, i) => {
+        const nodeClass = step.type === 'notify' ? 'pipeline-node-notify' : 'pipeline-node-action';
+        return (i > 0 ? '<span class="pipeline-connector"></span>' : '') +
+            `<div class="pipeline-node ${nodeClass}">
+                <span class="pipeline-node-icon">${step.icon}</span>
+                <span class="pipeline-node-label">${step.label}</span>
+            </div>`;
+    }).join('');
+
+    const overlay = document.createElement('div');
+    overlay.className = 'pipeline-detail-overlay';
+    overlay.innerHTML = `
+        <div class="pipeline-detail-modal" style="--pipeline-color: ${group.color}">
+            <button class="pipeline-detail-close" onclick="this.closest('.pipeline-detail-overlay').remove()">&times;</button>
+            <div class="pipeline-detail-header">
+                <span class="pipeline-detail-icon">${group.icon}</span>
+                <div>
+                    <div class="pipeline-detail-title">${group.name}</div>
+                    <div class="pipeline-detail-desc">${group.desc}</div>
+                </div>
+            </div>
+            <div class="pipeline-detail-flow" style="--pipeline-color: ${group.color}">${flowHtml}</div>
+            <div class="pipeline-detail-section-title">How It Works</div>
+            <div class="pipeline-detail-section-desc">This pipeline deploys ${group.automations.length} automations${group.automations.some(a => a.then_actions.some(t => t.type === 'fire_signal')) ? ' linked by signals — each step triggers the next automatically' : ' running on independent schedules'}.</div>
+            <div class="pipeline-detail-autos">${autoDetails}</div>
+            <button class="pipeline-deploy-btn" style="--pipeline-color: ${group.color}; margin-top: 8px;" onclick="this.closest('.pipeline-detail-overlay').remove(); deployHubGroup('${group.id}')">Deploy Pipeline</button>
+        </div>
+    `;
+
+    overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) overlay.remove();
+    });
+
+    document.body.appendChild(overlay);
+}
+
+function _buildHubRecipes() {
+    const pane = document.createElement('div');
+    const categories = ['All', 'Sync', 'Discovery', 'Maintenance', 'Alerts', 'Chains'];
+    const difficulties = ['All', 'Beginner', 'Intermediate', 'Advanced'];
+
+    let activeCat = 'All', activeDiff = 'All';
+
+    // Category filters
+    const catFilters = document.createElement('div');
+    catFilters.className = 'auto-hub-filters';
+    categories.forEach(c => {
+        const pill = document.createElement('button');
+        pill.className = 'auto-hub-filter-pill' + (c === 'All' ? ' active' : '');
+        pill.textContent = c;
+        pill.dataset.filter = c;
+        pill.dataset.filterType = 'category';
+        pill.onclick = () => {
+            activeCat = c;
+            catFilters.querySelectorAll('.auto-hub-filter-pill').forEach(p => p.classList.toggle('active', p.dataset.filter === c));
+            filterRecipes();
+        };
+        catFilters.appendChild(pill);
+    });
+    pane.appendChild(catFilters);
+
+    // Difficulty filters
+    const diffFilters = document.createElement('div');
+    diffFilters.className = 'auto-hub-filters';
+    difficulties.forEach(d => {
+        const pill = document.createElement('button');
+        pill.className = 'auto-hub-filter-pill' + (d === 'All' ? ' active' : '');
+        pill.textContent = d;
+        pill.dataset.filter = d;
+        pill.dataset.filterType = 'difficulty';
+        pill.onclick = () => {
+            activeDiff = d;
+            diffFilters.querySelectorAll('.auto-hub-filter-pill').forEach(p => p.classList.toggle('active', p.dataset.filter === d));
+            filterRecipes();
+        };
+        diffFilters.appendChild(pill);
+    });
+    pane.appendChild(diffFilters);
+
+    const grid = document.createElement('div');
+    grid.className = 'auto-hub-recipes-grid';
+
+    _hubRecipes().forEach(r => {
+        const card = document.createElement('div');
+        card.className = 'auto-hub-recipe-card';
+        card.dataset.category = r.category;
+        card.dataset.difficulty = r.difficulty;
+
+        const trigLabel = _autoFormatTrigger(r.when.type, r.when.config);
+        const actLabel = _autoFormatAction(r.do.type);
+
+        let chainHTML = '';
+        if (r.chain) {
+            chainHTML = '<div class="auto-hub-recipe-chain">' + r.chain.map((step, i) => {
+                let cls = 'flow-action';
+                if (i === 0) cls = 'flow-trigger';
+                else if (step.startsWith('\u26A1')) cls = 'flow-notify';
+                return (i > 0 ? '<span class="flow-arrow">&rarr;</span>' : '') +
+                    `<span class="${cls}">${_esc(step)}</span>`;
+            }).join('') + '</div>';
+        } else {
+            chainHTML = `<div class="auto-hub-recipe-chain">
+                <span class="flow-trigger">${_esc(trigLabel)}</span>
+                <span class="flow-arrow">&rarr;</span>
+                <span class="flow-action">${_esc(actLabel)}</span>
+                ${r.then.length ? r.then.map(th => `<span class="flow-arrow">&rarr;</span><span class="flow-notify">${_esc(_autoFormatNotify(th.type))}</span>`).join('') : ''}
+            </div>`;
+        }
+
+        card.innerHTML = `
+            <div class="auto-hub-recipe-header">
+                <div class="auto-hub-recipe-icon">${r.icon}</div>
+                <div class="auto-hub-recipe-name">${_esc(r.name)}</div>
+                <span class="auto-hub-badge ${r.difficulty}">${_esc(r.difficulty)}</span>
+            </div>
+            <div class="auto-hub-recipe-desc">${_esc(r.desc)}</div>
+            ${chainHTML}
+            ${r.note ? `<div class="auto-hub-recipe-note">${_esc(r.note)}</div>` : ''}
+            <button class="auto-hub-recipe-use" onclick="event.stopPropagation(); useHubRecipe('${r.id}')">Use This</button>
+        `;
+        card.onclick = () => useHubRecipe(r.id);
+        grid.appendChild(card);
+    });
+    pane.appendChild(grid);
+
+    function filterRecipes() {
+        grid.querySelectorAll('.auto-hub-recipe-card').forEach(card => {
+            const catMatch = activeCat === 'All' || card.dataset.category === activeCat;
+            const diffMatch = activeDiff === 'All' || card.dataset.difficulty === activeDiff.toLowerCase();
+            card.style.display = (catMatch && diffMatch) ? '' : 'none';
+        });
+    }
+
+    return pane;
+}
+
+function _buildHubGuides() {
+    const pane = document.createElement('div');
+
+    const callout = document.createElement('div');
+    callout.className = 'auto-hub-callout';
+    callout.innerHTML = '<span class="auto-hub-callout-icon">\uD83D\uDCA1</span><span>Click any guide to expand step-by-step instructions. Related recipes let you jump straight to a pre-filled template.</span>';
+    pane.appendChild(callout);
+
+    _hubGuides().forEach(g => {
+        const card = document.createElement('div');
+        card.className = 'auto-hub-guide-card';
+
+        const headerEl = document.createElement('div');
+        headerEl.className = 'auto-hub-guide-header';
+        headerEl.innerHTML = `
+            <span class="auto-hub-guide-icon">${g.icon}</span>
+            <span class="auto-hub-guide-title">${_esc(g.title)}</span>
+            <span class="auto-hub-badge ${g.difficulty}">${_esc(g.difficulty)}</span>
+            <span class="auto-hub-guide-chevron">&#9660;</span>
+        `;
+        headerEl.onclick = () => card.classList.toggle('expanded');
+        card.appendChild(headerEl);
+
+        const bodyEl = document.createElement('div');
+        bodyEl.className = 'auto-hub-guide-body';
+        bodyEl.innerHTML = `
+            <div class="auto-hub-guide-subtitle">${_esc(g.subtitle)}</div>
+            <ol class="auto-hub-steps">${g.steps.map(s => `<li>${s}</li>`).join('')}</ol>
+            ${g.relatedRecipes.length ? `
+                <div class="auto-hub-guide-related">
+                    <span class="auto-hub-guide-related-label">Related:</span>
+                    ${g.relatedRecipes.map(rId => {
+            const recipe = _hubRecipes().find(r => r.id === rId);
+            return recipe ? `<button class="auto-hub-guide-related-link" onclick="event.stopPropagation(); useHubRecipe('${rId}')">${recipe.icon} ${_esc(recipe.name)}</button>` : '';
+        }).join('')}
+                </div>
+            ` : ''}
+        `;
+        card.appendChild(bodyEl);
+        pane.appendChild(card);
+    });
+
+    return pane;
+}
+
+function _buildHubTips() {
+    const pane = document.createElement('div');
+
+    const callout = document.createElement('div');
+    callout.className = 'auto-hub-callout';
+    callout.innerHTML = '<span class="auto-hub-callout-icon">\u2728</span><span>Power-user tips to get the most out of your automations.</span>';
+    pane.appendChild(callout);
+
+    const grid = document.createElement('div');
+    grid.className = 'auto-hub-tips-grid';
+    _hubTips().forEach(t => {
+        const card = document.createElement('div');
+        card.className = 'auto-hub-tip-card';
+        card.innerHTML = `
+            <div class="auto-hub-tip-header">
+                <span class="auto-hub-tip-icon">${t.icon}</span>
+                <span class="auto-hub-tip-title">${_esc(t.title)}</span>
+                <span class="auto-hub-tip-tag">${_esc(t.tag)}</span>
+            </div>
+            <div class="auto-hub-tip-body">${t.body}</div>
+        `;
+        grid.appendChild(card);
+    });
+    pane.appendChild(grid);
+    return pane;
+}
+
+function _buildHubReference() {
+    const pane = document.createElement('div');
+    const sections = [
+        { label: 'Triggers (WHEN)', data: _hubReference().triggers },
+        { label: 'Actions (DO)', data: _hubReference().actions },
+        { label: 'Then Actions (THEN)', data: _hubReference().thenActions },
+    ];
+
+    sections.forEach(sec => {
+        const totalItems = sec.data.reduce((n, g) => n + g.items.length, 0);
+        const group = document.createElement('div');
+        group.className = 'auto-hub-ref-group';
+
+        const header = document.createElement('div');
+        header.className = 'auto-hub-ref-group-header';
+        header.innerHTML = `
+            <span class="auto-hub-ref-group-label">${_esc(sec.label)}</span>
+            <span class="auto-hub-ref-group-count">${totalItems}</span>
+            <span class="auto-hub-ref-chevron">&#9660;</span>
+        `;
+        header.onclick = () => group.classList.toggle('expanded');
+        group.appendChild(header);
+
+        const body = document.createElement('div');
+        body.className = 'auto-hub-ref-body';
+        sec.data.forEach(sub => {
+            body.innerHTML += `<div class="auto-hub-ref-subheader">${_esc(sub.group)}</div>`;
+            let tableHTML = '<table class="auto-hub-table"><thead><tr><th>Type</th><th>Description</th></tr></thead><tbody>';
+            sub.items.forEach(item => {
+                tableHTML += `<tr><td>${_esc(item.label)}</td><td>${_esc(item.desc)}</td></tr>`;
+            });
+            tableHTML += '</tbody></table>';
+            body.innerHTML += tableHTML;
+        });
+        group.appendChild(body);
+        pane.appendChild(group);
+    });
+    return pane;
+}
+
+async function useHubRecipe(recipeId) {
+    const t = _hubRecipes().find(r => r.id === recipeId);
+    if (!t) return;
+    await (_hubIsVideo() ? showVideoAutomationBuilder() : showAutomationBuilder());
+    _bEl('name').value = t.name;
+    _autoBuilder.when = { type: t.when.type, config: JSON.parse(JSON.stringify(t.when.config)) };
+    _autoBuilder.do = { type: t.do.type, config: JSON.parse(JSON.stringify(t.do.config)) };
+    _autoBuilder.then = t.then.map(th => ({ type: th.type, config: JSON.parse(JSON.stringify(th.config)) }));
+    _renderBuilderSidebar();
+    _renderBuilderCanvas();
+    if (t.note) {
+        showToast(t.note, 'info');
+    }
+}
+
+async function deployHubGroup(groupId) {
+    const group = _hubGroups().find(g => g.id === groupId);
+    if (!group) return;
+
+    // Check if any automations need notifications — prompt for config
+    const needsNotify = group.automations.some(a => a.needs_notify);
+    let notifyConfig = null;
+
+    if (needsNotify) {
+        notifyConfig = await _promptNotifyConfig(group.name);
+        if (notifyConfig === null) return; // User cancelled
+        if (notifyConfig === false) notifyConfig = null; // Skip notifications, still deploy
+    }
+
+    // Deploy all automations in the group
+    let created = 0, failed = 0;
+    for (const auto of group.automations) {
+        try {
+            const payload = {
+                name: auto.name,
+                trigger_type: auto.trigger_type,
+                trigger_config: auto.trigger_config,
+                action_type: auto.action_type,
+                action_config: auto.action_config,
+                then_actions: [...auto.then_actions],
+                group_name: auto.group_name,
+                enabled: true,
+            };
+            if (_hubIsVideo()) payload.owned_by = 'video';
+
+            // Inject notification config for automations that need it
+            if (auto.needs_notify && notifyConfig) {
+                payload.then_actions.push(notifyConfig);
+            }
+
+            const response = await fetch('/api/automations', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+
+            if (response.ok) {
+                created++;
+            } else {
+                const err = await response.json();
+                console.error(`Failed to create "${auto.name}":`, err);
+                failed++;
+            }
+        } catch (e) {
+            console.error(`Error creating "${auto.name}":`, e);
+            failed++;
+        }
+    }
+
+    if (created > 0) {
+        showToast(`Deployed "${group.name}" — ${created} automation${created > 1 ? 's' : ''} created${failed ? `, ${failed} failed` : ''}`, 'success');
+        loadAutomations();
+    } else {
+        showToast(`Failed to deploy "${group.name}"`, 'error');
+    }
+}
+
+function _promptNotifyConfig(groupName) {
+    return new Promise(resolve => {
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:10000;display:flex;align-items:center;justify-content:center;';
+
+        overlay.innerHTML = `
+            <div style="background:var(--bg-secondary, #1e1e2e);border:1px solid rgba(255,255,255,0.1);border-radius:14px;padding:28px;max-width:420px;width:90%;color:var(--text-primary, #fff);font-family:inherit;">
+                <h3 style="margin:0 0 6px;font-size:1.1em;">Configure Notifications</h3>
+                <p style="margin:0 0 18px;font-size:0.85em;opacity:0.5;">${groupName} includes notification steps. Choose how to get notified.</p>
+                <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:18px;">
+                    <label style="font-size:0.85em;opacity:0.7;">Notification Type</label>
+                    <select id="deploy-notify-type" style="padding:9px 12px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.08);border-radius:8px;color:#fff;font-size:0.9em;">
+                        <option value="discord_webhook">Discord Webhook</option>
+                        <option value="telegram">Telegram</option>
+                        <option value="pushbullet">Pushbullet</option>
+                        <option value="none">Skip Notifications</option>
+                    </select>
+                    <div id="deploy-notify-fields"></div>
+                </div>
+                <div style="display:flex;gap:10px;justify-content:flex-end;">
+                    <button id="deploy-notify-cancel" style="padding:8px 20px;border:1px solid rgba(255,255,255,0.1);border-radius:8px;background:transparent;color:rgba(255,255,255,0.7);cursor:pointer;font-size:0.88em;">Cancel</button>
+                    <button id="deploy-notify-confirm" style="padding:8px 20px;border:none;border-radius:8px;background:var(--accent-color,#1db954);color:#fff;cursor:pointer;font-size:0.88em;font-weight:600;">Deploy</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(overlay);
+
+        const typeSelect = overlay.querySelector('#deploy-notify-type');
+        const fieldsDiv = overlay.querySelector('#deploy-notify-fields');
+
+        function updateFields() {
+            const type = typeSelect.value;
+            if (type === 'discord_webhook') {
+                fieldsDiv.innerHTML = '<input id="deploy-notify-url" type="text" placeholder="Discord Webhook URL" style="width:100%;padding:9px 12px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.08);border-radius:8px;color:#fff;font-size:0.88em;margin-top:6px;box-sizing:border-box;">';
+            } else if (type === 'telegram') {
+                fieldsDiv.innerHTML = '<input id="deploy-notify-token" type="text" placeholder="Bot Token" style="width:100%;padding:9px 12px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.08);border-radius:8px;color:#fff;font-size:0.88em;margin-top:6px;box-sizing:border-box;"><input id="deploy-notify-chat" type="text" placeholder="Chat ID" style="width:100%;padding:9px 12px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.08);border-radius:8px;color:#fff;font-size:0.88em;margin-top:6px;box-sizing:border-box;"><input id="deploy-notify-thread" type="text" placeholder="Thread ID" style="width:100%;padding:9px 12px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.08);border-radius:8px;color:#fff;font-size:0.88em;margin-top:6px;box-sizing:border-box;">';
+            } else if (type === 'pushbullet') {
+                fieldsDiv.innerHTML = '<input id="deploy-notify-token" type="text" placeholder="Access Token" style="width:100%;padding:9px 12px;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.08);border-radius:8px;color:#fff;font-size:0.88em;margin-top:6px;box-sizing:border-box;">';
+            } else {
+                fieldsDiv.innerHTML = '';
+            }
+        }
+        typeSelect.addEventListener('change', updateFields);
+        updateFields();
+
+        overlay.querySelector('#deploy-notify-cancel').addEventListener('click', () => {
+            document.body.removeChild(overlay);
+            resolve(null);
+        });
+
+        overlay.querySelector('#deploy-notify-confirm').addEventListener('click', () => {
+            const type = typeSelect.value;
+            let config = {};
+            if (type === 'discord_webhook') {
+                config = { webhook_url: (overlay.querySelector('#deploy-notify-url')?.value || '').trim() };
+            } else if (type === 'telegram') {
+                config = { bot_token: (overlay.querySelector('#deploy-notify-token')?.value || '').trim(), chat_id: (overlay.querySelector('#deploy-notify-chat')?.value || '').trim(), thread_id: (overlay.querySelector('#deploy-notify-thread')?.value || '').trim() };
+            } else if (type === 'pushbullet') {
+                config = { access_token: (overlay.querySelector('#deploy-notify-token')?.value || '').trim() };
+            } else {
+                document.body.removeChild(overlay);
+                resolve(false); // Skip notifications but still deploy
+                return;
+            }
+            document.body.removeChild(overlay);
+            resolve({ type, config });
+        });
+
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) { document.body.removeChild(overlay); resolve(null); }
+        });
+    });
+}
+
+// --- Filter Bar ---
+function _initAutoFilterBar(automations) {
+    const bar = document.getElementById('auto-filter-bar');
+    if (!bar) return;
+    if (automations.length < 7) { bar.style.display = 'none'; return; }
+    bar.style.display = '';
+
+    // Populate trigger dropdown
+    const trigSel = document.getElementById('auto-filter-trigger');
+    const actSel = document.getElementById('auto-filter-action');
+    const trigTypes = [...new Set(automations.map(a => a.trigger_type))].sort();
+    const actTypes = [...new Set(automations.map(a => a.action_type))].sort();
+    const prevTrig = trigSel.value;
+    const prevAct = actSel.value;
+    trigSel.innerHTML = '<option value="">All Triggers</option>' + trigTypes.map(t =>
+        `<option value="${_escAttr(t)}">${_esc(_autoFormatTrigger(t, {}))}</option>`).join('');
+    actSel.innerHTML = '<option value="">All Actions</option>' + actTypes.map(t =>
+        `<option value="${_escAttr(t)}">${_esc(_autoFormatAction(t))}</option>`).join('');
+    trigSel.value = prevTrig;
+    actSel.value = prevAct;
+
+    // Bind events (use a flag to avoid double-binding)
+    if (!bar.dataset.bound) {
+        bar.dataset.bound = '1';
+        document.getElementById('auto-filter-search').addEventListener('input', _filterAutomations);
+        trigSel.addEventListener('change', _filterAutomations);
+        actSel.addEventListener('change', _filterAutomations);
+    }
+    _filterAutomations();
+}
+
+function _filterAutomations() {
+    const q = (document.getElementById('auto-filter-search').value || '').toLowerCase().trim();
+    const trigFilter = document.getElementById('auto-filter-trigger').value;
+    const actFilter = document.getElementById('auto-filter-action').value;
+    const cards = document.querySelectorAll('#automations-list .automation-card');
+    let visible = 0;
+    cards.forEach(card => {
+        const name = (card.querySelector('.automation-name')?.textContent || '').toLowerCase();
+        const trig = card.querySelector('.flow-trigger')?.textContent || '';
+        const act = card.querySelector('.flow-action')?.textContent || '';
+        // Match search text against name, trigger label, action label
+        const matchQ = !q || name.includes(q) || trig.toLowerCase().includes(q) || act.toLowerCase().includes(q);
+        // Match trigger/action type filters using data attributes
+        const matchTrig = !trigFilter || card.dataset.triggerType === trigFilter;
+        const matchAct = !actFilter || card.dataset.actionType === actFilter;
+        const show = matchQ && matchTrig && matchAct;
+        card.style.display = show ? '' : 'none';
+        if (show) visible++;
+    });
+    const countEl = document.getElementById('auto-filter-count');
+    if (countEl) {
+        countEl.textContent = (q || trigFilter || actFilter) ? `${visible} of ${cards.length}` : '';
+    }
+}
+
+// --- Group Dropdown ---
+let _activeGroupDropdown = null;
+
+function _showGroupDropdown(event, autoId, currentGroup) {
+    // Close any existing dropdown
+    _closeGroupDropdown();
+
+    const btn = event.currentTarget;
+    const card = btn.closest('.automation-card');
+    if (!card) return;
+
+    // Collect all existing group names from visible cards
+    const allGroups = new Set();
+    document.querySelectorAll('#automations-list .automation-card .automation-group-btn[data-group]').forEach(b => {
+        const g = b.dataset.group;
+        if (g) allGroups.add(g);
+    });
+
+    const dropdown = document.createElement('div');
+    dropdown.className = 'auto-group-dropdown';
+
+    let html = '';
+    if (currentGroup) {
+        html += `<div class="auto-group-option ungroup" onclick="_assignGroup(${autoId}, null)">Remove from group</div>`;
+        html += '<div class="auto-group-divider"></div>';
+    }
+    allGroups.forEach(g => {
+        const isActive = g === currentGroup;
+        html += `<div class="auto-group-option${isActive ? ' active' : ''}" onclick="_assignGroup(${autoId}, '${_escJs(g)}')">${_esc(g)}</div>`;
+    });
+    if (allGroups.size) html += '<div class="auto-group-divider"></div>';
+    html += `<input class="auto-group-input" placeholder="New group name..." onkeydown="if(event.key==='Enter'){_assignGroup(${autoId}, this.value.trim()); event.preventDefault();}">`;
+
+    dropdown.innerHTML = html;
+
+    // Position dropdown on document.body to avoid overflow:hidden clipping
+    const rect = btn.getBoundingClientRect();
+    dropdown.style.position = 'fixed';
+    dropdown.style.right = (window.innerWidth - rect.right) + 'px';
+    dropdown.style.left = 'auto';
+    document.body.appendChild(dropdown);
+    _activeGroupDropdown = dropdown;
+
+    // Open upward if not enough room below
+    const dropdownHeight = dropdown.offsetHeight;
+    if (rect.bottom + 4 + dropdownHeight > window.innerHeight && rect.top - 4 - dropdownHeight > 0) {
+        dropdown.style.top = (rect.top - 4 - dropdownHeight) + 'px';
+    } else {
+        dropdown.style.top = (rect.bottom + 4) + 'px';
+    }
+
+    // Focus the input
+    setTimeout(() => dropdown.querySelector('.auto-group-input')?.focus(), 50);
+
+    // Close on outside click
+    const handler = (e) => {
+        if (!dropdown.contains(e.target) && e.target !== btn) {
+            _closeGroupDropdown();
+            document.removeEventListener('click', handler, true);
+        }
+    };
+    setTimeout(() => document.addEventListener('click', handler, true), 10);
+}
+
+function _closeGroupDropdown() {
+    if (_activeGroupDropdown) {
+        _activeGroupDropdown.remove();
+        _activeGroupDropdown = null;
+    }
+}
+
+async function _assignGroup(autoId, groupName) {
+    _closeGroupDropdown();
+    try {
+        const res = await fetch('/api/automations/' + autoId, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ group_name: groupName || null })
+        });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        showToast(groupName ? `Moved to "${groupName}"` : 'Removed from group', 'success');
+        await loadAutomations();
+    } catch (err) { showToast('Error: ' + err.message, 'error'); }
+}
+
+function renderAutomationCard(a) {
+    const card = document.createElement('div');
+    card.className = 'automation-card' + (a.enabled ? '' : ' disabled') + (a.is_system ? ' system' : '');
+    card.dataset.id = a.id;
+    card.dataset.triggerType = a.trigger_type || '';
+    card.dataset.actionType = a.action_type || '';
+
+    // Drag-and-drop (non-system only)
+    if (!a.is_system) {
+        card.draggable = true;
+        card.addEventListener('dragstart', (e) => {
+            _autoDragState = { id: a.id, groupName: a.group_name || null };
+            e.dataTransfer.setData('text/plain', String(a.id));
+            e.dataTransfer.effectAllowed = 'move';
+            card.classList.add('dragging');
+            // Dim protected sections during drag
+            document.querySelectorAll('.section-protected').forEach(s => s.classList.add('no-drop'));
+        });
+        card.addEventListener('dragend', () => {
+            card.classList.remove('dragging');
+            _autoDragState = null;
+            _autoDragEnterCount = 0;
+            document.querySelectorAll('.drop-target').forEach(el => el.classList.remove('drop-target'));
+            document.querySelectorAll('.no-drop').forEach(el => el.classList.remove('no-drop'));
+            if (_autoDragExpandTimer) { clearTimeout(_autoDragExpandTimer); _autoDragExpandTimer = null; }
+        });
+    }
+    const tIcon = _autoIcons[a.trigger_type] || '\u2699\uFE0F';
+    const aIcon = _autoIcons[a.action_type] || '\u2699\uFE0F';
+    const tl = tIcon + ' ' + _autoFormatTrigger(a.trigger_type, a.trigger_config);
+    const al = aIcon + ' ' + _autoFormatAction(a.action_type);
+    const thenItems = a.then_actions || [];
+    const actionDelay = a.action_config && a.action_config.delay ? a.action_config.delay : 0;
+    const metaParts = [];
+    if (a.last_run) metaParts.push('Last: ' + _autoTimeAgo(a.last_run));
+    const _timerTriggers = ['schedule', 'daily_time', 'weekly_time'];
+    if (a.next_run && a.enabled && _timerTriggers.includes(a.trigger_type)) metaParts.push('<span class="auto-next-run" data-next="' + _escAttr(a.next_run) + '">Next: ' + _autoTimeUntil(a.next_run) + '</span>');
+    if (!_timerTriggers.includes(a.trigger_type) && a.enabled) metaParts.push('Listening');
+    if (a.run_count) metaParts.push('<span class="auto-runs-link" onclick="event.stopPropagation(); showAutomationHistory(' + a.id + ', \'' + _escJs(a.name) + '\', \'' + _escJs(a.action_type || '') + '\')" title="View run history">Runs: ' + a.run_count + '</span>');
+    if (a.last_error) metaParts.push('Error: ' + _esc(a.last_error));
+
+    const dupeBtn = a.is_system ? '' :
+        `<button class="automation-dupe-btn" title="Duplicate" onclick="event.stopPropagation(); duplicateAutomation(${a.id})">&#128203;</button>`;
+    const groupBtn = a.is_system ? '' :
+        `<button class="automation-group-btn${a.group_name ? ' grouped' : ''}" data-group="${_escAttr(a.group_name || '')}" title="${a.group_name ? 'Group: ' + _escAttr(a.group_name) : 'Assign group'}" onclick="event.stopPropagation(); _showGroupDropdown(event, ${a.id}, ${a.group_name ? "'" + _escJs(a.group_name) + "'" : 'null'})">&#128193;</button>`;
+    const deleteBtn = a.is_system ? '' :
+        `<button class="automation-delete-btn" title="Delete" onclick="event.stopPropagation(); deleteAutomation(${a.id}, '${_escJs(a.name)}')">&#128465;</button>`;
+
+    card.innerHTML = `
+        <div class="automation-status ${a.enabled ? 'enabled' : 'disabled'}"></div>
+        <div class="automation-info">
+            <div class="automation-name">${_esc(a.name)}</div>
+            <div class="automation-flow">
+                <span class="flow-trigger">${_esc(tl)}</span>
+                <span class="flow-arrow">&rarr;</span>
+                ${actionDelay ? `<span class="flow-delay">\u23F3 ${actionDelay}m</span><span class="flow-arrow">&rarr;</span>` : ''}
+                <span class="flow-action">${_esc(al)}</span>
+                ${thenItems.length ? thenItems.map(t => `<span class="flow-arrow">&rarr;</span><span class="flow-notify">${_esc(_autoFormatNotify(t.type))}</span>`).join('') : ''}
+            </div>
+            <div class="automation-meta">${metaParts.join(' &middot; ')}</div>
+        </div>
+        <div class="automation-actions">
+            <button class="automation-run-btn" title="Run now" onclick="event.stopPropagation(); runAutomation(${a.id})">&#9654;</button>
+            <label class="automation-toggle" onclick="event.stopPropagation();">
+                <input type="checkbox" ${a.enabled ? 'checked' : ''} onchange="toggleAutomation(${a.id})">
+                <span class="toggle-slider"></span>
+            </label>
+            <button class="automation-edit-btn" title="Edit" onclick="event.stopPropagation(); editAutomation(${a.id})">&#9881;</button>
+            ${dupeBtn}
+            ${groupBtn}
+            ${deleteBtn}
+        </div>
+    `;
+    return card;
+}
+
+function _autoFormatTrigger(type, config) {
+    if (type === 'schedule' && config) return 'Every ' + (config.interval || 1) + ' ' + (config.unit || 'hours');
+    if (type === 'daily_time' && config) return 'Daily at ' + (config.time || '00:00');
+    if (type === 'weekly_time' && config) {
+        const days = (config.days || []).map(d => d.charAt(0).toUpperCase() + d.slice(1)).join(', ');
+        return (days || 'Every day') + ' at ' + (config.time || '00:00');
+    }
+    if (type === 'signal_received' && config) {
+        const sig = config.signal_name || 'unknown';
+        return 'Signal: ' + sig;
+    }
+    const labels = {
+        app_started: 'App Started', track_downloaded: 'Track Downloaded', batch_complete: 'Batch Complete',
+        watchlist_new_release: 'New Release Found', playlist_synced: 'Playlist Synced',
+        playlist_changed: 'Playlist Changed', discovery_completed: 'Discovery Complete',
+        wishlist_processing_completed: 'Wishlist Processed', watchlist_scan_completed: 'Watchlist Scan Done',
+        database_update_completed: 'Database Updated', download_failed: 'Download Failed',
+        download_quarantined: 'File Quarantined', wishlist_item_added: 'Wishlist Item Added',
+        watchlist_artist_added: 'Artist Watched', watchlist_artist_removed: 'Artist Unwatched',
+        import_completed: 'Import Complete', mirrored_playlist_created: 'Playlist Mirrored',
+        quality_scan_completed: 'Quality Scan Done', duplicate_scan_completed: 'Duplicate Scan Done',
+        library_scan_completed: 'Library Scan Done', signal_received: 'Signal Received'
+    };
+    let label = labels[type] || type || 'Unknown';
+    if (config && config.conditions && config.conditions.length) {
+        const first = config.conditions[0];
+        label += ' (' + first.field + ' ' + first.operator + ' "' + first.value + '"' +
+            (config.conditions.length > 1 ? ' +' + (config.conditions.length - 1) + ' more' : '') + ')';
+    }
+    return label;
+}
+function _autoFormatAction(type) {
+    const labels = {
+        process_wishlist: 'Process Wishlist', scan_watchlist: 'Scan Watchlist',
+        scan_library: 'Scan Library', refresh_mirrored: 'Refresh Mirrored',
+        sync_playlist: 'Sync Playlist', discover_playlist: 'Discover Playlist',
+        notify_only: 'Notify Only',
+        start_database_update: 'Update Database', run_duplicate_cleaner: 'Run Duplicate Cleaner',
+        clear_quarantine: 'Clear Quarantine', cleanup_wishlist: 'Clean Up Wishlist',
+        update_discovery_pool: 'Update Discovery', start_quality_scan: 'Run Quality Scan',
+        backup_database: 'Backup Database',
+        refresh_beatport_cache: 'Refresh Beatport Cache', clean_search_history: 'Clean Search History',
+        clean_completed_downloads: 'Clean Completed Downloads',
+        full_cleanup: 'Full Cleanup',
+        playlist_pipeline: 'Playlist Pipeline',
+        // Video side
+        video_scan_library: 'Scan Video Library', video_scan_server: 'Scan Video Server',
+        video_update_database: 'Update Video Database', video_update_database_hourly: 'Update Video Database (Hourly)',
+        video_add_airing_episodes: 'Wishlist Airing Episodes',
+        video_deep_scan_movies: 'Deep Scan Movie Library', video_deep_scan_tv: 'Deep Scan TV Library',
+        video_scan_watchlist_people: 'Scan Watchlist People',
+        video_scan_watchlist_studios: 'Scan Watchlist Studios',
+        video_scan_watchlist_channels: 'Scan Watchlist Channels',
+        video_scan_watchlist_playlists: 'Scan Watchlist Playlists',
+        video_process_movie_wishlist: 'Process Movie Wishlist',
+        video_process_episode_wishlist: 'Process Episode Wishlist',
+        video_process_youtube_wishlist: 'Process YouTube Wishlist',
+        video_refresh_airing_schedules: 'Refresh Airing Schedules',
+        video_reenrich_stale: 'Refresh Stale Metadata',
+        video_clean_youtube_episodes: 'Clean Old YouTube Episodes',
+        video_clean_search_history: 'Clean Search History',
+        video_clean_completed_downloads: 'Clean Completed Downloads',
+        video_full_cleanup: 'Full Cleanup', video_backup_database: 'Backup Database',
+        video_apply_overlays: 'Auto-Update Overlays', video_clean_plex_images: 'Clean Up Plex Images',
+        video_sync_collections: 'Sync Collections',
+        video_rss_sync: 'RSS Release Sync',
+        video_seeding_sweep: 'Seeding Goal Sweep',
+        video_import_lists: 'Sync Import Lists',
+    };
+    return labels[type] || type || 'Unknown';
+}
+function _autoFormatNotify(type) {
+    if (type === 'discord_webhook') return 'Discord';
+    if (type === 'pushbullet') return 'Pushbullet';
+    if (type === 'telegram') return 'Telegram';
+    if (type === 'fire_signal') return '\u26A1 Signal';
+    if (type === 'run_script') return '\uD83D\uDCBB Script';
+    return type || '';
+}
+function _autoParseUTC(ts) {
+    // If timestamp already has timezone info (+00:00 or Z), parse as-is; otherwise append Z to treat as UTC
+    if (/[Zz]$/.test(ts) || /[+-]\d{2}:\d{2}$/.test(ts)) return new Date(ts).getTime();
+    return new Date(ts + 'Z').getTime();
+}
+function _autoTimeAgo(ts) {
+    if (!ts) return 'Never';
+    const d = (Date.now() - _autoParseUTC(ts)) / 1000;
+    if (d < 60) return 'just now'; if (d < 3600) return Math.floor(d / 60) + 'm ago';
+    if (d < 86400) return Math.floor(d / 3600) + 'h ago'; return Math.floor(d / 86400) + 'd ago';
+}
+function _autoTimeUntil(ts) {
+    if (!ts) return '';
+    const d = (_autoParseUTC(ts) - Date.now()) / 1000;
+    if (d <= 0) return 'soon'; if (d < 60) return 'in ' + Math.ceil(d) + 's';
+    if (d < 3600) return 'in ' + Math.ceil(d / 60) + 'm'; if (d < 86400) return 'in ' + Math.round(d / 3600) + 'h';
+    return 'in ' + Math.round(d / 86400) + 'd';
+}
+
+// --- Live countdown for "Next: in Xs" ---
+setInterval(() => {
+    document.querySelectorAll('.auto-next-run[data-next]').forEach(el => {
+        el.textContent = 'Next: ' + _autoTimeUntil(el.dataset.next);
+    });
+}, 1000);
+
+// --- CRUD ---
+
+async function deleteAutomation(id, name) {
+    if (!await showConfirmDialog({ title: 'Delete Automation', message: `Delete automation "${name}"?`, confirmText: 'Delete', destructive: true })) return;
+    try {
+        const res = await fetch('/api/automations/' + id, { method: 'DELETE' });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        showToast('Automation deleted', 'success');
+        await loadAutomations();
+    } catch (err) { showToast('Error: ' + err.message, 'error'); }
+}
+
+async function duplicateAutomation(id) {
+    try {
+        const res = await fetch('/api/automations/' + id + '/duplicate', { method: 'POST' });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        showToast('Automation duplicated', 'success');
+        await loadAutomations();
+    } catch (err) { showToast('Error: ' + err.message, 'error'); }
+}
+
+async function toggleAutomation(id) {
+    try {
+        const res = await fetch('/api/automations/' + id + '/toggle', { method: 'POST' });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        await loadAutomations();
+    } catch (err) { showToast('Error: ' + err.message, 'error'); }
+}
+
+// --- Automation Progress Tracking ---
+const _autoProgressLogCounts = {};
+const _autoProgressHideTimers = {};
+
+function updateAutomationProgressFromData(data) {
+    for (const [aidStr, state] of Object.entries(data)) {
+        const aid = parseInt(aidStr);
+        const card = document.querySelector(`.automation-card[data-id="${aid}"]`);
+        if (!card) continue;
+
+        let panel = card.querySelector('.automation-output');
+        if (!panel) {
+            panel = document.createElement('div');
+            panel.className = 'automation-output';
+            panel.innerHTML = `
+                <div class="auto-progress-bar-wrap"><div class="auto-progress-bar" style="width:0%"></div></div>
+                <div class="auto-progress-phase"></div>
+                <div class="auto-progress-log"></div>
+            `;
+            card.appendChild(panel);
+            _autoProgressLogCounts[aid] = 0;
+        }
+
+        // Update progress bar
+        const bar = panel.querySelector('.auto-progress-bar');
+        bar.style.width = (state.progress || 0) + '%';
+
+        // Update phase text
+        const phaseEl = panel.querySelector('.auto-progress-phase');
+        phaseEl.textContent = state.phase || '';
+
+        // Status indicator on card
+        const statusDot = card.querySelector('.automation-status');
+
+        if (state.status === 'running') {
+            if (statusDot) statusDot.className = 'automation-status running';
+            card.classList.add('running');
+            panel.classList.add('visible');
+            panel.classList.remove('finished', 'error');
+            if (_autoProgressHideTimers[aid]) {
+                clearTimeout(_autoProgressHideTimers[aid]);
+                delete _autoProgressHideTimers[aid];
+            }
+            // Reset log for new run (handles re-run within hide window)
+            if (_autoProgressLogCounts[aid] > 0 && state.log && state.log.length < _autoProgressLogCounts[aid]) {
+                const existingLog = panel.querySelector('.auto-progress-log');
+                if (existingLog) existingLog.innerHTML = '';
+                _autoProgressLogCounts[aid] = 0;
+            }
+        } else if (state.status === 'finished' || state.status === 'error') {
+            if (statusDot) statusDot.className = 'automation-status ' + (card.querySelector('input[type=checkbox]')?.checked ? 'enabled' : 'disabled');
+            card.classList.remove('running');
+            bar.style.width = '100%';
+            panel.classList.add('finished');
+            if (state.status === 'error') panel.classList.add('error');
+            if (!_autoProgressHideTimers[aid]) {
+                _autoProgressHideTimers[aid] = setTimeout(() => {
+                    panel.classList.remove('visible');
+                    delete _autoProgressHideTimers[aid];
+                    _autoProgressLogCounts[aid] = 0;
+                }, 30000);
+            }
+        }
+
+        // Update log lines
+        const logEl = panel.querySelector('.auto-progress-log');
+        const rendered = _autoProgressLogCounts[aid] || 0;
+        const logLines = state.log || [];
+        if (logLines.length > rendered) {
+            // Normal append — log is still growing
+            for (let i = rendered; i < logLines.length; i++) {
+                const line = logLines[i];
+                const div = document.createElement('div');
+                div.className = 'auto-log-line ' + (line.type || 'info');
+                div.textContent = line.text;
+                logEl.appendChild(div);
+            }
+            _autoProgressLogCounts[aid] = logLines.length;
+            logEl.scrollTop = logEl.scrollHeight;
+        } else if (logLines.length === rendered && logLines.length >= 50) {
+            // Log buffer is full and rotating — replace last few lines
+            const children = logEl.children;
+            if (children.length > 0) {
+                const lastServerLine = logLines[logLines.length - 1];
+                const lastDomLine = children[children.length - 1];
+                if (lastServerLine && lastDomLine.textContent !== lastServerLine.text) {
+                    // Content changed — full re-render
+                    logEl.innerHTML = '';
+                    for (const line of logLines) {
+                        const div = document.createElement('div');
+                        div.className = 'auto-log-line ' + (line.type || 'info');
+                        div.textContent = line.text;
+                        logEl.appendChild(div);
+                    }
+                    _autoProgressLogCounts[aid] = logLines.length;
+                    logEl.scrollTop = logEl.scrollHeight;
+                }
+            }
+        }
+    }
+}
+
+async function runAutomation(id) {
+    try {
+        const res = await fetch('/api/automations/' + id + '/run', { method: 'POST' });
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        showToast('Automation triggered', 'success');
+        setTimeout(() => loadAutomations(), 1500);
+    } catch (err) { showToast('Error: ' + err.message, 'error'); }
+}
+
+const _RESULT_DISPLAY_MAP = {
+    'start_database_update': [
+        { key: 'artists', label: 'Artists' },
+        { key: 'albums', label: 'Albums' },
+        { key: 'tracks', label: 'Tracks' },
+        { key: 'removed_artists', label: 'Removed Artists', hideZero: true },
+        { key: 'removed_albums', label: 'Removed Albums', hideZero: true },
+        { key: 'removed_tracks', label: 'Removed Tracks', hideZero: true },
+    ],
+    'deep_scan_library': [
+        { key: 'artists', label: 'Artists' },
+        { key: 'albums', label: 'Albums' },
+        { key: 'tracks', label: 'Tracks' },
+        { key: 'removed_artists', label: 'Removed Artists', hideZero: true },
+        { key: 'removed_albums', label: 'Removed Albums', hideZero: true },
+        { key: 'removed_tracks', label: 'Removed Tracks', hideZero: true },
+    ],
+    'scan_watchlist': [
+        { key: 'artists_scanned', label: 'Artists Scanned' },
+        { key: 'successful_scans', label: 'Successful' },
+        { key: 'new_tracks_found', label: 'New Tracks' },
+        { key: 'tracks_added_to_wishlist', label: 'Added to Wishlist' },
+    ],
+    'run_duplicate_cleaner': [
+        { key: 'files_scanned', label: 'Files Scanned' },
+        { key: 'duplicates_found', label: 'Duplicates Found' },
+        { key: 'files_deleted', label: 'Files Deleted' },
+        { key: 'space_freed_mb', label: 'Space Freed (MB)' },
+    ],
+    'start_quality_scan': [
+        { key: 'tracks_scanned', label: 'Tracks Scanned' },
+        { key: 'quality_met', label: 'Quality Met' },
+        { key: 'low_quality', label: 'Low Quality' },
+        { key: 'matched', label: 'Added to Wishlist' },
+    ],
+    'scan_library': [
+        { key: 'scan_duration_seconds', label: 'Duration (s)' },
+    ],
+    'backup_database': [
+        { key: 'size_mb', label: 'Backup Size (MB)' },
+    ],
+    'refresh_mirrored': [
+        { key: 'refreshed', label: 'Playlists Refreshed' },
+        { key: 'errors', label: 'Errors', hideZero: true },
+    ],
+    'clear_quarantine': [
+        { key: 'removed', label: 'Items Removed' },
+    ],
+    'cleanup_wishlist': [
+        { key: 'removed', label: 'Duplicates Removed' },
+    ],
+    'full_cleanup': [
+        { key: 'quarantine_removed', label: 'Quarantine Removed' },
+        { key: 'staging_removed', label: 'Import Dirs Removed' },
+        { key: 'total_removed', label: 'Total Items Removed' },
+    ],
+    'playlist_pipeline': [
+        { key: 'playlists_refreshed', label: 'Refreshed' },
+        { key: 'tracks_discovered', label: 'Discovered' },
+        { key: 'tracks_synced', label: 'Synced' },
+        { key: 'sync_skipped', label: 'Skipped', hideZero: true },
+        { key: 'wishlist_queued', label: 'Wishlist Queued' },
+        { key: 'duration_seconds', label: 'Duration (s)' },
+    ],
+    'sync_playlist': [
+        { key: 'matched_tracks', label: 'In Library' },
+        { key: 'failed_tracks', label: 'Missing' },
+        { key: 'wishlist_added_count', label: 'Added to Wishlist', hideZero: true },
+        { key: 'total_tracks', label: 'Total Tracks' },
+        { key: 'synced_tracks', label: 'On Server Playlist', hideZero: true },
+    ],
+};
+
+function _renderResultStats(resultJson, actionType) {
+    if (!resultJson || typeof resultJson !== 'object') return '';
+    var fields = _RESULT_DISPLAY_MAP[actionType];
+    var items = [];
+    if (fields) {
+        fields.forEach(function (f) {
+            var val = resultJson[f.key];
+            if (val == null) return;
+            if (f.hideZero && (val === 0 || val === '0')) return;
+            items.push({ label: f.label, value: val });
+        });
+    } else {
+        // Generic fallback: show all non-status, non-underscore keys
+        Object.keys(resultJson).forEach(function (k) {
+            if (k === 'status' || k.startsWith('_')) return;
+            var label = k.replace(/_/g, ' ').replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+            items.push({ label: label, value: resultJson[k] });
+        });
+    }
+    if (items.length === 0) return '';
+    var html = '<div class="history-stats-grid">';
+    items.forEach(function (it) {
+        html += '<div class="history-stat-item"><div class="history-stat-label">' + _esc(it.label) + '</div><div class="history-stat-value">' + _esc(String(it.value)) + '</div></div>';
+    });
+    html += '</div>';
+    return html;
+}
+
+async function showAutomationHistory(automationId, automationName, actionType) {
+    let modal = document.getElementById('automation-history-modal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'automation-history-modal';
+        modal.className = 'modal-overlay';
+        document.body.appendChild(modal);
+    }
+    modal.innerHTML = '<div class="modal-container automation-history-modal"><div class="history-modal-header"><h3>Run History: ' + _esc(automationName) + '</h3><button class="history-close-btn" onclick="document.getElementById(\'automation-history-modal\').style.display=\'none\'">&times;</button></div><div class="history-modal-body"><div class="history-loading">Loading...</div></div></div>';
+    modal.style.display = 'flex';
+    modal.onclick = function (e) { if (e.target === modal) modal.style.display = 'none'; };
+
+    try {
+        const res = await fetch('/api/automations/' + automationId + '/history?limit=50');
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        const body = modal.querySelector('.history-modal-body');
+        if (!data.history || data.history.length === 0) {
+            body.innerHTML = '<div class="history-empty">No run history yet. History will be recorded on future runs.</div>';
+            return;
+        }
+        let html = '<div class="history-entries">';
+        data.history.forEach(function (entry) {
+            const statusClass = 'history-status-' + (entry.status || 'completed');
+            const statusLabel = (entry.status || 'completed').charAt(0).toUpperCase() + (entry.status || 'completed').slice(1);
+            const timeAgo = _autoTimeAgo(entry.started_at);
+            const duration = entry.duration_seconds != null ? _formatDuration(entry.duration_seconds) : '';
+            const summary = entry.summary ? _esc(entry.summary) : '';
+            const hasLogs = entry.log_lines && entry.log_lines.length > 0;
+            const entryId = 'history-entry-' + entry.id;
+
+            html += '<div class="history-entry">';
+            html += '<div class="history-entry-header" onclick="var el=document.getElementById(\'' + entryId + '\'); if(el) el.classList.toggle(\'expanded\')">';
+            html += '<span class="history-status-badge ' + statusClass + '">' + statusLabel + '</span>';
+            html += '<span class="history-time">' + timeAgo + '</span>';
+            if (duration) html += '<span class="history-duration">' + duration + '</span>';
+            if (hasLogs) html += '<span class="history-expand-icon">&#9660;</span>';
+            html += '</div>';
+            if (summary) html += '<div class="history-summary">' + summary + '</div>';
+            if (entry.result_json && typeof entry.result_json === 'object') {
+                html += _renderResultStats(entry.result_json, actionType);
+            }
+            if (hasLogs) {
+                html += '<div id="' + entryId + '" class="history-log-section">';
+                entry.log_lines.forEach(function (log) {
+                    html += '<div class="history-log-line history-log-' + (log.type || 'info') + '">' + _esc(log.text || '') + '</div>';
+                });
+                html += '</div>';
+            }
+            html += '</div>';
+        });
+        html += '</div>';
+        if (data.total > data.history.length) {
+            html += '<div class="history-total">Showing ' + data.history.length + ' of ' + data.total + ' runs</div>';
+        }
+        body.innerHTML = html;
+    } catch (err) {
+        const body = modal.querySelector('.history-modal-body');
+        if (body) body.innerHTML = '<div class="history-empty">Error loading history: ' + _esc(err.message) + '</div>';
+    }
+}
+
+function _formatDuration(seconds) {
+    if (seconds < 1) return '<1s';
+    if (seconds < 60) return Math.round(seconds) + 's';
+    var m = Math.floor(seconds / 60);
+    var s = Math.round(seconds % 60);
+    if (m < 60) return m + 'm ' + s + 's';
+    var h = Math.floor(m / 60);
+    m = m % 60;
+    return h + 'h ' + m + 'm';
+}
+
+async function saveAutomation() {
+    const name = _bEl('name').value.trim();
+    if (!name) { showToast('Name is required', 'error'); return; }
+    if (!_autoBuilder.when) { showToast('Add a trigger (WHEN)', 'error'); return; }
+    if (!_autoBuilder.do) { showToast('Add an action (DO)', 'error'); return; }
+
+    // Read configs from DOM
+    const triggerConfig = _readPlacedConfig('when');
+    const actionConfig = _readPlacedConfig('do');
+
+    // Read THEN actions (multi-slot)
+    const thenActions = _autoBuilder.then.map((item, i) => ({
+        type: item.type,
+        config: _readPlacedConfig('then-' + i),
+    }));
+
+    // Read optional delay from DO slot
+    const delayEl = document.getElementById('cfg-do-delay');
+    const delayVal = delayEl ? parseInt(delayEl.value) : 0;
+    if (delayVal > 0) actionConfig.delay = delayVal;
+
+    const groupInput = _bEl('group');
+    const groupName = groupInput ? groupInput.value.trim() : '';
+
+    const body = {
+        name,
+        trigger_type: _autoBuilder.when.type, trigger_config: triggerConfig,
+        action_type: _autoBuilder.do.type, action_config: actionConfig,
+        then_actions: thenActions,
+        group_name: groupName || null,
+    };
+    // Tag the side that owns this automation (video) so it stays on the video
+    // page and off the music one. Music context leaves this null (unchanged).
+    if (_autoBuilderCtx.ownedBy) body.owned_by = _autoBuilderCtx.ownedBy;
+
+    try {
+        let res;
+        if (_autoBuilder.editId) {
+            res = await fetch('/api/automations/' + _autoBuilder.editId, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        } else {
+            res = await fetch('/api/automations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        }
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+        showToast(_autoBuilder.editId ? 'Automation updated' : 'Automation created', 'success');
+        hideAutomationBuilder();
+        if (_autoBuilderCtx.onSaved) await _autoBuilderCtx.onSaved();
+    } catch (err) { showToast('Error: ' + err.message, 'error'); }
+}
+
+// --- Builder View ---
+
+// Music entry point — sets the music context, then opens the shared builder.
+function showAutomationBuilder(editId) {
+    _autoBuilderCtx = _AUTO_CTX_MUSIC;
+    return _openAutomationBuilder(editId);
+}
+
+// Video entry point — sets the video context (video ids + video-scoped blocks +
+// owned_by='video'), then opens the SAME shared builder on the video page.
+function showVideoAutomationBuilder(editId) {
+    _autoBuilderCtx = _AUTO_CTX_VIDEO;
+    return _openAutomationBuilder(editId);
+}
+
+async function _openAutomationBuilder(editId) {
+    // Clear BOTH builders' sidebar/canvas first so stale cfg-* ids from a
+    // previously-open builder (music or video) can never be matched by
+    // getElementById while this one is open. Cheap and bulletproof.
+    ['builder-sidebar', 'builder-canvas', 'vauto-builder-sidebar', 'vauto-builder-canvas'].forEach(function (id) {
+        const el = document.getElementById(id); if (el) el.innerHTML = '';
+    });
+
+    // Load block definitions for the active scope (always refresh).
+    try {
+        const res = await fetch(_autoBuilderCtx.blocksUrl);
+        _autoBlocks = await res.json();
+    } catch (e) {
+        if (!_autoBlocks) { showToast('Failed to load blocks', 'error'); return; }
+    }
+
+    _autoMirroredPlaylists = null; // invalidate so it re-fetches
+    _autoSpotifyAuthenticated = false;
+    _autoBuilder = { editId: editId || null, when: null, do: null, then: [], isSystem: false };
+
+    // Populate group datalist from existing automations
+    try {
+        const allRes = await fetch('/api/automations');
+        const allAutos = await allRes.json();
+        const groupSet = new Set();
+        if (Array.isArray(allAutos)) allAutos.forEach(a => { if (a.group_name) groupSet.add(a.group_name); });
+        const datalist = _bEl('groupList');
+        if (datalist) datalist.innerHTML = [...groupSet].sort().map(g => `<option value="${_escAttr(g)}">`).join('');
+    } catch (e) { }
+
+    // If editing, load automation data
+    if (editId) {
+        try {
+            const res = await fetch('/api/automations/' + editId);
+            const a = await res.json();
+            if (a.error) throw new Error(a.error);
+            _bEl('name').value = a.name || '';
+            const groupInput = _bEl('group');
+            if (groupInput) groupInput.value = a.group_name || '';
+            _autoBuilder.when = { type: a.trigger_type, config: a.trigger_config || {} };
+            _autoBuilder.do = { type: a.action_type, config: a.action_config || {} };
+            // Load then_actions array
+            _autoBuilder.then = (a.then_actions || []).map(item => ({
+                type: item.type, config: item.config || {}
+            }));
+            // Backward compat: if no then_actions but has notify_type
+            if (!_autoBuilder.then.length && a.notify_type) {
+                _autoBuilder.then = [{ type: a.notify_type, config: a.notify_config || {} }];
+            }
+            _autoBuilder.isSystem = !!a.is_system;
+        } catch (err) { showToast('Failed to load automation', 'error'); return; }
+    } else {
+        _bEl('name').value = '';
+        const groupInput = _bEl('group');
+        if (groupInput) groupInput.value = '';
+    }
+
+    // System automations: lock the name field and hide group
+    _bEl('name').readOnly = _autoBuilder.isSystem;
+    const groupEl = _bEl('group');
+    if (groupEl) groupEl.style.display = _autoBuilder.isSystem ? 'none' : '';
+
+    _renderBuilderSidebar();
+    _renderBuilderCanvas();
+
+    _bEl('listView').style.display = 'none';
+    _bEl('builderView').style.display = '';
+}
+
+function hideAutomationBuilder() {
+    _bEl('builderView').style.display = 'none';
+    _bEl('listView').style.display = '';
+    const nameEl = _bEl('name'); if (nameEl) nameEl.readOnly = false;
+    _autoBuilder = { editId: null, when: null, do: null, then: [], isSystem: false };
+}
+
+// --- Sidebar ---
+
+function _renderBuilderSidebar() {
+    const sidebar = _bEl('sidebar');
+    if (!sidebar || !_autoBlocks) return;
+
+    let html = '';
+    const sections = [
+        { key: 'triggers', title: 'Triggers', slot: 'when' },
+        { key: 'actions', title: 'Actions', slot: 'do' },
+        { key: 'notifications', title: 'Then', slot: 'then' },
+    ];
+
+    sections.forEach(sec => {
+        html += `<div class="sidebar-section"><div class="sidebar-section-title">${sec.title}</div>`;
+        (_autoBlocks[sec.key] || []).forEach(block => {
+            const icon = _autoIcons[block.type] || '\u2699\uFE0F';
+            const disabled = !block.available;
+            const helpKey = 'auto-' + block.type;
+            const hasHelp = !!TOOL_HELP_CONTENT[helpKey];
+            html += `<div class="block-item${disabled ? ' coming-soon' : ''}" ${!disabled ? `draggable="true" ondragstart="_autoDragStart(event,'${block.type}','${sec.slot}')" onclick="_autoClickBlock('${block.type}','${sec.slot}')"` : ''}>
+                <div class="block-item-icon">${icon}</div>
+                <div class="block-item-text">
+                    <div class="block-item-label">${_esc(block.label)}</div>
+                    <div class="block-item-desc">${_esc(block.description)}</div>
+                </div>
+                ${disabled ? '<span class="coming-soon-badge">Soon</span>' : ''}
+                ${hasHelp ? `<button class="tool-help-button block-help-btn" onclick="event.stopPropagation(); openToolHelpModal('${helpKey}')" title="Learn more">?</button>` : ''}
+            </div>`;
+        });
+        html += '</div>';
+    });
+    sidebar.innerHTML = html;
+}
+
+// --- Canvas ---
+
+function _renderBuilderCanvas() {
+    const canvas = _bEl('canvas');
+    if (!canvas) return;
+
+    let html = '';
+
+    // WHEN slot
+    const whenData = _autoBuilder.when;
+    html += '<span class="flow-slot-label when">WHEN</span>';
+    if (whenData) {
+        html += `<div class="flow-slot filled" id="slot-when" ondragover="_autoDragOver(event,'when')" ondragleave="_autoDragLeave(event,'when')" ondrop="_autoDrop(event,'when')">
+            ${_renderPlacedBlock('when', whenData)}
+        </div>`;
+    } else {
+        html += `<div class="flow-slot empty" id="slot-when" ondragover="_autoDragOver(event,'when')" ondragleave="_autoDragLeave(event,'when')" ondrop="_autoDrop(event,'when')">
+            <div class="flow-slot-prompt">Drag a trigger here — WHEN does this run?</div>
+        </div>`;
+    }
+
+    html += '<div class="flow-connector"></div>';
+
+    // DO slot
+    const doData = _autoBuilder.do;
+    html += '<span class="flow-slot-label do">DO</span>';
+    if (doData) {
+        html += `<div class="flow-slot filled" id="slot-do" ondragover="_autoDragOver(event,'do')" ondragleave="_autoDragLeave(event,'do')" ondrop="_autoDrop(event,'do')">
+            ${_renderPlacedBlock('do', doData)}
+        </div>`;
+    } else {
+        html += `<div class="flow-slot empty" id="slot-do" ondragover="_autoDragOver(event,'do')" ondragleave="_autoDragLeave(event,'do')" ondrop="_autoDrop(event,'do')">
+            <div class="flow-slot-prompt">Drag an action here — WHAT should it do?</div>
+        </div>`;
+    }
+
+    html += '<div class="flow-connector"></div>';
+
+    // THEN section (multi-slot, 1-3 items)
+    html += '<span class="flow-slot-label then">THEN</span>';
+    if (_autoBuilder.then.length > 0) {
+        _autoBuilder.then.forEach((item, i) => {
+            if (i > 0) html += '<div class="flow-connector small"></div>';
+            html += `<div class="flow-slot filled then-slot" id="slot-then-${i}">
+                ${_renderPlacedBlock('then-' + i, item)}
+            </div>`;
+        });
+    }
+    if (_autoBuilder.then.length < 3) {
+        if (_autoBuilder.then.length > 0) html += '<div class="flow-connector small"></div>';
+        html += `<div class="flow-slot empty then-add" id="slot-then-add"
+            ondragover="_autoDragOver(event,'then')" ondragleave="_autoDragLeave(event,'then')" ondrop="_autoDrop(event,'then')">
+            <div class="flow-slot-prompt">${_autoBuilder.then.length === 0
+                ? 'Drag a then-action here (optional)'
+                : '+ Add another (max 3)'}</div>
+        </div>`;
+    }
+
+    canvas.innerHTML = html;
+    // Load mirrored playlist selects if any are present
+    _autoLoadMirroredSelects();
+    // Personalized-pipeline kind pickers (one per slot that uses it)
+    ['when', 'do'].forEach(sk => {
+        if (document.getElementById('cfg-' + sk + '-kinds-picker')) {
+            _autoLoadPersonalizedKinds(sk);
+        }
+    });
+    _autoBuilder.then.forEach((item, i) => {
+        const sk = 'then-' + i;
+        if (document.getElementById('cfg-' + sk + '-kinds-picker')) {
+            _autoLoadPersonalizedKinds(sk);
+        }
+    });
+    // Set up checkbox state for refresh_mirrored
+    ['when', 'do'].forEach(sk => {
+        const allCb = document.getElementById('cfg-' + sk + '-all');
+        if (allCb) _autoTogglePlaylistSelect(sk);
+    });
+    // Also check then slots
+    _autoBuilder.then.forEach((item, i) => {
+        const allCb = document.getElementById('cfg-then-' + i + '-all');
+        if (allCb) _autoTogglePlaylistSelect('then-' + i);
+    });
+}
+
+function _renderPlacedBlock(slotKey, data) {
+    const blockDef = _findBlockDef(data.type);
+    const icon = _autoIcons[data.type] || '\u2699\uFE0F';
+    const label = blockDef ? blockDef.label : data.type;
+    const configHtml = _renderBlockConfigFields(slotKey, data.type, data.config || {});
+
+    // Add optional delay field for action blocks
+    let delayHtml = '';
+    if (slotKey === 'do') {
+        const delayVal = (data.config && data.config.delay) || '';
+        delayHtml = `<div class="placed-block-config"><div class="config-row">
+            <label>Delay (minutes)</label>
+            <input type="number" id="cfg-${slotKey}-delay" value="${delayVal}" min="0" placeholder="0" style="width:80px;" title="Wait before executing action">
+        </div></div>`;
+    }
+
+    // System automations: lock trigger and action slots (no remove, no replace)
+    const locked = _autoBuilder.isSystem && (slotKey === 'when' || slotKey === 'do');
+    const removeBtn = locked ? '' : `<button class="placed-block-remove" onclick="_autoRemoveBlock('${slotKey}')">\u2715</button>`;
+
+    return `<div class="placed-block${locked ? ' locked' : ''}" data-type="${_escAttr(data.type)}">
+        <div class="placed-block-header">
+            <span class="placed-block-icon">${icon}</span>
+            <span class="placed-block-label">${_esc(label)}</span>
+            ${removeBtn}
+        </div>
+        ${configHtml ? '<div class="placed-block-config">' + configHtml + '</div>' : ''}
+        ${delayHtml}
+    </div>`;
+}
+
+function _renderBlockConfigFields(slotKey, blockType, config) {
+    if (blockType === 'schedule') {
+        const interval = config.interval || 6;
+        const unit = config.unit || 'hours';
+        return `<div class="config-row">
+            <label>Every</label>
+            <input type="number" id="cfg-${slotKey}-interval" value="${interval}" min="1" style="width:70px;">
+            <select id="cfg-${slotKey}-unit">
+                <option value="minutes"${unit === 'minutes' ? ' selected' : ''}>Minutes</option>
+                <option value="hours"${unit === 'hours' ? ' selected' : ''}>Hours</option>
+                <option value="days"${unit === 'days' ? ' selected' : ''}>Days</option>
+            </select>
+        </div>`;
+    }
+    if (blockType === 'daily_time') {
+        const timeVal = config.time || '03:00';
+        return `<div class="config-row">
+            <label>At</label>
+            <input type="time" id="cfg-${slotKey}-time" value="${timeVal}">
+        </div>`;
+    }
+    if (blockType === 'weekly_time') {
+        const timeVal = config.time || '03:00';
+        const selectedDays = config.days || [];
+        const allDays = [['mon', 'Mon'], ['tue', 'Tue'], ['wed', 'Wed'], ['thu', 'Thu'], ['fri', 'Fri'], ['sat', 'Sat'], ['sun', 'Sun']];
+        let dayHtml = '<div class="config-row"><label>Days</label><div class="day-picker" id="cfg-' + slotKey + '-days">';
+        allDays.forEach(([val, lbl]) => {
+            const active = selectedDays.includes(val) ? ' active' : '';
+            dayHtml += `<button type="button" class="day-btn${active}" data-day="${val}" onclick="this.classList.toggle('active')">${lbl}</button>`;
+        });
+        dayHtml += '</div></div>';
+        return `<div class="config-row">
+            <label>At</label>
+            <input type="time" id="cfg-${slotKey}-time" value="${timeVal}">
+        </div>${dayHtml}`;
+    }
+
+    // Event triggers with conditions
+    const blockDef = _findBlockDef(blockType);
+    if (blockDef && blockDef.has_conditions) {
+        return _renderConditionBuilder(slotKey, blockDef, config);
+    }
+
+    if (blockType === 'process_wishlist') {
+        const cat = config.category || 'all';
+        return `<div class="config-row">
+            <label>Category</label>
+            <select id="cfg-${slotKey}-category">
+                <option value="all"${cat === 'all' ? ' selected' : ''}>All</option>
+                <option value="albums"${cat === 'albums' ? ' selected' : ''}>Albums</option>
+                <option value="singles"${cat === 'singles' ? ' selected' : ''}>Singles</option>
+            </select>
+        </div>`;
+    }
+    if (blockType === 'signal_received') {
+        const sigName = _escAttr(config.signal_name || '');
+        const knownSignals = (_autoBlocks && _autoBlocks.known_signals) || [];
+        return `<div class="config-row">
+            <label>Signal Name</label>
+            <input type="text" id="cfg-${slotKey}-signal_name" value="${sigName}"
+                list="known-signals-list-${slotKey}" placeholder="e.g. libraryReady"
+                oninput="this.value = this.value.toLowerCase().replace(/[^a-z0-9_\\-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '')"
+                style="font-family:monospace;">
+            <datalist id="known-signals-list-${slotKey}">
+                ${knownSignals.map(s => `<option value="${s}">`).join('')}
+            </datalist>
+        </div>
+        <div class="config-row" style="color:rgba(255,255,255,0.35);font-size:11px;">Triggers when another automation fires this signal</div>`;
+    }
+    if (blockType === 'fire_signal') {
+        const sigName = _escAttr(config.signal_name || '');
+        const knownSignals = (_autoBlocks && _autoBlocks.known_signals) || [];
+        return `<div class="config-row">
+            <label>Signal Name</label>
+            <input type="text" id="cfg-${slotKey}-signal_name" value="${sigName}"
+                list="known-signals-fire-${slotKey}" placeholder="e.g. libraryReady"
+                oninput="this.value = this.value.toLowerCase().replace(/[^a-z0-9_\\-]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '')"
+                style="font-family:monospace;">
+            <datalist id="known-signals-fire-${slotKey}">
+                ${knownSignals.map(s => `<option value="${s}">`).join('')}
+            </datalist>
+        </div>
+        <div class="config-row" style="color:rgba(255,255,255,0.35);font-size:11px;">Other automations with "Signal Received" trigger will wake up</div>`;
+    }
+    if (blockType === 'run_script') {
+        const scriptName = _escAttr(config.script_name || '');
+        const timeout = config.timeout || 60;
+        // Fetch scripts list and populate
+        const selectId = `cfg-${slotKey}-script_name`;
+        setTimeout(async () => {
+            try {
+                const resp = await fetch('/api/scripts');
+                const data = await resp.json();
+                const sel = document.getElementById(selectId);
+                if (sel && data.scripts) {
+                    sel.innerHTML = '<option value="">Select a script...</option>' +
+                        data.scripts.map(s => `<option value="${_escAttr(s.name)}"${s.name === scriptName ? ' selected' : ''}>${escapeHtml(s.name)} (${s.extension})</option>`).join('');
+                }
+            } catch (e) { console.warn('Failed to load scripts:', e); }
+        }, 100);
+        return `<div class="config-row">
+            <label>Script</label>
+            <select id="${selectId}">
+                <option value="${scriptName}">${scriptName || 'Loading...'}</option>
+            </select>
+        </div>
+        <div class="config-row">
+            <label>Timeout</label>
+            <input type="number" id="cfg-${slotKey}-timeout" value="${timeout}" min="5" max="300" style="width:80px;"> seconds
+        </div>
+        <div class="config-row" style="color:rgba(255,255,255,0.35);font-size:11px;">Place scripts in the <code>scripts/</code> folder. Supported: .sh, .py, .bat, .ps1</div>`;
+    }
+    if (blockType === 'scan_watchlist' || blockType === 'scan_library' || blockType === 'notify_only') {
+        return '<div class="config-row" style="color:rgba(255,255,255,0.4);font-size:12px;">No configuration needed</div>';
+    }
+    if (blockType === 'refresh_mirrored') {
+        const allChecked = config.all ? ' checked' : '';
+        return `<div class="config-row">
+            <label>Playlist</label>
+            <select id="cfg-${slotKey}-playlist_id" class="mirrored-playlist-select" data-block-type="refresh_mirrored" data-value="${_escAttr(config.playlist_id || '')}">
+                <option value="">Loading...</option>
+            </select>
+        </div>
+        <div class="config-row">
+            <label><input type="checkbox" id="cfg-${slotKey}-all"${allChecked} onchange="_autoTogglePlaylistSelect('${slotKey}')"> Refresh all mirrored playlists</label>
+        </div>`;
+    }
+    if (blockType === 'sync_playlist') {
+        return `<div class="config-row">
+            <label>Playlist</label>
+            <select id="cfg-${slotKey}-playlist_id" class="mirrored-playlist-select" data-value="${_escAttr(config.playlist_id || '')}">
+                <option value="">Loading...</option>
+            </select>
+        </div>`;
+    }
+    if (blockType === 'discover_playlist') {
+        const allChecked = config.all ? ' checked' : '';
+        return `<div class="config-row">
+            <label>Playlist</label>
+            <select id="cfg-${slotKey}-playlist_id" class="mirrored-playlist-select" data-value="${_escAttr(config.playlist_id || '')}">
+                <option value="">Loading...</option>
+            </select>
+        </div>
+        <div class="config-row">
+            <label><input type="checkbox" id="cfg-${slotKey}-all"${allChecked} onchange="_autoTogglePlaylistSelect('${slotKey}')"> Discover all mirrored playlists</label>
+        </div>`;
+    }
+    if (blockType === 'playlist_pipeline') {
+        const allChecked = config.all ? ' checked' : '';
+        const skipWishlistChecked = config.skip_wishlist ? ' checked' : '';
+        return `<div class="config-row">
+            <label>Playlist</label>
+            <select id="cfg-${slotKey}-playlist_id" class="mirrored-playlist-select" data-value="${_escAttr(config.playlist_id || '')}">
+                <option value="">Loading...</option>
+            </select>
+        </div>
+        <div class="config-row">
+            <label><input type="checkbox" id="cfg-${slotKey}-all"${allChecked} onchange="_autoTogglePlaylistSelect('${slotKey}')"> Process all mirrored playlists</label>
+        </div>
+        <div class="config-row">
+            <label><input type="checkbox" id="cfg-${slotKey}-skip_wishlist"${skipWishlistChecked}> Skip wishlist processing</label>
+        </div>
+        <div class="config-row" style="color:rgba(255,255,255,0.35);font-size:11px;">Runs 4 phases: Refresh → Discover → Sync → Download Missing</div>`;
+    }
+    if (blockType === 'personalized_pipeline') {
+        const refreshFirstChecked = config.refresh_first ? ' checked' : '';
+        const skipWishlistChecked = config.skip_wishlist ? ' checked' : '';
+        // Stash existing selections on a hidden input as JSON so the
+        // async populator can mark them checked once kinds load. The
+        // visible picker container starts as a loading message.
+        const initialKinds = JSON.stringify(Array.isArray(config.kinds) ? config.kinds : []);
+        // The default `.config-row` flex layout puts label on the left
+        // and input on the right — wrong for a tall multi-select picker.
+        // Use a dedicated column-layout wrapper so the picker spans
+        // the full card width.
+        return `<div class="config-row" style="flex-direction:column;align-items:stretch;gap:6px;">
+            <label style="min-width:0;">Personalized playlists to sync</label>
+            <input type="hidden" id="cfg-${slotKey}-kinds" data-initial='${_escAttr(initialKinds)}' value='${_escAttr(initialKinds)}'>
+            <div id="cfg-${slotKey}-kinds-picker" class="personalized-kinds-picker" style="max-height:280px;overflow-y:auto;border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:10px 12px;background:rgba(0,0,0,0.25);width:100%;box-sizing:border-box;">
+                <div style="color:rgba(255,255,255,0.4);font-size:12px;">Loading personalized playlists…</div>
+            </div>
+            <div style="color:rgba(255,255,255,0.35);font-size:11px;text-transform:none;letter-spacing:0;">Pick which Discover-page playlists this automation will sync. Variant kinds (Time Machine, Genre, Daily Mix, Seasonal Mix) expose individual instances below their kind row.</div>
+        </div>
+        <div class="config-row">
+            <label><input type="checkbox" id="cfg-${slotKey}-refresh_first"${refreshFirstChecked}> Refresh playlists before sync (regenerate snapshots)</label>
+        </div>
+        <div class="config-row">
+            <label><input type="checkbox" id="cfg-${slotKey}-skip_wishlist"${skipWishlistChecked}> Skip wishlist processing</label>
+        </div>
+        <div class="config-row" style="color:rgba(255,255,255,0.35);font-size:11px;">Runs 2 phases: Snapshot → Sync → Download Missing</div>`;
+    }
+    // Shared variable tags builder for notification types
+    function _notifyVarHtml(slotKey) {
+        let allVars = ['time', 'name', 'run_count', 'status'];
+        const triggerDef = _autoBuilder.when ? _findBlockDef(_autoBuilder.when.type) : null;
+        if (triggerDef && triggerDef.variables) {
+            triggerDef.variables.forEach(v => { if (!allVars.includes(v)) allVars.push(v); });
+        }
+        let html = '<div class="variable-tags">';
+        allVars.forEach(v => { html += `<span class="variable-tag" onclick="_autoInsertVar('cfg-${slotKey}-message','{${v}}')">{${v}}</span>`; });
+        return html + '</div>';
+    }
+
+    if (blockType === 'discord_webhook') {
+        const url = _escAttr(config.webhook_url || '');
+        return `<div class="config-row">
+            <label>Webhook URL</label>
+            <input type="text" id="cfg-${slotKey}-webhook_url" value="${url}" placeholder="https://discord.com/api/webhooks/...">
+        </div>
+        <div class="config-row">
+            <label>Message</label>
+            <textarea id="cfg-${slotKey}-message" placeholder="Message with {variables}...">${config.message || '{name} completed with status: {status}'}</textarea>
+        </div>
+        ${_notifyVarHtml(slotKey)}`;
+    }
+    if (blockType === 'pushbullet') {
+        const token = _escAttr(config.access_token || '');
+        return `<div class="config-row">
+            <label>Access Token</label>
+            <input type="text" id="cfg-${slotKey}-access_token" value="${token}" placeholder="o.xxxxxxxxxxxxxxxxxxxx">
+        </div>
+        <div class="config-row">
+            <label>Title</label>
+            <input type="text" id="cfg-${slotKey}-title" value="${_escAttr(config.title || '{name}')}" placeholder="Notification title">
+        </div>
+        <div class="config-row">
+            <label>Message</label>
+            <textarea id="cfg-${slotKey}-message" placeholder="Message with {variables}...">${config.message || 'Completed with status: {status}'}</textarea>
+        </div>
+        ${_notifyVarHtml(slotKey)}`;
+    }
+    if (blockType === 'telegram') {
+        const botToken = _escAttr(config.bot_token || '');
+        const chatId = _escAttr(config.chat_id || '');
+        const threadId = _escAttr(config.thread_id || '');
+        return `<div class="config-row">
+            <label>Bot Token</label>
+            <input type="text" id="cfg-${slotKey}-bot_token" value="${botToken}" placeholder="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11">
+        </div>
+        <div class="config-row">
+            <label>Chat ID</label>
+            <input type="text" id="cfg-${slotKey}-chat_id" value="${chatId}" placeholder="-1001234567890 or @channelname">
+        </div>
+        <div class="config-row">
+            <label>Thread ID</label>
+            <input type="text" id="cfg-${slotKey}-thread_id" value="${threadId}" placeholder="Optional integer">
+        </div>
+        <div class="config-row">
+            <label>Message</label>
+            <textarea id="cfg-${slotKey}-message" placeholder="Message with {variables}...">${config.message || '{name} completed with status: {status}'}</textarea>
+        </div>
+        ${_notifyVarHtml(slotKey)}`;
+    }
+    if (blockType === 'webhook') {
+        const url = _escAttr(config.url || '');
+        const hdrs = (config.headers || '').replace(/"/g, '&quot;');
+        return `<div class="config-row">
+            <label>URL</label>
+            <input type="text" id="cfg-${slotKey}-url" value="${url}" placeholder="https://your-server.com/hook">
+        </div>
+        <div class="config-row">
+            <label>Headers <span style="opacity:0.4;font-weight:400">(one per line, Key: Value)</span></label>
+            <textarea id="cfg-${slotKey}-headers" placeholder="Authorization: Bearer token123\nX-Custom: value" style="font-family:monospace;font-size:11px;">${hdrs}</textarea>
+        </div>
+        <div class="config-row">
+            <label>Custom Message <span style="opacity:0.4;font-weight:400">(optional)</span></label>
+            <textarea id="cfg-${slotKey}-message" placeholder="Message with {variables}...">${config.message || ''}</textarea>
+        </div>
+        <div class="config-row" style="color:rgba(255,255,255,0.35);font-size:11px;">
+            Sends a JSON POST with all event variables. Custom message added as "message" field if set.
+        </div>
+        ${_notifyVarHtml(slotKey)}`;
+    }
+    // Generic config_fields renderer — drives the VIDEO builder only (gated on
+    // the video context) so the music side keeps its bespoke renderers above and
+    // is byte-identical. Any video block that declares config_fields in
+    // core/automation/blocks.py (select / text / number / checkbox) renders here.
+    if (_autoBuilderCtx.ownedBy) {
+        const def = _findBlockDef(blockType);
+        if (def && Array.isArray(def.config_fields) && def.config_fields.length) {
+            return def.config_fields.map(f => _renderGenericConfigField(slotKey, f, config)).join('');
+        }
+    }
+    return '';
+}
+
+// One generic config row from a block's config_fields definition.
+function _renderGenericConfigField(slotKey, f, config) {
+    const id = 'cfg-' + slotKey + '-' + f.key;
+    const cur = (config && config[f.key] !== undefined && config[f.key] !== null) ? config[f.key] : f.default;
+    const label = _esc(f.label || f.key);
+    if (f.type === 'select') {
+        const opts = (f.options || []).map(o =>
+            `<option value="${_escAttr(o.value)}"${String(cur) === String(o.value) ? ' selected' : ''}>${_esc(o.label)}</option>`).join('');
+        return `<div class="config-row"><label>${label}</label><select id="${id}">${opts}</select></div>`;
+    }
+    if (f.type === 'checkbox') {
+        return `<div class="config-row"><label><input type="checkbox" id="${id}"${cur ? ' checked' : ''}> ${label}</label></div>`;
+    }
+    if (f.type === 'number') {
+        const min = (f.min !== undefined) ? ` min="${f.min}"` : '';
+        return `<div class="config-row"><label>${label}</label><input type="number" id="${id}" value="${_escAttr(cur != null ? cur : '')}"${min} style="width:90px;"></div>`;
+    }
+    return `<div class="config-row"><label>${label}</label><input type="text" id="${id}" value="${_escAttr(cur != null ? cur : '')}" placeholder="${_escAttr(f.placeholder || '')}"></div>`;
+}
+
+// Read one generic config field back from the DOM (mirror of the renderer).
+function _readGenericConfigField(slotKey, f) {
+    const el = document.getElementById('cfg-' + slotKey + '-' + f.key);
+    if (!el) return (f.default !== undefined) ? f.default : '';
+    if (f.type === 'checkbox') return el.checked;
+    if (f.type === 'number') { const n = parseFloat(el.value); return isNaN(n) ? (f.default != null ? f.default : 0) : n; }
+    return el.value;
+}
+
+// --- Condition Builder ---
+
+function _renderConditionBuilder(slotKey, blockDef, config) {
+    const conditions = config.conditions || [];
+    const match = config.match || 'all';
+    const fields = blockDef.condition_fields || [];
+
+    let html = '<div class="condition-builder" id="conditions-' + slotKey + '">';
+    html += `<div class="config-row condition-header">
+        <label>Match</label>
+        <select id="cfg-${slotKey}-match" class="condition-match-select">
+            <option value="all"${match === 'all' ? ' selected' : ''}>All conditions</option>
+            <option value="any"${match === 'any' ? ' selected' : ''}>Any condition</option>
+        </select>
+    </div>`;
+
+    html += '<div id="condition-rows-' + slotKey + '">';
+    if (conditions.length) {
+        conditions.forEach((cond, i) => {
+            html += _renderConditionRow(slotKey, i, fields, cond);
+        });
+    }
+    html += '</div>';
+
+    html += `<button class="add-condition-btn" onclick="_autoAddCondition('${slotKey}')">+ Add Condition</button>`;
+    html += '</div>';
+
+    if (!conditions.length) {
+        html += '<div class="config-row" style="color:rgba(255,255,255,0.35);font-size:12px;margin-top:4px;">No conditions = triggers on every event</div>';
+    }
+
+    return html;
+}
+
+function _renderConditionRow(slotKey, index, fields, cond) {
+    const field = cond ? cond.field : (fields[0] || '');
+    const operator = cond ? cond.operator : 'equals';
+    const value = cond ? _escAttr(cond.value) : '';
+
+    let fieldOpts = '';
+    fields.forEach(f => { fieldOpts += `<option value="${f}"${f === field ? ' selected' : ''}>${f}</option>`; });
+
+    // For playlist-related triggers, use a mirrored playlist dropdown instead of free text
+    const triggerType = _autoBuilder.when ? _autoBuilder.when.type : '';
+    const usePlaylistSelect = ((triggerType === 'playlist_changed' || triggerType === 'discovery_completed') && field === 'playlist_name');
+    const valueHtml = usePlaylistSelect
+        ? `<select class="cond-value mirrored-playlist-name-select" data-slot="${slotKey}" data-idx="${index}" data-value="${value}"></select>`
+        : `<input type="text" class="cond-value" data-slot="${slotKey}" data-idx="${index}" value="${value}" placeholder="value...">`;
+
+    return `<div class="condition-row" data-index="${index}">
+        <select class="cond-field" data-slot="${slotKey}" data-idx="${index}">${fieldOpts}</select>
+        <select class="cond-operator" data-slot="${slotKey}" data-idx="${index}">
+            <option value="equals"${operator === 'equals' ? ' selected' : ''}>equals</option>
+            <option value="contains"${operator === 'contains' ? ' selected' : ''}>contains</option>
+            <option value="starts_with"${operator === 'starts_with' ? ' selected' : ''}>starts with</option>
+            <option value="not_contains"${operator === 'not_contains' ? ' selected' : ''}>not contains</option>
+        </select>
+        ${valueHtml}
+        <button class="remove-condition-btn" onclick="_autoRemoveCondition('${slotKey}',${index})">\u2715</button>
+    </div>`;
+}
+
+function _autoAddCondition(slotKey) {
+    const data = _autoBuilder[slotKey];
+    if (!data) return;
+    if (!data.config) data.config = {};
+    if (!data.config.conditions) data.config.conditions = [];
+
+    // Save existing conditions from DOM before re-render
+    _autoSaveConditionsFromDOM(slotKey);
+
+    const blockDef = _findBlockDef(data.type);
+    const fields = blockDef ? (blockDef.condition_fields || []) : [];
+    data.config.conditions.push({ field: fields[0] || '', operator: 'contains', value: '' });
+    _renderBuilderCanvas();
+    // Re-populate mirrored playlist selects if needed
+    _autoLoadMirroredSelects();
+}
+
+function _autoRemoveCondition(slotKey, index) {
+    const data = _autoBuilder[slotKey];
+    if (!data || !data.config || !data.config.conditions) return;
+    _autoSaveConditionsFromDOM(slotKey);
+    data.config.conditions.splice(index, 1);
+    _renderBuilderCanvas();
+    _autoLoadMirroredSelects();
+}
+
+function _autoSaveConditionsFromDOM(slotKey) {
+    const data = _autoBuilder[slotKey];
+    if (!data || !data.config) return;
+    const container = document.getElementById('condition-rows-' + slotKey);
+    if (!container) return;
+    const rows = container.querySelectorAll('.condition-row');
+    const conditions = [];
+    rows.forEach(row => {
+        const field = row.querySelector('.cond-field')?.value || '';
+        const operator = row.querySelector('.cond-operator')?.value || 'contains';
+        const value = row.querySelector('.cond-value')?.value || '';
+        conditions.push({ field, operator, value });
+    });
+    data.config.conditions = conditions;
+    // Also save match mode
+    const matchEl = document.getElementById('cfg-' + slotKey + '-match');
+    if (matchEl) data.config.match = matchEl.value;
+}
+
+// --- Mirrored Playlist Select ---
+
+function _autoTogglePlaylistSelect(slotKey) {
+    const allCb = document.getElementById('cfg-' + slotKey + '-all');
+    const sel = document.getElementById('cfg-' + slotKey + '-playlist_id');
+    if (sel) sel.disabled = allCb && allCb.checked;
+}
+
+// --- Personalized Playlist Picker (multi-select kind+variant) ---
+
+// Cached so the second action card renders instantly without re-fetching.
+let _autoPersonalizedKinds = null;
+
+async function _autoLoadPersonalizedKinds(slotKey) {
+    const picker = document.getElementById('cfg-' + slotKey + '-kinds-picker');
+    const hidden = document.getElementById('cfg-' + slotKey + '-kinds');
+    if (!picker || !hidden) return;
+
+    // Read existing selection so we can pre-check matching boxes after render.
+    let selected = [];
+    try {
+        const initial = hidden.dataset.initial || hidden.value || '[]';
+        selected = JSON.parse(initial);
+        if (!Array.isArray(selected)) selected = [];
+    } catch (_) { selected = []; }
+    const selectedKey = (kind, variant) => `${kind}::${variant || ''}`;
+    const selectedSet = new Set(selected.map(s => selectedKey(s.kind, s.variant)));
+
+    // Fetch + cache the kinds catalog.
+    if (!_autoPersonalizedKinds) {
+        try {
+            const res = await fetch('/api/personalized/kinds');
+            const data = await res.json();
+            _autoPersonalizedKinds = (data && data.kinds) || [];
+        } catch (e) {
+            _autoPersonalizedKinds = [];
+        }
+    }
+
+    if (!_autoPersonalizedKinds.length) {
+        picker.innerHTML = '<div style="color:rgba(255,255,255,0.4);font-size:12px;">No personalized playlists registered. Restart the server if you just upgraded.</div>';
+        return;
+    }
+
+    // Render: one row per (kind, variant). Singletons get one row;
+    // variant kinds get one row per resolved variant + an "all" toggle.
+    // Inline styles override the parent `.placed-block-config label`
+    // rule (uppercase / min-width / letter-spacing) — without these
+    // overrides every row would render as a tiny narrow chip.
+    const rowStyle = 'display:flex;align-items:center;gap:8px;padding:4px 0;cursor:pointer;font-size:13px;text-transform:none;letter-spacing:0;color:rgba(255,255,255,0.85);min-width:0;';
+    const variantRowStyle = rowStyle + 'padding-left:20px;font-size:12px;color:rgba(255,255,255,0.7);';
+    const sectionHeader = 'font-weight:600;margin:8px 0 2px;color:rgba(255,255,255,0.85);font-size:13px;text-transform:none;letter-spacing:0;';
+    let html = '';
+    _autoPersonalizedKinds.forEach(spec => {
+        const baseLabel = spec.name_template
+            ? spec.name_template.replace('{variant}', '').replace(/\s*[—-]\s*$/,'').trim()
+            : spec.kind;
+
+        if (!spec.requires_variant) {
+            // Singleton: one checkbox.
+            const key = selectedKey(spec.kind, '');
+            const checked = selectedSet.has(key) ? ' checked' : '';
+            html += `<label style="${rowStyle}font-weight:600;">
+                <input type="checkbox" data-kind="${_escAttr(spec.kind)}"${checked}>
+                <span>${_escAttr(baseLabel)}</span>
+            </label>`;
+        } else {
+            const variants = Array.isArray(spec.variants) ? spec.variants : [];
+            html += `<div style="margin:6px 0 4px;border-top:1px solid rgba(255,255,255,0.05);padding-top:6px;">
+                <div style="${sectionHeader}">${_escAttr(baseLabel)}</div>`;
+            if (variants.length === 0) {
+                html += `<div style="font-size:11px;color:rgba(255,255,255,0.35);padding-left:20px;text-transform:none;letter-spacing:0;">(no variants available — populate via the discover page first)</div>`;
+            } else {
+                variants.forEach(variant => {
+                    const key = selectedKey(spec.kind, variant);
+                    const checked = selectedSet.has(key) ? ' checked' : '';
+                    html += `<label style="${variantRowStyle}">
+                        <input type="checkbox" data-kind="${_escAttr(spec.kind)}" data-variant="${_escAttr(variant)}"${checked}>
+                        <span>${_escAttr(variant)}</span>
+                    </label>`;
+                });
+            }
+            html += '</div>';
+        }
+    });
+    picker.innerHTML = html;
+}
+
+async function _autoLoadMirroredSelects() {
+    const selects = document.querySelectorAll('.mirrored-playlist-select');
+    const nameSelects = document.querySelectorAll('.mirrored-playlist-name-select');
+    if (!selects.length && !nameSelects.length) return;
+
+    if (!_autoMirroredPlaylists) {
+        try {
+            const res = await fetch('/api/mirrored-playlists/list');
+            const data = await res.json();
+            // New format returns { playlists, spotify_authenticated }
+            if (Array.isArray(data)) {
+                // Backward compat: old format was plain array
+                _autoMirroredPlaylists = data;
+                _autoSpotifyAuthenticated = false;
+            } else {
+                _autoMirroredPlaylists = data.playlists || [];
+                _autoSpotifyAuthenticated = data.spotify_authenticated || false;
+            }
+        } catch (e) { _autoMirroredPlaylists = []; _autoSpotifyAuthenticated = false; }
+    }
+
+    selects.forEach(sel => {
+        const savedValue = sel.dataset.value || '';
+        const isRefresh = sel.dataset.blockType === 'refresh_mirrored';
+        sel.innerHTML = '<option value="">-- Select playlist --</option>';
+        _autoMirroredPlaylists.forEach(p => {
+            // For refresh selects: hide file playlists, hide spotify (library) if not authed
+            if (isRefresh) {
+                if (p.source === 'file' || p.source === 'beatport') return;
+                if (p.source === 'spotify' && !_autoSpotifyAuthenticated) return;
+            }
+            sel.innerHTML += `<option value="${p.id}"${String(p.id) === savedValue ? ' selected' : ''}>${_esc(p.name)}</option>`;
+        });
+    });
+
+    nameSelects.forEach(sel => {
+        const savedValue = sel.dataset.value || '';
+        sel.innerHTML = '<option value="">-- Select playlist --</option>';
+        _autoMirroredPlaylists.forEach(p => {
+            sel.innerHTML += `<option value="${_escAttr(p.name)}"${p.name === savedValue ? ' selected' : ''}>${_esc(p.name)}</option>`;
+        });
+    });
+}
+
+function _readPlacedConfig(slotKey) {
+    let data;
+    if (slotKey.startsWith('then-')) {
+        const idx = parseInt(slotKey.split('-')[1]);
+        data = _autoBuilder.then[idx];
+    } else {
+        data = _autoBuilder[slotKey];
+    }
+    if (!data) return {};
+    const type = data.type;
+    if (type === 'schedule') {
+        return {
+            interval: parseInt(document.getElementById('cfg-' + slotKey + '-interval')?.value) || 6,
+            unit: document.getElementById('cfg-' + slotKey + '-unit')?.value || 'hours',
+        };
+    }
+    if (type === 'daily_time') {
+        return { time: document.getElementById('cfg-' + slotKey + '-time')?.value || '03:00' };
+    }
+    if (type === 'weekly_time') {
+        const daysEl = document.getElementById('cfg-' + slotKey + '-days');
+        const days = daysEl ? Array.from(daysEl.querySelectorAll('.day-btn.active')).map(b => b.dataset.day) : [];
+        return {
+            time: document.getElementById('cfg-' + slotKey + '-time')?.value || '03:00',
+            days,
+        };
+    }
+    // Event triggers with conditions
+    const blockDef = _findBlockDef(type);
+    if (blockDef && blockDef.has_conditions) {
+        _autoSaveConditionsFromDOM(slotKey);
+        return {
+            conditions: (data.config && data.config.conditions) || [],
+            match: document.getElementById('cfg-' + slotKey + '-match')?.value || 'all',
+        };
+    }
+    if (type === 'process_wishlist') {
+        return { category: document.getElementById('cfg-' + slotKey + '-category')?.value || 'all' };
+    }
+    if (type === 'refresh_mirrored') {
+        const allCb = document.getElementById('cfg-' + slotKey + '-all');
+        return {
+            playlist_id: document.getElementById('cfg-' + slotKey + '-playlist_id')?.value || '',
+            all: allCb ? allCb.checked : false,
+        };
+    }
+    if (type === 'sync_playlist') {
+        return { playlist_id: document.getElementById('cfg-' + slotKey + '-playlist_id')?.value || '' };
+    }
+    if (type === 'discover_playlist') {
+        const allCb = document.getElementById('cfg-' + slotKey + '-all');
+        return {
+            playlist_id: document.getElementById('cfg-' + slotKey + '-playlist_id')?.value || '',
+            all: allCb ? allCb.checked : false,
+        };
+    }
+    if (type === 'playlist_pipeline') {
+        const allCb = document.getElementById('cfg-' + slotKey + '-all');
+        const skipWl = document.getElementById('cfg-' + slotKey + '-skip_wishlist');
+        return {
+            playlist_id: document.getElementById('cfg-' + slotKey + '-playlist_id')?.value || '',
+            all: allCb ? allCb.checked : false,
+            skip_wishlist: skipWl ? skipWl.checked : false,
+        };
+    }
+    if (type === 'personalized_pipeline') {
+        // Each checked box has data-kind / data-variant attributes;
+        // walk them to assemble the kinds list.
+        const picker = document.getElementById('cfg-' + slotKey + '-kinds-picker');
+        const kinds = [];
+        if (picker) {
+            picker.querySelectorAll('input[type="checkbox"][data-kind]:checked').forEach(cb => {
+                const entry = { kind: cb.dataset.kind };
+                if (cb.dataset.variant) entry.variant = cb.dataset.variant;
+                kinds.push(entry);
+            });
+        }
+        const refreshFirstCb = document.getElementById('cfg-' + slotKey + '-refresh_first');
+        const skipWl = document.getElementById('cfg-' + slotKey + '-skip_wishlist');
+        return {
+            kinds,
+            refresh_first: refreshFirstCb ? refreshFirstCb.checked : false,
+            skip_wishlist: skipWl ? skipWl.checked : false,
+        };
+    }
+    if (type === 'signal_received' || type === 'fire_signal') {
+        return { signal_name: document.getElementById('cfg-' + slotKey + '-signal_name')?.value?.trim() || '' };
+    }
+    if (type === 'run_script') {
+        return {
+            script_name: document.getElementById('cfg-' + slotKey + '-script_name')?.value || '',
+            timeout: parseInt(document.getElementById('cfg-' + slotKey + '-timeout')?.value || '60') || 60,
+        };
+    }
+    if (type === 'discord_webhook') {
+        return {
+            webhook_url: document.getElementById('cfg-' + slotKey + '-webhook_url')?.value?.trim() || '',
+            message: document.getElementById('cfg-' + slotKey + '-message')?.value || '',
+        };
+    }
+    if (type === 'pushbullet') {
+        return {
+            access_token: document.getElementById('cfg-' + slotKey + '-access_token')?.value?.trim() || '',
+            title: document.getElementById('cfg-' + slotKey + '-title')?.value || '',
+            message: document.getElementById('cfg-' + slotKey + '-message')?.value || '',
+        };
+    }
+    if (type === 'telegram') {
+        return {
+            bot_token: document.getElementById('cfg-' + slotKey + '-bot_token')?.value?.trim() || '',
+            chat_id: document.getElementById('cfg-' + slotKey + '-chat_id')?.value?.trim() || '',
+            thread_id: document.getElementById('cfg-' + slotKey + '-thread_id')?.value?.trim() || '',
+            message: document.getElementById('cfg-' + slotKey + '-message')?.value || '',
+        };
+    }
+    if (type === 'webhook') {
+        return {
+            url: document.getElementById('cfg-' + slotKey + '-url')?.value?.trim() || '',
+            headers: document.getElementById('cfg-' + slotKey + '-headers')?.value || '',
+            message: document.getElementById('cfg-' + slotKey + '-message')?.value || '',
+        };
+    }
+    // Generic config_fields read — video builder only (mirror of the generic
+    // renderer above); music keeps its bespoke readers, untouched.
+    if (_autoBuilderCtx.ownedBy) {
+        const def = _findBlockDef(type);
+        if (def && Array.isArray(def.config_fields) && def.config_fields.length) {
+            const out = {};
+            def.config_fields.forEach(f => { out[f.key] = _readGenericConfigField(slotKey, f); });
+            return out;
+        }
+    }
+    return {};
+}
+
+function _findBlockDef(type) {
+    if (!_autoBlocks) return null;
+    for (const cat of ['triggers', 'actions', 'notifications']) {
+        const found = (_autoBlocks[cat] || []).find(b => b.type === type);
+        if (found) return found;
+    }
+    return null;
+}
+
+// --- Drag & Drop ---
+
+function _autoDragStart(e, blockType, slotCategory) {
+    e.dataTransfer.setData('text/plain', JSON.stringify({ type: blockType, slot: slotCategory }));
+    e.dataTransfer.effectAllowed = 'copy';
+}
+
+function _autoDragOver(e, slotKey) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    const targetId = slotKey === 'then' ? 'slot-then-add' : 'slot-' + slotKey;
+    document.getElementById(targetId)?.classList.add('drag-over');
+}
+
+function _autoDragLeave(e, slotKey) {
+    const targetId = slotKey === 'then' ? 'slot-then-add' : 'slot-' + slotKey;
+    document.getElementById(targetId)?.classList.remove('drag-over');
+}
+
+function _autoDrop(e, slotKey) {
+    e.preventDefault();
+    const dropTargetId = slotKey === 'then' ? 'slot-then-add' : 'slot-' + slotKey;
+    document.getElementById(dropTargetId)?.classList.remove('drag-over');
+    if (_autoBuilder.isSystem && (slotKey === 'when' || slotKey === 'do')) return;
+    try {
+        const data = JSON.parse(e.dataTransfer.getData('text/plain'));
+        // Handle THEN slot (append to array)
+        if (slotKey === 'then') {
+            if (data.slot !== 'then') { showToast('Wrong slot — drop ' + data.slot + ' blocks here', 'error'); return; }
+            if (_autoBuilder.then.length >= 3) { showToast('Maximum 3 then-actions', 'error'); return; }
+            _autoBuilder.then.push({ type: data.type, config: {} });
+        } else {
+            if (data.slot !== slotKey) { showToast('Wrong slot — drop ' + data.slot + ' blocks here', 'error'); return; }
+            _autoBuilder[slotKey] = { type: data.type, config: {} };
+        }
+        _renderBuilderCanvas();
+    } catch (err) { }
+}
+
+// Click-to-add (alternative to drag)
+function _autoClickBlock(blockType, slotCategory) {
+    if (_autoBuilder.isSystem && (slotCategory === 'when' || slotCategory === 'do')) return;
+    if (slotCategory === 'then') {
+        if (_autoBuilder.then.length >= 3) { showToast('Maximum 3 then-actions', 'error'); return; }
+        _autoBuilder.then.push({ type: blockType, config: {} });
+    } else {
+        _autoBuilder[slotCategory] = { type: blockType, config: {} };
+    }
+    _renderBuilderCanvas();
+}
+
+function _autoRemoveBlock(slotKey) {
+    if (_autoBuilder.isSystem && (slotKey === 'when' || slotKey === 'do')) return;
+    // Handle then-N slots
+    if (slotKey.startsWith('then-')) {
+        const idx = parseInt(slotKey.split('-')[1]);
+        if (!isNaN(idx) && idx >= 0 && idx < _autoBuilder.then.length) {
+            _autoBuilder.then.splice(idx, 1);
+        }
+    } else {
+        _autoBuilder[slotKey] = null;
+    }
+    _renderBuilderCanvas();
+}
+
+// Variable insertion
+function _autoInsertVar(textareaId, variable) {
+    const el = document.getElementById(textareaId);
+    if (!el) return;
+    const start = el.selectionStart, end = el.selectionEnd;
+    el.value = el.value.substring(0, start) + variable + el.value.substring(end);
+    el.selectionStart = el.selectionEnd = start + variable.length;
+    el.focus();
+}
+
+// --- Report Issue Helper ---
+
+function showReportIssueModal(entityType, entityId, entityName, artistName, albumTitle) {
+    const bridge = window.SoulSyncIssueDomain;
+    if (bridge && typeof bridge.openReportIssue === 'function') {
+        bridge.openReportIssue({
+            entityType,
+            entityId,
+            entityName,
+            artistName,
+            albumTitle: albumTitle || '',
+        });
+        return;
+    }
+
+    console.warn('Report issue bridge is unavailable');
+}
+
+// --- Helpers ---
+
+function _esc(str) {
+    if (!str) return '';
+    const d = document.createElement('div');
+    d.textContent = str;
+    return d.innerHTML;
+}
+
+function _escAttr(str) {
+    if (!str) return '';
+    return String(str).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Escape a string for use INSIDE a single-quoted JS string literal that itself
+// sits inside a double-quoted HTML attribute, e.g. onclick="fn('<value>')".
+// Such a value is decoded twice: first the HTML attribute parser resolves
+// entities, then the JS parser reads the string. _escAttr only HTML-escapes, so
+// an apostrophe becomes &#39; which the attribute parser turns back into a bare
+// ' — terminating the JS string and throwing a SyntaxError that silently kills
+// the whole handler (this is the "Road trip-The Rolfe's" delete-button bug).
+// Fix: backslash-escape the JS metacharacters (\ and ') FIRST so they survive
+// HTML decoding intact, then HTML-escape the characters that would otherwise
+// break the surrounding attribute. Order matters — & is escaped before the
+// later replacements insert their own entities.
+function _escJs(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/\\/g, '\\\\')
+        .replace(/'/g, "\\'")
+        .replace(/\r?\n/g, ' ')
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+// ===== ENHANCE QUALITY MODAL =====
+
+let _enhanceQualityData = null;
+let _enhanceArtistId = null;
+
+const ENHANCE_TIER_MAP = {
+    'lossless': { num: 1, label: 'Lossless', cssClass: 'lossless' },
+    'high_lossy': { num: 2, label: 'High Lossy', cssClass: 'high-lossy' },
+    'standard_lossy': { num: 3, label: 'Standard Lossy', cssClass: 'standard-lossy' },
+    'low_lossy': { num: 4, label: 'Low Lossy', cssClass: 'low-lossy' },
+    'unknown': { num: 999, label: 'Unknown', cssClass: 'unknown' },
+};
+
+async function checkArtistEnhanceEligibility(artistId) {
+    const btn = document.getElementById('library-artist-enhance-btn');
+    if (!btn) return;
+    btn.classList.add('hidden');
+    _enhanceArtistId = artistId;
+
+    try {
+        const resp = await fetch(`/api/library/artist/${artistId}/quality-analysis`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (!data.success || !data.tracks || data.tracks.length === 0) return;
+
+        _enhanceQualityData = data;
+
+        // Show button if any tracks are below the user's min acceptable tier
+        const minTier = data.min_acceptable_tier || 1;
+        const belowCount = data.tracks.filter(t => t.tier_num > minTier).length;
+        if (belowCount > 0) {
+            btn.classList.remove('hidden');
+            btn.querySelector('.enhance-text').textContent = `Enhance Quality (${belowCount})`;
+        }
+    } catch (e) {
+        console.debug('Enhance eligibility check failed:', e);
+    }
+}
+
+async function playArtistRadio() {
+    const artistId = artistDetailPageState.currentArtistId;
+    const artistName = artistDetailPageState.currentArtistName || '';
+    if (!artistId) {
+        showToast('No artist selected', 'error');
+        return;
+    }
+    return startArtistRadioById(artistId, artistName);
+}
+
+// Parameterized core of the artist-detail Radio button — also driven by the Artist Web graph panel
+// ("Play radio" on an owned node), so both entry points share one implementation.
+async function startArtistRadioById(artistId, artistName) {
+    try {
+        // Get tracks from this artist's library
+        const resp = await fetch(`/api/library/artist/${artistId}/enhanced`);
+        if (!resp.ok) throw new Error('Failed to load artist data');
+        const data = await resp.json();
+        if (!data.success) throw new Error(data.error || 'Failed');
+
+        // Collect all tracks with file paths
+        const allTracks = [];
+        for (const album of (data.albums || [])) {
+            for (const track of (album.tracks || [])) {
+                if (track.file_path) {
+                    allTracks.push({ track, album });
+                }
+            }
+        }
+
+        if (!allTracks.length) {
+            showToast('No playable tracks found for this artist', 'error');
+            return;
+        }
+
+        // Pick a random track
+        const random = allTracks[Math.floor(Math.random() * allTracks.length)];
+        const albumArt = random.album.thumb_url || data.artist?.thumb_url || null;
+
+        // Clear existing queue and disable radio before starting fresh
+        npRadioMode = false;
+        clearQueue();
+        if (audioPlayer && !audioPlayer.paused) {
+            audioPlayer.pause();
+        }
+
+        // Play the track and WAIT for it to resolve (playLibraryTrack is async
+        // and fetches the canonical DB row before setting currentTrack) — so
+        // currentTrack.id is reliably set before we fetch the radio queue. A
+        // fixed setTimeout raced this and often fired before the id existed,
+        // leaving the queue empty until the song ended.
+        await playLibraryTrack({
+            id: random.track.id,
+            title: random.track.title,
+            file_path: random.track.file_path,
+            bitrate: random.track.bitrate,
+            artist_id: artistId,
+            album_id: random.album.id,
+        }, random.album.title || '', artistName);
+
+        // Enable radio mode + immediately seed the queue with similar tracks —
+        // same path the modal's Radio button uses (fetchIfNeeded also adds the
+        // current track to the queue first).
+        if (typeof npSetPlayContext === 'function') {
+            npSetPlayContext(`${artistName || 'Artist'} Radio`);
+        }
+        if (typeof npSetRadioMode === 'function') {
+            npSetRadioMode(true, { toast: false, fetchIfNeeded: true });
+        } else {
+            npRadioMode = true;
+        }
+
+        showToast(`Playing ${artistName} radio — similar tracks will auto-queue`, 'success');
+    } catch (e) {
+        showToast(`Failed to start artist radio: ${e.message}`, 'error');
+    }
+}
+
+async function writeArtistImageToDisk(overwrite) {
+    // Issue #572: writes `artist.jpg` to the artist's folder so
+    // Navidrome (which has no API for artist images) picks up a
+    // real photo on its next scan. Plex/Jellyfin also read this
+    // file as a fallback, so it's safe to run regardless of which
+    // server is active.
+    const artistId = artistDetailPageState.currentArtistId;
+    if (!artistId) {
+        showToast('No artist selected', 'error');
+        return;
+    }
+    const btn = document.getElementById('library-artist-write-image-btn');
+    if (btn) {
+        btn.disabled = true;
+        const txt = btn.querySelector('.write-image-text');
+        if (txt) txt.textContent = 'Writing…';
+    }
+    try {
+        let resp = await fetch(`/api/artist/${artistId}/write-image-to-disk`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ overwrite: !!overwrite }),
+        });
+        let data = await resp.json();
+
+        // Default protect-existing path: surface a confirm so the user
+        // explicitly opts in to clobbering a hand-picked artist.jpg.
+        if (!data.success && /already exists/i.test(data.error || '')) {
+            if (confirm('artist.jpg already exists in the folder. Overwrite with the new image?')) {
+                resp = await fetch(`/api/artist/${artistId}/write-image-to-disk`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ overwrite: true }),
+                });
+                data = await resp.json();
+            } else {
+                showToast('Cancelled — existing artist.jpg kept', 'info');
+                return;
+            }
+        }
+
+        if (!data.success) {
+            showToast(`Failed: ${data.error || 'Unknown error'}`, 'error');
+            return;
+        }
+        const scan = data.scan_triggered ? ' (Navidrome scan triggered)' : '';
+        showToast(`artist.jpg written${scan}`, 'success');
+    } catch (e) {
+        showToast(`Write failed: ${e.message}`, 'error');
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            const txt = btn.querySelector('.write-image-text');
+            if (txt) txt.textContent = 'Write Artist Image';
+        }
+    }
+}
+window.writeArtistImageToDisk = writeArtistImageToDisk;
+
+
+function openEnhanceQualityModal() {
+    if (!_enhanceQualityData) return;
+    const data = _enhanceQualityData;
+
+    // Remove existing modal if any
+    const existing = document.getElementById('enhance-quality-overlay');
+    if (existing) existing.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'enhance-quality-overlay';
+    overlay.className = 'enhance-modal-overlay';
+    overlay.onclick = (e) => { if (e.target === overlay) closeEnhanceQualityModal(); };
+
+    const minTier = data.min_acceptable_tier || 1;
+    const summary = data.quality_summary || {};
+
+    overlay.innerHTML = `
+        <div class="enhance-modal" onclick="event.stopPropagation()">
+            <div class="enhance-modal-header">
+                <h3>⚡ Enhance Quality — ${_esc(data.artist_name)}</h3>
+                <button class="enhance-modal-close" onclick="closeEnhanceQualityModal()">&times;</button>
+            </div>
+            <div class="enhance-summary-bar">
+                ${_buildEnhanceSummaryChips(summary)}
+            </div>
+            <div class="enhance-controls">
+                <div class="enhance-tier-selector">
+                    <label>Upgrade tracks below:</label>
+                    <select id="enhance-tier-dropdown" onchange="updateEnhanceThreshold(parseInt(this.value))">
+                        <option value="1" ${minTier <= 1 ? 'selected' : ''}>Lossless (FLAC/WAV)</option>
+                        <option value="2" ${minTier === 2 ? 'selected' : ''}>High Lossy (OGG/Opus)</option>
+                        <option value="3" ${minTier === 3 ? 'selected' : ''}>Standard Lossy (M4A/AAC)</option>
+                        <option value="4" ${minTier >= 4 ? 'selected' : ''}>Low Lossy (MP3/WMA)</option>
+                    </select>
+                </div>
+                <div class="enhance-select-controls">
+                    <button class="enhance-select-btn" onclick="enhanceSelectAll(true)">Select All Below</button>
+                    <button class="enhance-select-btn" onclick="enhanceSelectAll(false)">Deselect All</button>
+                    <span class="enhance-selected-count" id="enhance-selected-count">0 selected</span>
+                </div>
+            </div>
+            <div class="enhance-modal-body">
+                <table class="enhance-track-table">
+                    <thead>
+                        <tr>
+                            <th></th>
+                            <th>#</th>
+                            <th>Title</th>
+                            <th>Album</th>
+                            <th>Format</th>
+                            <th>Bitrate</th>
+                        </tr>
+                    </thead>
+                    <tbody id="enhance-track-tbody">
+                    </tbody>
+                </table>
+            </div>
+            <div class="enhance-modal-footer">
+                <div class="enhance-footer-info" id="enhance-footer-info"></div>
+                <div class="enhance-footer-actions">
+                    <button class="enhance-btn secondary" onclick="closeEnhanceQualityModal()">Cancel</button>
+                    <button class="enhance-btn primary" id="enhance-submit-btn" onclick="submitEnhanceQuality()" disabled>
+                        ⚡ Enhance 0 Tracks
+                    </button>
+                </div>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(overlay);
+    renderEnhanceTrackRows(minTier);
+}
+
+function _buildEnhanceSummaryChips(summary) {
+    const chips = [
+        { key: 'lossless', label: 'FLAC', cssClass: 'lossless' },
+        { key: 'high_lossy', label: 'OGG/Opus', cssClass: 'high-lossy' },
+        { key: 'standard_lossy', label: 'M4A/AAC', cssClass: 'standard-lossy' },
+        { key: 'low_lossy', label: 'MP3/WMA', cssClass: 'low-lossy' },
+    ];
+    return chips
+        .filter(c => (summary[c.key] || 0) > 0)
+        .map(c => `
+            <div class="enhance-summary-chip ${c.cssClass}">
+                <span class="chip-count">${summary[c.key]}</span>
+                <span class="chip-label">${c.label}</span>
+            </div>
+        `).join('');
+}
+
+function renderEnhanceTrackRows(thresholdTier) {
+    const tbody = document.getElementById('enhance-track-tbody');
+    if (!tbody || !_enhanceQualityData) return;
+
+    const tracks = _enhanceQualityData.tracks;
+    // Sort: below-threshold first, then by album + track number
+    const sorted = [...tracks].sort((a, b) => {
+        const aBt = a.tier_num > thresholdTier ? 0 : 1;
+        const bBt = b.tier_num > thresholdTier ? 0 : 1;
+        if (aBt !== bBt) return aBt - bBt;
+        const albumCmp = (a.album_title || '').localeCompare(b.album_title || '');
+        if (albumCmp !== 0) return albumCmp;
+        return (a.disc_number || 1) * 1000 + (a.track_number || 0) - ((b.disc_number || 1) * 1000 + (b.track_number || 0));
+    });
+
+    tbody.innerHTML = sorted.map(track => {
+        const isBelow = track.tier_num > thresholdTier;
+        const tierInfo = ENHANCE_TIER_MAP[track.tier_name] || ENHANCE_TIER_MAP['unknown'];
+        const bitrateStr = track.bitrate ? `${track.bitrate} kbps` : '-';
+        return `
+            <tr class="enhance-track-row ${isBelow ? 'below-threshold' : 'above-threshold'}"
+                data-track-id="${_escAttr(track.track_id)}" data-tier="${track.tier_num}">
+                <td><input type="checkbox" class="enhance-track-check"
+                    ${isBelow ? 'checked' : ''} onchange="updateEnhanceSelectedCount()"></td>
+                <td>${track.track_number || '-'}</td>
+                <td>${_esc(track.title)}</td>
+                <td>${_esc(track.album_title)}</td>
+                <td><span class="enhance-format-badge ${tierInfo.cssClass}">${_esc(track.format)}</span></td>
+                <td><span class="enhance-bitrate">${bitrateStr}</span></td>
+            </tr>
+        `;
+    }).join('');
+
+    updateEnhanceSelectedCount();
+}
+
+function updateEnhanceThreshold(tierNum) {
+    const rows = document.querySelectorAll('.enhance-track-row');
+    rows.forEach(row => {
+        const trackTier = parseInt(row.dataset.tier);
+        const isBelow = trackTier > tierNum;
+        const cb = row.querySelector('.enhance-track-check');
+
+        row.classList.toggle('below-threshold', isBelow);
+        row.classList.toggle('above-threshold', !isBelow);
+        if (cb) cb.checked = isBelow;
+    });
+    updateEnhanceSelectedCount();
+}
+
+function enhanceSelectAll(select) {
+    const thresholdTier = parseInt(document.getElementById('enhance-tier-dropdown')?.value || '1');
+    const checks = document.querySelectorAll('.enhance-track-check');
+    checks.forEach(cb => {
+        const row = cb.closest('.enhance-track-row');
+        const trackTier = parseInt(row?.dataset.tier || '999');
+        if (select) {
+            cb.checked = trackTier > thresholdTier;
+        } else {
+            cb.checked = false;
+        }
+    });
+    updateEnhanceSelectedCount();
+}
+
+function updateEnhanceSelectedCount() {
+    const checks = document.querySelectorAll('.enhance-track-check:checked');
+    const count = checks.length;
+    const countEl = document.getElementById('enhance-selected-count');
+    const submitBtn = document.getElementById('enhance-submit-btn');
+
+    if (countEl) countEl.textContent = `${count} selected`;
+    if (submitBtn) {
+        submitBtn.textContent = `⚡ Enhance ${count} Track${count !== 1 ? 's' : ''}`;
+        submitBtn.disabled = count === 0;
+    }
+}
+
+async function submitEnhanceQuality() {
+    const checks = document.querySelectorAll('.enhance-track-check:checked');
+    const trackIds = [];
+    checks.forEach(cb => {
+        const row = cb.closest('.enhance-track-row');
+        if (row?.dataset.trackId) trackIds.push(row.dataset.trackId);
+    });
+
+    if (trackIds.length === 0) return;
+
+    const submitBtn = document.getElementById('enhance-submit-btn');
+    const footerInfo = document.getElementById('enhance-footer-info');
+    if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = '<span class="enhance-spinner"></span>Processing...';
+    }
+    if (footerInfo) footerInfo.textContent = 'Matching tracks across metadata sources and adding to wishlist...';
+
+    try {
+        const resp = await fetch(`/api/library/artist/${_enhanceArtistId}/enhance`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ track_ids: trackIds })
+        });
+
+        const result = await resp.json();
+
+        if (result.success) {
+            const msg = `${result.enhanced_count} track${result.enhanced_count !== 1 ? 's' : ''} queued for enhancement`;
+            if (footerInfo) footerInfo.textContent = msg;
+
+            showToast(msg + (result.failed_count > 0 ? ` (${result.failed_count} failed)` : ''), 'success');
+
+            // Update button count
+            const enhBtn = document.getElementById('library-artist-enhance-btn');
+            if (enhBtn && result.enhanced_count > 0) {
+                const remaining = trackIds.length - result.enhanced_count;
+                if (remaining <= 0) {
+                    enhBtn.classList.add('hidden');
+                }
+            }
+
+            if (submitBtn) {
+                submitBtn.textContent = '✅ Done';
+                submitBtn.disabled = true;
+            }
+
+            // Auto-close after short delay
+            setTimeout(() => closeEnhanceQualityModal(), 1500);
+        } else {
+            throw new Error(result.error || 'Enhancement failed');
+        }
+    } catch (e) {
+        console.error('Enhance quality error:', e);
+        showToast(`Enhancement failed: ${e.message}`, 'error');
+        if (submitBtn) {
+            submitBtn.textContent = `⚡ Enhance ${trackIds.length} Tracks`;
+            submitBtn.disabled = false;
+        }
+        if (footerInfo) footerInfo.textContent = '';
+    }
+}
+
+function closeEnhanceQualityModal() {
+    const overlay = document.getElementById('enhance-quality-overlay');
+    if (overlay) {
+        overlay.classList.add('hidden');
+        setTimeout(() => overlay.remove(), 300);
+    }
+}
+
+// Global exports
+window.openEnhanceQualityModal = openEnhanceQualityModal;
+window.closeEnhanceQualityModal = closeEnhanceQualityModal;
+window.updateEnhanceThreshold = updateEnhanceThreshold;
+window.enhanceSelectAll = enhanceSelectAll;
+window.updateEnhanceSelectedCount = updateEnhanceSelectedCount;
+window.submitEnhanceQuality = submitEnhanceQuality;
+
+// ===== END ENHANCE QUALITY MODAL =====

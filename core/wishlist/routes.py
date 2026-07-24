@@ -1,0 +1,681 @@
+"""Wishlist controller helpers for Flask-style endpoints."""
+
+from __future__ import annotations
+
+import json
+import re
+import threading
+from dataclasses import dataclass
+from typing import Any, Callable, Dict
+
+from core.metadata import normalize_image_url
+from core.metadata.artwork import is_internal_image_host
+from core.wishlist.reporting import build_wishlist_stats_payload
+from core.wishlist.selection import prepare_wishlist_tracks_for_display
+from core.wishlist.service import get_wishlist_service
+from core.wishlist.state import get_wishlist_cycle as _get_wishlist_cycle
+from core.wishlist.state import set_wishlist_cycle as _set_wishlist_cycle
+from utils.logging_config import get_logger
+
+
+module_logger = get_logger("wishlist.routes")
+logger = module_logger
+
+
+@dataclass
+class WishlistRouteRuntime:
+    """Dependencies needed to service wishlist HTTP endpoints outside the controller."""
+
+    get_music_database: Callable[[], Any]
+    profile_id: int
+    download_batches: Dict[str, Dict[str, Any]]
+    download_tasks: Dict[str, Dict[str, Any]]
+    tasks_lock: Any
+    is_wishlist_actually_processing: Callable[[], bool]
+    reset_wishlist_processing_state: Callable[[], None]
+    add_activity_item: Callable[[Any, Any, Any, Any], Any]
+    active_server: str
+    logger: Any = module_logger
+    get_next_run_seconds: Callable[[str], int] | None = None
+    thread_factory: Callable[..., Any] = threading.Thread
+
+
+def _build_album_images(album: Dict[str, Any]) -> list[dict[str, Any]]:
+    if isinstance(album.get("images"), list) and album.get("images"):
+        return list(album["images"])
+    if album.get("image_url"):
+        return [{"url": album["image_url"], "height": 640, "width": 640}]
+    return []
+
+
+def _build_track_data(track: Dict[str, Any], album: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a wishlist-modal add payload into the canonical
+    wishlist track shape.
+
+    Pre-fix this used default values (``track_number=1``,
+    ``disc_number=1``, ``total_tracks=1``, ``release_date=''``) when
+    the upstream UI omitted a field. That silently poisoned every
+    wishlist row added from the library "add to wishlist" modal:
+    track_number locked to 1 regardless of source position, year
+    dropped from folder paths because release_date was empty. The
+    library modal flow is what's used for "add this album's missing
+    tracks to wishlist" and "add this playlist to wishlist" bulk
+    actions — the most common user path, so the regression was
+    everywhere.
+
+    Now preserve missing values explicitly (None for numeric
+    positions, omit-or-empty for release_date) so the downstream
+    import pipeline can detect-and-recover via
+    ``core/imports/track_number.py:resolve_track_number`` instead
+    of locking to 1.
+    """
+    album_images = _build_album_images(album)
+    return {
+        "id": track.get("id"),
+        "name": track.get("name"),
+        "artists": track.get("artists", []),
+        "album": {
+            "id": album.get("id"),
+            "name": album.get("name"),
+            "artists": album.get("artists", []),
+            "images": album_images,
+            "album_type": album.get("album_type", "album"),
+            # release_date stays as whatever the upstream sent
+            # (including '' when truly unknown). Path template
+            # gracefully omits the year when empty; we don't fake
+            # a date.
+            "release_date": album.get("release_date", ""),
+            # total_tracks=None preserves "we don't know"; UI uses
+            # this for category classification + path math. Pre-fix
+            # default of 1 mislabelled multi-track albums as singles.
+            "total_tracks": album.get("total_tracks"),
+        },
+        "duration_ms": track.get("duration_ms", 0),
+        # Numeric positions: None when missing, not 1.
+        "track_number": track.get("track_number"),
+        "disc_number": track.get("disc_number"),
+        "explicit": track.get("explicit", False),
+        "popularity": track.get("popularity", 0),
+        "preview_url": track.get("preview_url"),
+        "external_urls": track.get("external_urls", {}),
+    }
+
+
+def _build_spotify_track_data(track: Dict[str, Any], album: Dict[str, Any]) -> Dict[str, Any]:
+    """Backward-compatible wrapper for `_build_track_data`."""
+    return _build_track_data(track, album)
+
+
+def _load_track_spotify_data(track: Dict[str, Any]) -> Dict[str, Any]:
+    spotify_data = track.get("spotify_data", {})
+    if isinstance(spotify_data, str):
+        try:
+            spotify_data = json.loads(spotify_data)
+        except Exception:
+            spotify_data = {}
+    if not isinstance(spotify_data, dict):
+        spotify_data = {}
+    return spotify_data
+
+
+def _album_lookup_id(spotify_data: Dict[str, Any]) -> tuple[str | None, Dict[str, Any]]:
+    album_data = spotify_data.get("album") or {}
+    if not isinstance(album_data, dict):
+        album_data = {}
+
+    track_album_id = album_data.get("id")
+    if not track_album_id:
+        album_name = album_data.get("name", "Unknown Album")
+        artists = spotify_data.get("artists", [])
+        if isinstance(artists, list) and artists and isinstance(artists[0], dict):
+            artist_name = artists[0].get("name", "Unknown Artist")
+        elif isinstance(artists, list) and artists and isinstance(artists[0], str):
+            artist_name = artists[0]
+        else:
+            artist_name = "Unknown Artist"
+        custom_id = f"{album_name}_{artist_name}"
+        track_album_id = re.sub(r"[^a-zA-Z0-9\s_-]", "", custom_id)
+        track_album_id = re.sub(r"\s+", "_", track_album_id).lower()
+
+    return track_album_id, album_data
+
+
+def process_wishlist_api(
+    runtime: WishlistRouteRuntime,
+    *,
+    start_processing: Callable[[], None],
+) -> tuple[Dict[str, Any], int]:
+    """Trigger wishlist processing in the background."""
+    try:
+        if runtime.is_wishlist_actually_processing():
+            return {"success": False, "error": "Wishlist processing already in progress"}, 409
+
+        thread = runtime.thread_factory(target=start_processing, daemon=True)
+        thread.start()
+        return {"success": True, "message": "Wishlist processing started"}, 200
+    except Exception as exc:
+        runtime.logger.error("Error starting wishlist processing: %s", exc)
+        return {"success": False, "error": str(exc)}, 500
+
+
+def get_wishlist_count(runtime: WishlistRouteRuntime) -> tuple[Dict[str, Any], int]:
+    """Return the current wishlist count for the active profile."""
+    try:
+        count = get_wishlist_service().get_wishlist_count(profile_id=runtime.profile_id)
+        return {"count": count}, 200
+    except Exception as exc:
+        runtime.logger.error("Error getting wishlist count: %s", exc)
+        return {"error": str(exc)}, 500
+
+
+def get_wishlist_stats(runtime: WishlistRouteRuntime) -> tuple[Dict[str, Any], int]:
+    """Return wishlist statistics for the UI."""
+    try:
+        raw_tracks = get_wishlist_service().get_wishlist_tracks_for_download(profile_id=runtime.profile_id)
+        next_run_in_seconds = runtime.get_next_run_seconds("process_wishlist") if runtime.get_next_run_seconds else 0
+        is_processing = runtime.is_wishlist_actually_processing()
+        current_cycle = _get_wishlist_cycle(runtime.get_music_database)
+
+        payload = build_wishlist_stats_payload(
+            raw_tracks,
+            next_run_in_seconds=next_run_in_seconds,
+            is_auto_processing=is_processing,
+            current_cycle=current_cycle,
+        )
+        return payload, 200
+    except Exception as exc:
+        runtime.logger.error("Error getting wishlist stats: %s", exc)
+        return {"error": str(exc)}, 500
+
+
+def get_wishlist_cycle(runtime: WishlistRouteRuntime) -> tuple[Dict[str, Any], int]:
+    """Return the current wishlist cycle."""
+    try:
+        cycle = _get_wishlist_cycle(runtime.get_music_database)
+        return {"cycle": cycle}, 200
+    except Exception as exc:
+        runtime.logger.error("Error getting wishlist cycle: %s", exc)
+        return {"error": str(exc)}, 500
+
+
+def set_wishlist_cycle(runtime: WishlistRouteRuntime, cycle: str) -> tuple[Dict[str, Any], int]:
+    """Persist the wishlist cycle."""
+    try:
+        if cycle not in ["albums", "singles"]:
+            return {"error": "Invalid cycle. Must be 'albums' or 'singles'"}, 400
+
+        _set_wishlist_cycle(runtime.get_music_database, cycle)
+        runtime.logger.info("Wishlist cycle set to: %s", cycle)
+        return {"success": True, "cycle": cycle}, 200
+    except Exception as exc:
+        runtime.logger.error("Error setting wishlist cycle: %s", exc)
+        return {"error": str(exc)}, 500
+
+
+def _needs_image_fix(url: str | None) -> bool:
+    """True when an image URL won't render in the browser as-is — a media-server RELATIVE
+    path (/library/.., /Items/.., /rest/..) or an internal/localhost host. Spotify/iTunes CDN
+    URLs render directly and are left untouched, so already-working items never change."""
+    if not url or not isinstance(url, str):
+        return False
+    if url.startswith('/') and not url.startswith('//'):
+        return True
+    if url.startswith('http://') or url.startswith('https://'):
+        return is_internal_image_host(url)
+    return False
+
+
+def _enrich_wishlist_images(tracks: list[dict[str, Any]], db: Any) -> dict[str, str]:
+    """Make wishlist art browser-renderable using the library data we already have.
+
+    The library stores album/artist art as media-server RELATIVE paths (e.g. Plex
+    /library/metadata/..) which don't render in a browser <img>. Normal wishlist items carry
+    Spotify CDN URLs (fine), but library-sourced items — re-downloads and preview-clip
+    re-fetches — carry the relative path, so their art comes up blank. We fix two things here,
+    on read, so it also repairs items already sitting in the wishlist:
+
+      1. Normalize each track's album.images[*].url that needs it (relative/internal only —
+         CDN URLs are left as-is to avoid regressing items that already render).
+      2. Build an artist-name -> normalized library photo map so the nebula can show artist
+         photos for non-watchlist artists (it otherwise only has watchlisted-artist photos).
+    """
+    artist_names: set[str] = set()
+    for track in tracks:
+        sd = track.get('spotify_data')
+        if isinstance(sd, dict):
+            album = sd.get('album')
+            if isinstance(album, dict):
+                images = album.get('images')
+                if isinstance(images, list):
+                    for img in images:
+                        if isinstance(img, dict) and _needs_image_fix(img.get('url')):
+                            fixed = normalize_image_url(img['url'])
+                            if fixed:
+                                img['url'] = fixed
+        name = track.get('artist_name')
+        if name and name != 'Unknown Artist':
+            artist_names.add(name)
+
+    artist_images: dict[str, str] = {}
+    if not artist_names:
+        return artist_images
+    try:
+        conn = db._get_connection()
+        try:
+            placeholders = ','.join('?' * len(artist_names))
+            rows = conn.execute(
+                f"SELECT name, thumb_url FROM artists "
+                f"WHERE name IN ({placeholders}) AND thumb_url IS NOT NULL AND thumb_url != ''",
+                list(artist_names),
+            ).fetchall()
+        finally:
+            conn.close()
+        for row in rows:
+            name, thumb = row[0], row[1]
+            fixed = normalize_image_url(thumb) if _needs_image_fix(thumb) else thumb
+            if name and fixed:
+                artist_images[name.lower()] = fixed
+    except Exception as exc:  # noqa: BLE001 — art is cosmetic, never fail the tracks endpoint
+        logger.debug("Could not build wishlist artist-image map: %s", exc)
+    return artist_images
+
+
+def get_wishlist_tracks(
+    runtime: WishlistRouteRuntime,
+    *,
+    category: str | None = None,
+    limit: int | None = None,
+) -> tuple[Dict[str, Any], int]:
+    """Return wishlist tracks for the modal UI."""
+    try:
+        db = runtime.get_music_database()
+
+        with runtime.tasks_lock:
+            wishlist_batch_active = any(
+                batch.get("playlist_id") == "wishlist" and batch.get("phase") in ["analysis", "downloading"]
+                for batch in runtime.download_batches.values()
+            )
+
+        if not wishlist_batch_active:
+            duplicates_removed = db.remove_wishlist_duplicates(profile_id=runtime.profile_id)
+            if duplicates_removed > 0:
+                runtime.logger.warning("Cleaned %s duplicate tracks from wishlist", duplicates_removed)
+        else:
+            runtime.logger.warning("Skipping wishlist duplicate cleanup - download in progress")
+
+        raw_tracks = get_wishlist_service().get_wishlist_tracks_for_download(profile_id=runtime.profile_id)
+        prepared = prepare_wishlist_tracks_for_display(raw_tracks, category=category, limit=limit)
+
+        if prepared["duplicates_found"] > 0:
+            runtime.logger.warning(
+                "[API-Wishlist-Tracks] Found and removed %s duplicate tracks during sanitization",
+                prepared["duplicates_found"],
+            )
+
+        # Make library-sourced art renderable + supply artist photos (see _enrich_wishlist_images).
+        artist_images = _enrich_wishlist_images(prepared["tracks"], db)
+
+        if category:
+            runtime.logger.info(
+                "Wishlist filter: %s/%s tracks in '%s' category (limit: %s)",
+                len(prepared["tracks"]),
+                prepared["total"],
+                category,
+                limit or "none",
+            )
+            return {
+                "tracks": prepared["tracks"],
+                "category": category,
+                "total": prepared["total"],
+                "artist_images": artist_images,
+            }, 200
+
+        return {
+            "tracks": prepared["tracks"],
+            "total": prepared["total"],
+            "artist_images": artist_images,
+        }, 200
+    except Exception as exc:
+        runtime.logger.error("Error getting wishlist tracks: %s", exc)
+        return {"error": str(exc)}, 500
+
+
+def clear_wishlist(runtime: WishlistRouteRuntime) -> tuple[Dict[str, Any], int]:
+    """Clear the wishlist and cancel active wishlist batches."""
+    try:
+        success = get_wishlist_service().clear_wishlist(profile_id=runtime.profile_id)
+
+        if success:
+            cancelled_count = 0
+            with runtime.tasks_lock:
+                for _batch_id, batch_data in runtime.download_batches.items():
+                    if batch_data.get("playlist_id") == "wishlist" and batch_data.get("phase") not in (
+                        "complete",
+                        "error",
+                        "cancelled",
+                    ):
+                        batch_data["phase"] = "cancelled"
+                        for task_id in batch_data.get("queue", []):
+                            if task_id in runtime.download_tasks and runtime.download_tasks[task_id]["status"] not in (
+                                "completed",
+                                "failed",
+                                "not_found",
+                                "cancelled",
+                            ):
+                                runtime.download_tasks[task_id]["status"] = "cancelled"
+                                cancelled_count += 1
+
+            runtime.reset_wishlist_processing_state()
+
+            if cancelled_count > 0:
+                runtime.logger.warning("[Wishlist Clear] Cancelled %s active wishlist downloads", cancelled_count)
+                runtime.add_activity_item("", "Wishlist Cleared", f"Wishlist cleared and {cancelled_count} downloads cancelled", "Now")
+
+            return {
+                "success": True,
+                "message": "Wishlist cleared successfully",
+                "cancelled_downloads": cancelled_count,
+            }, 200
+
+        return {"success": False, "error": "Failed to clear wishlist"}, 500
+    except Exception as exc:
+        runtime.logger.error("Error clearing wishlist: %s", exc)
+        return {"success": False, "error": str(exc)}, 500
+
+
+def remove_track_from_wishlist(
+    runtime: WishlistRouteRuntime,
+    spotify_track_id: str | None,
+) -> tuple[Dict[str, Any], int]:
+    """Remove a single track from the wishlist."""
+    try:
+        if not spotify_track_id:
+            return {"success": False, "error": "No spotify_track_id provided"}, 400
+
+        service = get_wishlist_service()
+        _db = getattr(service, "database", None)
+        # #874: capture the track's display info BEFORE removal (the row is
+        # gone afterwards) so the ignore-list entry carries a human label.
+        _ignore_data = None
+        try:
+            if _db is not None:
+                _ignore_data = _db.get_wishlist_spotify_data(
+                    spotify_track_id, profile_id=runtime.profile_id)
+        except Exception:
+            _ignore_data = None
+
+        success = service.remove_track_from_wishlist(
+            spotify_track_id,
+            profile_id=runtime.profile_id,
+        )
+
+        if success:
+            # #874: a user-initiated remove means "stop auto-requeuing this".
+            # Record a TTL'd ignore so the watchlist/auto-processor doesn't
+            # re-add it. Best-effort — never fails the remove.
+            from core.wishlist.ignore import ignore_wishlist_track, REASON_REMOVED
+            ignore_wishlist_track(_db, runtime.profile_id,
+                                  spotify_track_id, REASON_REMOVED, spotify_data=_ignore_data)
+            runtime.logger.info("Successfully removed track from wishlist: %s", spotify_track_id)
+            return {"success": True, "message": "Track removed from wishlist"}, 200
+
+        runtime.logger.warning("Failed to remove track from wishlist: %s", spotify_track_id)
+        return {"success": False, "error": "Track not found in wishlist"}, 404
+    except Exception as exc:
+        runtime.logger.error("Error removing track from wishlist: %s", exc)
+        return {"success": False, "error": str(exc)}, 500
+
+
+def remove_album_from_wishlist(
+    runtime: WishlistRouteRuntime,
+    *,
+    album_id: str | None = None,
+    album_name_filter: str | None = None,
+) -> tuple[Dict[str, Any], int]:
+    """Remove every wishlist track that belongs to the selected album."""
+    try:
+        if not album_id and not album_name_filter:
+            return {"success": False, "error": "No album_id or album_name provided"}, 400
+
+        wishlist_service = get_wishlist_service()
+        all_tracks = wishlist_service.get_wishlist_tracks_for_download(profile_id=runtime.profile_id)
+
+        tracks_to_remove = []
+        for track in all_tracks:
+            spotify_data = _load_track_spotify_data(track)
+            track_album_id, album_data = _album_lookup_id(spotify_data)
+
+            matched = False
+            if album_id and track_album_id == album_id:
+                matched = True
+            elif album_name_filter:
+                track_album_name = album_data.get("name", "")
+                if isinstance(spotify_data.get("album"), str):
+                    track_album_name = spotify_data["album"]
+                if track_album_name and track_album_name.lower().strip() == album_name_filter.lower().strip():
+                    matched = True
+
+            if matched:
+                spotify_track_id = track.get("track_id") or track.get("spotify_track_id") or track.get("id")
+                if spotify_track_id:
+                    # Keep the loaded spotify_data alongside the id so the #874
+                    # ignore entry can be labelled without a second DB read.
+                    tracks_to_remove.append((spotify_track_id, spotify_data))
+
+        from core.wishlist.ignore import ignore_wishlist_track, REASON_REMOVED
+        _db = getattr(wishlist_service, "database", None)
+        removed_count = 0
+        album_remove_pid = runtime.profile_id
+        for spotify_track_id, track_spotify_data in tracks_to_remove:
+            if wishlist_service.remove_track_from_wishlist(spotify_track_id, profile_id=album_remove_pid):
+                removed_count += 1
+                # #874: user removed the whole album → ignore each track.
+                ignore_wishlist_track(_db, album_remove_pid,
+                                      spotify_track_id, REASON_REMOVED, spotify_data=track_spotify_data)
+
+        if removed_count > 0:
+            runtime.logger.info("Successfully removed %s tracks from album %s", removed_count, album_id)
+            return {
+                "success": True,
+                "message": f"Removed {removed_count} track(s) from wishlist",
+                "removed_count": removed_count,
+            }, 200
+
+        runtime.logger.warning("No tracks found for album %s", album_id)
+        return {"success": False, "error": "No tracks found for this album"}, 404
+    except Exception as exc:
+        runtime.logger.error("Error removing album from wishlist: %s", exc)
+        return {"success": False, "error": str(exc)}, 500
+
+
+def _primary_artist_name(spotify_data: Dict[str, Any]) -> str:
+    artists = spotify_data.get("artists") or []
+    if isinstance(artists, list) and artists:
+        first = artists[0]
+        if isinstance(first, dict):
+            return str(first.get("name") or "")
+        return str(first or "")
+    return ""
+
+
+def remove_artist_from_wishlist(
+    runtime: WishlistRouteRuntime,
+    artist_name: str,
+) -> tuple[Dict[str, Any], int]:
+    """Remove EVERY wishlist track whose primary artist matches (#1065).
+
+    QT3496: excluding one artist from a big discography wishlist meant
+    unchecking / deleting every album one by one. Mirrors the per-album
+    removal exactly — each removed track gets an ignore entry (#874) so the
+    next watchlist/discography pass doesn't quietly re-add the artist."""
+    try:
+        artist_name = str(artist_name or "").strip()
+        if not artist_name:
+            return {"success": False, "error": "Missing artist_name"}, 400
+        wanted = artist_name.lower()
+
+        wishlist_service = get_wishlist_service()
+        all_tracks = wishlist_service.get_wishlist_tracks_for_download(profile_id=runtime.profile_id)
+
+        tracks_to_remove = []
+        for track in all_tracks:
+            spotify_data = _load_track_spotify_data(track)
+            if _primary_artist_name(spotify_data).lower().strip() != wanted:
+                continue
+            spotify_track_id = track.get("track_id") or track.get("spotify_track_id") or track.get("id")
+            if spotify_track_id:
+                tracks_to_remove.append((spotify_track_id, spotify_data))
+
+        from core.wishlist.ignore import ignore_wishlist_track, REASON_REMOVED
+        _db = getattr(wishlist_service, "database", None)
+        removed_count = 0
+        pid = runtime.profile_id
+        for spotify_track_id, track_spotify_data in tracks_to_remove:
+            if wishlist_service.remove_track_from_wishlist(spotify_track_id, profile_id=pid):
+                removed_count += 1
+                ignore_wishlist_track(_db, pid, spotify_track_id, REASON_REMOVED,
+                                      spotify_data=track_spotify_data)
+
+        if removed_count > 0:
+            runtime.logger.info("Removed %s wishlist track(s) for artist %r",
+                                removed_count, artist_name)
+            return {
+                "success": True,
+                "message": f"Removed {removed_count} track(s) by {artist_name}",
+                "removed_count": removed_count,
+            }, 200
+        return {"success": False, "error": "No wishlist tracks found for this artist"}, 404
+    except Exception as exc:
+        runtime.logger.error("Error removing artist from wishlist: %s", exc)
+        return {"success": False, "error": str(exc)}, 500
+
+
+def remove_batch_from_wishlist(
+    runtime: WishlistRouteRuntime,
+    spotify_track_ids,
+) -> tuple[Dict[str, Any], int]:
+    """Remove a batch of tracks from the wishlist."""
+    try:
+        if not spotify_track_ids or not isinstance(spotify_track_ids, list):
+            return {"success": False, "error": "Missing or invalid spotify_track_ids"}, 400
+
+        from core.wishlist.ignore import ignore_wishlist_track, REASON_REMOVED
+        service = get_wishlist_service()
+        _db = getattr(service, "database", None)
+        removed = 0
+        pid = runtime.profile_id
+        for track_id in spotify_track_ids:
+            # Capture label before the row is deleted (#874).
+            _data = None
+            try:
+                if _db is not None:
+                    _data = _db.get_wishlist_spotify_data(track_id, profile_id=pid)
+            except Exception:
+                _data = None
+            if service.remove_track_from_wishlist(track_id, profile_id=pid):
+                removed += 1
+                ignore_wishlist_track(_db, pid, track_id, REASON_REMOVED, spotify_data=_data)
+
+        runtime.logger.info("Batch removed %s track(s) from wishlist", removed)
+        return {
+            "success": True,
+            "removed": removed,
+            "message": f"Removed {removed} track{'s' if removed != 1 else ''} from wishlist",
+        }, 200
+    except Exception as exc:
+        runtime.logger.error("Error batch removing from wishlist: %s", exc)
+        return {"success": False, "error": str(exc)}, 500
+
+
+def add_album_track_to_wishlist(
+    runtime: WishlistRouteRuntime,
+    *,
+    track: Dict[str, Any] | None,
+    artist: Dict[str, Any] | None,
+    album: Dict[str, Any] | None,
+    source_type: str = "album",
+    source_context: Dict[str, Any] | None = None,
+) -> tuple[Dict[str, Any], int]:
+    """Add a single album track to the wishlist."""
+    try:
+        if not track or not artist or not album:
+            return {"success": False, "error": "Missing required fields: track, artist, album"}, 400
+
+        track_data = _build_track_data(track, album)
+
+        # #825: don't add a track that's already in the library, unless the user
+        # has opted into duplicates. The manual album "add to wishlist" modal
+        # otherwise dumped owned tracks straight into the wishlist with no check
+        # (carlosjfcasero) — and the auto-cleanup may not reliably remove them.
+        # Respects the same wishlist.allow_duplicate_tracks toggle the watchlist
+        # scan + cleanup use: OFF → skip owned, ON → add anyway. (The quality
+        # re-download flow uses a different endpoint, so it's unaffected.)
+        try:
+            from config.settings import config_manager as _cfg
+            if not _cfg.get('wishlist.allow_duplicate_tracks', True):
+                _db = runtime.get_music_database()
+                _existing, _conf = _db.check_track_exists(
+                    track.get('name', ''), artist.get('name', ''),
+                    confidence_threshold=0.7,
+                    server_source=runtime.active_server,
+                    album=album.get('name', ''),
+                )
+                if _existing and _conf >= 0.7:
+                    runtime.logger.info(
+                        "[Wishlist Add] skipping '%s' by '%s' — already in library "
+                        "(allow_duplicate_tracks is off)",
+                        track.get('name'), artist.get('name'))
+                    return {"success": True, "skipped": True,
+                            "message": f"'{track.get('name')}' is already in your library"}, 200
+        except Exception as _own_err:
+            runtime.logger.debug("Wishlist add ownership check failed (adding anyway): %s", _own_err)
+
+        enhanced_source_context = {
+            **(source_context or {}),
+            "artist_id": artist.get("id"),
+            "artist_name": artist.get("name"),
+            "album_id": album.get("id"),
+            "album_name": album.get("name"),
+            "added_via": "library_wishlist_modal",
+        }
+
+        success = get_wishlist_service().add_track_to_wishlist(
+            track_data=track_data,
+            failure_reason="Added from library (incomplete album)",
+            source_type=source_type,
+            source_context=enhanced_source_context,
+            profile_id=runtime.profile_id,
+            # Explicit user click in the album modal — must bypass + clear the
+            # ignore-list, even if the user previously cancelled this track
+            # (otherwise the add is silently dropped — carlosjfcasero, #897).
+            user_initiated=True,
+        )
+
+        if success:
+            runtime.logger.info("Added track '%s' by '%s' to wishlist", track.get("name"), artist.get("name"))
+            return {"success": True, "message": f"Added '{track.get('name')}' to wishlist"}, 200
+
+        runtime.logger.error("Failed to add track '%s' to wishlist", track.get("name"))
+        return {"success": False, "error": "Failed to add track to wishlist"}, 200
+    except Exception as exc:
+        runtime.logger.error("Error adding track to wishlist: %s", exc)
+        import traceback
+
+        traceback.print_exc()
+        return {"success": False, "error": str(exc)}, 500
+
+
+__all__ = [
+    "WishlistRouteRuntime",
+    "process_wishlist_api",
+    "get_wishlist_count",
+    "get_wishlist_stats",
+    "get_wishlist_cycle",
+    "set_wishlist_cycle",
+    "get_wishlist_tracks",
+    "clear_wishlist",
+    "remove_track_from_wishlist",
+    "remove_album_from_wishlist",
+    "remove_batch_from_wishlist",
+    "add_album_track_to_wishlist",
+]

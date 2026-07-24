@@ -1,0 +1,429 @@
+"""Regression tests for file integrity checks on downloaded audio.
+
+Discord-reported (fresh.dumbledore [VRN]): slskd sometimes hosts broken
+files (truncated transfers, corrupted FLAC, wrong file masquerading as
+the target). The integrity layer at ``core/imports/file_integrity.py``
+catches these before they reach tagging/library sync, using three
+universal checks: file-size sanity, mutagen parse, and duration
+agreement against the metadata-source-provided expected length.
+
+These tests exercise the module directly with fabricated files (real
+mp3 + flac samples generated via mutagen-friendly stubs and a couple of
+hand-written WAV/FLAC files) so we don't need ffmpeg or live downloads.
+"""
+
+from __future__ import annotations
+
+import os
+import struct
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from core.imports import file_integrity
+
+
+def _write_minimal_wav(path: Path, duration_s: float = 1.0, sample_rate: int = 8000) -> None:
+    """Write a minimal valid WAV file. Mutagen parses WAV via the
+    standard wave module wrapper, giving us a real `info.length`
+    we can assert against without needing ffmpeg."""
+    n_samples = int(duration_s * sample_rate)
+    n_channels = 1
+    bits_per_sample = 16
+    byte_rate = sample_rate * n_channels * bits_per_sample // 8
+    block_align = n_channels * bits_per_sample // 8
+    data_size = n_samples * block_align
+    fmt_chunk = struct.pack(
+        "<4sIHHIIHH",
+        b"fmt ", 16, 1, n_channels, sample_rate, byte_rate, block_align, bits_per_sample,
+    )
+    data_chunk = struct.pack("<4sI", b"data", data_size) + (b"\x00\x00" * n_samples)
+    riff = struct.pack("<4sI4s", b"RIFF", 4 + len(fmt_chunk) + len(data_chunk), b"WAVE")
+    path.write_bytes(riff + fmt_chunk + data_chunk)
+
+
+# ---------------------------------------------------------------------------
+# File size check
+# ---------------------------------------------------------------------------
+
+
+def test_rejects_zero_byte_file(tmp_path: Path) -> None:
+    """A 0-byte file is the most common slskd-broken case."""
+    f = tmp_path / "empty.flac"
+    f.write_bytes(b"")
+
+    result = file_integrity.check_audio_integrity(str(f))
+
+    assert result.ok is False
+    assert "too small" in result.reason.lower()
+    assert result.checks["size_bytes"] == 0
+
+
+def test_rejects_tiny_stub(tmp_path: Path) -> None:
+    """A few hundred bytes can't be a real audio file — slskd dropped a stub."""
+    f = tmp_path / "stub.mp3"
+    f.write_bytes(b"x" * 500)
+
+    result = file_integrity.check_audio_integrity(str(f))
+
+    assert result.ok is False
+    assert "too small" in result.reason.lower()
+
+
+def test_size_threshold_is_overridable(tmp_path: Path) -> None:
+    """Tests / dev workflows can lower the size threshold."""
+    f = tmp_path / "small_but_intentional.bin"
+    f.write_bytes(b"y" * 100)
+
+    # Should pass the size check at threshold=50, then fail mutagen parse
+    # since it's not real audio.
+    result = file_integrity.check_audio_integrity(str(f), min_file_size_bytes=50)
+
+    assert result.ok is False
+    assert "mutagen" in result.reason.lower() or "could not" in result.reason.lower()
+
+
+def test_missing_file_returns_clean_failure(tmp_path: Path) -> None:
+    """No exception should escape — caller wants a clean boolean."""
+    result = file_integrity.check_audio_integrity(str(tmp_path / "ghost.flac"))
+
+    assert result.ok is False
+    assert "stat" in result.reason.lower() or "cannot" in result.reason.lower()
+
+
+# ---------------------------------------------------------------------------
+# Mutagen parse check
+# ---------------------------------------------------------------------------
+
+
+def test_rejects_non_audio_file_with_audio_extension(tmp_path: Path) -> None:
+    """A text file renamed to .flac (sometimes happens when slskd matches
+    a wrong file) should fail the parse check, not slip through."""
+    f = tmp_path / "fake.flac"
+    # Big enough to clear the size check, but not audio.
+    f.write_bytes(b"this is definitely not flac data\n" * 1000)
+
+    result = file_integrity.check_audio_integrity(str(f))
+
+    assert result.ok is False
+    # Either mutagen returns None (unidentified) or raises — either is a fail.
+    assert "mutagen" in result.reason.lower() or "no info" in result.reason.lower() or "identify" in result.reason.lower()
+
+
+def test_accepts_valid_wav_with_no_expected_duration(tmp_path: Path) -> None:
+    """Real audio with no caller-provided duration should pass — only
+    size + parse run."""
+    f = tmp_path / "real.wav"
+    _write_minimal_wav(f, duration_s=2.0)
+
+    result = file_integrity.check_audio_integrity(str(f))
+
+    assert result.ok is True
+    assert result.checks["actual_length_s"] == pytest.approx(2.0, abs=0.1)
+    assert result.checks["length_check"] == "skipped"
+
+
+# ---------------------------------------------------------------------------
+# Zero-length-but-valid parse (#756): streamed / fragmented FLAC
+# ---------------------------------------------------------------------------
+
+
+def test_accepts_zero_length_when_parse_is_otherwise_valid(tmp_path: Path, monkeypatch) -> None:
+    """#756: HiFi assembles FLAC from HLS segments and demuxes with
+    `ffmpeg -c copy`, leaving STREAMINFO total_samples=0. Mutagen then
+    reports length 0 even though every audio frame is present and the file
+    plays fine. Such a file — large, identifiable format, valid info block —
+    must be ACCEPTED (unknown length), not quarantined as 'zero-length'."""
+    import mutagen
+
+    f = tmp_path / "streamed.flac"
+    f.write_bytes(b"\x00" * (50 * 1024))  # clears size gate; bytes irrelevant (mutagen mocked)
+
+    # Valid parse, valid info block, but length 0 — the streamed-FLAC signature.
+    fake_audio = SimpleNamespace(info=SimpleNamespace(length=0))
+    monkeypatch.setattr(mutagen, "File", lambda *a, **k: fake_audio)
+
+    # Even with an expected duration present, it must accept (can't compare to
+    # an unknown length) rather than reject.
+    result = file_integrity.check_audio_integrity(str(f), expected_duration_ms=200_000)
+
+    assert result.ok is True
+    assert result.checks["mutagen_parse"] == "zero_length_unknown"
+    assert result.checks["length_check"] == "skipped_unknown_length"
+
+
+def test_zero_length_still_rejects_when_too_small(tmp_path: Path, monkeypatch) -> None:
+    """A genuinely empty/stub file with length 0 must still fail — the size
+    gate fires before parse, so the relaxation can't let real stubs through."""
+    import mutagen
+
+    f = tmp_path / "stub.flac"
+    f.write_bytes(b"\x00" * 200)  # below the 10KB size gate
+
+    fake_audio = SimpleNamespace(info=SimpleNamespace(length=0))
+    monkeypatch.setattr(mutagen, "File", lambda *a, **k: fake_audio)
+
+    result = file_integrity.check_audio_integrity(str(f))
+
+    assert result.ok is False
+    assert "too small" in result.reason.lower()
+
+
+# ---------------------------------------------------------------------------
+# Duration agreement check
+# ---------------------------------------------------------------------------
+
+
+def test_accepts_when_length_within_tolerance(tmp_path: Path) -> None:
+    """A 5-second file claiming 5.5 seconds (within 3s tolerance) passes."""
+    f = tmp_path / "track.wav"
+    _write_minimal_wav(f, duration_s=5.0)
+
+    result = file_integrity.check_audio_integrity(str(f), expected_duration_ms=5500)
+
+    assert result.ok is True
+    assert result.checks["length_check"] == "passed"
+    assert result.checks["length_drift_s"] == pytest.approx(0.5, abs=0.2)
+
+
+def test_rejects_truncated_file(tmp_path: Path) -> None:
+    """A 2-second file claiming to be a 30-second track is truncated.
+    This is the headline slskd case — bytes stopped flowing partway
+    through but slskd reported success."""
+    f = tmp_path / "truncated.wav"
+    _write_minimal_wav(f, duration_s=2.0)
+
+    result = file_integrity.check_audio_integrity(str(f), expected_duration_ms=30_000)
+
+    assert result.ok is False
+    assert "duration" in result.reason.lower() or "drift" in result.reason.lower()
+    assert result.checks["length_drift_s"] > 3.0
+
+
+# ── #937: a file that runs LONGER than expected is a version/master difference, not
+#    truncation — it gets more leeway, while SHORTER files stay tight. ──
+
+def test_accepts_longer_master_beyond_short_tolerance(tmp_path: Path) -> None:
+    """The reported case (A-Ha remaster): file runs ~3.5s LONGER than the metadata.
+    Past the 3s short-tolerance but a remaster, not a bad download — must pass."""
+    f = tmp_path / "remaster.wav"
+    _write_minimal_wav(f, duration_s=9.0)   # 9.0s file vs 5.5s expected → +3.5s longer
+
+    result = file_integrity.check_audio_integrity(str(f), expected_duration_ms=5500)
+
+    assert result.ok is True
+    assert result.checks["length_check"] == "passed"
+    assert result.checks["effective_tolerance_s"] == pytest.approx(15.0)
+
+
+def test_shorter_file_still_tight_after_longer_loosening(tmp_path: Path) -> None:
+    """Loosening the LONGER direction must not loosen truncation detection — a file
+    3.5s SHORTER than expected is still rejected at the 3s tolerance."""
+    f = tmp_path / "short.wav"
+    _write_minimal_wav(f, duration_s=5.5)   # 5.5s vs 9.0s expected → -3.5s shorter
+
+    result = file_integrity.check_audio_integrity(str(f), expected_duration_ms=9000)
+
+    assert result.ok is False
+    assert "truncated" in result.reason.lower()
+    assert result.checks["effective_tolerance_s"] == pytest.approx(3.0)
+
+
+def test_wildly_longer_file_still_rejected(tmp_path: Path) -> None:
+    """A different/wrong song that happens to run long is still caught — +25s blows
+    past even the 15s longer-tolerance."""
+    f = tmp_path / "wronglong.wav"
+    _write_minimal_wav(f, duration_s=30.0)  # 30s vs 5s expected → +25s
+
+    result = file_integrity.check_audio_integrity(str(f), expected_duration_ms=5000)
+
+    assert result.ok is False
+    assert "longer than expected" in result.reason.lower()
+
+
+def test_user_pinned_tolerance_is_symmetric(tmp_path: Path) -> None:
+    """An explicit user tolerance is honoured in BOTH directions — the longer-direction
+    loosening only applies to the auto default, not a value the user pinned."""
+    f = tmp_path / "long.wav"
+    _write_minimal_wav(f, duration_s=9.0)   # +4s longer
+
+    result = file_integrity.check_audio_integrity(
+        str(f), expected_duration_ms=5000, length_tolerance_s=2.0)
+
+    assert result.ok is False
+    assert result.checks["effective_tolerance_s"] == pytest.approx(2.0)
+
+
+def test_rejects_wrong_file_substituted(tmp_path: Path) -> None:
+    """A 10-second clip masquerading as a 3-minute album track. slskd
+    matched on a similar filename but the actual content is a snippet."""
+    f = tmp_path / "wrong.wav"
+    _write_minimal_wav(f, duration_s=10.0)
+
+    result = file_integrity.check_audio_integrity(str(f), expected_duration_ms=180_000)
+
+    assert result.ok is False
+    assert result.checks["length_drift_s"] > 100
+
+
+def test_long_track_uses_wider_tolerance(tmp_path: Path) -> None:
+    """Tracks over 10 minutes get 5s tolerance instead of 3s — long
+    tracks naturally drift more (intros, outros, encoder padding)."""
+    # Write a 12-minute file (720s) but at minimum sample rate to keep
+    # the test fast — under 30KB total.
+    f = tmp_path / "long.wav"
+    _write_minimal_wav(f, duration_s=720.0, sample_rate=8000)
+
+    # Claim 724 seconds — 4s drift, which would fail the 3s default but
+    # passes the 5s long-track threshold.
+    result = file_integrity.check_audio_integrity(str(f), expected_duration_ms=724_000)
+
+    assert result.ok is True
+    assert result.checks["length_tolerance_s"] == pytest.approx(5.0)
+
+
+def test_caller_can_override_tolerance(tmp_path: Path) -> None:
+    """Edge cases (e.g. live recordings, known-flaky sources) can opt
+    into a wider tolerance per-call."""
+    f = tmp_path / "loose.wav"
+    _write_minimal_wav(f, duration_s=5.0)
+
+    # 8-second drift — would fail default 3s, passes explicit 10s.
+    result = file_integrity.check_audio_integrity(
+        str(f), expected_duration_ms=13_000, length_tolerance_s=10.0,
+    )
+
+    assert result.ok is True
+
+
+def test_zero_expected_duration_skips_length_check(tmp_path: Path) -> None:
+    """Some metadata sources don't carry duration — duration check
+    must be skipped, not treated as a 0-length match."""
+    f = tmp_path / "no_duration.wav"
+    _write_minimal_wav(f, duration_s=5.0)
+
+    result = file_integrity.check_audio_integrity(str(f), expected_duration_ms=0)
+
+    assert result.ok is True
+    assert result.checks["length_check"] == "skipped"
+
+
+def test_negative_expected_duration_skips_length_check(tmp_path: Path) -> None:
+    """Defensive: bad metadata returning negative duration shouldn't
+    crash or false-reject."""
+    f = tmp_path / "neg_duration.wav"
+    _write_minimal_wav(f, duration_s=5.0)
+
+    result = file_integrity.check_audio_integrity(str(f), expected_duration_ms=-100)
+
+    assert result.ok is True
+    assert result.checks["length_check"] == "skipped"
+
+
+# ---------------------------------------------------------------------------
+# Failure-mode robustness
+# ---------------------------------------------------------------------------
+
+
+def test_check_never_raises(tmp_path: Path, monkeypatch) -> None:
+    """The integrity check is wrapped in try/except in pipeline.py but
+    callers shouldn't have to. Verify that even pathological inputs
+    return a clean IntegrityResult."""
+    f = tmp_path / "test.wav"
+    _write_minimal_wav(f, duration_s=2.0)
+
+    # Force a mutagen import-time failure by stubbing the import.
+    # Should NOT raise — should pass gracefully (mutagen unavailable).
+    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+    def _broken_import(name, *args, **kwargs):
+        if name == "mutagen":
+            raise ImportError("simulated missing mutagen")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setitem(__builtins__ if isinstance(__builtins__, dict) else __builtins__.__dict__,
+                        "__import__", _broken_import)
+
+    try:
+        result = file_integrity.check_audio_integrity(str(f))
+    except Exception as e:
+        pytest.fail(f"check_audio_integrity raised: {e}")
+
+    assert result.ok is True
+    assert result.checks.get("mutagen_parse") == "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# HiFi 30s-preview escape (sella's incident): a zero-length header must be
+# DECODED, not blindly trusted, when we have an expected duration.
+# ---------------------------------------------------------------------------
+
+
+def _zero_length_flac(tmp_path: Path) -> Path:
+    """A file mutagen parses to length 0 — the HiFi fragmented-FLAC shape.
+    We fake it by pointing the parse at a real WAV but forcing info.length 0
+    via monkeypatch in the tests that need the branch."""
+    f = tmp_path / "hifi.flac"
+    _write_minimal_wav(f, duration_s=1.0)
+    return f
+
+
+def test_zero_length_with_expected_duration_decodes_and_rejects_a_preview(tmp_path, monkeypatch):
+    f = _zero_length_flac(tmp_path)
+    # force the mutagen length to 0 (fragmented-FLAC shape) …
+    monkeypatch.setattr(file_integrity, "probe_decoded_duration", lambda *_a, **_k: 30.0)
+    monkeypatch.setattr(file_integrity, "MutagenFile", None, raising=False)
+
+    class _Info:
+        length = 0
+    monkeypatch.setattr("mutagen.File", lambda *_a, **_k: SimpleNamespace(info=_Info(), tags={}))
+
+    res = file_integrity.check_audio_integrity(str(f), expected_duration_ms=220_000)
+    assert res.ok is False
+    assert "30s" in res.reason and "220s" in res.reason
+    assert res.checks["mutagen_parse"] == "zero_length_decoded_short"
+
+
+def test_zero_length_that_decodes_to_full_length_is_accepted(tmp_path, monkeypatch):
+    f = _zero_length_flac(tmp_path)
+    monkeypatch.setattr(file_integrity, "probe_decoded_duration", lambda *_a, **_k: 218.0)
+
+    class _Info:
+        length = 0
+    monkeypatch.setattr("mutagen.File", lambda *_a, **_k: SimpleNamespace(info=_Info(), tags={}))
+
+    res = file_integrity.check_audio_integrity(str(f), expected_duration_ms=220_000)
+    assert res.ok is True
+    assert res.checks["mutagen_parse"] == "zero_length_decoded_ok"
+
+
+def test_zero_length_without_ffmpeg_still_accepts_streamed_flac(tmp_path, monkeypatch):
+    # #756 must still hold: no decode possible → don't quarantine good FLAC
+    f = _zero_length_flac(tmp_path)
+    monkeypatch.setattr(file_integrity, "probe_decoded_duration", lambda *_a, **_k: 0.0)
+
+    class _Info:
+        length = 0
+    monkeypatch.setattr("mutagen.File", lambda *_a, **_k: SimpleNamespace(info=_Info(), tags={}))
+
+    res = file_integrity.check_audio_integrity(str(f), expected_duration_ms=220_000)
+    assert res.ok is True
+    assert res.checks["mutagen_parse"] == "zero_length_unknown"
+
+
+def test_zero_length_with_no_expected_duration_is_unchanged(tmp_path, monkeypatch):
+    # no expected duration → nothing to decode against, old accept path
+    f = _zero_length_flac(tmp_path)
+    called = {"n": 0}
+    def _probe(*_a, **_k):
+        called["n"] += 1
+        return 30.0
+    monkeypatch.setattr(file_integrity, "probe_decoded_duration", _probe)
+
+    class _Info:
+        length = 0
+    monkeypatch.setattr("mutagen.File", lambda *_a, **_k: SimpleNamespace(info=_Info(), tags={}))
+
+    res = file_integrity.check_audio_integrity(str(f))
+    assert res.ok is True and called["n"] == 0    # never even decoded

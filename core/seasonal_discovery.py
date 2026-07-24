@@ -1,0 +1,962 @@
+#!/usr/bin/env python3
+
+"""
+Seasonal Discovery Service - Provides seasonal/holiday music content
+"""
+
+from typing import List, Dict, Any, Optional
+from datetime import datetime
+from dataclasses import dataclass
+import random
+from utils.logging_config import get_logger
+
+logger = get_logger("seasonal_discovery")
+
+# Seasonal configuration with keywords and active periods
+SEASONAL_CONFIG = {
+    "halloween": {
+        "name": "Halloween Hits",
+        "description": "Spooky albums and tracks for Halloween",
+        "keywords": ["halloween", "spooky", "horror", "monster", "witch", "zombie", "ghost", "haunted", "scary"],
+        "active_months": [10],  # October
+        "playlist_size": 50,
+        "icon": "🎃"
+    },
+    "christmas": {
+        "name": "Christmas Classics",
+        "description": "Holiday music and Christmas favorites",
+        "keywords": ["christmas", "xmas", "holiday", "santa", "jingle", "winter wonderland", "sleigh", "noel", "carol"],
+        "active_months": [11, 12],  # November-December
+        "playlist_size": 50,
+        "icon": "🎅"
+    },
+    "valentines": {
+        "name": "Love Songs",
+        "description": "Romantic tracks for Valentine's Day",
+        "keywords": ["love", "valentine", "romance", "heart", "romantic", "darling"],
+        "active_months": [2],  # February
+        "playlist_size": 50,
+        "icon": "💝"
+    },
+    "summer": {
+        "name": "Summer Vibes",
+        "description": "Hot tracks for summer days",
+        "keywords": ["summer", "beach", "sun", "vacation", "tropical", "poolside", "sunshine"],
+        "active_months": [6, 7, 8],  # June-August
+        "playlist_size": 50,
+        "icon": "☀️"
+    },
+    "spring": {
+        "name": "Spring Awakening",
+        "description": "Fresh sounds for spring",
+        "keywords": ["spring", "bloom", "fresh", "renewal", "garden", "flower"],
+        "active_months": [3, 4, 5],  # March-May
+        "playlist_size": 50,
+        "icon": "🌸"
+    },
+    "autumn": {
+        "name": "Autumn Sounds",
+        "description": "Cozy tracks for fall",
+        "keywords": ["fall", "autumn", "harvest", "leaves", "cozy", "pumpkin"],
+        "active_months": [9, 10, 11],  # September-November (overlaps with Halloween)
+        "playlist_size": 50,
+        "icon": "🍂"
+    }
+}
+
+@dataclass
+class SeasonalAlbum:
+    """Represents a seasonal album"""
+    spotify_id: str
+    title: str
+    artist_name: str
+    cover_url: Optional[str]
+    release_date: Optional[str]
+    popularity: int
+    season_key: str
+
+@dataclass
+class SeasonalTrack:
+    """Represents a seasonal track"""
+    spotify_id: str
+    title: str
+    artist_name: str
+    album_name: str
+    album_cover_url: Optional[str]
+    duration_ms: int
+    popularity: int
+    season_key: str
+
+class SeasonalDiscoveryService:
+    """Service for managing seasonal music discovery"""
+
+    def __init__(self, spotify_client, database):
+        self.spotify_client = spotify_client
+        self.database = database
+        self._ensure_database_schema()
+
+    def _get_source(self):
+        """Determine active music source — delegates to centralized metadata_service."""
+        from core.metadata_service import get_primary_source
+        return get_primary_source()
+
+    def _ensure_database_schema(self):
+        """Create seasonal content tables if they don't exist"""
+        try:
+            with self.database._get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Seasonal albums cache
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS seasonal_albums (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        season_key TEXT NOT NULL,
+                        spotify_album_id TEXT NOT NULL,
+                        album_name TEXT,
+                        artist_name TEXT,
+                        album_cover_url TEXT,
+                        release_date TEXT,
+                        popularity INTEGER DEFAULT 0,
+                        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(season_key, spotify_album_id)
+                    )
+                """)
+
+                # Seasonal tracks cache
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS seasonal_tracks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        season_key TEXT NOT NULL,
+                        spotify_track_id TEXT NOT NULL,
+                        track_name TEXT,
+                        artist_name TEXT,
+                        album_name TEXT,
+                        album_cover_url TEXT,
+                        duration_ms INTEGER,
+                        popularity INTEGER DEFAULT 0,
+                        track_data_json TEXT,
+                        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(season_key, spotify_track_id)
+                    )
+                """)
+
+                # Curated seasonal playlists
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS curated_seasonal_playlists (
+                        season_key TEXT PRIMARY KEY,
+                        track_ids TEXT,
+                        curated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        track_count INTEGER DEFAULT 0
+                    )
+                """)
+
+                # Metadata about last seasonal update
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS seasonal_metadata (
+                        season_key TEXT PRIMARY KEY,
+                        last_populated_at TIMESTAMP,
+                        album_count INTEGER DEFAULT 0,
+                        track_count INTEGER DEFAULT 0
+                    )
+                """)
+
+                conn.commit()
+
+                # Add source column to existing tables (migration for existing installs)
+                for table in ['seasonal_albums', 'seasonal_tracks']:
+                    try:
+                        cursor.execute(f"ALTER TABLE {table} ADD COLUMN source TEXT NOT NULL DEFAULT 'spotify'")
+                        conn.commit()
+                    except Exception as e:
+                        logger.debug("source column migration %s: %s", table, e)
+
+                logger.info("Seasonal discovery database schema initialized")
+
+        except Exception as e:
+            logger.error(f"Error creating seasonal database schema: {e}")
+
+    def _get_effective_month(self, hemisphere: str = None) -> int:
+        """Get the effective month, adjusted for hemisphere setting.
+
+        Southern hemisphere offsets by 6 months so seasons align correctly
+        (e.g., December in southern hemisphere maps to June = summer → winter).
+        Holiday months (Halloween, Christmas, Valentine's) are NOT offset.
+        """
+        month = datetime.now().month
+        if hemisphere is None:
+            hemisphere = self._get_hemisphere()
+        if hemisphere == 'southern':
+            # Offset by 6 months for seasonal content
+            return ((month - 1 + 6) % 12) + 1
+        return month
+
+    def _get_hemisphere(self) -> str:
+        """Get configured hemisphere from database metadata."""
+        try:
+            with self.database._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT value FROM metadata WHERE key = 'hemisphere'")
+                row = cursor.fetchone()
+                if row:
+                    val = row[0] if isinstance(row, tuple) else row['value']
+                    if val in ('northern', 'southern'):
+                        return val
+        except Exception as e:
+            logger.debug("read hemisphere metadata failed: %s", e)
+        return 'northern'
+
+    def get_current_season(self) -> Optional[str]:
+        """
+        Detect current season based on current month.
+        Respects hemisphere setting — southern hemisphere offsets seasonal
+        months by 6, but holidays stay calendar-fixed.
+
+        Returns:
+            Season key (e.g., 'halloween', 'christmas') or None
+        """
+        real_month = datetime.now().month
+        hemisphere = self._get_hemisphere()
+        effective_month = self._get_effective_month(hemisphere)
+
+        # Holidays that are calendar-fixed (not season-dependent)
+        _HOLIDAY_KEYS = {'halloween', 'christmas', 'valentines'}
+
+        # Check each season to find active ones
+        active_seasons = []
+        for season_key, config in SEASONAL_CONFIG.items():
+            if hemisphere == 'southern' and season_key in _HOLIDAY_KEYS:
+                # Holidays use real calendar month
+                if real_month in config['active_months']:
+                    active_seasons.append(season_key)
+            else:
+                # Seasons use effective (offset) month
+                if effective_month in config['active_months']:
+                    active_seasons.append(season_key)
+
+        if not active_seasons:
+            return None
+
+        # Prioritize specific holidays over general seasons
+        # Halloween > Autumn, Christmas > Winter, etc.
+        priority_order = ['halloween', 'christmas', 'valentines', 'summer', 'spring', 'autumn']
+
+        for priority_season in priority_order:
+            if priority_season in active_seasons:
+                return priority_season
+
+        return active_seasons[0] if active_seasons else None
+
+    def get_all_active_seasons(self) -> List[str]:
+        """Get all seasons active in current month (hemisphere-aware)"""
+        real_month = datetime.now().month
+        hemisphere = self._get_hemisphere()
+        effective_month = self._get_effective_month(hemisphere)
+
+        _HOLIDAY_KEYS = {'halloween', 'christmas', 'valentines'}
+
+        active_seasons = []
+        for season_key, config in SEASONAL_CONFIG.items():
+            if hemisphere == 'southern' and season_key in _HOLIDAY_KEYS:
+                if real_month in config['active_months']:
+                    active_seasons.append(season_key)
+            else:
+                if effective_month in config['active_months']:
+                    active_seasons.append(season_key)
+
+        return active_seasons
+
+    def should_populate_seasonal_content(self, season_key: str, days_threshold: int = 7) -> bool:
+        """
+        Check if seasonal content should be re-populated for the active source.
+
+        Args:
+            season_key: Season to check
+            days_threshold: Minimum days since last population (default: 7)
+
+        Returns:
+            True if should populate, False otherwise
+        """
+        try:
+            source = self._get_source()
+            metadata_key = f"{season_key}_{source}"
+
+            with self.database._get_connection() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute("""
+                    SELECT last_populated_at
+                    FROM seasonal_metadata
+                    WHERE season_key = ?
+                """, (metadata_key,))
+
+                result = cursor.fetchone()
+
+                if not result or not result['last_populated_at']:
+                    return True  # Never populated for this source
+
+                last_populated = datetime.fromisoformat(result['last_populated_at'])
+                days_since = (datetime.now() - last_populated).days
+
+                return days_since >= days_threshold
+
+        except Exception as e:
+            logger.error(f"Error checking seasonal population status: {e}")
+            return True  # Populate if we can't determine
+
+    def populate_seasonal_content(self, season_key: str):
+        """
+        Populate seasonal content from multiple sources, isolated by active music source.
+        1. Discovery pool keyword search (filtered by active source)
+        2. Search for seasonal albums from watchlist/similar artists
+        3. General seasonal search
+
+        Args:
+            season_key: Season to populate (e.g., 'halloween', 'christmas')
+        """
+        try:
+            if season_key not in SEASONAL_CONFIG:
+                logger.error(f"Unknown season key: {season_key}")
+                return
+
+            source = self._get_source()
+            config = SEASONAL_CONFIG[season_key]
+            logger.info(f"Populating seasonal content for: {config['name']} (source: {source})")
+
+            # Clear existing seasonal content for this season + source only
+            self._clear_seasonal_content(season_key, source)
+
+            albums_found = 0
+            tracks_found = 0
+
+            # Source 1: Search discovery pool for seasonal tracks (filtered by active source)
+            logger.info(f"Searching discovery pool for {season_key} tracks (source: {source})...")
+            pool_tracks = self._search_discovery_pool_seasonal(season_key, source)
+            for track in pool_tracks:
+                if self._add_seasonal_track(season_key, track, source):
+                    tracks_found += 1
+
+            logger.info(f"Found {len(pool_tracks)} tracks from discovery pool")
+
+            # Source 2: Search for seasonal albums from watchlist artists
+            logger.info(f"Searching {source} for {season_key} albums from watchlist artists...")
+            watchlist_albums = self._search_watchlist_seasonal_albums(season_key)
+            for album in watchlist_albums:
+                if self._add_seasonal_album(season_key, album, source):
+                    albums_found += 1
+
+            logger.info(f"Found {len(watchlist_albums)} albums from watchlist artists")
+
+            # Source 3: General search for seasonal content
+            logger.info(f"Searching {source} for {season_key} albums...")
+            search_albums = self._search_seasonal_albums(season_key, limit=50)
+            for album in search_albums:
+                if self._add_seasonal_album(season_key, album, source):
+                    albums_found += 1
+
+            logger.info(f"Found {len(search_albums)} albums from general search")
+
+            # Update metadata (per source)
+            self._update_seasonal_metadata(season_key, albums_found, tracks_found, source)
+
+            logger.info(f"Seasonal content populated for {config['name']} ({source}): {albums_found} albums, {tracks_found} tracks")
+
+        except Exception as e:
+            logger.error(f"Error populating seasonal content for {season_key}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _search_discovery_pool_seasonal(self, season_key: str, source: str = 'spotify') -> List[Dict]:
+        """Search discovery pool for tracks matching seasonal keywords, filtered by source"""
+        try:
+            config = SEASONAL_CONFIG[season_key]
+            keywords = config['keywords']
+
+            # Use the right track ID column based on source
+            track_id_col = 'spotify_track_id' if source == 'spotify' else 'itunes_track_id'
+
+            seasonal_tracks = []
+
+            with self.database._get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Build keyword search query
+                keyword_conditions = " OR ".join(["LOWER(track_name) LIKE ?" for _ in keywords])
+                keyword_conditions += " OR " + " OR ".join(["LOWER(album_name) LIKE ?" for _ in keywords])
+
+                keyword_params = [f"%{kw}%" for kw in keywords] + [f"%{kw}%" for kw in keywords]
+
+                cursor.execute(f"""
+                    SELECT DISTINCT
+                        {track_id_col} as track_id,
+                        track_name,
+                        artist_name,
+                        album_name,
+                        album_cover_url,
+                        duration_ms,
+                        popularity,
+                        track_data_json
+                    FROM discovery_pool
+                    WHERE source = ? AND {track_id_col} IS NOT NULL
+                      AND ({keyword_conditions})
+                    LIMIT 100
+                """, [source] + keyword_params)
+
+                rows = cursor.fetchall()
+
+                for row in rows:
+                    import json
+                    # Parse track_data_json if it's a string
+                    track_data_json = row['track_data_json']
+                    if isinstance(track_data_json, str):
+                        try:
+                            track_data_json = json.loads(track_data_json)
+                        except:
+                            track_data_json = {}
+
+                    seasonal_tracks.append({
+                        'spotify_track_id': row['track_id'],
+                        'track_name': row['track_name'],
+                        'artist_name': row['artist_name'],
+                        'album_name': row['album_name'],
+                        'album_cover_url': row['album_cover_url'],
+                        'duration_ms': row['duration_ms'],
+                        'popularity': row['popularity'],
+                        'track_data_json': track_data_json
+                    })
+
+                return seasonal_tracks
+
+        except Exception as e:
+            logger.error(f"Error searching discovery pool for seasonal tracks: {e}")
+            return []
+
+    def _search_watchlist_seasonal_albums(self, season_key: str) -> List[Dict]:
+        """Search for seasonal albums from watchlist artists (Spotify + iTunes)"""
+        try:
+            config = SEASONAL_CONFIG[season_key]
+            keywords = config['keywords']
+
+            watchlist_artists = self.database.get_watchlist_artists()
+            if not watchlist_artists:
+                return []
+
+            seasonal_albums = []
+            source = self._get_source()
+            use_spotify = (source == 'spotify') and self.spotify_client and self.spotify_client.is_spotify_authenticated()
+
+            # IMPROVED: Sample 20 random watchlist artists (up from 10) for more variety
+            sampled_artists = random.sample(watchlist_artists, min(20, len(watchlist_artists)))
+
+            from core.metadata_service import get_primary_client, get_primary_source
+            fallback_client = get_primary_client()
+            fallback_source = get_primary_source()
+
+            for artist in sampled_artists:
+                try:
+                    albums = []
+                    if use_spotify and artist.spotify_artist_id:
+                        albums = self.spotify_client.get_artist_albums(
+                            artist.spotify_artist_id,
+                            album_type='album,single,ep',
+                            limit=50
+                        ) or []
+                    elif not use_spotify:
+                        artist_id = getattr(artist, 'deezer_artist_id', None) if fallback_source == 'deezer' else getattr(artist, 'itunes_artist_id', None)
+                        if artist_id:
+                            albums = fallback_client.get_artist_albums(
+                                artist_id,
+                                album_type='album,single,ep',
+                                limit=50
+                            ) or []
+
+                    # Filter albums by seasonal keywords in title
+                    for album in albums:
+                        album_name_lower = album.name.lower()
+
+                        if any(keyword in album_name_lower for keyword in keywords):
+                            seasonal_albums.append({
+                                'spotify_album_id': album.id,
+                                'album_name': album.name,
+                                'artist_name': artist.artist_name,
+                                'album_cover_url': album.image_url if hasattr(album, 'image_url') else None,
+                                'release_date': album.release_date if hasattr(album, 'release_date') else None,
+                                'popularity': getattr(album, 'popularity', 50),
+                                '_source': source
+                            })
+
+                    import time
+                    time.sleep(0.5)  # Rate limiting
+
+                except Exception as e:
+                    logger.debug(f"Error searching albums for {artist.artist_name}: {e}")
+                    continue
+
+            return seasonal_albums
+
+        except Exception as e:
+            logger.error(f"Error searching watchlist seasonal albums: {e}")
+            return []
+
+    def _search_seasonal_albums(self, season_key: str, limit: int = 50) -> List[Dict]:
+        """
+        Search for seasonal albums using keyword search (Spotify or iTunes).
+
+        IMPROVED: Searches more broadly for full albums to get larger track pools.
+        """
+        try:
+            config = SEASONAL_CONFIG[season_key]
+            keywords = config['keywords']
+            source = self._get_source()
+            use_spotify = (source == 'spotify') and self.spotify_client and self.spotify_client.is_spotify_authenticated()
+
+            seasonal_albums = []
+            seen_album_ids = set()
+
+            # IMPROVED: Search with top 5 keywords (up from 3) for more variety
+            search_keywords = list(keywords[:5])
+
+            # Add specific "album" searches to prioritize full albums over singles
+            season_name = config['name'].lower()
+            if 'christmas' in season_name:
+                search_keywords.append('christmas album')
+                search_keywords.append('christmas songs')
+            elif 'halloween' in season_name:
+                search_keywords.append('halloween album')
+
+            if use_spotify:
+                for keyword in search_keywords:
+                    try:
+                        search_results = self.spotify_client.search_albums(keyword, limit=20)
+
+                        for album in search_results:
+                            if album.id in seen_album_ids:
+                                continue
+
+                            seen_album_ids.add(album.id)
+
+                            seasonal_albums.append({
+                                'spotify_album_id': album.id,
+                                'album_name': album.name,
+                                'artist_name': ', '.join(album.artists) if album.artists else 'Various Artists',
+                                'album_cover_url': album.image_url if hasattr(album, 'image_url') else None,
+                                'release_date': album.release_date if hasattr(album, 'release_date') else None,
+                                'popularity': getattr(album, 'popularity', 50)
+                            })
+
+                        import time
+                        time.sleep(0.3)  # Rate limiting
+
+                    except Exception as e:
+                        logger.debug(f"Error searching Spotify for '{keyword}': {e}")
+                        continue
+            else:
+                # Fallback metadata source (iTunes or Deezer)
+                from core.metadata_service import get_primary_client
+                fallback_client = get_primary_client()
+
+                for keyword in search_keywords:
+                    try:
+                        search_results = fallback_client.search_albums(keyword, limit=20)
+
+                        for album in search_results:
+                            if album.id in seen_album_ids:
+                                continue
+
+                            seen_album_ids.add(album.id)
+
+                            seasonal_albums.append({
+                                'spotify_album_id': album.id,  # Column name is spotify_album_id but stores iTunes ID too
+                                'album_name': album.name,
+                                'artist_name': ', '.join(album.artists) if album.artists else 'Various Artists',
+                                'album_cover_url': album.image_url if hasattr(album, 'image_url') else None,
+                                'release_date': album.release_date if hasattr(album, 'release_date') else None,
+                                'popularity': 50  # iTunes has no popularity — default mid-range
+                            })
+
+                        import time
+                        time.sleep(0.3)  # Rate limiting
+
+                    except Exception as e:
+                        logger.debug(f"Error searching iTunes for '{keyword}': {e}")
+                        continue
+
+            logger.info(f"Found {len(seasonal_albums)} seasonal albums from {source} search")
+
+            # Return up to limit, prioritizing albums with higher popularity
+            seasonal_albums.sort(key=lambda a: a.get('popularity', 0), reverse=True)
+            return seasonal_albums[:limit]
+
+        except Exception as e:
+            logger.error(f"Error searching seasonal albums: {e}")
+            return []
+
+    def _add_seasonal_album(self, season_key: str, album_data: Dict, source: str = 'spotify') -> bool:
+        """Add a seasonal album to the database"""
+        try:
+            with self.database._get_connection() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute("""
+                    INSERT OR IGNORE INTO seasonal_albums (
+                        season_key, spotify_album_id, album_name, artist_name,
+                        album_cover_url, release_date, popularity, source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    season_key,
+                    album_data['spotify_album_id'],
+                    album_data['album_name'],
+                    album_data['artist_name'],
+                    album_data.get('album_cover_url'),
+                    album_data.get('release_date'),
+                    album_data.get('popularity', 50),
+                    source
+                ))
+
+                conn.commit()
+                return cursor.rowcount > 0
+
+        except Exception as e:
+            logger.error(f"Error adding seasonal album: {e}")
+            return False
+
+    def _add_seasonal_track(self, season_key: str, track_data: Dict, source: str = 'spotify') -> bool:
+        """Add a seasonal track to the database"""
+        try:
+            import json
+
+            with self.database._get_connection() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute("""
+                    INSERT OR IGNORE INTO seasonal_tracks (
+                        season_key, spotify_track_id, track_name, artist_name,
+                        album_name, album_cover_url, duration_ms, popularity, track_data_json, source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    season_key,
+                    track_data['spotify_track_id'],
+                    track_data['track_name'],
+                    track_data['artist_name'],
+                    track_data['album_name'],
+                    track_data.get('album_cover_url'),
+                    track_data.get('duration_ms', 0),
+                    track_data.get('popularity', 50),
+                    json.dumps(track_data.get('track_data_json', {})),
+                    source
+                ))
+
+                conn.commit()
+                return cursor.rowcount > 0
+
+        except Exception as e:
+            logger.error(f"Error adding seasonal track: {e}")
+            return False
+
+    def _clear_seasonal_content(self, season_key: str, source: str = None):
+        """Clear existing seasonal content for a season, scoped to source"""
+        try:
+            if source is None:
+                source = self._get_source()
+
+            with self.database._get_connection() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute("DELETE FROM seasonal_albums WHERE season_key = ? AND source = ?", (season_key, source))
+                cursor.execute("DELETE FROM seasonal_tracks WHERE season_key = ? AND source = ?", (season_key, source))
+
+                conn.commit()
+                logger.debug(f"Cleared existing seasonal content for {season_key} (source: {source})")
+
+        except Exception as e:
+            logger.error(f"Error clearing seasonal content: {e}")
+
+    def _update_seasonal_metadata(self, season_key: str, album_count: int, track_count: int, source: str = None):
+        """Update metadata about seasonal content population (per source)"""
+        try:
+            if source is None:
+                source = self._get_source()
+            metadata_key = f"{season_key}_{source}"
+
+            with self.database._get_connection() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute("""
+                    INSERT OR REPLACE INTO seasonal_metadata (
+                        season_key, last_populated_at, album_count, track_count
+                    ) VALUES (?, CURRENT_TIMESTAMP, ?, ?)
+                """, (metadata_key, album_count, track_count))
+
+                conn.commit()
+
+        except Exception as e:
+            logger.error(f"Error updating seasonal metadata: {e}")
+
+    def get_seasonal_albums(self, season_key: str, limit: int = 20, source: str = None) -> List[Dict]:
+        """Get cached seasonal albums for a season, filtered by active source"""
+        try:
+            if source is None:
+                source = self._get_source()
+
+            with self.database._get_connection() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute("""
+                    SELECT
+                        spotify_album_id,
+                        album_name,
+                        artist_name,
+                        album_cover_url,
+                        release_date,
+                        popularity,
+                        source
+                    FROM seasonal_albums
+                    WHERE season_key = ? AND source = ?
+                    ORDER BY popularity DESC, album_name ASC
+                    LIMIT ?
+                """, (season_key, source, limit))
+
+                rows = cursor.fetchall()
+
+                return [dict(row) for row in rows]
+
+        except Exception as e:
+            logger.error(f"Error getting seasonal albums: {e}")
+            return []
+
+    def curate_seasonal_playlist(self, season_key: str):
+        """
+        Curate a seasonal playlist using Spotify-quality algorithm, isolated by source.
+
+        Strategy:
+        - Pulls tracks from seasonal albums (for active source only)
+        - Balances by artist (max 3 per artist)
+        - Mixes popular + mid-tier + deep cuts (60/30/10 split)
+        - Saves curated playlist to database (per source)
+        """
+        try:
+            if season_key not in SEASONAL_CONFIG:
+                logger.error(f"Unknown season key: {season_key}")
+                return
+
+            source = self._get_source()
+            config = SEASONAL_CONFIG[season_key]
+            playlist_size = config['playlist_size']
+
+            logger.info(f"Curating seasonal playlist for: {config['name']} (source: {source})")
+
+            # Get all seasonal tracks for this season + source
+            all_tracks = []
+
+            # Get tracks from seasonal_tracks table (filtered by source)
+            with self.database._get_connection() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute("""
+                    SELECT
+                        spotify_track_id,
+                        track_name,
+                        artist_name,
+                        album_name,
+                        popularity
+                    FROM seasonal_tracks
+                    WHERE season_key = ? AND source = ?
+                """, (season_key, source))
+
+                rows = cursor.fetchall()
+                all_tracks.extend([dict(row) for row in rows])
+
+            # Get tracks from seasonal albums (filtered by source)
+            seasonal_albums = self.get_seasonal_albums(season_key, limit=50, source=source)
+
+            use_spotify = (source == 'spotify') and self.spotify_client and self.spotify_client.is_spotify_authenticated()
+            if not use_spotify:
+                from core.metadata_service import get_primary_client
+                fallback_client = get_primary_client()
+
+            for album in seasonal_albums:
+                try:
+                    album_data = None
+                    album_id = album['spotify_album_id']
+
+                    if use_spotify:
+                        album_data = self.spotify_client.get_album(album_id)
+                    else:
+                        album_data = fallback_client.get_album(album_id)
+
+                    if not album_data or 'tracks' not in album_data:
+                        continue
+
+                    for track in album_data['tracks'].get('items', []):
+                        # Use track's actual artist, not album artist
+                        track_artist = track['artists'][0]['name'] if track.get('artists') else album['artist_name']
+
+                        # Enhance track object with full album data (including total_tracks)
+                        enhanced_track = {
+                            **track,
+                            'album': {
+                                'id': album_data['id'],
+                                'name': album_data.get('name', 'Unknown Album'),
+                                'images': album_data.get('images', []),
+                                'release_date': album_data.get('release_date', ''),
+                                'album_type': album_data.get('album_type', 'album'),
+                                'total_tracks': album_data.get('total_tracks', 0)
+                            }
+                        }
+
+                        track_data = {
+                            'spotify_track_id': track['id'],  # Stores iTunes track ID when on iTunes source
+                            'track_name': track['name'],
+                            'artist_name': track_artist,
+                            'album_name': album['album_name'],
+                            'popularity': album.get('popularity', 50),
+                            'album_cover_url': album.get('album_cover_url'),
+                            'duration_ms': track.get('duration_ms', 0),
+                            'track_data_json': enhanced_track
+                        }
+
+                        all_tracks.append(track_data)
+
+                        # Also save track to seasonal_tracks table for later retrieval
+                        self._add_seasonal_track(season_key, track_data, source)
+
+                    import time
+                    time.sleep(0.3)  # Rate limiting
+
+                except Exception as e:
+                    logger.debug(f"Error getting tracks from album {album['album_name']}: {e}")
+                    continue
+
+            if not all_tracks:
+                logger.warning(f"No tracks found for seasonal playlist: {season_key} (source: {source})")
+                return
+
+            logger.info(f"Found {len(all_tracks)} total tracks for {season_key} curation (source: {source})")
+
+            # Balance by artist - max 3 tracks per artist
+            tracks_by_artist = {}
+            for track in all_tracks:
+                artist = track['artist_name']
+                if artist not in tracks_by_artist:
+                    tracks_by_artist[artist] = []
+                tracks_by_artist[artist].append(track)
+
+            balanced_tracks = []
+            for _artist, artist_tracks in tracks_by_artist.items():
+                # Sort by popularity and take top 3
+                sorted_tracks = sorted(artist_tracks, key=lambda t: t.get('popularity', 50), reverse=True)
+                balanced_tracks.extend(sorted_tracks[:3])
+
+            # Separate by popularity tiers
+            popular = [t for t in balanced_tracks if t.get('popularity', 50) >= 60]
+            mid_tier = [t for t in balanced_tracks if 40 <= t.get('popularity', 50) < 60]
+            deep_cuts = [t for t in balanced_tracks if t.get('popularity', 50) < 40]
+
+            # Shuffle each tier
+            random.shuffle(popular)
+            random.shuffle(mid_tier)
+            random.shuffle(deep_cuts)
+
+            # Create balanced mix (60% popular, 30% mid-tier, 10% deep cuts)
+            curated_tracks = []
+            curated_tracks.extend(popular[:int(playlist_size * 0.6)])
+            curated_tracks.extend(mid_tier[:int(playlist_size * 0.3)])
+            curated_tracks.extend(deep_cuts[:int(playlist_size * 0.1)])
+
+            # Shuffle final selection
+            random.shuffle(curated_tracks)
+            curated_tracks = curated_tracks[:playlist_size]
+
+            # Extract track IDs
+            track_ids = [track['spotify_track_id'] for track in curated_tracks]
+
+            # Save curated playlist (per source)
+            self._save_curated_playlist(season_key, track_ids, source)
+
+            logger.info(f"Curated {len(track_ids)} tracks for {config['name']} playlist (source: {source})")
+
+        except Exception as e:
+            logger.error(f"Error curating seasonal playlist for {season_key}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _save_curated_playlist(self, season_key: str, track_ids: List[str], source: str = None):
+        """Save curated playlist to database (per source)"""
+        try:
+            import json
+
+            if source is None:
+                source = self._get_source()
+            playlist_key = f"{season_key}_{source}"
+
+            with self.database._get_connection() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute("""
+                    INSERT OR REPLACE INTO curated_seasonal_playlists (
+                        season_key, track_ids, curated_at, track_count
+                    ) VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+                """, (playlist_key, json.dumps(track_ids), len(track_ids)))
+
+                conn.commit()
+
+        except Exception as e:
+            logger.error(f"Error saving curated seasonal playlist: {e}")
+
+    def get_curated_seasonal_playlist(self, season_key: str, source: str = None) -> List[str]:
+        """Get curated seasonal playlist track IDs for the active source"""
+        try:
+            import json
+
+            if source is None:
+                source = self._get_source()
+            playlist_key = f"{season_key}_{source}"
+
+            with self.database._get_connection() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute("""
+                    SELECT track_ids
+                    FROM curated_seasonal_playlists
+                    WHERE season_key = ?
+                """, (playlist_key,))
+
+                result = cursor.fetchone()
+
+                if result and result['track_ids']:
+                    return json.loads(result['track_ids'])
+
+                return []
+
+        except Exception as e:
+            logger.error(f"Error getting curated seasonal playlist: {e}")
+            return []
+
+    def populate_all_seasons(self):
+        """Populate content for all seasons (run periodically)"""
+        logger.info("Starting population of all seasonal content...")
+
+        for season_key in SEASONAL_CONFIG.keys():
+            try:
+                # Check if needs update (7 day threshold)
+                if self.should_populate_seasonal_content(season_key, days_threshold=7):
+                    logger.info(f"Populating {season_key}...")
+                    self.populate_seasonal_content(season_key)
+                    self.curate_seasonal_playlist(season_key)
+                else:
+                    logger.info(f"Skipping {season_key} (recently updated)")
+            except Exception as e:
+                logger.error(f"Error populating season {season_key}: {e}")
+                continue
+
+        logger.info("Finished populating all seasonal content")
+
+
+# Singleton instance
+_seasonal_discovery_instance = None
+
+def get_seasonal_discovery_service(spotify_client, database):
+    """Get the global seasonal discovery service instance"""
+    global _seasonal_discovery_instance
+    if _seasonal_discovery_instance is None:
+        _seasonal_discovery_instance = SeasonalDiscoveryService(spotify_client, database)
+    return _seasonal_discovery_instance

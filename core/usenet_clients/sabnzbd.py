@@ -1,0 +1,394 @@
+"""SABnzbd adapter.
+
+Auth model: a single API key passed as ``?apikey=...`` on every
+request. No login flow. Every endpoint is the same path ``/api`` with
+a ``mode=`` query param.
+
+Reference: https://sabnzbd.org/wiki/configuration/4.3/api
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import List, Optional, Union
+
+import requests as http_requests
+
+from config.settings import config_manager
+from core.usenet_clients.base import UsenetStatus
+from utils.logging_config import get_logger
+
+logger = get_logger("usenet.sabnzbd")
+
+
+# SAB Status enum (sabnzbd/constants.py:~95-118) → adapter-uniform set.
+# SAB emits PascalCase strings (``Idle``, ``Downloading``, ...) under
+# the slot ``status`` field; this map is keyed lowercase because
+# ``_map_state`` normalises before lookup. Anything unmapped lands on
+# ``error`` via ``_map_state``'s default — the album-bundle poll
+# helper treats that default as a transient miss so a brand-new
+# unmapped state can't infinite-loop the poll.
+_SAB_QUEUE_STATE_MAP = {
+    "idle":         "queued",
+    "queued":       "queued",
+    "grabbing":     "queued",
+    "propagating":  "queued",
+    "fetching":     "downloading",
+    "downloading":  "downloading",
+    "paused":       "paused",
+    "checking":     "verifying",
+    "quickcheck":   "verifying",
+    "verifying":    "verifying",
+    "repairing":    "repairing",
+    "extracting":   "extracting",
+    "moving":       "extracting",
+    "running":      "extracting",
+    "completed":    "completed",
+    "failed":       "failed",
+    "deleted":      "failed",
+}
+
+
+def _map_state(sab_state: str) -> str:
+    return _SAB_QUEUE_STATE_MAP.get((sab_state or "").lower(), "error")
+
+
+class SABnzbdAdapter:
+    """SABnzbd REST API adapter (v2+)."""
+
+    DEFAULT_TIMEOUT = 15
+
+    def __init__(self) -> None:
+        self._load_config()
+
+    def _load_config(self) -> None:
+        self._url = (config_manager.get('usenet_client.url', '') or '').rstrip('/')
+        self._api_key = config_manager.get('usenet_client.api_key', '') or ''
+        self._category = config_manager.get('usenet_client.category', 'soulsync') or 'soulsync'
+
+    def reload_settings(self) -> None:
+        self._load_config()
+
+    def is_configured(self) -> bool:
+        return bool(self._url and self._api_key)
+
+    async def check_connection(self) -> bool:
+        if not self.is_configured():
+            return False
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._check_connection_sync)
+
+    def _check_connection_sync(self) -> bool:
+        # ``mode=version`` is the cheapest authenticated probe SAB exposes.
+        data = self._call_sync('version')
+        return bool(data and data.get('version'))
+
+    def _call_sync(self, mode: str, **extra) -> Optional[dict]:
+        if not self.is_configured():
+            return None
+        params = {
+            'mode': mode,
+            'output': 'json',
+            'apikey': self._api_key,
+        }
+        params.update(extra)
+        try:
+            resp = http_requests.get(f"{self._url}/api", params=params, timeout=self.DEFAULT_TIMEOUT)
+            if not resp.ok:
+                logger.warning("SABnzbd mode=%s returned HTTP %s", mode, resp.status_code)
+                return None
+            return resp.json()
+        except http_requests.exceptions.RequestException as e:
+            logger.error("SABnzbd mode=%s request failed: %s", mode, e)
+            return None
+        except ValueError as e:
+            logger.error("SABnzbd mode=%s response was not JSON: %s", mode, e)
+            return None
+
+    def _post_sync(self, mode: str, files=None, **extra) -> Optional[dict]:
+        if not self.is_configured():
+            return None
+        params = {
+            'mode': mode,
+            'output': 'json',
+            'apikey': self._api_key,
+        }
+        params.update(extra)
+        try:
+            resp = http_requests.post(f"{self._url}/api", params=params, files=files,
+                                      timeout=self.DEFAULT_TIMEOUT)
+            if not resp.ok:
+                logger.warning("SABnzbd POST mode=%s returned HTTP %s", mode, resp.status_code)
+                return None
+            return resp.json()
+        except http_requests.exceptions.RequestException as e:
+            logger.error("SABnzbd POST mode=%s failed: %s", mode, e)
+            return None
+        except ValueError as e:
+            logger.error("SABnzbd POST mode=%s response was not JSON: %s", mode, e)
+            return None
+
+    async def add_nzb(
+        self,
+        url_or_bytes: Union[str, bytes],
+        category: str = "soulsync",
+        save_path: Optional[str] = None,
+    ) -> Optional[str]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, self._add_nzb_sync, url_or_bytes, category, save_path
+        )
+
+    def _add_nzb_sync(
+        self,
+        url_or_bytes: Union[str, bytes],
+        category: str,
+        save_path: Optional[str],
+    ) -> Optional[str]:
+        cat = category or self._category
+        if isinstance(url_or_bytes, bytes):
+            files = {'name': ('soulsync.nzb', url_or_bytes, 'application/x-nzb')}
+            data = self._post_sync('addfile', files=files, cat=cat)
+        else:
+            data = self._call_sync('addurl', name=url_or_bytes, cat=cat)
+        if not data or not data.get('status'):
+            return None
+        ids = data.get('nzo_ids') or []
+        return ids[0] if ids else None
+
+    async def get_status(self, job_id: str) -> Optional[UsenetStatus]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._get_status_sync, job_id)
+
+    def _get_status_sync(self, job_id: str) -> Optional[UsenetStatus]:
+        # Direct nzo_ids lookup against queue, then history. Falls back
+        # to the bulk fetch for SAB versions that don't honour the
+        # nzo_ids filter (very old SAB), but the direct path is the hot
+        # path because the bulk history fetch was limited to 50 entries
+        # — on a busy SAB server a recently-completed job would roll
+        # past the window and the poll would log "disappeared".
+        if not job_id:
+            return None
+        queue = self._call_sync('queue', nzo_ids=job_id)
+        if queue and isinstance(queue.get('queue'), dict):
+            for slot in queue['queue'].get('slots', []) or []:
+                if str(slot.get('nzo_id') or '') == job_id:
+                    return self._parse_queue_slot(slot)
+        history = self._call_sync('history', nzo_ids=job_id)
+        if history and isinstance(history.get('history'), dict):
+            for slot in history['history'].get('slots', []) or []:
+                if str(slot.get('nzo_id') or '') == job_id:
+                    return self._parse_history_slot(slot)
+        # Fallback: SAB version pre-dating nzo_ids filter support. The
+        # bulk path is still limit=50; the helper's transient-miss
+        # tolerance will cover the gap if the entry briefly rolls out
+        # of the window.
+        for status in self._get_all_sync():
+            if status.id == job_id:
+                return status
+        return None
+
+    async def get_all(self) -> List[UsenetStatus]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._get_all_sync)
+
+    def _get_all_sync(self) -> List[UsenetStatus]:
+        out: List[UsenetStatus] = []
+        # Active queue
+        queue = self._call_sync('queue')
+        if queue and isinstance(queue.get('queue'), dict):
+            for slot in queue['queue'].get('slots', []) or []:
+                out.append(self._parse_queue_slot(slot))
+        # History — completed / failed jobs SAB still tracks
+        history = self._call_sync('history', limit=50)
+        if history and isinstance(history.get('history'), dict):
+            for slot in history['history'].get('slots', []) or []:
+                out.append(self._parse_history_slot(slot))
+        return out
+
+    def _parse_queue_slot(self, slot: dict) -> UsenetStatus:
+        try:
+            percentage = float(slot.get('percentage') or 0.0)
+        except (TypeError, ValueError):
+            percentage = 0.0
+        progress = percentage / 100.0
+        # mb / mbleft are strings of MB values in SAB's queue API.
+        size_mb = self._safe_float(slot.get('mb'))
+        left_mb = self._safe_float(slot.get('mbleft'))
+        size_bytes = int(size_mb * 1024 * 1024) if size_mb else 0
+        downloaded_bytes = int((size_mb - left_mb) * 1024 * 1024) if size_mb and left_mb is not None else 0
+        # ``timeleft`` is HH:MM:SS — convert to seconds.
+        eta = self._parse_timeleft(slot.get('timeleft'))
+        return UsenetStatus(
+            id=str(slot.get('nzo_id') or ''),
+            name=slot.get('filename') or slot.get('name') or '',
+            state=_map_state(slot.get('status') or ''),
+            progress=max(0.0, min(progress, 1.0)),
+            size=size_bytes,
+            downloaded=max(0, downloaded_bytes),
+            download_speed=0,  # queue endpoint doesn't include per-slot speed
+            eta=eta,
+            category=slot.get('cat'),
+        )
+
+    def _parse_history_slot(self, slot: dict) -> UsenetStatus:
+        # History entries cover BOTH finished jobs AND jobs that are still
+        # POST-PROCESSING. SAB removes a job from the queue the moment the
+        # download finishes and runs par2 verify / repair / unpack / move
+        # while the job sits in History — exposing the live stage in the
+        # ``status`` field ('Verifying' / 'Repairing' / 'Extracting' /
+        # 'Moving' / 'Running' / ...). Only 'Completed' means truly done;
+        # 'Failed' / 'Deleted' mean failure.
+        #
+        # The old logic mapped EVERY non-'failed' status to 'completed'.
+        # That made the poll treat a still-extracting 1.7 GB FLAC album
+        # (status 'Extracting', ``storage`` not written yet) as "completed
+        # but no save_path" and burn the completed-no-path window mid-PP —
+        # exactly the #721 stuck-at-99% signature in production where the
+        # path IS shared. Route the status through the same queue-state map
+        # so PP stages stay NON-terminal: the poll keeps waiting (as
+        # 'downloading') for as long as post-processing takes, and only a
+        # real 'Completed' flips it to terminal success.
+        mapped = _map_state(slot.get('status') or '')
+        is_failed = mapped == 'failed'
+        is_completed = mapped == 'completed'
+        # Only trust the final path on a TRUE completion. Mid-PP the path
+        # fields may be empty or still point at the incomplete dir; the
+        # completed-no-path retry handles the brief gap between the
+        # 'Completed' flip and ``storage`` landing in the same response.
+        save_path = self._extract_history_save_path(slot) if is_completed else None
+        # ``incomplete_path`` is surfaced separately (NOT as save_path) so
+        # the poll loops can fall back to it only as a last resort once
+        # the final ``storage`` field has provably failed to land — see
+        # ``UsenetStatus.incomplete_path`` and the #721 fallback in
+        # ``poll_album_download``. Whitespace-only values are treated as
+        # absent, same as the save_path chain.
+        incomplete_path = slot.get('incomplete_path')
+        if not (isinstance(incomplete_path, str) and incomplete_path.strip()):
+            incomplete_path = None
+        bytes_total = int(slot.get('bytes') or 0)
+        return UsenetStatus(
+            id=str(slot.get('nzo_id') or ''),
+            name=slot.get('name') or '',
+            state=mapped,
+            # Download itself is finished for ANY History slot (in-PP or
+            # done), so report full download progress — don't snap the UI
+            # back to 0% while SAB verifies/unpacks. Failed = 0.
+            progress=0.0 if is_failed else 1.0,
+            size=bytes_total,
+            downloaded=0 if is_failed else bytes_total,
+            download_speed=0,
+            save_path=save_path,
+            incomplete_path=incomplete_path,
+            category=slot.get('category'),
+            error=slot.get('fail_message') if is_failed else None,
+        )
+
+    # SAB version differences: ``storage`` is the documented final-path
+    # field on recent versions, but older builds populated ``path``
+    # instead, and some forks use ``download_path`` or ``dirname``.
+    # ``storage`` is also empty for the first few seconds after a job
+    # flips to History — SAB writes the path AFTER its post-processing
+    # move completes. Issue #721 (Forty Licks stuck at 61%): the bundle
+    # poll returned save_path=None on the first ``Completed`` read, the
+    # plugin marked the batch failed, and the UI never unstuck. The
+    # ``poll_album_download`` retry loop now tolerates a short window
+    # of completed-but-no-path; this helper widens the field net so
+    # we pick the path up whenever ANY of the known SAB keys carries it.
+    _HISTORY_SAVE_PATH_KEYS = (
+        'storage',
+        'path',
+        'download_path',
+        'dirname',
+    )
+    # ``incomplete_path`` is intentionally NOT in this list. SAB
+    # populates it BEFORE the post-process move, so it would always
+    # resolve on the first ``Completed`` read — bypassing
+    # ``poll_album_download``'s new retry window, and pointing the
+    # bundle plugin at the in-progress staging dir instead of the
+    # final destination. The poll's retry loop is the safer place to
+    # handle the SAB History→storage write gap.
+
+    def _extract_history_save_path(self, slot: dict) -> Optional[str]:
+        for key in self._HISTORY_SAVE_PATH_KEYS:
+            value = slot.get(key)
+            if value and isinstance(value, str) and value.strip():
+                return value
+        # Loud diagnostic when the bundle poll is about to wait/fail on
+        # this: users on SAB versions / forks with novel field names need
+        # to see this in the logs so we can grow ``_HISTORY_SAVE_PATH_KEYS``.
+        # INFO (not DEBUG) on purpose — a completed History slot with no
+        # resolvable path is the #721 stuck-bundle signature, and dumping
+        # the actual slot keys here is what lets us add the missing field
+        # without a debug-logging round-trip. It only fires for completed
+        # slots that lack every known path field, so it self-limits the
+        # moment ``storage`` lands.
+        logger.info(
+            "[SAB] History slot for nzo_id=%s has no save_path in any "
+            "of the known fields %r — slot keys: %r",
+            slot.get('nzo_id'),
+            self._HISTORY_SAVE_PATH_KEYS,
+            sorted(slot.keys()),
+        )
+        return None
+
+    @staticmethod
+    def _safe_float(value) -> Optional[float]:
+        if value is None or value == '':
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_timeleft(value) -> Optional[int]:
+        if not value or not isinstance(value, str):
+            return None
+        parts = value.split(':')
+        try:
+            if len(parts) == 3:
+                h, m, s = parts
+                return int(h) * 3600 + int(m) * 60 + int(s)
+            if len(parts) == 2:
+                m, s = parts
+                return int(m) * 60 + int(s)
+        except ValueError:
+            return None
+        return None
+
+    async def remove(self, job_id: str, delete_files: bool = False) -> bool:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._remove_sync, job_id, delete_files)
+
+    def _remove_sync(self, job_id: str, delete_files: bool) -> bool:
+        # SAB deletes from queue or history depending on where the job is.
+        # We try queue first; if SAB reports no-op, fall through to history.
+        params = {'name': 'delete', 'value': job_id}
+        if delete_files:
+            params['del_files'] = 1
+        data = self._call_sync('queue', **params)
+        if data and data.get('status'):
+            return True
+        # History delete
+        history_params = {'name': 'delete', 'value': job_id}
+        if delete_files:
+            history_params['del_files'] = 1
+        data = self._call_sync('history', **history_params)
+        return bool(data and data.get('status'))
+
+    async def pause(self, job_id: str) -> bool:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._pause_sync, job_id)
+
+    def _pause_sync(self, job_id: str) -> bool:
+        data = self._call_sync('queue', name='pause', value=job_id)
+        return bool(data and data.get('status'))
+
+    async def resume(self, job_id: str) -> bool:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._resume_sync, job_id)
+
+    def _resume_sync(self, job_id: str) -> bool:
+        data = self._call_sync('queue', name='resume', value=job_id)
+        return bool(data and data.get('status'))

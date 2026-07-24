@@ -1,0 +1,275 @@
+"""Compatibility facade and orchestration for metadata enrichment."""
+
+from __future__ import annotations
+
+import os
+from types import SimpleNamespace
+from typing import Any
+
+from core.metadata.art_preservation import (
+    restore_embedded_art,
+    snapshot_embedded_art,
+)
+from core.metadata.artwork import embed_album_art_metadata
+from core.metadata.common import (
+    get_config_manager,
+    get_file_lock,
+    get_mutagen_symbols,
+    is_vorbis_like,
+    save_audio_file,
+    strip_all_non_audio_tags,
+    verify_metadata_written,
+)
+from core.metadata.source import embed_source_ids, extract_source_metadata
+from utils.logging_config import get_logger as _create_logger
+
+
+__all__ = [
+    "build_metadata_enrichment_runtime",
+    "enhance_file_metadata",
+    "extract_source_metadata",
+    "embed_source_ids",
+]
+
+
+logger = _create_logger("metadata.enrichment")
+
+
+def build_metadata_enrichment_runtime(
+    *,
+    mb_worker: Any | None = None,
+    deezer_worker: Any | None = None,
+    audiodb_worker: Any | None = None,
+    tidal_client: Any | None = None,
+    hifi_client: Any | None = None,
+    qobuz_enrichment_worker: Any | None = None,
+    lastfm_worker: Any | None = None,
+    genius_worker: Any | None = None,
+    bandcamp_worker: Any | None = None,
+    spotify_enrichment_worker: Any | None = None,
+    itunes_enrichment_worker: Any | None = None,
+    jiosaavn_worker: Any | None = None,
+) -> SimpleNamespace:
+    """Build the runtime object consumed by core.metadata.enrichment/source."""
+    return SimpleNamespace(
+        mb_worker=mb_worker,
+        deezer_worker=deezer_worker,
+        audiodb_worker=audiodb_worker,
+        jiosaavn_worker=jiosaavn_worker,
+        tidal_client=tidal_client,
+        hifi_client=hifi_client,
+        qobuz_enrichment_worker=qobuz_enrichment_worker,
+        lastfm_worker=lastfm_worker,
+        genius_worker=genius_worker,
+        bandcamp_worker=bandcamp_worker,
+        spotify_enrichment_worker=spotify_enrichment_worker,
+        itunes_enrichment_worker=itunes_enrichment_worker,
+    )
+
+
+def enhance_file_metadata(file_path: str, context: dict, artist: dict, album_info: dict, runtime=None) -> bool:
+    cfg = get_config_manager()
+    if cfg.get("metadata_enhancement.enabled", True) is False:
+        logger.warning("Metadata enhancement disabled in config.")
+        return True
+
+    if album_info is None:
+        album_info = {}
+
+    symbols = get_mutagen_symbols()
+    if not symbols:
+        logger.error("Mutagen is unavailable, cannot enhance metadata.")
+        return False
+
+    file_lock = get_file_lock(file_path)
+    with file_lock:
+        logger.info("Enhancing metadata for: %s", os.path.basename(file_path))
+        art_snapshot = []  # defined up front so the except handler can restore
+        audio_file = None
+        try:
+            strip_all_non_audio_tags(file_path)
+            audio_file = symbols.File(file_path)
+            if audio_file is None:
+                logger.error("Could not load audio file with Mutagen: %s", file_path)
+                return False
+
+            # Capture any embedded cover art BEFORE we clear it. The rewrite
+            # below clears pictures/tags up front, but new art isn't fetched
+            # until much later (and may fail / be unavailable / be disabled).
+            # Without this snapshot, every such failure saves the file with
+            # the art destroyed and nothing put back — issue #764.
+            art_snapshot = snapshot_embedded_art(audio_file, symbols)
+
+            if hasattr(audio_file, "clear_pictures"):
+                audio_file.clear_pictures()
+
+            if audio_file.tags is not None:
+                if len(audio_file.tags) > 0:
+                    tag_keys = list(audio_file.tags.keys())[:15]
+                    logger.info("Clearing %s existing tags: %s", len(audio_file.tags), ", ".join(str(k) for k in tag_keys))
+                audio_file.tags.clear()
+            else:
+                audio_file.add_tags()
+
+            save_audio_file(audio_file, symbols)
+
+            metadata = extract_source_metadata(context, artist, album_info)
+            if not metadata:
+                logger.error("Could not extract source metadata, saving with cleared tags.")
+                # Don't destroy the original art just because we couldn't
+                # enrich the tags — put it back before saving.
+                restore_embedded_art(audio_file, symbols, art_snapshot)
+                save_audio_file(audio_file, symbols)
+                return True
+
+            # Discord report (Netti93) — many album-dict construction
+            # sites pass `total_tracks: 0` when source data is incomplete
+            # (per types.py, 0 means "unknown"). Pre-fix this serialized
+            # to "6/0" tags. Helper drops the `/N` suffix when total is
+            # unknown so the tag reads "6" instead — matches retag's
+            # behavior at core/tag_writer.py and ID3 spec convention.
+            from core.metadata.track_number_format import (
+                format_track_number_tag,
+                format_track_number_tuple,
+            )
+            track_num_str = format_track_number_tag(
+                metadata.get('track_number'), metadata.get('total_tracks')
+            )
+            # Disc number is written UNCONDITIONALLY (floored to >=1), like the
+            # track number above. The old code only wrote it when truthy, so a
+            # track whose disc came back 0/None/'' (e.g. matched to a different
+            # edition) lost its disc tag on the clear-then-rewrite and floated
+            # ungrouped above the disc sections in Jellyfin/Plex (Sokhi).
+            from core.imports.track_number import normalize_disc_number
+            _disc_num = normalize_disc_number(metadata.get('disc_number'))
+            disc_num_str = str(_disc_num)
+            write_multi = cfg.get("metadata_enhancement.tags.write_multi_artist", False)
+            artists_list = metadata.get("_artists_list", [])
+
+            if isinstance(audio_file.tags, symbols.ID3):
+                if metadata.get("title"):
+                    audio_file.tags.add(symbols.TIT2(encoding=3, text=[metadata["title"]]))
+                if metadata.get("artist"):
+                    # TPE1 = display artist string (already joined by
+                    # source.py with the configured separator, or
+                    # primary-only when feat_in_title is on).
+                    audio_file.tags.add(symbols.TPE1(encoding=3, text=[metadata["artist"]]))
+                    # When write_multi_artist is on, ALSO write the
+                    # multi-value list to a TXXX:Artists frame (Picard
+                    # convention). Keeps TPE1 as the display string AND
+                    # exposes the per-artist list for media servers
+                    # that read ARTISTS. Pre-fix this path overwrote
+                    # TPE1 with the list, which clobbered the
+                    # configured separator + feat_in_title semantics.
+                    if write_multi and len(artists_list) > 1:
+                        audio_file.tags.add(
+                            symbols.TXXX(encoding=3, desc='Artists', text=list(artists_list))
+                        )
+                if metadata.get("album_artist"):
+                    audio_file.tags.add(symbols.TPE2(encoding=3, text=[metadata["album_artist"]]))
+                if metadata.get("album"):
+                    audio_file.tags.add(symbols.TALB(encoding=3, text=[metadata["album"]]))
+                if metadata.get("date"):
+                    audio_file.tags.add(symbols.TDRC(encoding=3, text=[metadata["date"]]))
+                if metadata.get("genre"):
+                    audio_file.tags.add(symbols.TCON(encoding=3, text=[metadata["genre"]]))
+                audio_file.tags.add(symbols.TRCK(encoding=3, text=[track_num_str]))
+                audio_file.tags.add(symbols.TPOS(encoding=3, text=[disc_num_str]))
+            elif is_vorbis_like(audio_file, symbols):
+                if metadata.get("title"):
+                    audio_file["title"] = [metadata["title"]]
+                if metadata.get("artist"):
+                    audio_file["artist"] = [metadata["artist"]]
+                    if write_multi and len(artists_list) > 1:
+                        audio_file["artists"] = artists_list
+                if metadata.get("album_artist"):
+                    audio_file["albumartist"] = [metadata["album_artist"]]
+                if metadata.get("album"):
+                    audio_file["album"] = [metadata["album"]]
+                if metadata.get("date"):
+                    audio_file["date"] = [metadata["date"]]
+                if metadata.get("genre"):
+                    audio_file["genre"] = [metadata["genre"]]
+                audio_file["tracknumber"] = [track_num_str]
+                audio_file["discnumber"] = [disc_num_str]
+            elif isinstance(audio_file, symbols.MP4):
+                if metadata.get("title"):
+                    audio_file["\xa9nam"] = [metadata["title"]]
+                if metadata.get("artist"):
+                    audio_file["\xa9ART"] = artists_list if (write_multi and len(artists_list) > 1) else [metadata["artist"]]
+                if metadata.get("album_artist"):
+                    audio_file["aART"] = [metadata["album_artist"]]
+                if metadata.get("album"):
+                    audio_file["\xa9alb"] = [metadata["album"]]
+                if metadata.get("date"):
+                    audio_file["\xa9day"] = [metadata["date"]]
+                if metadata.get("genre"):
+                    audio_file["\xa9gen"] = [metadata["genre"]]
+                audio_file["trkn"] = [format_track_number_tuple(
+                    metadata.get("track_number"), metadata.get("total_tracks")
+                )]
+                audio_file["disk"] = [(_disc_num, 0)]
+
+            embed_source_ids(audio_file, metadata, context, runtime=runtime)
+
+            if album_info is not None and metadata.get("musicbrainz_release_id"):
+                album_info["musicbrainz_release_id"] = metadata["musicbrainz_release_id"]
+
+            if cfg.get("metadata_enhancement.embed_album_art", True):
+                embed_album_art_metadata(audio_file, metadata)
+
+            quality = context.get("_audio_quality", "")
+            if quality and cfg.get("metadata_enhancement.tags.quality_tag", True) is not False:
+                if isinstance(audio_file.tags, symbols.ID3):
+                    audio_file.tags.add(symbols.TXXX(encoding=3, desc="QUALITY", text=[quality]))
+                elif is_vorbis_like(audio_file, symbols):
+                    audio_file["quality"] = [quality]
+                elif isinstance(audio_file, symbols.MP4):
+                    audio_file["----:com.apple.iTunes:QUALITY"] = [symbols.MP4FreeForm(quality.encode("utf-8"))]
+
+            # If art embedding was skipped/disabled or produced nothing (no
+            # URL, download failed, rejected by the min-resolution guard),
+            # the file still has the pictures we cleared above. Restore the
+            # original so import never strips existing art (#764). No-op when
+            # new art was embedded — that path is unchanged.
+            restore_embedded_art(audio_file, symbols, art_snapshot)
+
+            save_audio_file(audio_file, symbols)
+
+            verified = verify_metadata_written(file_path)
+            if verified:
+                logger.info("Metadata enhanced successfully.")
+            else:
+                logger.info("Metadata saved but verification found issues (see above).")
+            return True
+        except Exception as exc:
+            import traceback
+
+            logger.error("Error enhancing metadata for %s: %s", file_path, exc)
+            logger.error("[Metadata Debug] Exception type: %s", type(exc).__name__)
+            logger.info("[Metadata Debug] File exists: %s", os.path.exists(file_path))
+            logger.warning("[Metadata Debug] Artist: %s", artist.get("name", "MISSING") if artist else "None")
+            logger.warning("[Metadata Debug] Album info: %s", album_info.get("album_name", "MISSING") if album_info else "None")
+            logger.error("[Metadata Debug] Traceback:\n%s", traceback.format_exc())
+            # The file was saved with tags CLEARED up front (so stale tags never
+            # linger), then the failure-prone enrichment ran. By the time most
+            # failures hit — the external source-id embed / cover-art fetch — the
+            # core tags (album/artist/title/track from the matched context) are
+            # already on the in-memory object but NOT yet on disk; the on-disk
+            # file is still the cleared one. Persist the in-memory tags now (and
+            # restore the original art too, #764) so a mid-enrichment crash leaves
+            # a correctly-tagged file instead of an UNTAGGED one (Sokhi: tracks
+            # landing in Rockbox's 'untagged' bucket after a 'processing failed').
+            #
+            # Previously this save was gated on there being original art to
+            # restore, so an art-less file lost its tags entirely on any crash.
+            # Guarded so a failure here can't mask the original error.
+            try:
+                if audio_file is not None:
+                    if art_snapshot:
+                        restore_embedded_art(audio_file, symbols, art_snapshot)
+                    save_audio_file(audio_file, symbols)
+                    logger.info("Persisted core tags (and restored art) after enrichment error.")
+            except Exception as restore_exc:
+                logger.debug("Tag/art persist after error failed: %s", restore_exc)
+            return False

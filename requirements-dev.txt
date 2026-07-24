@@ -1,0 +1,8 @@
+# SoulSync development requirements
+# Runtime web dependencies + test runner
+
+-r requirements.txt
+ruff==0.15.12
+
+# Test runner
+pytest==9.0.3

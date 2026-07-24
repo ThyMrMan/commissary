@@ -1,0 +1,469 @@
+"""Static block definitions for the automation builder UI.
+
+Returned verbatim by `/api/automations/blocks` (with `known_signals`
+injected by the route from `signals.collect_known_signals`).
+
+Three top-level lists:
+- `TRIGGERS` — WHEN blocks: schedule, daily/weekly time, app started,
+  event triggers (track_downloaded, batch_complete, etc.), signal_received,
+  webhook_received.
+- `ACTIONS` — DO blocks: process_wishlist, scan_library, etc.
+- `NOTIFICATIONS` — THEN blocks: discord/pushbullet/telegram/webhook,
+  plus fire_signal and run_script then-actions.
+
+Each block carries an optional ``scope`` tag so the SAME definitions can
+feed both the music and the (isolated) video automation builders:
+  - ``"both"``  — generic; shown on both sides (schedule, notifications, …).
+  - ``"video"`` — video-only; shown only on the video builder.
+  - absent      — treated as music-only (the default); never shown on video.
+Use :func:`blocks_for_scope` to get the filtered lists for one side.
+"""
+
+from __future__ import annotations
+
+TRIGGERS: list[dict] = [
+    {"type": "schedule", "label": "Schedule", "icon": "clock", "scope": "both", "description": "Run on a timer interval", "available": True,
+     "config_fields": [
+         {"key": "interval", "type": "number", "label": "Every", "default": 6, "min": 1},
+         {"key": "unit", "type": "select", "label": "Unit",
+          "options": [{"value": "minutes", "label": "Minutes"}, {"value": "hours", "label": "Hours"}, {"value": "days", "label": "Days"}],
+          "default": "hours"}
+     ]},
+    {"type": "daily_time", "label": "Daily Time", "icon": "clock", "scope": "both", "description": "Run every day at a specific time", "available": True,
+     "config_fields": [
+         {"key": "time", "type": "time", "label": "At", "default": "03:00"}
+     ]},
+    {"type": "weekly_time", "label": "Weekly Schedule", "icon": "calendar", "scope": "both", "description": "Run on specific days of the week at a set time", "available": True,
+     "config_fields": [
+         {"key": "time", "type": "time", "label": "At", "default": "03:00"},
+         {"key": "days", "type": "multi_select", "label": "Days",
+          "options": [{"value": "mon", "label": "Mon"}, {"value": "tue", "label": "Tue"}, {"value": "wed", "label": "Wed"},
+                      {"value": "thu", "label": "Thu"}, {"value": "fri", "label": "Fri"}, {"value": "sat", "label": "Sat"}, {"value": "sun", "label": "Sun"}]}
+     ]},
+    # monthly_time was always supported by the engine (schedule.py) but never
+    # had a builder block — unlocked so users can build monthly maintenance.
+    {"type": "monthly_time", "label": "Monthly Schedule", "icon": "calendar", "scope": "both",
+     "description": "Run once a month on a chosen day", "available": True,
+     "config_fields": [
+         {"key": "time", "type": "time", "label": "Time", "default": "03:00"},
+         {"key": "day_of_month", "type": "number", "label": "Day of month", "default": 1, "min": 1, "max": 31}
+     ]},
+    {"type": "app_started", "label": "App Started", "icon": "power", "scope": "both", "description": "When SoulSync starts up", "available": True},
+    {"type": "track_downloaded", "label": "Track Downloaded", "icon": "download", "description": "When a track finishes downloading", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["artist", "title", "album", "quality"],
+     "variables": ["artist", "title", "album", "quality"]},
+    {"type": "batch_complete", "label": "Batch Complete", "icon": "check-circle", "description": "When an album/playlist download finishes", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["playlist_name"],
+     "variables": ["playlist_name", "total_tracks", "completed_tracks", "failed_tracks"]},
+    {"type": "watchlist_new_release", "label": "New Release Found", "icon": "bell", "description": "When watchlist detects new music", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["artist"],
+     "variables": ["artist", "new_tracks", "added_to_wishlist"]},
+    {"type": "playlist_synced", "label": "Playlist Synced", "icon": "refresh", "description": "When a playlist sync completes", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["playlist_name"],
+     "variables": ["playlist_name", "total_tracks", "matched_tracks", "synced_tracks", "failed_tracks"]},
+    {"type": "playlist_changed", "label": "Playlist Changed", "icon": "edit", "description": "When a mirrored playlist detects track changes from source", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["playlist_name"],
+     "variables": ["playlist_name", "old_count", "new_count", "added", "removed"]},
+    {"type": "discovery_completed", "label": "Discovery Complete", "icon": "search", "description": "When playlist track discovery finishes", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["playlist_name"],
+     "variables": ["playlist_name", "total_tracks", "discovered_count", "failed_count", "skipped_count"]},
+    # Phase 3 triggers
+    {"type": "wishlist_processing_completed", "label": "Wishlist Processed", "icon": "check-circle",
+     "description": "When auto-wishlist processing finishes", "available": True,
+     "variables": ["tracks_processed", "tracks_found", "tracks_failed"]},
+    {"type": "watchlist_scan_completed", "label": "Watchlist Scan Done", "icon": "check-circle",
+     "description": "When watchlist scan finishes", "available": True,
+     "variables": ["artists_scanned", "new_tracks_found", "tracks_added"]},
+    {"type": "database_update_completed", "label": "Database Updated", "icon": "database",
+     "description": "When library database refresh finishes", "available": True,
+     "variables": ["total_artists", "total_albums", "total_tracks"]},
+    {"type": "library_scan_completed", "label": "Library Scan Done", "icon": "hard-drive",
+     "description": "When media library scan finishes", "available": True,
+     "variables": ["server_type"]},
+    {"type": "download_failed", "label": "Download Failed", "icon": "x-circle",
+     "description": "When a track permanently fails to download", "available": True,
+     "has_conditions": True, "condition_fields": ["artist", "title", "reason"],
+     "variables": ["artist", "title", "reason"]},
+    {"type": "download_quarantined", "label": "File Quarantined", "icon": "alert-triangle",
+     "description": "When AcoustID verification fails", "available": True,
+     "has_conditions": True, "condition_fields": ["artist", "title"],
+     "variables": ["artist", "title", "reason"]},
+    {"type": "wishlist_item_added", "label": "Wishlist Item Added", "icon": "plus-circle",
+     "description": "When a track is added to wishlist", "available": True,
+     "has_conditions": True, "condition_fields": ["artist", "title"],
+     "variables": ["artist", "title", "reason"]},
+    {"type": "watchlist_artist_added", "label": "Artist Watched", "icon": "user-plus",
+     "description": "When an artist is added to watchlist", "available": True,
+     "has_conditions": True, "condition_fields": ["artist"],
+     "variables": ["artist", "artist_id"]},
+    {"type": "watchlist_artist_removed", "label": "Artist Unwatched", "icon": "user-minus",
+     "description": "When an artist is removed from watchlist", "available": True,
+     "has_conditions": True, "condition_fields": ["artist"],
+     "variables": ["artist", "artist_id"]},
+    {"type": "import_completed", "label": "Import Complete", "icon": "upload",
+     "description": "When album/track import finishes", "available": True,
+     "has_conditions": True, "condition_fields": ["artist", "album_name"],
+     "variables": ["track_count", "album_name", "artist"]},
+    {"type": "mirrored_playlist_created", "label": "Playlist Mirrored", "icon": "copy",
+     "description": "When a new playlist is mirrored", "available": True,
+     "has_conditions": True, "condition_fields": ["playlist_name", "source"],
+     "variables": ["playlist_name", "source", "track_count"]},
+    {"type": "quality_scan_completed", "label": "Quality Scan Done", "icon": "bar-chart",
+     "description": "When quality scan finishes", "available": True,
+     "variables": ["quality_met", "low_quality", "total_scanned"]},
+    {"type": "duplicate_scan_completed", "label": "Duplicate Scan Done", "icon": "layers",
+     "description": "When duplicate cleaner finishes", "available": True,
+     "variables": ["files_scanned", "duplicates_found", "space_freed"]},
+    # Signal trigger
+    {"type": "signal_received", "label": "Signal Received", "icon": "zap", "scope": "both",
+     "description": "When another automation fires a named signal", "available": True,
+     "config_fields": [
+         {"key": "signal_name", "type": "signal_input", "label": "Signal Name"}
+     ],
+     "variables": ["signal_name"]},
+    # Webhook trigger
+    {"type": "webhook_received", "label": "Webhook Received", "icon": "globe", "scope": "both",
+     "description": "When an external API request is received (POST /api/v1/request)", "available": True,
+     "variables": ["query", "request_id", "source"]},
+
+    # ── Video side (scope='video') — the post-download scan chain triggers ──
+    {"type": "video_batch_complete", "label": "Video Download Batch Done", "icon": "check-circle", "scope": "video",
+     "description": "When a batch of video downloads finishes", "available": True,
+     "variables": ["completed"]},
+    {"type": "video_library_scan_completed", "label": "Video Library Scan Done", "icon": "hard-drive", "scope": "video",
+     "description": "When the media server finishes rescanning your video sections", "available": True,
+     "variables": ["server"]},
+    # Per-item download lifecycle (movies, episodes AND YouTube — filter with
+    # conditions on `kind`: movie / show / youtube).
+    {"type": "video_download_completed", "label": "Video Downloaded", "icon": "download", "scope": "video",
+     "description": "When one movie, episode or YouTube video finishes downloading and lands in the library", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["title", "kind", "channel", "quality"],
+     "variables": ["kind", "title", "year", "season", "episode", "channel", "quality", "source", "dest_path"]},
+    {"type": "video_download_failed", "label": "Video Download Failed", "icon": "alert-triangle", "scope": "video",
+     "description": "When a download gives up for good (after retries) — the item goes back on the wishlist", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["title", "kind", "error"],
+     "variables": ["kind", "title", "error", "source"]},
+    {"type": "video_import_failed", "label": "Video Import Failed", "icon": "alert-circle", "scope": "video",
+     "description": "When a file downloads fine but can't be placed (sample, wrong episode, not an upgrade) and needs manual import", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["title", "kind", "error"],
+     "variables": ["kind", "title", "error", "dest_path"]},
+    {"type": "video_upgrade_completed", "label": "Quality Upgrade Landed", "icon": "trending-up", "scope": "video",
+     "description": "When a download REPLACED an existing library copy with a better one", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["title", "kind"],
+     "variables": ["kind", "title", "quality", "dest_path"]},
+    # Library maintenance (Tools page repair jobs).
+    {"type": "video_repair_finding_created", "label": "Maintenance Finding Raised", "icon": "tool", "scope": "video",
+     "description": "When a Library Maintenance job raises a NEW finding (missing episodes, broken file, ghost, ...) — condition on severity 'critical' for outage alerts", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["job_id", "finding_type", "severity", "title"],
+     "variables": ["job_id", "finding_type", "severity", "title"]},
+    {"type": "video_repair_scan_completed", "label": "Maintenance Scan Done", "icon": "tool", "scope": "video",
+     "description": "When a Library Maintenance job finishes a scan", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["job_id", "status"],
+     "variables": ["job_id", "job_name", "status", "scanned", "findings_created", "errors"]},
+    # Wishlist / watchlist activity.
+    {"type": "video_wishlist_item_added", "label": "Video Wishlist Item Added", "icon": "plus-circle", "scope": "video",
+     "description": "When something is added to the video wishlist (a movie, one or more episodes, or YouTube videos)", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["title", "kind"],
+     "variables": ["kind", "title", "count"]},
+    {"type": "video_watchlist_added", "label": "Video Watchlist Follow", "icon": "eye", "scope": "video",
+     "description": "When a show, person, channel or playlist is followed on the watchlist", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["title", "kind"],
+     "variables": ["kind", "title"]},
+    {"type": "video_watchlist_removed", "label": "Video Watchlist Unfollow", "icon": "eye-off", "scope": "video",
+     "description": "When a show, person, channel or playlist is unfollowed", "available": True,
+     "has_conditions": True,
+     "condition_fields": ["title", "kind"],
+     "variables": ["kind", "title"]},
+    # Studio pipelines.
+    {"type": "video_collections_synced", "label": "Collections Synced", "icon": "layers", "scope": "video",
+     "description": "When a collections sync pass finishes (manual or the nightly automation)", "available": True,
+     "variables": ["synced", "errors"]},
+    {"type": "video_overlays_applied", "label": "Overlays Applied", "icon": "image", "scope": "video",
+     "description": "When an overlay apply pass finishes", "available": True,
+     "variables": ["applied", "errors"]},
+    {"type": "video_database_update_completed", "label": "Video Database Updated", "icon": "database", "scope": "video",
+     "description": "When SoulSync finishes reading the server's library into its database", "available": True,
+     "variables": ["media_type", "mode"]},
+]
+
+
+ACTIONS: list[dict] = [
+    {"type": "process_wishlist", "label": "Process Wishlist", "icon": "list", "description": "Retry failed downloads from wishlist", "available": True,
+     "config_fields": [{"key": "category", "type": "select", "label": "Category", "options": [{"value": "all", "label": "All"}, {"value": "albums", "label": "Albums"}, {"value": "singles", "label": "Singles"}], "default": "all"}]},
+    {"type": "scan_watchlist", "label": "Scan Watchlist", "icon": "eye", "description": "Check watched artists AND followed labels for new releases", "available": True},
+    {"type": "scan_library", "label": "Scan Library", "icon": "refresh", "description": "Trigger media server library scan", "available": True},
+    {"type": "refresh_mirrored", "label": "Refresh Mirrored Playlist", "icon": "copy", "description": "Re-fetch playlist from source and update mirror", "available": True,
+     "config_fields": [
+         {"key": "playlist_id", "type": "mirrored_playlist_select", "label": "Playlist"},
+         {"key": "all", "type": "checkbox", "label": "Refresh all mirrored playlists", "default": False}
+     ]},
+    {"type": "sync_playlist", "label": "Sync Playlist", "icon": "sync", "description": "Sync mirrored playlist to media server", "available": True,
+     "config_fields": [
+         {"key": "playlist_id", "type": "mirrored_playlist_select", "label": "Playlist"}
+     ]},
+    {"type": "discover_playlist", "label": "Discover Playlist", "icon": "search", "description": "Find official Spotify/iTunes metadata for mirrored playlist tracks", "available": True,
+     "config_fields": [
+         {"key": "playlist_id", "type": "mirrored_playlist_select", "label": "Playlist"},
+         {"key": "all", "type": "checkbox", "label": "Discover all mirrored playlists", "default": False}
+     ]},
+    {"type": "playlist_pipeline", "label": "Playlist Pipeline", "icon": "rocket",
+     "description": "Full lifecycle: refresh → discover → sync → download missing. One automation for the entire flow.",
+     "available": True,
+     "config_fields": [
+         {"key": "playlist_id", "type": "mirrored_playlist_select", "label": "Playlist"},
+         {"key": "all", "type": "checkbox", "label": "Process all mirrored playlists", "default": False},
+         {"key": "skip_wishlist", "type": "checkbox", "label": "Skip wishlist processing", "default": False},
+     ]},
+    {"type": "personalized_pipeline", "label": "Personalized Playlist Pipeline", "icon": "sparkles",
+     "description": "Sync personalized / discover-page playlists (Hidden Gems, Time Machine, Fresh Tape, etc.) to your media server + queue missing tracks for download.",
+     "available": True,
+     "config_fields": [
+         {"key": "kinds", "type": "personalized_playlist_select", "label": "Playlists to sync",
+          "description": "Multi-select: Hidden Gems, Discovery Shuffle, Time Machine (per decade), Genre playlists, Fresh Tape, The Archives, Seasonal Mix (per season)"},
+         {"key": "refresh_first", "type": "checkbox", "label": "Refresh playlists before sync (regenerate snapshots)", "default": False},
+         {"key": "skip_wishlist", "type": "checkbox", "label": "Skip wishlist processing", "default": False},
+     ]},
+    {"type": "notify_only", "label": "Notify Only", "icon": "bell", "scope": "both", "description": "No action — just send notification", "available": True},
+    # Phase 3 actions
+    {"type": "start_database_update", "label": "Update Database", "icon": "database",
+     "description": "Trigger library database refresh", "available": True,
+     "config_fields": [
+         {"key": "full_refresh", "type": "checkbox", "label": "Full refresh (slower)", "default": False}
+     ]},
+    {"type": "run_duplicate_cleaner", "label": "Run Duplicate Cleaner", "icon": "layers",
+     "description": "Scan for and remove duplicate files", "available": True},
+    {"type": "clear_quarantine", "label": "Clear Quarantine", "icon": "trash",
+     "description": "Delete all quarantined files", "available": True},
+    {"type": "cleanup_wishlist", "label": "Clean Up Wishlist", "icon": "filter",
+     "description": "Remove duplicate/owned tracks from wishlist", "available": True},
+    {"type": "update_discovery_pool", "label": "Update Discovery", "icon": "compass",
+     "description": "Refresh discovery pool with new tracks", "available": True},
+    {"type": "start_quality_scan", "label": "Run Quality Scan", "icon": "bar-chart",
+     "description": "Run the Quality Upgrade Finder (scope is set in Library Maintenance)", "available": True},
+    {"type": "backup_database", "label": "Backup Database", "icon": "save",
+     "description": "Create timestamped database backup", "available": True},
+    {"type": "refresh_beatport_cache", "label": "Refresh Beatport Cache", "icon": "music",
+     "description": "Scrape Beatport homepage and warm the cache", "available": True},
+    {"type": "clean_search_history", "label": "Clean Search History", "icon": "trash-2",
+     "description": "Remove old searches from Soulseek", "available": True},
+    {"type": "clean_completed_downloads", "label": "Clean Completed Downloads", "icon": "check-square",
+     "description": "Clear completed downloads and empty directories", "available": True},
+    {"type": "seeding_sweep", "label": "Seeding Sweep", "icon": "download",
+     "description": "Radarr's seed-until-done tail for music torrents: once a completed torrent grab reaches your seed ratio or seed time goal (Settings → Downloads), remove it from the torrent client — including the client's copy of the file (your imported library copy is separate and never touched). Off until you set a goal. Pair with a half-hourly schedule.", "available": True},
+    {"type": "full_cleanup", "label": "Full Cleanup", "icon": "trash",
+     "description": "Clear quarantine, download queue, import folder, and search history in one sweep", "available": True},
+    {"type": "deep_scan_library", "label": "Deep Scan Library", "icon": "search",
+     "description": "Full library comparison without losing enrichment data", "available": True},
+    {"type": "run_script", "label": "Run Script", "icon": "terminal", "scope": "both",
+     "description": "Execute a script from the scripts folder", "available": True},
+    {"type": "search_and_download", "label": "Search & Download", "icon": "download",
+     "description": "Search for a track and download the best match", "available": True,
+     "config_fields": [
+         {"key": "query", "type": "text", "label": "Search Query",
+          "placeholder": "Artist - Track (leave empty to use trigger's query)"}
+     ]},
+
+    # ── Video side (isolated app, shared engine) ──────────────────────────
+    # Tagged scope='video' so they appear ONLY on the video automation
+    # builder, never the music one. Their handlers bridge into core.video.
+    {"type": "video_scan_library", "label": "Scan Video Library", "icon": "refresh", "scope": "video",
+     "description": "Tell the media server to rescan your selected movie/TV sections, then read what it found into SoulSync", "available": True,
+     "config_fields": [
+         {"key": "mode", "type": "select", "label": "Mode",
+          "options": [{"value": "full", "label": "Full (add + refresh)"},
+                      {"value": "incremental", "label": "Incremental (recent only)"},
+                      {"value": "deep", "label": "Deep (also remove missing)"}],
+          "default": "full"},
+         {"key": "media_type", "type": "select", "label": "Library",
+          "options": [{"value": "all", "label": "Movies + TV"},
+                      {"value": "movie", "label": "Movies only"},
+                      {"value": "show", "label": "TV only"}],
+          "default": "all"}
+     ]},
+    # Post-download chain actions (two stages, like music's scan_library +
+    # start_database_update). Stage 1 nudges the server; stage 2 reads it in.
+    {"type": "video_scan_server", "label": "Scan Video Server", "icon": "refresh", "scope": "video",
+     "description": "Get the server to index new downloads (skips the scan if it already has them), waits until it finishes, then fires 'Video Library Scan Done'", "available": True,
+     "config_fields": [
+         {"key": "media_type", "type": "select", "label": "Library",
+          "options": [{"value": "all", "label": "Movies + TV"},
+                      {"value": "movie", "label": "Movies only"},
+                      {"value": "show", "label": "TV only"}],
+          "default": "all"},
+         {"key": "skip_if_present", "type": "checkbox", "label": "Skip the scan if the server already has the download", "default": True},
+         {"key": "probe_grace_minutes", "type": "number", "label": "Give the server's auto-scan this long to ingest first (min)", "default": 2, "min": 0},
+         {"key": "max_wait_minutes", "type": "number", "label": "Max wait for scan (min)", "default": 60, "min": 1},
+         {"key": "debounce_seconds", "type": "number", "label": "Fallback wait if status unknown (sec)", "default": 120, "min": 10}
+     ]},
+    {"type": "video_update_database", "label": "Update Video Database", "icon": "database", "scope": "video",
+     "description": "Read newly-indexed media from the server into SoulSync (incremental)", "available": True,
+     "config_fields": [
+         {"key": "mode", "type": "select", "label": "Mode",
+          "options": [{"value": "incremental", "label": "Incremental (recent only)"},
+                      {"value": "full", "label": "Full (add + refresh)"}],
+          "default": "incremental"},
+         {"key": "media_type", "type": "select", "label": "Library",
+          "options": [{"value": "all", "label": "Movies + TV"},
+                      {"value": "movie", "label": "Movies only"},
+                      {"value": "show", "label": "TV only"}],
+          "default": "all"}
+     ]},
+    {"type": "video_update_database_hourly", "label": "Update Video Database (Hourly)", "icon": "database", "scope": "video",
+     "description": "The same incremental server-read on an hourly schedule, so manual library additions (which Plex auto-scans) appear within the hour instead of waiting for the weekly deep scan. Pair with a 1-hour Schedule trigger.", "available": True},
+    # Per-library deep-scan presets (the system 'Auto-Deep Scan TV/Movie Library' run
+    # these). Scope + deep mode are baked in by the registration wrapper, so no config
+    # fields — drag one in and it just deep-scans that library.
+    {"type": "video_deep_scan_tv", "label": "Deep Scan TV Library", "icon": "search", "scope": "video",
+     "description": "Full reconcile of the TV library: re-read every show from the server and drop ones it no longer has (a read, NOT a Plex disk-scan; never touches movies)", "available": True},
+    {"type": "video_deep_scan_movies", "label": "Deep Scan Movie Library", "icon": "search", "scope": "video",
+     "description": "Full reconcile of the Movie library: re-read every movie from the server and drop ones it no longer has (a read, NOT a Plex disk-scan; never touches TV)", "available": True},
+    {"type": "video_refresh_airing_schedules", "label": "Refresh Airing TV Schedules", "icon": "calendar", "scope": "video",
+     "description": "Re-pull the latest TMDB episode schedules (air dates, stills) for the still-airing shows on your watchlist, so the calendar the airing automation reads is current — newly-announced or rescheduled episodes get picked up instead of being missed. Skips ended/canceled shows. Pair with a daily Schedule a couple hours before the airing run.", "available": True},
+    {"type": "video_reenrich_stale", "label": "Refresh Stale Metadata", "icon": "refresh", "scope": "video",
+     "description": "Rolling freshness pass: re-pulls the stalest matched movies & shows (oldest first, up to a per-run cap) by their stored TMDB id — so ratings, newly-written overviews, late-arriving art and episode air-dates roll in over time. Refreshing a show cascades its episodes too. Skips anything refreshed within the last month by default (metadata drifts slowly). Gap-fills static fields, overwrites the dynamic ratings, never clobbers your owned data. Pair with a 6-hourly Schedule.", "available": True,
+     "config_fields": [
+         {"key": "batch_size", "type": "number", "label": "Items per run", "default": 500},
+         {"key": "movie_stale_days", "type": "number", "label": "Skip movies refreshed within (days)", "default": 30},
+         {"key": "show_stale_days", "type": "number", "label": "Skip shows refreshed within (days)", "default": 30}
+     ]},
+    {"type": "video_clean_youtube_episodes", "label": "Clean Old YouTube Episodes", "icon": "trash", "scope": "video",
+     "description": "Delete downloaded YouTube channel episodes that fall outside each channel's keep window (set per channel via its cog → Keep: e.g. last 30 episodes / last 3–6 months). Removes the video + its sidecars but keeps the history record so it's never re-downloaded. No-op for channels left on 'keep everything' (the default). Playlists are excluded. Pair with a daily Schedule.", "available": True},
+    {"type": "video_add_airing_episodes", "label": "Wishlist Today's Airings", "icon": "calendar", "scope": "video",
+     "description": "Sonarr-style: add every episode airing today (for shows you follow) to the wishlist, skipping ones you already own. Also tidies the watchlist by dropping shows that have ended/been canceled.", "available": True,
+     "config_fields": [
+         {"key": "prune_ended", "type": "checkbox", "label": "Also remove ended/canceled shows from the watchlist", "default": True}
+     ]},
+    # ── Watchlist → Wishlist pipeline ────────────────────────────────────────
+    # Stage 1 — scans that FILL the wishlist from what you follow.
+    {"type": "video_scan_watchlist_people", "label": "Scan Watchlist People", "icon": "users", "scope": "video",
+     "description": "For everyone you follow on the watchlist, wishlist every movie they acted in or directed that you don't already own — the whole back catalog plus anything upcoming (kept as 'monitored' until it's released). First run backlogs everything; later runs are fast.", "available": True},
+    {"type": "video_scan_watchlist_studios", "label": "Scan Watchlist Studios", "icon": "film", "scope": "video",
+     "description": "For every studio you follow (Pixar, A24, Disney…), wishlist every movie it produced that you don't already own — forward from when you followed it plus anything upcoming (kept 'monitored' until released), widened by each studio's lookback window. A settled-films vote floor keeps obscure shorts out; new releases always get through.", "available": True},
+    {"type": "video_scan_watchlist_channels", "label": "Scan Watchlist Channels", "icon": "youtube", "scope": "video",
+     "description": "For every YouTube channel you follow, wishlist its new long-form uploads (Shorts excluded). Forward-looking from when you followed, plus a safety net that keeps the last N videos current — N is the 'videos to grab' setting on Settings → Library. Pair with a 6-hourly Schedule trigger — channels post at all hours.", "available": True},
+    {"type": "video_scan_watchlist_playlists", "label": "Scan Watchlist Playlists", "icon": "list", "scope": "video",
+     "description": "For every YouTube playlist you follow, wishlist the newest N (the 'videos to grab' setting on Settings → Library) on the first scan, then only videos newly added to it — the same rule as channels, no whole-list flood. Each playlist becomes its own show in the library (playlist-as-show). Shorts excluded. Pair with a schedule.", "available": True},
+    # Stage 2 — processors that DRAIN the wishlist by downloading.
+    {"type": "video_process_movie_wishlist", "label": "Process Movie Wishlist", "icon": "download", "scope": "video",
+     "description": "Auto-grab your wished, released MOVIES from Soulseek: searches each, picks the best release per your quality profile, and downloads it (the monitor finishes + organises it). Skips unreleased ('monitored') ones and any already downloading. Needs the Movie library folder + slskd set. Pair with an hourly schedule.", "available": True,
+     "config_fields": [
+         {"key": "max_concurrent", "type": "number", "label": "Max simultaneous searches", "default": 3, "min": 1}
+     ]},
+    {"type": "video_process_episode_wishlist", "label": "Process Episode Wishlist", "icon": "download", "scope": "video",
+     "description": "Auto-grab your wished EPISODES from Soulseek: searches each, picks the best release per your quality profile, and downloads it. Fed by the 'Wishlist Today's Airings' scan. Needs the TV library folder + slskd set. Pair with an hourly schedule.", "available": True,
+     "config_fields": [
+         {"key": "max_concurrent", "type": "number", "label": "Max simultaneous searches", "default": 3, "min": 1}
+     ]},
+    {"type": "video_rss_sync", "label": "RSS Sync (Instant Grabs)", "icon": "download", "scope": "video",
+     "description": "Sonarr-speed acquisition: every few minutes, pull your indexers' newest releases from Prowlarr (one aggregate call, no searching) and instantly grab any that match your wishlist — a wanted episode lands minutes after it's posted instead of at the next hourly drain. Respects your quality profile, upgrade cutoff, blocklist and download mode (needs torrent/usenet enabled + Prowlarr). Pair with a 15-minute schedule.", "available": True},
+    {"type": "video_import_lists", "label": "Sync Import Lists", "icon": "list", "scope": "video",
+     "description": "Radarr/Sonarr Import Lists: everything on your configured external lists (TMDB lists, TMDB/IMDb charts, IMDb user lists, your Plex account watchlist) enters acquisition automatically — movies wishlist, shows follow with the list's monitor policy. Only NEW list members are added, so removing something you didn't want never boomerangs back. Configure lists on Settings → Downloads. Pair with a 6-hourly schedule.", "available": True},
+    {"type": "video_seeding_sweep", "label": "Seeding Sweep", "icon": "download", "scope": "video",
+     "description": "Radarr's seed-until-done tail: once a completed torrent grab reaches your seed ratio or seed time goal (Settings → Downloads), remove it from the torrent client — including the client's copy of the file (your imported library copy is separate and never touched). Off until you set a goal. Pair with a half-hourly schedule.", "available": True},
+    {"type": "video_process_youtube_wishlist", "label": "Process YouTube Wishlist", "icon": "download", "scope": "video",
+     "description": "Download wished YouTube videos (yt-dlp), organised as a Plex 'TV by date' show (channel/year/date). Queues the WHOLE wishlist — the setting only limits how many download at the same time; each finished one starts the next, so it all drains. A completed download leaves the wishlist. Needs the YouTube library folder set on Settings → Downloads.", "available": True,
+     "config_fields": [
+         {"key": "max_concurrent", "type": "number", "label": "Max simultaneous downloads", "default": 3, "min": 1}
+     ]},
+    # Video twins of the music maintenance actions. Distinct action_type (the
+    # system seeder keys on action_type, so a shared key would collide with the
+    # music row) but the SAME shared handler — the cleanup operates on the common
+    # download/search state, so behaviour stays identical. scope='video' keeps
+    # them on the video builder only; the music blocks above are untouched.
+    {"type": "video_clean_search_history", "label": "Clean Search History", "icon": "trash-2", "scope": "video",
+     "description": "Remove old searches from Soulseek", "available": True},
+    {"type": "video_clean_completed_downloads", "label": "Clean Completed Downloads", "icon": "check-square", "scope": "video",
+     "description": "Clear completed downloads and empty directories", "available": True},
+    {"type": "video_full_cleanup", "label": "Full Cleanup", "icon": "trash", "scope": "video",
+     "description": "Clear quarantine, download queue, import folder, and search history in one sweep", "available": True},
+    # Custom (NOT a shared handler): backs up video_library.db, not the music DB.
+    {"type": "video_backup_database", "label": "Backup Database", "icon": "save", "scope": "video",
+     "description": "Create a timestamped backup of the video library database", "available": True},
+    # Studio pipelines — previously system-seeded ONLY (handlers existed with no
+    # block). Unlocked so users can chain them (e.g. Video Database Updated →
+    # Apply Overlays → Discord).
+    {"type": "video_apply_overlays", "label": "Apply Overlays", "icon": "image", "scope": "video",
+     "description": "Render + push your enabled overlay templates onto server artwork (the same pass the nightly 'Auto-Update Overlays' runs)", "available": True},
+    {"type": "video_sync_collections", "label": "Sync Collections", "icon": "layers", "scope": "video",
+     "description": "Resolve + push every enabled collection to the server (the same pass the nightly 'Sync Collections' runs)", "available": True},
+    {"type": "video_clean_plex_images", "label": "Clean Up Plex Images", "icon": "trash-2", "scope": "video",
+     "description": "Clear Plex's stale cached artwork so replaced posters/overlays actually show", "available": True},
+    # Library Maintenance from an automation — chain repair after scans, or put
+    # a job on a custom cadence beyond the Tools-page interval.
+    {"type": "video_run_repair_job", "label": "Run Maintenance Job", "icon": "tool", "scope": "video",
+     "description": "Force-run one Library Maintenance job (or every enabled job that's due). Findings appear on the Tools page; pair with the 'Maintenance Finding Raised' trigger for alerts.", "available": True,
+     "config_fields": [
+         {"key": "job_id", "type": "select", "label": "Job",
+          "options": [{"value": "all", "label": "All enabled jobs"},
+                      {"value": "missing_episodes", "label": "Missing Episodes"},
+                      {"value": "movie_collections", "label": "Complete the Collection"},
+                      {"value": "quality_upgrade", "label": "Quality Upgrade"},
+                      {"value": "broken_files", "label": "Broken Files"},
+                      {"value": "metadata_gaps", "label": "Metadata Gaps"},
+                      {"value": "duplicate_movies", "label": "Duplicates"},
+                      {"value": "wishlist_audit", "label": "Wishlist Audit"},
+                      {"value": "youtube_ghosts", "label": "YouTube Ghost Files"},
+                      {"value": "watched_cleanup", "label": "Watched Cleanup"},
+                      {"value": "naming_conformance", "label": "Naming Conformance"}],
+          "default": "all"}
+     ]},
+]
+
+
+NOTIFICATIONS: list[dict] = [
+    {"type": "discord_webhook", "label": "Discord Webhook", "icon": "message", "scope": "both", "description": "Send a Discord notification", "available": True,
+     "variables": ["time", "name", "run_count", "status"]},
+    {"type": "pushbullet", "label": "Pushbullet", "icon": "push", "scope": "both", "description": "Push notification to phone/desktop", "available": True,
+     "variables": ["time", "name", "run_count", "status"]},
+    {"type": "telegram", "label": "Telegram", "icon": "message", "scope": "both", "description": "Send a Telegram message", "available": True,
+     "variables": ["time", "name", "run_count", "status"]},
+    {"type": "webhook", "label": "Webhook (POST)", "icon": "globe", "scope": "both", "description": "Send a POST request to any URL", "available": True,
+     "variables": ["time", "name", "run_count", "status"]},
+    # Signal fire action
+    {"type": "fire_signal", "label": "Fire Signal", "icon": "zap", "scope": "both",
+     "description": "Fire a signal that other automations can listen for", "available": True,
+     "config_fields": [
+         {"key": "signal_name", "type": "signal_input", "label": "Signal Name"}
+     ]},
+    # Run script then-action
+    {"type": "run_script", "label": "Run Script", "icon": "terminal", "scope": "both",
+     "description": "Execute a script after the action completes", "available": True,
+     "config_fields": [
+         {"key": "script_name", "type": "script_select", "label": "Script"}
+     ]},
+]
+
+
+def _in_scope(block: dict, scope: str) -> bool:
+    """A block belongs to ``scope`` if it's generic (``"both"``) or tagged for
+    that side. Untagged blocks default to ``"music"`` (the original behaviour),
+    so the video builder never picks up music-only blocks by accident."""
+    s = block.get("scope", "music")
+    return s == "both" or s == scope
+
+
+def blocks_for_scope(scope: str = "music") -> dict:
+    """Return the trigger/action/notification lists filtered to one side.
+
+    ``scope="music"`` reproduces the pre-scope behaviour (everything except
+    video-only blocks); ``scope="video"`` returns generic + video-only blocks.
+    """
+    return {
+        "triggers": [b for b in TRIGGERS if _in_scope(b, scope)],
+        "actions": [b for b in ACTIONS if _in_scope(b, scope)],
+        "notifications": [b for b in NOTIFICATIONS if _in_scope(b, scope)],
+    }

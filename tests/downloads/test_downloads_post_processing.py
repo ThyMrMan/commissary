@@ -1,0 +1,652 @@
+"""Tests for core/downloads/post_processing.py — verification worker for completed downloads.
+
+The worker is large + side-effecty. Tests cover the major control-flow
+branches: missing task, cancelled, already-completed, missing
+filename/username, file-found-in-transfer with + without metadata, file-
+found-in-downloads with + without context, file-not-found-after-retries,
+youtube special path, and top-level exception swallow.
+"""
+
+from __future__ import annotations
+
+import os
+import pytest
+
+from core.downloads import post_processing as pp
+from core.runtime_state import (
+    download_tasks,
+    matched_context_lock,
+    matched_downloads_context,
+    tasks_lock,
+)
+
+
+@pytest.fixture(autouse=True)
+def reset_state():
+    download_tasks.clear()
+    matched_downloads_context.clear()
+    yield
+    download_tasks.clear()
+    matched_downloads_context.clear()
+
+
+# ---------------------------------------------------------------------------
+# Fakes
+# ---------------------------------------------------------------------------
+
+class _Recorder:
+    """Captures every call into a list of (name, args, kwargs)."""
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, name):
+        def _inner(*args, **kwargs):
+            self.calls.append((name, args, kwargs))
+            return None
+        return _inner
+
+
+def _build_deps(
+    *,
+    config=None,
+    download_orchestrator=None,
+    run_async=None,
+    docker_resolve_path=None,
+    extract_filename=None,
+    make_context_key=None,
+    find_completed_file=None,
+    enhance_file_metadata=None,
+    wipe_source_tags=None,
+    post_process_with_verification=None,
+    mark_task_completed=None,
+    on_download_completed=None,
+):
+    rec = _Recorder()
+    return pp.PostProcessDeps(
+        config_manager=config or _FakeConfig(),
+        download_orchestrator=download_orchestrator,
+        run_async=run_async or (lambda c: None),
+        docker_resolve_path=docker_resolve_path or (lambda p: p),
+        extract_filename=extract_filename or (lambda f: os.path.basename(f) if f else ''),
+        make_context_key=make_context_key or (lambda u, f: f"{u}::{f}"),
+        find_completed_file=find_completed_file or (lambda *a, **kw: (None, None)),
+        enhance_file_metadata=enhance_file_metadata or rec('enhance'),
+        wipe_source_tags=wipe_source_tags or rec('wipe'),
+        post_process_with_verification=post_process_with_verification or rec('post_process'),
+        mark_task_completed=mark_task_completed or rec('mark_completed'),
+        on_download_completed=on_download_completed or rec('on_complete'),
+    ), rec
+
+
+class _FakeConfig:
+    def __init__(self, values=None):
+        self._v = values or {}
+
+    def get(self, key, default=None):
+        return self._v.get(key, default)
+
+
+# ---------------------------------------------------------------------------
+# Branch coverage tests
+# ---------------------------------------------------------------------------
+
+def test_missing_task_returns_early_no_callbacks():
+    deps, rec = _build_deps()
+    pp.run_post_processing_worker('absent', 'b1', deps)
+    assert rec.calls == []
+
+
+def test_cancelled_task_returns_early_no_callbacks():
+    download_tasks['t1'] = {'status': 'cancelled'}
+    deps, rec = _build_deps()
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    assert rec.calls == []
+
+
+def test_already_completed_task_returns_early():
+    download_tasks['t1'] = {'status': 'completed'}
+    deps, rec = _build_deps()
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    assert rec.calls == []
+
+
+def test_stream_processed_task_returns_early():
+    download_tasks['t1'] = {'status': 'post_processing', 'stream_processed': True}
+    deps, rec = _build_deps()
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    assert rec.calls == []
+
+
+def test_requeued_task_bails_without_marking_failed():
+    """RACE GUARD: the monitor sets status -> 'post_processing' and submits this
+    worker. If, before the worker runs, the browser-poll post-processor
+    quarantines the file and requeues the next-best candidate (status ->
+    'searching', username/filename cleared), this worker must bail WITHOUT
+    marking failed or notifying batch completion. Otherwise it clobbers the
+    in-flight retry with a false 'missing file or source information' failure
+    while a parallel attempt imports the song."""
+    download_tasks['t1'] = {'status': 'searching', 'track_info': {}}
+    deps, rec = _build_deps()
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    assert download_tasks['t1']['status'] == 'searching'  # untouched
+    assert 'error_message' not in download_tasks['t1']
+    assert not any(c[0] == 'on_complete' for c in rec.calls)
+
+
+def test_queued_task_bails_without_marking_failed():
+    """Same race guard for a task another path reset to 'queued'."""
+    download_tasks['t1'] = {'status': 'queued', 'track_info': {}}
+    deps, rec = _build_deps()
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    assert download_tasks['t1']['status'] == 'queued'
+    assert not any(c[0] == 'on_complete' for c in rec.calls)
+
+
+def test_missing_filename_marks_failed_and_calls_on_complete():
+    download_tasks['t1'] = {'status': 'post_processing', 'username': 'u1', 'track_info': {}}
+    deps, rec = _build_deps()
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    assert download_tasks['t1']['status'] == 'failed'
+    assert 'Post-processing failed' in download_tasks['t1']['error_message']
+    assert ('on_complete', ('b1', 't1', False), {}) in rec.calls
+
+
+def test_missing_username_marks_failed_and_calls_on_complete():
+    download_tasks['t1'] = {'status': 'post_processing', 'filename': 'song.flac', 'track_info': {}}
+    deps, rec = _build_deps()
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    assert download_tasks['t1']['status'] == 'failed'
+
+
+def test_file_not_found_after_retries_marks_failed(monkeypatch):
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': 'song.flac',
+        'username': 'u1',
+        'track_info': {},
+    }
+    # Skip sleeps to keep test fast
+    monkeypatch.setattr(pp.time, 'sleep', lambda s: None)
+    deps, rec = _build_deps()
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    assert download_tasks['t1']['status'] == 'failed'
+    # Actionable failure: names the folder searched + the two real causes, so a
+    # standalone user with a path mismatch can self-diagnose (Discord: Shdjfgatdif).
+    msg = download_tasks['t1']['error_message']
+    assert './downloads' in msg                    # the folder we actually searched
+    assert "download path doesn't match slskd" in msg   # the config-mismatch hint
+    assert 'song.flac' in msg                       # the file slskd reported
+    assert ('on_complete', ('b1', 't1', False), {}) in rec.calls
+
+
+def test_stream_processor_completes_during_search_loop_returns_no_failure(monkeypatch):
+    """If task gets marked completed by stream processor mid-retry, abort without failing."""
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': 'song.flac',
+        'username': 'u1',
+        'track_info': {},
+    }
+    monkeypatch.setattr(pp.time, 'sleep', lambda s: None)
+    call_count = [0]
+
+    def _stream_completes_after_first_search(*a, **kw):
+        call_count[0] += 1
+        if call_count[0] >= 1:
+            download_tasks['t1']['stream_processed'] = True
+        return (None, None)
+
+    deps, rec = _build_deps(find_completed_file=_stream_completes_after_first_search)
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    # Worker should detect stream_processed, return early, not mark failed
+    assert download_tasks['t1']['status'] == 'post_processing'  # original status preserved
+    assert ('on_complete', ('b1', 't1', False), {}) not in rec.calls
+
+
+def test_file_found_in_transfer_with_metadata_enhanced_skips_enhancement_and_completes():
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': 'song.flac',
+        'username': 'u1',
+        'track_info': {'name': 'Money'},
+        'metadata_enhanced': True,
+    }
+    deps, rec = _build_deps(
+        find_completed_file=lambda *a, **kw: ('/transfer/song.flac', 'transfer'),
+    )
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    # No enhance call because metadata_enhanced=True
+    assert not any(c[0] == 'enhance' for c in rec.calls)
+    # Mark + on-complete called
+    assert any(c[0] == 'mark_completed' for c in rec.calls)
+    assert ('on_complete', ('b1', 't1', True), {}) in rec.calls
+
+
+def test_file_found_in_transfer_no_context_writes_nothing(monkeypatch):
+    """jadux #wrong-metadata: a transfer-folder file whose identity can't be
+    verified (no context / expected filename) must not be written to AT ALL —
+    the old tag wipe could hit a neighboring track's finished file."""
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': 'song.flac',
+        'username': 'u1',
+        'track_info': {},
+        'metadata_enhanced': False,
+    }
+    monkeypatch.setattr(pp.os.path, 'exists', lambda p: True)
+    deps, rec = _build_deps(
+        find_completed_file=lambda *a, **kw: ('/transfer/song.flac', 'transfer'),
+    )
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    # NO writes of any kind to an unidentified transfer file
+    assert not any(c[0] == 'wipe' for c in rec.calls)
+    assert not any(c[0] == 'enhance' for c in rec.calls)
+    # Still completed (nothing touched, task closes out)
+    assert ('on_complete', ('b1', 't1', True), {}) in rec.calls
+
+
+def _transfer_task_with_context(title, track_number=1):
+    """Task + matched context whose expected final filename is
+    '0{track_number} - {title}.flac'."""
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': 'remote/original.flac',
+        'username': 'u1',
+        'track_info': {'name': title},
+        'metadata_enhanced': False,
+    }
+    matched_downloads_context['u1::remote/original.flac'] = {
+        'original_search_result': {'title': title, 'track_number': track_number,
+                                   'album': 'Some Album'},
+        'artist': {'name': 'Artist', 'id': 'a1'},
+        'album': {'name': 'Some Album', 'id': 'al1'},
+    }
+
+
+def test_transfer_file_matching_expected_name_is_enhanced(monkeypatch):
+    """The legit lag case (stream processor moved OUR file, flag not yet set)
+    keeps working: found name matches the context-derived expected name."""
+    _transfer_task_with_context('Money', track_number=1)
+    monkeypatch.setattr(pp.os.path, 'exists', lambda p: True)
+    deps, rec = _build_deps(
+        find_completed_file=lambda *a, **kw: ('/transfer/01 - Money.flac', 'transfer'),
+        enhance_file_metadata=lambda *a, **kw: True,
+    )
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    assert download_tasks['t1'].get('metadata_enhanced') is True
+    assert ('on_complete', ('b1', 't1', True), {}) in rec.calls
+
+
+def test_transfer_file_matching_expected_stem_different_ext_is_enhanced(monkeypatch):
+    """expected_final_filename hardcodes .flac — a legit .mp3 with the same
+    stem must still pass the identity check."""
+    _transfer_task_with_context('Money', track_number=1)
+    monkeypatch.setattr(pp.os.path, 'exists', lambda p: True)
+    deps, rec = _build_deps(
+        find_completed_file=lambda *a, **kw: ('/transfer/01 - Money.mp3', 'transfer'),
+        enhance_file_metadata=lambda *a, **kw: True,
+    )
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    assert download_tasks['t1'].get('metadata_enhanced') is True
+
+
+def test_transfer_file_of_another_track_is_never_tagged(monkeypatch):
+    """THE jadux incident: this task's context says '01 - 0bpm.flac' but the
+    finder handed back a different track's imported file ('01 - Bimo.flac').
+    Writing would stamp 0bpm's metadata into Bimo's file — must refuse."""
+    _transfer_task_with_context('0bpm', track_number=1)
+    monkeypatch.setattr(pp.os.path, 'exists', lambda p: True)
+    enhanced = []
+    deps, rec = _build_deps(
+        find_completed_file=lambda *a, **kw: ('/transfer/01 - Bimo.flac', 'transfer'),
+        enhance_file_metadata=lambda *a, **kw: enhanced.append(a) or True,
+    )
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    assert enhanced == []                                   # no tag write
+    assert not any(c[0] == 'wipe' for c in rec.calls)       # no wipe either
+    assert ('on_complete', ('b1', 't1', True), {}) in rec.calls
+
+
+def test_ambiguous_fuzzy_context_is_refused(monkeypatch):
+    """Exact context key missing + MULTIPLE same-user candidate keys → refuse
+    to guess (similar_keys[0] used to pick arbitrarily → wrong track's tags)."""
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': 'dir/01 - Intro.flac',
+        'username': 'u1',
+        'track_info': {'name': 'Intro'},
+        'metadata_enhanced': False,
+    }
+    # Two candidates, both same user, both containing the basename
+    matched_downloads_context['u1::albumA/01 - Intro.flac'] = {
+        'original_search_result': {'title': 'Intro A', 'track_number': 1},
+        'artist': {'name': 'A', 'id': 'a'},
+        'album': {'name': 'Album A', 'id': 'alA'},
+    }
+    matched_downloads_context['u1::albumB/01 - Intro.flac'] = {
+        'original_search_result': {'title': 'Intro B', 'track_number': 1},
+        'artist': {'name': 'B', 'id': 'b'},
+        'album': {'name': 'Album B', 'id': 'alB'},
+    }
+    monkeypatch.setattr(pp.os.path, 'exists', lambda p: True)
+    deps, rec = _build_deps(
+        find_completed_file=lambda *a, **kw: ('/transfer/01 - Intro.flac', 'transfer'),
+        enhance_file_metadata=lambda *a, **kw: True,
+    )
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    # ambiguous → no context → identity unverifiable → no writes
+    assert not any(c[0] == 'enhance' for c in rec.calls)
+    assert not any(c[0] == 'wipe' for c in rec.calls)
+
+
+def test_unique_fuzzy_context_still_recovers(monkeypatch):
+    """Exactly ONE same-user candidate → the legit recovery path still works
+    (context found, expected name derived, matching file enhanced)."""
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': 'dir/01 - Money.flac',
+        'username': 'u1',
+        'track_info': {'name': 'Money'},
+        'metadata_enhanced': False,
+    }
+    matched_downloads_context['u1::other-dir/01 - Money.flac'] = {
+        'original_search_result': {'title': 'Money', 'track_number': 1,
+                                   'album': 'Some Album'},
+        'artist': {'name': 'Artist', 'id': 'a1'},
+        'album': {'name': 'Some Album', 'id': 'al1'},
+    }
+    monkeypatch.setattr(pp.os.path, 'exists', lambda p: True)
+    deps, rec = _build_deps(
+        find_completed_file=lambda *a, **kw: ('/transfer/01 - Money.flac', 'transfer'),
+        enhance_file_metadata=lambda *a, **kw: True,
+    )
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    assert download_tasks['t1'].get('metadata_enhanced') is True
+
+
+def test_file_found_in_downloads_with_context_runs_post_process_with_verification():
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': 'song.flac',
+        'username': 'u1',
+        'track_info': {'name': 'Money'},
+    }
+    matched_downloads_context['u1::song.flac'] = {
+        'original_search_result': {'title': 'Money', 'track_number': 1},
+        'artist': {'name': 'Pink Floyd', 'id': 'art1'},
+        'album': {'name': 'DSOTM'},
+    }
+    deps, rec = _build_deps(
+        find_completed_file=lambda *a, **kw: ('/downloads/song.flac', 'download'),
+    )
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    # post_process_with_verification called with the context + file
+    assert any(c[0] == 'post_process' for c in rec.calls)
+
+
+def test_file_search_ignores_non_audio_candidates(monkeypatch):
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': 'Artist - Album.cue',
+        'username': 'torrent',
+        'track_info': {'name': 'Money'},
+    }
+    matched_downloads_context['torrent::Artist - Album.cue'] = {
+        'original_search_result': {'title': 'Money', 'track_number': 1},
+    }
+    monkeypatch.setattr(pp.time, 'sleep', lambda s: None)
+    deps, rec = _build_deps(
+        find_completed_file=lambda *a, **kw: ('/downloads/Artist - Album.cue', 'download'),
+    )
+
+    pp.run_post_processing_worker('t1', 'b1', deps)
+
+    assert download_tasks['t1']['status'] == 'failed'
+    assert not any(c[0] == 'post_process' for c in rec.calls)
+    assert ('on_complete', ('b1', 't1', False), {}) in rec.calls
+
+
+def test_file_found_in_downloads_no_context_marks_completed_directly():
+    """No matched context for the file → just mark completed since file exists."""
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': 'song.flac',
+        'username': 'u1',
+        'track_info': {'name': 'Money'},
+    }
+    deps, rec = _build_deps(
+        find_completed_file=lambda *a, **kw: ('/downloads/song.flac', 'download'),
+    )
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    # No post_process call (no context)
+    assert not any(c[0] == 'post_process' for c in rec.calls)
+    # Mark + on-complete called
+    assert any(c[0] == 'mark_completed' for c in rec.calls)
+    assert ('on_complete', ('b1', 't1', True), {}) in rec.calls
+
+
+def test_processing_exception_marks_failed_and_calls_on_complete():
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': 'song.flac',
+        'username': 'u1',
+        'track_info': {'name': 'Money'},
+    }
+    matched_downloads_context['u1::song.flac'] = {'original_search_result': {}}
+
+    def _exploding_post_process(*a, **kw):
+        raise RuntimeError("post-process boom")
+
+    deps, rec = _build_deps(
+        find_completed_file=lambda *a, **kw: ('/downloads/song.flac', 'download'),
+        post_process_with_verification=_exploding_post_process,
+    )
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    assert download_tasks['t1']['status'] == 'failed'
+    assert 'Post-processing failed' in download_tasks['t1']['error_message']
+    assert ('on_complete', ('b1', 't1', False), {}) in rec.calls
+
+
+def test_critical_outer_exception_marks_failed():
+    """Top-level exception (e.g. broken deps) still marks task failed."""
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': 'song.flac',
+        'username': 'u1',
+        'track_info': {},
+    }
+
+    def _broken_resolve(p):
+        raise RuntimeError("config dead")
+
+    deps, rec = _build_deps(docker_resolve_path=_broken_resolve)
+    # Must NOT raise
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    assert download_tasks['t1']['status'] == 'failed'
+    assert 'Critical post-processing error' in download_tasks['t1']['error_message']
+    assert ('on_complete', ('b1', 't1', False), {}) in rec.calls
+
+
+def test_youtube_task_uses_get_download_status_to_resolve_path(monkeypatch):
+    """YouTube downloads use a different filename scheme — worker queries soulseek client for real path."""
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': 'vid_id||Money',
+        'username': 'youtube',
+        'download_id': 'dl-yt-1',
+        'track_info': {},
+    }
+
+    class _FakeStatus:
+        file_path = '/downloads/Money.mp3'
+
+    class _FakeYTClient:
+        def get_download_status(self, dl_id):
+            assert dl_id == 'dl-yt-1'
+            return _FakeStatus()
+
+    # File exists on disk (mock)
+    monkeypatch.setattr(pp.os.path, 'exists', lambda p: p == '/downloads/Money.mp3')
+
+    deps, rec = _build_deps(
+        download_orchestrator=_FakeYTClient(),
+        run_async=lambda coro: coro,  # not async — direct call
+    )
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    # mark_completed should fire (file resolved from YouTube status)
+    assert any(c[0] == 'mark_completed' for c in rec.calls)
+
+
+def test_torrent_release_copies_best_matching_audio_to_transfer(tmp_path):
+    release_dir = tmp_path / 'release'
+    release_dir.mkdir()
+    wrong = release_dir / '01 - Intro.flac'
+    right = release_dir / '02 - Money.flac'
+    wrong.write_bytes(b'wrong')
+    right.write_bytes(b'right')
+    transfer_dir = tmp_path / 'transfer'
+
+    filename = 'magnet:?xt=abc||Artist - Album'
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': filename,
+        'username': 'torrent',
+        'download_id': 'dl-torrent-1',
+        'track_info': {'name': 'Money', 'artists': [{'name': 'Artist'}]},
+    }
+    matched_downloads_context[f'torrent::{filename}'] = {
+        'original_search_result': {'title': 'Money', 'track_number': 2},
+    }
+
+    class _FakeStatus:
+        file_path = str(wrong)
+        audio_files = [str(wrong), str(right)]
+
+    class _FakeTorrentClient:
+        def get_download_status(self, dl_id):
+            assert dl_id == 'dl-torrent-1'
+            return _FakeStatus()
+
+    deps, rec = _build_deps(
+        config=_FakeConfig({'soulseek.transfer_path': str(transfer_dir)}),
+        download_orchestrator=_FakeTorrentClient(),
+        run_async=lambda coro: coro,
+    )
+
+    pp.run_post_processing_worker('t1', 'b1', deps)
+
+    copied = transfer_dir / '02 - Money.flac'
+    assert copied.exists()
+    assert right.exists()
+    assert any(c[0] == 'post_process' and c[1][2] == str(copied) for c in rec.calls)
+
+
+def test_torrent_release_prefers_task_title_over_release_context(tmp_path):
+    release_dir = tmp_path / 'release'
+    release_dir.mkdir()
+    wrong = release_dir / '09.Harry Styles - Pop.flac'
+    right = release_dir / '10.Harry Styles - American Girls.flac'
+    wrong.write_bytes(b'wrong')
+    right.write_bytes(b'right')
+    transfer_dir = tmp_path / 'transfer'
+
+    filename = 'http://prowlarr/download?id=1||Harry Styles - Kiss All The Time'
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': filename,
+        'username': 'torrent',
+        'download_id': 'dl-torrent-1',
+        'track_info': {'name': 'American Girls', 'artists': [{'name': 'Harry Styles'}]},
+    }
+    matched_downloads_context[f'torrent::{filename}'] = {
+        'original_search_result': {'title': 'Pop', 'clean_title': 'Pop', 'track_number': 9},
+    }
+
+    class _FakeStatus:
+        file_path = str(wrong)
+        audio_files = [str(wrong), str(right)]
+
+    class _FakeTorrentClient:
+        def get_download_status(self, dl_id):
+            assert dl_id == 'dl-torrent-1'
+            return _FakeStatus()
+
+    deps, rec = _build_deps(
+        config=_FakeConfig({'soulseek.transfer_path': str(transfer_dir)}),
+        download_orchestrator=_FakeTorrentClient(),
+        run_async=lambda coro: coro,
+    )
+
+    pp.run_post_processing_worker('t1', 'b1', deps)
+
+    copied = transfer_dir / '10.Harry Styles - American Girls.flac'
+    assert copied.exists()
+    assert any(c[0] == 'post_process' and c[1][2] == str(copied) for c in rec.calls)
+
+
+def test_torrent_release_without_matching_file_does_not_fallback_to_generic_search(tmp_path):
+    release_dir = tmp_path / 'release'
+    release_dir.mkdir()
+    wrong = release_dir / '09.Harry Styles - Pop.flac'
+    wrong.write_bytes(b'wrong')
+    transfer_dir = tmp_path / 'transfer'
+
+    filename = 'http://prowlarr/download?id=1||Harry Styles - Kiss All The Time'
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': filename,
+        'username': 'torrent',
+        'download_id': 'dl-torrent-1',
+        'track_info': {'name': 'American Girls', 'artists': [{'name': 'Harry Styles'}]},
+    }
+    matched_downloads_context[f'torrent::{filename}'] = {
+        'original_search_result': {'title': 'Pop', 'clean_title': 'Pop', 'track_number': 9},
+    }
+
+    class _FakeStatus:
+        file_path = str(wrong)
+        audio_files = [str(wrong)]
+
+    class _FakeTorrentClient:
+        def get_download_status(self, dl_id):
+            assert dl_id == 'dl-torrent-1'
+            return _FakeStatus()
+
+    def _unexpected_search(*args, **kwargs):
+        raise AssertionError("torrent releases should not fall back to generic file search")
+
+    deps, rec = _build_deps(
+        config=_FakeConfig({'soulseek.transfer_path': str(transfer_dir)}),
+        download_orchestrator=_FakeTorrentClient(),
+        run_async=lambda coro: coro,
+        find_completed_file=_unexpected_search,
+    )
+
+    pp.run_post_processing_worker('t1', 'b1', deps)
+
+    assert download_tasks['t1']['status'] == 'failed'
+    assert 'No matching audio file' in download_tasks['t1']['error_message']
+    assert any(c[0] == 'on_complete' and c[1] == ('b1', 't1', False) for c in rec.calls)
+    assert not list(transfer_dir.glob('*'))
+
+
+def test_fuzzy_context_matching_when_exact_key_missing(monkeypatch):
+    """When exact key isn't in matched_downloads_context, worker tries fuzzy match
+    constrained to same Soulseek username."""
+    download_tasks['t1'] = {
+        'status': 'post_processing',
+        'filename': 'song.flac',
+        'username': 'u1',
+        'track_info': {},
+    }
+    # Different exact key but same user + filename substring
+    matched_downloads_context['u1::folder/song.flac'] = {
+        'original_search_result': {'title': 'Money', 'track_number': 1},
+    }
+    deps, rec = _build_deps(
+        find_completed_file=lambda *a, **kw: (None, None),  # file not found
+    )
+    monkeypatch.setattr(pp.time, 'sleep', lambda s: None)
+    # Won't find file → marks failed. But the fuzzy match log path executes.
+    pp.run_post_processing_worker('t1', 'b1', deps)
+    assert download_tasks['t1']['status'] == 'failed'

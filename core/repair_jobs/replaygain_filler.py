@@ -1,0 +1,269 @@
+"""ReplayGain Filler maintenance job (#437) — the loudness sibling of the Lyrics
+and Cover Art fillers.
+
+Post-processing applies ReplayGain to slskd/WebUI downloads, but content that
+enters the library another way — Lidarr, the REST API, manual adds — never gets
+it, and there was no way to (re)apply RG to existing tracks or fix the ones where
+analysis failed (a recurring ask on #437).
+
+This scans the library for tracks with no ReplayGain track-gain tag and creates a
+finding for each. Applying a finding runs the same ffmpeg ebur128 analysis the
+import pipeline uses and writes the RG tags in place — no moves, no re-matching.
+
+Scan only READS tags (cheap); the expensive ffmpeg analysis happens on apply.
+Requires ffmpeg (RG analysis can't run without it), so the scan no-ops when ffmpeg
+isn't on PATH rather than surfacing findings that could never be applied.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, Optional
+
+from core.library.path_resolver import resolve_library_file_path
+from core.repair_jobs import register_job
+from core.repair_jobs.base import JobContext, JobResult, RepairJob
+from utils.logging_config import get_logger
+
+logger = get_logger("repair_jobs.replaygain_filler")
+
+
+def needs_replaygain(rg_tags: Optional[Dict[str, Any]]) -> bool:
+    """Pure decision: does this track need ReplayGain written?
+
+    True when the track-gain tag is absent or blank. ``rg_tags`` is the dict from
+    ``core.replaygain.read_replaygain_tags`` (keys: track_gain, track_peak, …).
+    A present track_gain — even "+0.00 dB" — counts as already-tagged.
+    """
+    if not rg_tags:
+        return True
+    val = rg_tags.get('track_gain')
+    return val is None or str(val).strip() == ''
+
+
+def _resolve(file_path: str, context: JobContext) -> Optional[str]:
+    """Resolve a stored library path to one this process can read.
+
+    MUST pass the context's transfer folder + config_manager — a bare
+    ``resolve_library_file_path(path)`` has no base directories to suffix-walk,
+    so for Docker/NAS users (whose DB paths are the MEDIA SERVER's view) every
+    file silently resolved to None and the scan skipped the whole library
+    (the same hole the Corrupt File Detector shipped with; #1000 follow-up)."""
+    if not file_path:
+        return None
+    resolved = resolve_library_file_path(
+        file_path,
+        transfer_folder=context.transfer_folder,
+        config_manager=context.config_manager,
+    )
+    if not resolved and os.path.isfile(file_path):
+        resolved = file_path
+    return resolved
+
+
+@register_job
+class ReplayGainFillerJob(RepairJob):
+    job_id = 'replaygain_filler'
+    display_name = 'ReplayGain Filler'
+    description = 'Finds tracks with no ReplayGain tag and analyzes + writes loudness tags'
+    help_text = (
+        'Scans your library for tracks that have no ReplayGain track-gain tag — '
+        'common for albums added by Lidarr, the REST API, or by hand, which skip '
+        "the download post-processing where ReplayGain normally runs.\n\n"
+        'A finding is created for each. Applying one runs the same ffmpeg loudness '
+        'analysis (EBU R128) the import pipeline uses and writes the ReplayGain '
+        'tags in place — no files are moved or renamed. This also lets you re-fill '
+        'tracks where the original analysis failed.\n\n'
+        'Requires ffmpeg to be installed (the analysis cannot run without it).\n\n'
+        'Settings (#1060): "target_lufs" sets the loudness target gains are written '
+        'against (default -18, the ReplayGain 2.0 reference; try -14 if your player '
+        'leaves the library too quiet — the SAME target is used by import-time '
+        'analysis and the library page buttons, so everything stays consistent). '
+        '"rescan_existing" also flags tracks that ALREADY have ReplayGain tags so '
+        'they can be re-analyzed at the current target — turn it on after changing '
+        'the target, approve the findings in batches, then turn it off.'
+    )
+    icon = 'repair-icon-replaygain'
+    default_enabled = False
+    default_interval_hours = 48
+    default_settings = {
+        # #1060 — loudness target written into gains (see get_target_lufs)
+        'target_lufs': -18.0,
+        # #1060 — also flag already-tagged tracks for re-analysis at the target
+        'rescan_existing': False,
+    }
+    auto_fix = False
+
+    # Flood guard for rescan_existing: a whole library re-flag lands in batches
+    # of this many findings per scan run (the cap is LOGGED, never silent).
+    RESCAN_BATCH_LIMIT = 500
+
+    def scan(self, context: JobContext) -> JobResult:
+        result = JobResult()
+
+        try:
+            from core.replaygain import is_ffmpeg_available, read_replaygain_tags
+        except Exception as e:
+            logger.warning("[ReplayGain Filler] replaygain module unavailable: %s", e)
+            return result
+        if not is_ffmpeg_available():
+            logger.info("[ReplayGain Filler] ffmpeg not available — skipping scan "
+                        "(analysis cannot run without it)")
+            return result
+
+        cfgm = context.config_manager
+        # '.settings.' segment: that's where the job-settings UI saves (see
+        # set_job_settings) — get_config_key's flat path would miss it.
+        rescan_existing = bool(cfgm.get(f'repair.jobs.{self.job_id}.settings.rescan_existing', False)) if cfgm else False
+        rescan_capped = False
+        rescan_flagged = 0
+
+        rows = []
+        conn = None
+        try:
+            conn = context.db._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT t.id, t.title, ar.name, t.file_path
+                FROM tracks t
+                LEFT JOIN artists ar ON ar.id = t.artist_id
+                WHERE t.file_path IS NOT NULL AND t.file_path != ''
+            """)
+            rows = cursor.fetchall()
+        except Exception as e:
+            logger.error("[ReplayGain Filler] Error reading tracks: %s", e, exc_info=True)
+            result.errors += 1
+            return result
+        finally:
+            if conn:
+                conn.close()
+
+        total = len(rows)
+        if context.update_progress:
+            context.update_progress(0, total)
+        if context.report_progress:
+            context.report_progress(phase=f'Checking ReplayGain on {total} tracks...', total=total)
+
+        for i, row in enumerate(rows):
+            if context.check_stop():
+                return result
+            if i % 10 == 0 and context.wait_if_paused():
+                return result
+
+            track_id, title, artist_name, file_path = row[:4]
+            result.scanned += 1
+
+            resolved = _resolve(file_path, context)
+            if not resolved:
+                # Can't read the file from here → can't analyze it on apply either.
+                result.skipped += 1
+                continue
+
+            try:
+                rg = read_replaygain_tags(resolved)
+            except Exception as e:
+                logger.debug("[ReplayGain Filler] tag read failed for '%s': %s", title, e)
+                result.skipped += 1
+                continue
+
+            already_tagged = not needs_replaygain(rg)
+            if already_tagged and not rescan_existing:
+                result.skipped += 1
+                if context.update_progress and (i + 1) % 25 == 0:
+                    context.update_progress(i + 1, total)
+                continue
+            if already_tagged and rescan_capped:
+                result.skipped += 1
+                continue
+
+            if context.report_progress:
+                context.report_progress(
+                    scanned=i + 1, total=total,
+                    log_line=(f'Re-analyze at target: {title} — {artist_name or "Unknown"}'
+                              if already_tagged else
+                              f'No ReplayGain: {title} — {artist_name or "Unknown"}'),
+                    log_type='info')
+
+            if context.create_finding:
+                try:
+                    if already_tagged:
+                        # #1060 rescan: distinct finding type so a prior resolved
+                        # missing_replaygain finding can't dedup-block the re-tag.
+                        current_gain = (rg or {}).get('track_gain')
+                        inserted = context.create_finding(
+                            job_id=self.job_id,
+                            finding_type='replaygain_retag',
+                            severity='info',
+                            entity_type='track',
+                            entity_id=str(track_id),
+                            file_path=file_path,
+                            title=f'Re-analyze ReplayGain: {title or "Unknown"}',
+                            description=(f'"{title}" by {artist_name or "Unknown"} already has '
+                                         f'ReplayGain ({current_gain or "unknown gain"}) — approving '
+                                         're-analyzes it at your current loudness target.'),
+                            details={
+                                'track_id': track_id,
+                                'track_title': title,
+                                'artist': artist_name,
+                                'file_path': file_path,
+                                'current_gain': current_gain,
+                            })
+                        if inserted:
+                            rescan_flagged += 1
+                            if rescan_flagged >= self.RESCAN_BATCH_LIMIT:
+                                rescan_capped = True
+                                if context.report_progress:
+                                    context.report_progress(
+                                        log_line=(f'Re-analyze batch capped at {self.RESCAN_BATCH_LIMIT} '
+                                                  'this run — run the job again for the next batch.'),
+                                        log_type='warning')
+                    else:
+                        inserted = context.create_finding(
+                            job_id=self.job_id,
+                            finding_type='missing_replaygain',
+                            severity='info',
+                            entity_type='track',
+                            entity_id=str(track_id),
+                            file_path=file_path,
+                            title=f'No ReplayGain: {title or "Unknown"}',
+                            description=(f'"{title}" by {artist_name or "Unknown"} has no '
+                                         'ReplayGain tag — loudness can be analyzed + written.'),
+                            details={
+                                'track_id': track_id,
+                                'track_title': title,
+                                'artist': artist_name,
+                                'file_path': file_path,
+                            })
+                    if inserted:
+                        result.findings_created += 1
+                    else:
+                        result.findings_skipped_dedup += 1
+                except Exception as e:
+                    logger.debug("[ReplayGain Filler] create finding failed for track %s: %s", track_id, e)
+                    result.errors += 1
+
+            if context.update_progress and (i + 1) % 10 == 0:
+                context.update_progress(i + 1, total)
+
+        if context.update_progress:
+            context.update_progress(total, total)
+        logger.info("[ReplayGain Filler] %d tracks checked, %d missing ReplayGain, %d skipped",
+                    result.scanned, result.findings_created, result.skipped)
+        return result
+
+    def estimate_scope(self, context: JobContext) -> int:
+        conn = None
+        try:
+            conn = context.db._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT COUNT(*) FROM tracks
+                WHERE file_path IS NOT NULL AND file_path != ''
+            """)
+            row = cursor.fetchone()
+            return row[0] if row else 0
+        except Exception:
+            return 0
+        finally:
+            if conn:
+                conn.close()

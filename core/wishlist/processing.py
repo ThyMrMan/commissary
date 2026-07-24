@@ -1,0 +1,1165 @@
+"""Wishlist processing helpers."""
+
+from __future__ import annotations
+
+import threading
+import uuid
+from dataclasses import dataclass
+from datetime import datetime
+from contextlib import AbstractContextManager
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, Optional
+
+from core.wishlist.payloads import build_failed_track_wishlist_context
+from core.wishlist.selection import filter_wishlist_tracks_by_category, sanitize_and_dedupe_wishlist_tracks
+from core.wishlist.service import get_wishlist_service
+from core.wishlist.state import get_wishlist_cycle, set_wishlist_cycle
+from utils.logging_config import get_logger
+
+
+module_logger = get_logger("wishlist.processing")
+logger = module_logger
+
+
+# Album-bundle is wasteful for single-track wishlist items (downloads
+# the entire album to claim one file), so the bundle path only engages
+# when an album has ``N`` or more missing tracks in the wishlist. Default
+# 2 catches the "this user is missing several tracks from one album"
+# case while keeping single-track-per-album items on the cheaper
+# per-track flow. Configurable via ``wishlist.album_bundle_min_tracks``
+# for users who want different behaviour.
+_DEFAULT_ALBUM_BUNDLE_MIN_TRACKS = 2
+
+
+def _resolve_album_bundle_threshold() -> int:
+    """Return the configured min-tracks-per-album threshold for the
+    wishlist album-bundle grouper. Falls back to the default when the
+    config key is missing or carries garbage — same defensive shape as
+    the rest of the config-driven knobs in core/."""
+    try:
+        from config.settings import config_manager
+        raw = config_manager.get('wishlist.album_bundle_min_tracks',
+                                 _DEFAULT_ALBUM_BUNDLE_MIN_TRACKS)
+        value = int(raw)
+        if value >= 1:
+            return value
+    except Exception:  # noqa: S110 — defensive config-read fallback; uses default below
+        pass
+    return _DEFAULT_ALBUM_BUNDLE_MIN_TRACKS
+
+
+@dataclass
+class WishlistAutoProcessingRuntime:
+    """Dependencies needed to run automatic wishlist processing outside the controller."""
+
+    processing_guard: Callable[[], AbstractContextManager[bool]]
+    is_actually_processing: Callable[[], bool]
+    app_context_factory: Callable[[], AbstractContextManager[Any]]
+    get_profiles_database: Callable[[], Any]
+    get_music_database: Callable[[], Any]
+    download_batches: Dict[str, Dict[str, Any]]
+    tasks_lock: Any
+    update_automation_progress: Callable[..., Any]
+    automation_engine: Any
+    missing_download_executor: Any
+    run_full_missing_tracks_process: Callable[..., Any]  # (batch_id, playlist_id, tracks, serialize=False)
+    get_batch_max_concurrent: Callable[[], int]
+    get_active_server: Callable[[], str]
+    current_time_fn: Callable[[], float]
+    profile_id: int = 1
+    logger: Any = module_logger
+    # Dedicated pool for the inline-blocking per-album bundle downloads.
+    # Album-bundle batches block their worker thread for the whole search +
+    # download; running them on the shared ``missing_download_executor`` lets a
+    # burst of album batches (e.g. a big Album-Completeness "Fix all" → wishlist)
+    # starve the per-track flow AND the user's manual "Download Wishlist" (#740).
+    # Routing them here keeps the shared pool free. Falls back to the shared
+    # executor when unset (older callers / tests) — see the submit site below.
+    album_bundle_executor: Any = None
+
+
+def remove_completed_tracks_from_wishlist(
+    batch: Dict[str, Any],
+    download_tasks: Dict[str, Dict[str, Any]],
+    remove_from_wishlist: Callable[[Dict[str, Any]], Any],
+    *,
+    logger=logger,
+) -> int:
+    """Remove completed batch tasks from the wishlist."""
+    removed_count = 0
+    for task_id in batch.get('queue', []):
+        if task_id in download_tasks:
+            task = download_tasks[task_id]
+            if task.get('status') == 'completed':
+                try:
+                    track_info = task.get('track_info', {})
+                    context = {'track_info': track_info, 'original_search_result': track_info}
+                    remove_from_wishlist(context)
+                    removed_count += 1
+                except Exception as exc:
+                    logger.error(f"[Wishlist Processing] Error removing completed track from wishlist: {exc}")
+    return removed_count
+
+
+def make_wishlist_batch_row(
+    *,
+    playlist_id: str,
+    playlist_name: str,
+    track_count: int,
+    max_concurrent: int,
+    profile_id: int,
+    phase: str,
+    run_id: str | None = None,
+    is_album: bool = False,
+    album_context: Optional[Dict[str, Any]] = None,
+    artist_context: Optional[Dict[str, Any]] = None,
+    extra_fields: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Single source of truth for a wishlist ``download_batches`` row.
+
+    The auto and manual wishlist flows used to build this ~20-field dict in four
+    separate places, which let their batch shapes silently drift apart. They now
+    all go through here so every wishlist batch has an IDENTICAL field shape; the
+    genuinely per-flow differences (initial ``phase``, the auto-only
+    ``auto_initiated`` / ``current_cycle`` fields, album vs residual contexts) are
+    explicit arguments / ``extra_fields``.
+
+    NOTE: this builds the row only — it does NOT decide grouping, batch-id
+    allocation, or dispatch (parallel-submit vs serial), which legitimately
+    differ between the flows and stay in their callers.
+    """
+    row: Dict[str, Any] = {
+        'phase': phase,
+        'playlist_id': playlist_id,
+        'playlist_name': playlist_name,
+        'queue': [],
+        'active_count': 0,
+        'max_concurrent': max_concurrent,
+        'queue_index': 0,
+        'analysis_total': track_count,
+        'analysis_processed': 0,
+        'analysis_results': [],
+        'permanently_failed_tracks': [],
+        'cancelled_tracks': set(),
+        'force_download_all': True,
+        'profile_id': profile_id,
+        'is_album_download': is_album,
+        'album_context': album_context,
+        'artist_context': artist_context,
+        'wishlist_run_id': run_id,
+    }
+    if extra_fields:
+        row.update(extra_fields)
+    return row
+
+
+def _run_wishlist_cycle(
+    runtime,
+    *,
+    playlist_id: str,
+    cycle: str,
+    tracks: list,
+    run_id: str,
+    auto_initiated: bool,
+    first_batch_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """THE single wishlist orchestration engine — both the auto timer and the
+    manual trigger call this, so a manual scan runs the exact same code path as
+    an auto scan (group → per-album + residual batches → register → dispatch).
+
+    Per-flow differences are arguments, not separate code:
+      * ``auto_initiated`` stamps the auto-only fields (auto_initiated /
+        auto_processing_timestamp / current_cycle, which also drives the
+        once-per-run cycle toggle on completion) and selects the auto vs manual
+        display-name + log style.
+      * ``first_batch_id`` lets the manual flow reuse its synchronously-created
+        placeholder batch so the modal's existing poll target stays valid.
+
+    Album batches block their worker for the whole search+download, so they run
+    on the dedicated album pool; the residual per-track batch runs on the shared
+    pool. Returns a summary dict (submitted ids + album / residual counts).
+    """
+    logger = runtime.logger
+    from core.wishlist.album_grouping import group_wishlist_tracks_by_album
+
+    # Albums cycle splits into per-album bundles; singles keep the single
+    # per-track batch shape (Spotify already classifies them away from albums).
+    grouping = (
+        group_wishlist_tracks_by_album(
+            tracks, min_tracks_per_album=_resolve_album_bundle_threshold(),
+        )
+        if cycle == 'albums' else None
+    )
+
+    extra_fields = None
+    if auto_initiated:
+        extra_fields = {
+            'auto_initiated': True,
+            'auto_processing_timestamp': runtime.current_time_fn(),
+            'current_cycle': cycle,
+        }
+
+    # Reuse the caller-provided placeholder id for the FIRST batch created; every
+    # other batch gets a fresh uuid.
+    _reuse_id = first_batch_id
+
+    def _alloc_id() -> str:
+        nonlocal _reuse_id
+        if _reuse_id is not None:
+            bid, _reuse_id = _reuse_id, None
+            return bid
+        return str(uuid.uuid4())
+
+    album_executor = runtime.album_bundle_executor or runtime.missing_download_executor
+    submitted: list = []
+
+    album_groups = grouping.album_groups if grouping else []
+    for album_idx, group in enumerate(album_groups):
+        album_batch_id = _alloc_id()
+        album_name = group.album_context.get('name', 'Unknown')
+        batch_name = (
+            f"Wishlist (Auto - Album: {album_name})" if auto_initiated
+            else f"Wishlist (Album: {album_name})"
+        )
+        with runtime.tasks_lock:
+            runtime.download_batches[album_batch_id] = make_wishlist_batch_row(
+                playlist_id=playlist_id,
+                playlist_name=batch_name,
+                track_count=len(group.tracks),
+                max_concurrent=runtime.get_batch_max_concurrent(),
+                profile_id=runtime.profile_id,
+                phase='queued',
+                run_id=run_id,
+                is_album=True,
+                album_context=group.album_context,
+                artist_context=group.artist_context,
+                extra_fields=extra_fields,
+            )
+        if auto_initiated:
+            logger.info(
+                f"[Auto-Wishlist] Album sub-batch {album_idx + 1}/{len(album_groups)}: "
+                f"'{album_name}' by '{group.artist_context.get('name')}' "
+                f"({len(group.tracks)} tracks) → {album_batch_id} [run {run_id[:8]}]"
+            )
+        else:
+            logger.info(
+                f"[Manual-Wishlist] Album sub-batch {album_idx + 1}/{len(album_groups)}: "
+                f"'{album_name}' ({len(group.tracks)} tracks) → {album_batch_id}"
+            )
+        submitted.append(album_batch_id)
+        # Album bundles block their worker for the whole search+download →
+        # dedicated pool (falls back to the shared pool when unset). serialize=True
+        # makes the worker actually HOLD its pool slot until the album drains, so
+        # only a few albums are in flight at once instead of every album flooding
+        # the shared download pool with 'searching' tracks (#740 / Sokhi).
+        album_executor.submit(
+            runtime.run_full_missing_tracks_process,
+            album_batch_id, playlist_id, group.tracks, True,
+        )
+
+    residual_tracks = grouping.residual_tracks if grouping is not None else tracks
+    residual_count = len(residual_tracks) if residual_tracks else 0
+    if residual_tracks:
+        residual_batch_id = _alloc_id()
+        residual_name = (
+            f"Wishlist (Auto - {cycle.capitalize()})" if auto_initiated
+            else "Wishlist (Residual)"
+        )
+        with runtime.tasks_lock:
+            runtime.download_batches[residual_batch_id] = make_wishlist_batch_row(
+                playlist_id=playlist_id,
+                playlist_name=residual_name,
+                track_count=residual_count,
+                max_concurrent=runtime.get_batch_max_concurrent(),
+                profile_id=runtime.profile_id,
+                phase='queued',
+                run_id=run_id,
+                extra_fields=extra_fields,
+            )
+        submitted.append(residual_batch_id)
+        runtime.missing_download_executor.submit(
+            runtime.run_full_missing_tracks_process,
+            residual_batch_id, playlist_id, residual_tracks,
+        )
+        if auto_initiated:
+            logger.info(
+                f"Starting wishlist residual batch {residual_batch_id} with {residual_count} tracks "
+                f"({'singles' if cycle == 'singles' else 'unbucketed albums'}) "
+                f"[run {run_id[:8]}]"
+            )
+        else:
+            logger.info(
+                f"[Manual-Wishlist] Residual per-track batch {residual_batch_id} "
+                f"with {residual_count} tracks"
+            )
+
+    return {
+        'submitted': submitted,
+        'album_batches': len(album_groups),
+        'residual_count': residual_count,
+    }
+
+
+def add_cancelled_tracks_to_failed_tracks(
+    batch: Dict[str, Any],
+    download_tasks: Dict[str, Dict[str, Any]],
+    permanently_failed_tracks: list[Dict[str, Any]],
+    *,
+    logger=logger,
+    max_process: int = 100,
+) -> int:
+    """Promote cancelled-but-missing tasks into the failed-track list."""
+    cancelled_tracks = batch.get('cancelled_tracks', set())
+    if not cancelled_tracks:
+        return 0
+
+    processed_count = 0
+    for task_id in batch.get('queue', [])[:max_process]:
+        if task_id not in download_tasks:
+            continue
+        task = download_tasks[task_id]
+        track_index = task.get('track_index', 0)
+        if track_index not in cancelled_tracks:
+            continue
+
+        if task.get('status', 'unknown') == 'completed':
+            continue
+
+        original_track_info = task.get('track_info', {})
+        cancelled_track_info = build_failed_track_wishlist_context(
+            original_track_info,
+            track_index=track_index,
+            retry_count=0,
+            failure_reason='Download cancelled',
+            candidates=task.get('cached_candidates', []),
+        )
+
+        if any(t.get('table_index') == track_index for t in permanently_failed_tracks):
+            continue
+
+        permanently_failed_tracks.append(cancelled_track_info)
+        processed_count += 1
+        logger.error(
+            f"[Wishlist Processing] Added cancelled missing track {cancelled_track_info['track_name']} to failed list for wishlist"
+        )
+
+    return processed_count
+
+
+def record_failed_attempt(wishlist_service, track_data, failure_reason, profile_id,
+                          *, logger=logger) -> bool:
+    """Stamp one failed cycle attempt on the track's wishlist row
+    (retry_count + 1, last_attempted = now).
+
+    Runs for fresh adds AND duplicate-skips — the duplicate-skip IS the
+    repeat-failure signal (javiavid: retry_count stayed 0 forever because the
+    only increment path, mark_track_download_result, had no callers; that also
+    left the 3.1.1 failing badge/filter dead on the music side). Best-effort:
+    a stamp failure never disturbs wishlist processing."""
+    sp_id = track_data.get('id') if isinstance(track_data, dict) else None
+    if not sp_id or str(sp_id).startswith('wing_it_'):
+        return False
+    try:
+        return bool(wishlist_service.mark_track_download_result(
+            str(sp_id), False, error_message=str(failure_reason or '') or None,
+            profile_id=profile_id))
+    except Exception as e:
+        logger.debug("wishlist attempt stamp failed for %s: %s", sp_id, e)
+        return False
+
+
+def recover_uncaptured_failed_tracks(
+    batch: Dict[str, Any],
+    download_tasks: Dict[str, Dict[str, Any]],
+    permanently_failed_tracks: list[Dict[str, Any]],
+    *,
+    logger=logger,
+) -> int:
+    """Recover tasks force-marked failed/not_found so wishlist processing does not skip them."""
+    recovered_count = 0
+    for task_id in batch.get('queue', []):
+        if task_id not in download_tasks:
+            continue
+        task = download_tasks[task_id]
+        if task.get('status') not in ('failed', 'not_found'):
+            continue
+
+        track_index = task.get('track_index', 0)
+        if any(t.get('table_index') == track_index for t in permanently_failed_tracks):
+            continue
+
+        original_track_info = task.get('track_info', {})
+        recovered_track_info = build_failed_track_wishlist_context(
+            original_track_info,
+            track_index=track_index,
+            retry_count=task.get('retry_count', 0),
+            failure_reason=task.get('error_message', 'Download failed'),
+            candidates=task.get('cached_candidates', []),
+        )
+        permanently_failed_tracks.append(recovered_track_info)
+        recovered_count += 1
+        logger.error(
+            f"[Wishlist Processing] Recovered uncaptured failed track for wishlist: {recovered_track_info['track_name']}"
+        )
+
+    return recovered_count
+
+
+def resolve_wishlist_source_type_for_batch(batch: Dict[str, Any]) -> str:
+    """Pick the wishlist ``source_type`` for failed tracks coming out of a
+    download batch.
+
+    Album-context batches must produce ``'album'`` provenance — the legacy
+    hardcoded ``'playlist'`` mislabels every album-batch failure, breaks
+    the wishlist UI's source filter, and makes ``by_source_type`` stats
+    look like all wishlist work came from playlists.
+    """
+    return 'album' if batch.get('is_album_download') else 'playlist'
+
+
+def build_wishlist_source_context(batch: Dict[str, Any], current_time: datetime | None = None) -> Dict[str, Any]:
+    """Build the source_context payload used when adding failed tracks back to the wishlist."""
+    current_time = current_time or datetime.now()
+    playlist_id = batch.get('source_playlist_ref') or batch.get('playlist_id')
+    context = {
+        'playlist_name': batch.get('playlist_name', 'Unknown Playlist'),
+        'playlist_id': playlist_id,
+        'added_from': 'webui_modal',
+        'timestamp': current_time.isoformat(),
+    }
+    if batch.get('mirrored_playlist_id') is not None:
+        context['mirrored_playlist_id'] = batch.get('mirrored_playlist_id')
+    if batch.get('organize_by_playlist'):
+        context['organize_by_playlist'] = True
+    # Preserve album-batch provenance so wishlist requeue has a real signal
+    # for album-vs-single routing instead of relying on per-track album dicts
+    # that may have been mangled by reconstruction fallbacks.
+    if batch.get('is_album_download'):
+        context['is_album_download'] = True
+        album_ctx = batch.get('album_context')
+        if isinstance(album_ctx, dict):
+            context['album_context'] = album_ctx
+        artist_ctx = batch.get('artist_context')
+        if isinstance(artist_ctx, dict):
+            context['artist_context'] = artist_ctx
+    return context
+
+
+def _wishlist_run_has_siblings_still_active(
+    download_batches: Dict[str, Dict[str, Any]],
+    run_id: str,
+    completing_batch_id: str,
+) -> bool:
+    """Return True if any sibling batch sharing ``run_id`` is still
+    pre-terminal.
+
+    Used by ``finalize_auto_wishlist_completion`` to gate the run-
+    level cycle toggle. The caller already holds ``tasks_lock``.
+
+    The completing batch may or may not have its phase flipped to
+    'complete' yet by the time we land here; either way we skip it
+    in the sibling scan since we're handling its completion now."""
+    terminal_phases = {'complete', 'error', 'cancelled'}
+    for sibling_id, sibling in download_batches.items():
+        if sibling_id == completing_batch_id:
+            continue
+        if not isinstance(sibling, dict):
+            continue
+        if sibling.get('wishlist_run_id') != run_id:
+            continue
+        if sibling.get('phase') in terminal_phases:
+            continue
+        return True
+    return False
+
+
+def finalize_auto_wishlist_completion(
+    batch_id: str,
+    completion_summary: Dict[str, Any],
+    *,
+    download_batches: Dict[str, Dict[str, Any]],
+    tasks_lock,
+    reset_processing_state: Callable[[], None],
+    add_activity_item: Callable[[Any, Any, Any, Any], Any],
+    automation_engine,
+    db_factory: Callable[[], Any],
+    logger=logger,
+) -> Dict[str, Any]:
+    """Finalize auto wishlist processing after a batch finishes.
+
+    For wishlist runs that split into multiple sub-batches (Phase
+    1c.2.1: per-album bundle dispatch), the cycle toggle + state
+    reset only fire when the LAST sibling sub-batch of the same
+    ``wishlist_run_id`` completes. Earlier completions just record
+    their per-batch summary and return without toggling.
+
+    Back-compat: legacy single-batch runs (no ``wishlist_run_id``
+    field on the batch) keep the original toggle-immediately
+    behavior — the gate treats a missing run_id as "lone batch"."""
+    tracks_added = completion_summary.get('tracks_added', 0)
+    total_failed = completion_summary.get('total_failed', 0)
+    logger.error(
+        f"[Auto-Wishlist] Background processing complete: {tracks_added} added to wishlist, {total_failed} failed"
+    )
+
+    if tracks_added > 0:
+        add_activity_item("", "Wishlist Updated", f"{tracks_added} failed tracks added to wishlist", "Now")
+
+    # Run-level gate: if siblings of the same wishlist run are still
+    # active, defer cycle toggle + state reset until they finish.
+    with tasks_lock:
+        run_id = ''
+        if batch_id in download_batches:
+            run_id = download_batches[batch_id].get('wishlist_run_id') or ''
+        siblings_active = bool(run_id) and _wishlist_run_has_siblings_still_active(
+            download_batches, run_id, batch_id,
+        )
+    if siblings_active:
+        logger.info(
+            f"[Auto-Wishlist] Sub-batch {batch_id[:8]} done; waiting on sibling sub-batches "
+            f"of run {run_id[:8]} before toggling cycle"
+        )
+        return completion_summary
+
+    try:
+        with tasks_lock:
+            if batch_id in download_batches:
+                current_cycle = download_batches[batch_id].get('current_cycle', 'albums')
+            else:
+                current_cycle = 'albums'
+
+        next_cycle = 'singles' if current_cycle == 'albums' else 'albums'
+
+        db = db_factory()
+        with db._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                    INSERT OR REPLACE INTO metadata (key, value, updated_at)
+                    VALUES ('wishlist_cycle', ?, CURRENT_TIMESTAMP)
+                """,
+                (next_cycle,),
+            )
+            conn.commit()
+
+        logger.info(f"[Auto-Wishlist] Cycle toggled after completion: {current_cycle} → {next_cycle}")
+    except Exception as cycle_error:
+        logger.error(f"[Auto-Wishlist] Error toggling cycle: {cycle_error}")
+
+    reset_processing_state()
+
+    try:
+        if automation_engine:
+            automation_engine.emit('wishlist_processing_completed', {
+                'tracks_processed': str(total_failed),
+                'tracks_found': str(tracks_added),
+                'tracks_failed': str(total_failed - tracks_added),
+            })
+    except Exception as e:
+        logger.debug("emit wishlist_processing_completed failed: %s", e)
+
+    return completion_summary
+
+
+def remove_tracks_already_in_library(
+    wishlist_service,
+    profiles_database,
+    music_database,
+    active_server: str,
+    *,
+    logger=logger,
+    skip_track_fn: Callable[[dict[str, Any]], bool] | None = None,
+    log_prefix: str = "[Auto-Wishlist]",
+) -> int:
+    """Remove wishlist entries that are already present in the library."""
+    from core.library import manual_library_match as _mlm
+
+    all_profiles = profiles_database.get_all_profiles()
+    # Carry (profile_id, track) so the match check can be profile-scoped.
+    cleanup_tracks: list[tuple[int, dict]] = []
+    for profile in all_profiles:
+        pid = profile["id"]
+        for t in wishlist_service.get_wishlist_tracks_for_download(profile_id=pid):
+            cleanup_tracks.append((pid, t))
+
+    cleanup_removed = 0
+    for profile_id, track in cleanup_tracks:
+        if skip_track_fn and skip_track_fn(track):
+            continue
+
+        track_name = track.get('name', '')
+        artists = track.get('artists', [])
+        spotify_track_id = track.get('spotify_track_id') or track.get('id')
+        track_album = track.get('album', {}).get('name') if isinstance(track.get('album'), dict) else track.get('album')
+
+        if not track_name or not artists or not spotify_track_id:
+            continue
+
+        # Manual match check — skip fuzzy search if user already linked this track.
+        if _mlm.get_match_for_track(music_database, profile_id, track, default_source='wishlist'):
+            try:
+                removed = wishlist_service.mark_track_download_result(spotify_track_id, success=True)
+                if removed:
+                    cleanup_removed += 1
+                    logger.info(f"{log_prefix} [Manual Match] Skipped already-matched track: '{track_name}'")
+            except Exception as _mlm_err:
+                logger.error(f"{log_prefix} [Manual Match] Error removing track: {_mlm_err}")
+            continue
+
+        found_in_db = False
+        matched_artist_name = ''
+        for artist in artists:
+            if isinstance(artist, str):
+                artist_name = artist
+            elif isinstance(artist, dict) and 'name' in artist:
+                artist_name = artist['name']
+            else:
+                artist_name = str(artist)
+
+            try:
+                db_track, confidence = music_database.check_track_exists(
+                    track_name,
+                    artist_name,
+                    confidence_threshold=0.7,
+                    server_source=active_server,
+                    album=track_album,
+                )
+
+                if db_track and confidence >= 0.7:
+                    found_in_db = True
+                    matched_artist_name = artist_name
+                    break
+            except Exception:
+                continue
+
+        if found_in_db:
+            try:
+                removed = wishlist_service.mark_track_download_result(spotify_track_id, success=True)
+                if removed:
+                    cleanup_removed += 1
+                    logger.info(f"{log_prefix} Removed already-owned track: '{track_name}' by {matched_artist_name or artist_name}")
+            except Exception as remove_error:
+                logger.error(f"{log_prefix} Error removing track from wishlist: {remove_error}")
+
+    return cleanup_removed
+
+
+@dataclass
+class WishlistManualDownloadRuntime:
+    """Dependencies needed to start a manual wishlist download batch outside the controller."""
+
+    get_music_database: Callable[[], Any]
+    download_batches: Dict[str, Dict[str, Any]]
+    tasks_lock: Any
+    missing_download_executor: Any
+    run_full_missing_tracks_process: Callable[..., Any]  # (batch_id, playlist_id, tracks, serialize=False)
+    get_batch_max_concurrent: Callable[[], int]
+    add_activity_item: Callable[[Any, Any, Any, Any], Any]
+    active_server: str
+    profile_id: int
+    logger: Any = module_logger
+    # Dedicated album-bundle pool, shared with the auto flow via
+    # _run_wishlist_cycle. Falls back to missing_download_executor when unset.
+    album_bundle_executor: Any = None
+
+
+def start_manual_wishlist_download_batch(
+    runtime: WishlistManualDownloadRuntime,
+    *,
+    track_ids=None,
+    category: str | None = None,
+    force_download_all: bool = False,
+) -> tuple[Dict[str, Any], int]:
+    """Submit a manual wishlist batch.
+
+    The batch entry is created synchronously so the frontend can start polling
+    status immediately. The slow library-cleanup pass and master-worker hand-off
+    run in the background, freeing the request handler from a 30s+ block on
+    per-track DB checks for large wishlists.
+    """
+    logger = runtime.logger
+
+    try:
+        batch_id = str(uuid.uuid4())
+        playlist_id = "wishlist"
+        playlist_name = "Wishlist"
+
+        with runtime.tasks_lock:
+            # analysis_total starts at 0; the bg job updates it after cleanup
+            # finishes and the real track count is known.
+            runtime.download_batches[batch_id] = make_wishlist_batch_row(
+                playlist_id=playlist_id,
+                playlist_name=playlist_name,
+                track_count=0,
+                max_concurrent=runtime.get_batch_max_concurrent(),
+                profile_id=runtime.profile_id,
+                phase='analysis',
+            )
+
+        runtime.missing_download_executor.submit(
+            _prepare_and_run_manual_wishlist_batch,
+            runtime,
+            batch_id,
+            track_ids,
+            category,
+        )
+
+        return {"success": True, "batch_id": batch_id}, 200
+
+    except Exception as e:
+        logger.error(f"Error starting wishlist download process: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}, 500
+
+
+def _prepare_and_run_manual_wishlist_batch(
+    runtime: WishlistManualDownloadRuntime,
+    batch_id: str,
+    track_ids,
+    category: str | None,
+) -> None:
+    """Background worker for the manual wishlist batch — does the slow cleanup
+    + sanitize + filter + master-worker hand-off off the request thread."""
+    logger = runtime.logger
+
+    try:
+        wishlist_service = get_wishlist_service()
+        db = runtime.get_music_database()
+        manual_profile_id = runtime.profile_id
+
+        logger.warning("[Manual-Wishlist] Cleaning duplicate tracks before download...")
+        duplicates_removed = db.remove_wishlist_duplicates(profile_id=manual_profile_id)
+        if duplicates_removed > 0:
+            logger.warning(f"[Manual-Wishlist] Removed {duplicates_removed} duplicate tracks")
+
+        # NOTE: We deliberately do NOT call remove_tracks_already_in_library here.
+        # Wishlist tracks are already known-missing (force_download_all=True is set on
+        # the batch). The library check duplicates the work the master worker would
+        # skip, and on large wishlists costs ~1s per track in serial DB lookups.
+        # The standalone /api/wishlist/cleanup endpoint still runs that pass when
+        # users explicitly ask for maintenance.
+
+        raw_wishlist_tracks = wishlist_service.get_wishlist_tracks_for_download(profile_id=manual_profile_id)
+        if not raw_wishlist_tracks:
+            logger.warning("[Manual-Wishlist] No tracks in wishlist after cleanup — marking batch complete")
+            with runtime.tasks_lock:
+                if batch_id in runtime.download_batches:
+                    runtime.download_batches[batch_id]['phase'] = 'complete'
+                    runtime.download_batches[batch_id]['error'] = 'No tracks in wishlist'
+            return
+
+        wishlist_tracks, duplicates_found = sanitize_and_dedupe_wishlist_tracks(raw_wishlist_tracks)
+        if duplicates_found > 0:
+            logger.warning(f"[Manual-Wishlist] Found and removed {duplicates_found} duplicate tracks during sanitization")
+        logger.info(f"[Manual-Wishlist] Sanitized {len(wishlist_tracks)} tracks from wishlist service")
+
+        # #705: don't burn a search+timeout on tracks that aren't out yet
+        # (watchlist scans add announced albums on purpose). They stay in the
+        # wishlist and start processing the cycle after their release date
+        # passes. An explicit track selection overrides the gate — the user
+        # asked for those specifically.
+        if not track_ids:
+            from core.metadata.release_dates import split_released_unreleased
+            wishlist_tracks, _unreleased = split_released_unreleased(wishlist_tracks)
+            if _unreleased:
+                logger.info(
+                    f"[Manual-Wishlist] Skipping {len(_unreleased)} unreleased track(s) "
+                    f"(future release date) — they'll be searched once released")
+
+        if track_ids:
+            track_lookup = {}
+            for track in wishlist_tracks:
+                spotify_track_id = track.get('spotify_track_id') or track.get('id')
+                if spotify_track_id and spotify_track_id not in track_lookup:
+                    track_lookup[spotify_track_id] = track
+
+            filtered_tracks = []
+            seen_track_ids = set()
+            for frontend_index, tid in enumerate(track_ids):
+                if tid in track_lookup and tid not in seen_track_ids:
+                    track = track_lookup[tid]
+                    track['_original_index'] = frontend_index
+                    filtered_tracks.append(track)
+                    seen_track_ids.add(tid)
+
+            wishlist_tracks = filtered_tracks
+            logger.info(f"[Manual-Wishlist] Filtered to {len(wishlist_tracks)} specific tracks by ID (preserving frontend display order)")
+        elif category:
+            wishlist_tracks, _ = filter_wishlist_tracks_by_category(wishlist_tracks, category)
+            logger.info(f"[Manual-Wishlist] Filtered to {len(wishlist_tracks)} tracks for category: {category}")
+
+        for i, track in enumerate(wishlist_tracks):
+            track['_original_index'] = i
+
+        runtime.add_activity_item("", "Wishlist Download Started", f"{len(wishlist_tracks)} tracks", "Now")
+
+        if not wishlist_tracks:
+            # Nothing to download — clear out the placeholder batch.
+            with runtime.tasks_lock:
+                if batch_id in runtime.download_batches:
+                    runtime.download_batches[batch_id]['analysis_total'] = 0
+                    runtime.download_batches[batch_id]['phase'] = 'complete'
+            return
+
+        # Run the selection through the SHARED engine — the exact code path the
+        # auto timer uses (group → album bundles + per-track residual → parallel
+        # dispatch on the album / shared pools). cycle='albums' bundles whatever
+        # forms an album and drops the rest (singles / ungroupable) into the
+        # per-track residual, so this single call covers the whole selection.
+        # The placeholder batch_id is reused as the first sub-batch so the
+        # modal's existing poll target stays valid.
+        result = _run_wishlist_cycle(
+            runtime,
+            playlist_id='wishlist',
+            cycle='albums',
+            tracks=wishlist_tracks,
+            run_id=str(uuid.uuid4()),
+            auto_initiated=False,
+            first_batch_id=batch_id,
+        )
+        logger.info(
+            f"[Manual-Wishlist] Dispatched {result['album_batches']} album batch(es) + "
+            f"{result['residual_count']} residual track(s) via the shared engine"
+        )
+
+    except Exception as exc:
+        logger.error(f"Error preparing manual wishlist batch {batch_id}: {exc}")
+        import traceback
+
+        traceback.print_exc()
+        with runtime.tasks_lock:
+            if batch_id in runtime.download_batches:
+                runtime.download_batches[batch_id]['phase'] = 'error'
+                runtime.download_batches[batch_id]['error'] = str(exc)
+
+
+def cleanup_wishlist_against_library(
+    wishlist_service,
+    music_database,
+    profile_id: int,
+    active_server: str,
+    *,
+    logger=logger,
+) -> tuple[Dict[str, Any], int]:
+    """Remove wishlist tracks that already exist in the library for one profile."""
+    try:
+        logger.info("[Wishlist Cleanup] Starting wishlist cleanup process...")
+
+        wishlist_tracks = wishlist_service.get_wishlist_tracks_for_download(profile_id=profile_id)
+        if not wishlist_tracks:
+            return {"success": True, "message": "No tracks in wishlist to clean up", "removed_count": 0}, 200
+
+        logger.info(f"[Wishlist Cleanup] Found {len(wishlist_tracks)} tracks in wishlist")
+
+        removed_count = remove_tracks_already_in_library(
+            wishlist_service,
+            SimpleNamespace(get_all_profiles=lambda: [{"id": profile_id}]),
+            music_database,
+            active_server,
+            logger=logger,
+            log_prefix="[Wishlist Cleanup]",
+        )
+
+        logger.info(f"[Wishlist Cleanup] Completed cleanup: {removed_count} tracks removed from wishlist")
+        return {
+            "success": True,
+            "message": f"Wishlist cleanup completed: {removed_count} tracks removed",
+            "removed_count": removed_count,
+            "processed_count": len(wishlist_tracks),
+        }, 200
+
+    except Exception as e:
+        logger.error(f"Error in wishlist cleanup: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}, 500
+
+
+def process_wishlist_automatically(runtime: WishlistAutoProcessingRuntime, automation_id=None,
+                                   apply_backoff=None):
+    """Run automatic wishlist processing outside the controller."""
+    logger = runtime.logger
+    logger.info("[Auto-Wishlist] Timer triggered - starting automatic wishlist processing...")
+
+    try:
+        # CRITICAL FIX: Use smart stuck detection BEFORE acquiring lock
+        # This prevents deadlock and handles stuck flags (2-hour timeout)
+        if runtime.is_actually_processing():
+            logger.info("[Auto-Wishlist] Already processing (verified with stuck detection), skipping.")
+            return
+
+        with runtime.processing_guard() as acquired:
+            if not acquired:
+                logger.info("[Auto-Wishlist] Already processing (race condition check), skipping.")
+                return
+
+            with runtime.app_context_factory():
+                wishlist_service = get_wishlist_service()
+
+                # Check if wishlist has tracks across all profiles
+                database = runtime.get_profiles_database()
+                all_profiles = database.get_all_profiles()
+                count = sum(wishlist_service.get_wishlist_count(profile_id=p['id']) for p in all_profiles)
+                logger.info(f"[Auto-Wishlist] Wishlist count check: {count} tracks found across {len(all_profiles)} profiles")
+                runtime.update_automation_progress(automation_id, progress=10, phase='Checking wishlist',
+                                                   log_line=f'{count} tracks across {len(all_profiles)} profiles', log_type='info')
+                if count == 0:
+                    logger.warning("ℹ️ [Auto-Wishlist] No tracks in wishlist for auto-processing.")
+                    return
+
+                logger.info(f"[Auto-Wishlist] Found {count} tracks in wishlist, starting automatic processing...")
+
+                # Check if wishlist processing is already active (auto or manual)
+                playlist_id = "wishlist"
+                with runtime.tasks_lock:
+                    for _batch_id, batch_data in runtime.download_batches.items():
+                        batch_playlist_id = batch_data.get('playlist_id')
+                        # Check for both auto ('wishlist') and manual ('wishlist_manual') batches
+                        if (batch_playlist_id in ['wishlist', 'wishlist_manual'] and
+                            batch_data.get('phase') not in ['complete', 'error', 'cancelled']):
+                            logger.info(f"Wishlist processing already active in another batch ({batch_playlist_id}), skipping automatic start")
+                            return
+
+                # CRITICAL: Clean duplicates BEFORE fetching tracks to prevent count mismatches
+                # This prevents the "11 tracks shown but 12 counted" bug
+                music_database = runtime.get_music_database()
+
+                logger.warning("[Auto-Wishlist] Cleaning duplicate tracks before processing...")
+                for profile in all_profiles:
+                    duplicates_removed = music_database.remove_wishlist_duplicates(profile_id=profile['id'])
+                    if duplicates_removed > 0:
+                        logger.warning(f"[Auto-Wishlist] Removed {duplicates_removed} duplicate tracks from profile {profile['id']}")
+
+                # NOTE: We deliberately do NOT call remove_tracks_already_in_library here.
+                # The batch sets force_download_all=True (see comment a few lines below),
+                # so wishlist tracks are treated as known-missing and the master worker
+                # skips per-track library lookups. Doing the same expensive scan here
+                # before submitting the batch defeats that optimization and adds
+                # ~1s per track in serial DB queries. The standalone
+                # /api/wishlist/cleanup endpoint still exposes that pass for users
+                # who want explicit maintenance.
+                runtime.update_automation_progress(automation_id, progress=25, phase='Preparing wishlist',
+                                                   log_line='Skipped library scan — wishlist tracks treated as known-missing',
+                                                   log_type='info')
+
+                # Get wishlist tracks for processing - combine all profiles
+                raw_wishlist_tracks = []
+                for profile in all_profiles:
+                    raw_wishlist_tracks.extend(wishlist_service.get_wishlist_tracks_for_download(profile_id=profile['id']))
+                if not raw_wishlist_tracks:
+                    logger.warning("No tracks returned from wishlist service.")
+                    return
+
+                # SANITIZE: Ensure consistent data format from wishlist service
+                wishlist_tracks, duplicates_found = sanitize_and_dedupe_wishlist_tracks(raw_wishlist_tracks)
+                if duplicates_found > 0:
+                    logger.warning(f"[Auto-Wishlist] Found and removed {duplicates_found} duplicate tracks during sanitization")
+                logger.info(f"[Auto-Wishlist] Sanitized {len(wishlist_tracks)} tracks from wishlist service")
+
+                # #705: skip tracks with a future release date — searching for
+                # them burns a full search+timeout per track, every cycle, for
+                # files that can't exist yet. They stay in the wishlist and
+                # join the cycle automatically once their date passes.
+                from core.metadata.release_dates import split_released_unreleased
+                wishlist_tracks, _unreleased = split_released_unreleased(wishlist_tracks)
+                if _unreleased:
+                    logger.info(
+                        f"[Auto-Wishlist] Skipping {len(_unreleased)} unreleased track(s) "
+                        f"(future release date) — they'll be searched once released")
+
+                # Progressive retry backoff (javiavid): repeatedly-failing tracks
+                # earn a growing cooldown (4h → 24h → 7d) instead of burning a
+                # search every hourly cycle forever. SCHEDULED work only — the
+                # manual "Process Wishlist Now" button retries everything (the
+                # click is the override, like Sonarr's manual search). Callers
+                # may state intent via apply_backoff; otherwise a present
+                # automation_id marks the run as scheduled.
+                _backoff = apply_backoff if apply_backoff is not None else (automation_id is not None)
+                if _backoff:
+                    from datetime import datetime as _dt, timezone as _tz
+
+                    from core.wishlist.retry_backoff import split_due_for_retry
+                    # NAIVE UTC on purpose: last_attempted is SQLite's naive-UTC
+                    # CURRENT_TIMESTAMP and the parser yields naive datetimes —
+                    # an aware 'now' would TypeError on comparison.
+                    wishlist_tracks, _cooling = split_due_for_retry(
+                        wishlist_tracks, _dt.now(_tz.utc).replace(tzinfo=None))
+                    if _cooling:
+                        logger.info(
+                            f"[Auto-Wishlist] {len(_cooling)} track(s) cooling down after "
+                            f"repeated failures (retry backoff) — skipped this cycle")
+                        runtime.update_automation_progress(
+                            automation_id, log_line=(
+                                f'{len(_cooling)} repeatedly-failing track(s) on backoff '
+                                f'cooldown — retried later automatically'),
+                            log_type='info')
+
+                # CYCLE FILTERING: Get current cycle and filter tracks by category
+                current_cycle = get_wishlist_cycle(lambda: music_database)
+
+                # Filter tracks by current cycle category
+                filtered_tracks, _ = filter_wishlist_tracks_by_category(wishlist_tracks, current_cycle)
+
+                logger.info(f"[Auto-Wishlist] Current cycle: {current_cycle}")
+                logger.info(f"[Auto-Wishlist] Filtered {len(filtered_tracks)}/{len(wishlist_tracks)} tracks for '{current_cycle}' category")
+                runtime.update_automation_progress(automation_id, progress=40, phase=f'Processing {current_cycle}',
+                                                   log_line=f'Cycle: {current_cycle} — {len(filtered_tracks)} tracks to process', log_type='info')
+
+                # If no tracks in this category, skip to next cycle immediately
+                if len(filtered_tracks) == 0:
+                    logger.warning(f"ℹ️ [Auto-Wishlist] No {current_cycle} tracks in wishlist, toggling cycle and scheduling next run")
+
+                    # Toggle cycle
+                    next_cycle = 'singles' if current_cycle == 'albums' else 'albums'
+                    set_wishlist_cycle(lambda: music_database, next_cycle)
+                    logger.info(f"[Auto-Wishlist] Cycle toggled: {current_cycle} → {next_cycle}")
+                    return
+
+                # Use filtered tracks for processing — stamp original index
+                wishlist_tracks = filtered_tracks
+                for i, track in enumerate(wishlist_tracks):
+                    track['_original_index'] = i
+
+                # Reify one "wishlist run" id (the completion handler gates the
+                # once-per-run cycle toggle on it) and hand off to the SHARED
+                # wishlist engine — the same code path the manual trigger uses.
+                wishlist_run_id = str(uuid.uuid4())
+                _cycle_result = _run_wishlist_cycle(
+                    runtime,
+                    playlist_id=playlist_id,
+                    cycle=current_cycle,
+                    tracks=wishlist_tracks,
+                    run_id=wishlist_run_id,
+                    auto_initiated=True,
+                )
+
+                _summary_parts: list[str] = []
+                if _cycle_result['album_batches']:
+                    _summary_parts.append(f"{_cycle_result['album_batches']} album batch(es)")
+                if _cycle_result['residual_count']:
+                    _summary_parts.append(f"{_cycle_result['residual_count']} per-track")
+                _summary_text = ', '.join(_summary_parts) or 'no batches'
+                runtime.update_automation_progress(
+                    automation_id, progress=50,
+                    phase=f'Downloading {len(wishlist_tracks)} tracks',
+                    log_line=f'Started: {_summary_text} for cycle {current_cycle}',
+                    log_type='success',
+                )
+
+    except Exception as e:
+        logger.error(f"Error in automatic wishlist processing: {e}")
+        import traceback
+
+        traceback.print_exc()
+        runtime.update_automation_progress(automation_id, log_line=f'Error: {str(e)}', log_type='error')
+        raise
+
+
+# jadux's stall: every DB-update completion fires a cleanup, and on a big
+# wishlist (3450 tracks) one pass takes HOURS (per-track fuzzy matching), so
+# they stacked until every worker of the shared pool was grinding cleanups and
+# completed downloads queued behind them forever. One cleanup at a time —
+# a request that arrives while one is running is SKIPPED (the next DB update
+# will fire another against fresher state; nothing is lost by not stacking).
+_auto_cleanup_lock = threading.Lock()
+_auto_cleanup_running = False
+
+
+def automatic_wishlist_cleanup_after_db_update(
+    *,
+    wishlist_service=None,
+    profiles_database=None,
+    music_database=None,
+    active_server: str | None = None,
+    logger=logger,
+) -> int:
+    """Remove wishlist entries that already exist in the library after a DB update.
+
+    Overlap-guarded: only one cleanup runs at a time; concurrent requests are
+    skipped (returning 0), never queued."""
+    global _auto_cleanup_running
+    with _auto_cleanup_lock:
+        if _auto_cleanup_running:
+            logger.info("[Auto Cleanup] Previous cleanup still running — skipping this one")
+            return 0
+        _auto_cleanup_running = True
+    try:
+        return _automatic_wishlist_cleanup_inner(
+            wishlist_service=wishlist_service,
+            profiles_database=profiles_database,
+            music_database=music_database,
+            active_server=active_server,
+            logger=logger,
+        )
+    finally:
+        with _auto_cleanup_lock:
+            _auto_cleanup_running = False
+
+
+def _automatic_wishlist_cleanup_inner(
+    *,
+    wishlist_service=None,
+    profiles_database=None,
+    music_database=None,
+    active_server: str | None = None,
+    logger=logger,
+) -> int:
+    try:
+        from config.settings import config_manager
+        from database.music_database import MusicDatabase, get_database
+
+        wishlist_service = wishlist_service or get_wishlist_service()
+        profiles_database = profiles_database or get_database()
+        music_database = music_database or MusicDatabase()
+        active_server = active_server or config_manager.get_active_media_server()
+
+        logger.info("[Auto Cleanup] Starting automatic wishlist cleanup after database update...")
+
+        all_profiles = profiles_database.get_all_profiles()
+        wishlist_tracks = []
+        for profile in all_profiles:
+            wishlist_tracks.extend(wishlist_service.get_wishlist_tracks_for_download(profile_id=profile["id"]))
+
+        if not wishlist_tracks:
+            logger.warning("[Auto Cleanup] No tracks in wishlist to clean up")
+            return 0
+
+        logger.info(f"[Auto Cleanup] Found {len(wishlist_tracks)} tracks in wishlist")
+
+        removed_count = remove_tracks_already_in_library(
+            wishlist_service,
+            profiles_database,
+            music_database,
+            active_server,
+            logger=logger,
+            log_prefix="[Auto Cleanup]",
+        )
+
+        logger.info(f"[Auto Cleanup] Completed automatic cleanup: {removed_count} tracks removed from wishlist")
+        return removed_count
+
+    except Exception as e:
+        logger.error(f"[Auto Cleanup] Error in automatic wishlist cleanup: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return 0
+
+
+__all__ = [
+    "remove_completed_tracks_from_wishlist",
+    "add_cancelled_tracks_to_failed_tracks",
+    "recover_uncaptured_failed_tracks",
+    "build_wishlist_source_context",
+    "finalize_auto_wishlist_completion",
+    "automatic_wishlist_cleanup_after_db_update",
+    "WishlistAutoProcessingRuntime",
+    "WishlistManualDownloadRuntime",
+    "process_wishlist_automatically",
+    "start_manual_wishlist_download_batch",
+    "cleanup_wishlist_against_library",
+    "remove_tracks_already_in_library",
+]

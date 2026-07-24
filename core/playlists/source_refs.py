@@ -1,0 +1,245 @@
+"""Helpers for mirrored-playlist upstream source references.
+
+Mirrored playlist rows have two legacy fields:
+- ``source_playlist_id``: the stable lookup key used for uniqueness.
+- ``description``: for URL-backed mirrors, the original/canonical URL.
+
+Keeping the normalization here prevents the refresh worker, API endpoint,
+and UI repair flow from each inventing a slightly different meaning.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from dataclasses import dataclass
+from typing import Mapping, Optional
+from urllib.parse import parse_qs, urlparse
+
+
+_SPOTIFY_ID_RE = re.compile(r"^[A-Za-z0-9]{16,32}$")
+
+
+def stable_source_track_id(track: Mapping, existing: Optional[str] = None) -> str:
+    """A stable per-track id for a mirrored-playlist track.
+
+    Spotify / YouTube / Deezer tracks carry a native id. File-import (CSV / M3U /
+    TXT) and iTunes-only sources don't — they arrive with an empty
+    ``source_track_id``. The whole manual-match system (Find & Add ↔ sync) keys on
+    ``source_track_id``, and an empty key can neither be recorded (the persist is a
+    no-op) nor looked up — so a manual match on a file-import track is silently
+    dropped and the track re-appears as "extra" (#901).
+
+    When a native id is present it's used verbatim. Otherwise we derive a
+    DETERMINISTIC id from the track's identity (artist|title|album, normalized) so
+    the SAME song gets the SAME id across re-imports and discovery passes — which
+    is exactly what the match lookup needs. Prefixed ``file:`` so it's recognizable
+    and never collides with a real upstream id. Returns '' only when there's no
+    usable identity at all (no title)."""
+    native = (existing if existing is not None else track.get("source_track_id")) or ""
+    native = str(native).strip()
+    if native:
+        return native
+    title = str(track.get("track_name") or track.get("name") or "").strip().lower()
+    if not title:
+        return ""
+    artist = str(track.get("artist_name") or track.get("artist") or "").strip().lower()
+    album = str(track.get("album_name") or track.get("album") or "").strip().lower()
+    digest = hashlib.md5(f"{artist}|{title}|{album}".encode("utf-8")).hexdigest()[:16]
+    return f"file:{digest}"
+
+
+def coalesce_mirror_track(track: Mapping) -> dict:
+    """Normalize a track dict to the mirror shape, accepting the Spotify shape too.
+
+    The mirror stores ``track_name`` / ``artist_name`` / ``album_name`` /
+    ``source_track_id``. The GET playlist endpoints return Spotify-shaped tracks
+    (``name`` / ``artists[].name`` / ``album.name`` / ``id``) — and feeding those
+    straight back into the mirror wrote all-empty rows (#990), because the mapper
+    used ``t.get('track_name', '')`` with silent defaults. The two shapes are
+    unambiguous, so map the Spotify fields ONLY when the mirror key is absent;
+    everything else (duration_ms, image_url, extra_data, …) is preserved.
+    """
+    if not isinstance(track, Mapping):
+        return {}
+    out = dict(track)
+    if not out.get("track_name"):
+        out["track_name"] = track.get("name") or ""
+    if not out.get("artist_name"):
+        artists = track.get("artists")
+        if isinstance(artists, list) and artists:
+            first = artists[0]
+            out["artist_name"] = (first.get("name") if isinstance(first, Mapping) else str(first)) or ""
+        elif isinstance(track.get("artist"), str):
+            out["artist_name"] = track["artist"]
+    if not out.get("album_name"):
+        album = track.get("album")
+        if isinstance(album, Mapping):
+            out["album_name"] = album.get("name") or ""
+        elif isinstance(album, str):
+            out["album_name"] = album
+    if not out.get("source_track_id") and track.get("id"):
+        out["source_track_id"] = str(track["id"])
+    return out
+
+
+# Synthetic batch playlist_id prefixes that wrap a mirrored_playlists PK.
+# Download/discovery flows build a batch playlist_id as f"{prefix}{pk}" — e.g.
+# auto_mirror_<pk> (core/automation/handlers/sync_playlist.py), youtube_mirrored_<pk>
+# (YouTube discovery), and mirrored_<pk> (web_server url hashes). The trailing
+# digits are the mirrored_playlists primary key, NOT an upstream source id, so a
+# (source, source_playlist_id) lookup will never match them.
+_MIRRORED_PK_PREFIXES = ("youtube_mirrored_", "auto_mirror_", "mirrored_")
+
+
+def extract_mirrored_pk(playlist_ref: object) -> Optional[int]:
+    """Return the mirrored_playlists PK from a synthetic batch ref, else None.
+
+    Handles the synthetic forms above plus a bare numeric ref. Anything else
+    (a real upstream source id) returns None so the caller falls back to a
+    (source, source_playlist_id) lookup.
+    """
+    ref = str(playlist_ref or "").strip()
+    if not ref:
+        return None
+    for prefix in _MIRRORED_PK_PREFIXES:
+        if ref.startswith(prefix):
+            tail = ref[len(prefix):]
+            return int(tail) if tail.isdigit() else None
+    return int(ref) if ref.isdigit() else None
+
+
+@dataclass(frozen=True)
+class MirroredSourceRef:
+    source_playlist_id: str
+    description: Optional[str]
+
+
+@dataclass(frozen=True)
+class MirroredSourceRefView:
+    source_ref: str
+    source_ref_kind: str
+    source_ref_status: str
+    source_ref_error: Optional[str] = None
+
+
+def normalize_mirrored_source_ref(
+    source: str,
+    source_ref: str,
+    existing_description: str = "",
+) -> MirroredSourceRef:
+    """Normalize a user-provided source URL/ID for storage.
+
+    URL-backed sources keep a deterministic hash in ``source_playlist_id`` and
+    store the canonical URL in ``description``. Direct-ID sources store the ID
+    directly and preserve the existing description unless a source-specific URL
+    parser says otherwise.
+    """
+    source = (source or "").strip().lower()
+    source_ref = (source_ref or "").strip()
+    existing_description = (existing_description or "").strip()
+
+    if not source_ref:
+        raise ValueError("Source link or ID is required")
+
+    if source == "spotify_public":
+        canonical_url = _canonical_spotify_url(source_ref)
+        return MirroredSourceRef(_short_hash(canonical_url), canonical_url)
+
+    if source == "youtube":
+        canonical_url = _canonical_youtube_url(source_ref)
+        return MirroredSourceRef(_short_hash(canonical_url), canonical_url)
+
+    if source == "deezer" and source_ref.startswith(("http://", "https://")):
+        from core.deezer_client import DeezerClient
+
+        parsed_id = DeezerClient.parse_playlist_url(source_ref)
+        if not parsed_id:
+            raise ValueError("Use a valid Deezer playlist URL or playlist ID")
+        return MirroredSourceRef(str(parsed_id), existing_description or None)
+
+    return MirroredSourceRef(source_ref, existing_description or None)
+
+
+def require_refresh_url(source: str, description: str, playlist_name: str = "") -> str:
+    """Return a URL required by hash-backed refresh sources, or raise clearly."""
+    source = (source or "").strip().lower()
+    description = (description or "").strip()
+    if source in {"spotify_public", "youtube"}:
+        if not description.startswith(("http://", "https://")):
+            label = f" '{playlist_name}'" if playlist_name else ""
+            raise ValueError(f"{source} mirror{label} is missing its original source URL")
+    return description
+
+
+def describe_mirrored_source_ref(playlist: Mapping[str, object]) -> MirroredSourceRefView:
+    """Build a UI/API friendly view of a mirrored playlist's refresh ref."""
+    source = str(playlist.get("source") or "").strip().lower()
+    source_playlist_id = str(playlist.get("source_playlist_id") or "").strip()
+    description = str(playlist.get("description") or "").strip()
+    name = str(playlist.get("name") or "")
+
+    if source in {"spotify_public", "youtube"}:
+        if description.startswith(("http://", "https://")):
+            return MirroredSourceRefView(description, "url", "ok")
+        try:
+            require_refresh_url(source, description, name)
+        except ValueError as exc:
+            return MirroredSourceRefView(
+                source_playlist_id,
+                "url",
+                "missing",
+                str(exc),
+            )
+
+    return MirroredSourceRefView(source_playlist_id, "id", "ok" if source_playlist_id else "missing")
+
+
+def _canonical_spotify_url(source_ref: str) -> str:
+    parsed = _parse_spotify_ref(source_ref)
+    if parsed:
+        return f"https://open.spotify.com/{parsed['type']}/{parsed['id']}"
+
+    # Repair flow convenience: if the user pastes only a Spotify ID, assume
+    # playlist. Album URLs still need their URL/URI so the type is explicit.
+    if _SPOTIFY_ID_RE.match(source_ref):
+        return f"https://open.spotify.com/playlist/{source_ref}"
+
+    raise ValueError("Use a valid open.spotify.com playlist/album URL, Spotify URI, or playlist ID")
+
+
+def _parse_spotify_ref(source_ref: str) -> Optional[dict]:
+    uri_match = re.match(r"spotify:(playlist|album):([A-Za-z0-9]+)", source_ref)
+    if uri_match:
+        return {"type": uri_match.group(1), "id": uri_match.group(2)}
+
+    url_match = re.search(
+        r"https?://open\.spotify\.com/(?:embed/)?(playlist|album)/([A-Za-z0-9]+)",
+        source_ref,
+    )
+    if url_match:
+        return {"type": url_match.group(1), "id": url_match.group(2)}
+
+    return None
+
+
+def _canonical_youtube_url(source_ref: str) -> str:
+    parsed_url = urlparse(source_ref)
+    playlist_id = ""
+
+    if parsed_url.scheme and parsed_url.netloc:
+        host = parsed_url.netloc.lower()
+        if not ("youtube.com" in host or "music.youtube.com" in host):
+            raise ValueError("Use a valid YouTube playlist URL")
+        playlist_id = parse_qs(parsed_url.query).get("list", [""])[0]
+    else:
+        playlist_id = source_ref
+
+    if not playlist_id:
+        raise ValueError("YouTube playlist URL must include a list= playlist id")
+
+    return f"https://youtube.com/playlist?list={playlist_id}"
+
+
+def _short_hash(value: str) -> str:
+    return hashlib.md5(value.encode()).hexdigest()[:12]

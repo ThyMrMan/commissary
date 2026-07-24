@@ -1,0 +1,6240 @@
+// SUPPORT MODAL
+// ===============================
+
+function showSupportModal() {
+    const overlay = document.getElementById('support-modal-overlay');
+    if (overlay) overlay.classList.remove('hidden');
+}
+
+function closeSupportModal() {
+    const overlay = document.getElementById('support-modal-overlay');
+    if (overlay) overlay.classList.add('hidden');
+}
+
+async function copyAddress(address, cryptoName) {
+    try {
+        // navigator.clipboard requires HTTPS — use fallback for HTTP (Docker)
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(address);
+        } else {
+            const textarea = document.createElement('textarea');
+            textarea.value = address;
+            textarea.style.position = 'fixed';
+            textarea.style.opacity = '0';
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textarea);
+        }
+        showToast(`${cryptoName} address copied to clipboard`, 'success');
+    } catch (error) {
+        console.error('Failed to copy address:', error);
+        // Show the address so user can copy manually
+        showToast(`${cryptoName}: ${address}`, 'info');
+    }
+}
+
+// ===============================
+// SETTINGS FUNCTIONALITY
+// ===============================
+
+let settingsAutoSaveTimer = null;
+
+// The "Only allow AcoustID-verified tracks" toggle lives in Audio Verification
+// and is always shown (its help notes it needs AcoustID enabled), so users can
+// always find it. Kept as a no-op for any existing callers.
+function syncAcoustidRequireVerifiedVisibility() {
+    const group = document.getElementById('acoustid-require-verified-group');
+    if (group) group.style.display = '';
+}
+window.syncAcoustidRequireVerifiedVisibility = syncAcoustidRequireVerifiedVisibility;
+
+// #923: "Prefer explicit versions" only makes sense while explicit content is
+// allowed at all — grey the sub-checkbox out (keeping its saved value) when
+// the parent filter is off. Called on settings load + the parent's onchange.
+function syncPreferExplicitState() {
+    const parent = document.getElementById('allow-explicit');
+    const child = document.getElementById('prefer-explicit');
+    if (!parent || !child) return;
+    child.disabled = !parent.checked;
+    const label = child.closest('.checkbox-label');
+    if (label) label.style.opacity = parent.checked ? '' : '0.45';
+}
+window.syncPreferExplicitState = syncPreferExplicitState;
+
+// Retry Logic: the two numeric rows are only meaningful when their parent toggle
+// is on — hide them otherwise. "Retries per query" needs Exhaustive retry;
+// "Minimum matching mismatches" needs the version-mismatch fallback.
+function syncRetryConditionalRows() {
+    const pairs = [
+        ['retry-exhaustive', 'retries-per-query-row'],
+        ['accept-version-mismatch-fallback', 'version-mismatch-min-count-row'],
+    ];
+    for (const [toggleId, rowId] of pairs) {
+        const toggle = document.getElementById(toggleId);
+        const row = document.getElementById(rowId);
+        if (row) row.style.display = (toggle && toggle.checked) ? '' : 'none';
+    }
+}
+window.syncRetryConditionalRows = syncRetryConditionalRows;
+
+function debouncedAutoSaveSettings() {
+    // Ignore changes made while the page is programmatically populating its
+    // fields on load — those aren't user edits and must not trigger a full
+    // save (which re-initializes every backend service client).
+    if (window._suppressSettingsAutoSave) return;
+    // ISOLATION: the video side reuses this shared settings page, so editing a
+    // VIDEO field (TMDB key, region, autoplay…) would otherwise fire this MUSIC
+    // auto-save — which reads the server toggle from the DOM and would persist
+    // active_media_server, letting the video side change the music server. Video
+    // settings save themselves via /api/video/*; never auto-save music here.
+    if (document.body.getAttribute('data-side') === 'video') return;
+    // #879: never auto-save while the last settings load failed — the form is
+    // showing defaults, not the real config, so saving would wipe it.
+    if (window._settingsLoadFailed) return;
+    // #827: the Logs tab has no savable settings — its live-viewer controls
+    // (source picker, filters, auto-scroll) were tripping the auto-save and
+    // flooding app.log with "Settings saved" lines, drowning out the logs the
+    // user is trying to read. Never auto-save while the Logs tab is active.
+    if (document.querySelector('.stg-tab.active')?.dataset.tab === 'logs') return;
+    if (settingsAutoSaveTimer) clearTimeout(settingsAutoSaveTimer);
+    settingsAutoSaveTimer = setTimeout(() => saveSettings(true), 2000);
+}
+
+function handleManualSaveClick() {
+    if (settingsAutoSaveTimer) clearTimeout(settingsAutoSaveTimer);
+    saveSettings(false);
+}
+
+function syncMetadataSourceSelection(source) {
+    const select = document.getElementById('metadata-fallback-source');
+    if (!select || !source) return;
+    const option = select.querySelector(`option[value="${source}"]`);
+    if (option) select.value = source;
+    select.dataset.lastValidSource = source;
+}
+
+function _isMetadataSourceSelectable(source) {
+    if (source === 'spotify') {
+        // Official Spotify needs a connected session.
+        return _lastStatusPayload?.spotify?.authenticated === true;
+    }
+    if (source === 'spotify_free') {
+        // No-creds Spotify only needs the SpotipyFree package installed —
+        // selecting it IS the opt-in, so it must NOT depend on having selected it.
+        return _lastStatusPayload?.spotify?.free_installed === true;
+    }
+    if (source === 'discogs') {
+        const token = document.getElementById('discogs-token');
+        return !!token?.value?.trim();
+    }
+    if (source === 'jiosaavn') {
+        return document.getElementById('experimental-jiosaavn-enabled')?.checked === true;
+    }
+    return true;
+}
+
+function syncJiosaavnMetadataSourceOption(enabled) {
+    const select = document.getElementById('metadata-fallback-source');
+    if (!select) return;
+
+    let option = select.querySelector('option[value="jiosaavn"]');
+    if (enabled) {
+        if (!option) {
+            option = document.createElement('option');
+            option.value = 'jiosaavn';
+            option.textContent = 'JioSaavn';
+            const anchor = select.querySelector('option[value="musicbrainz"]');
+            if (anchor?.nextSibling) {
+                select.insertBefore(option, anchor.nextSibling);
+            } else {
+                select.appendChild(option);
+            }
+        }
+        return;
+    }
+
+    if (select.value === 'jiosaavn') {
+        select.value = 'deezer';
+        select.dataset.lastValidSource = 'deezer';
+    }
+    option?.remove();
+}
+
+let _experimentalEnableResolver = null;
+
+function showExperimentalEnableDialog({ title, message }) {
+    if (_experimentalEnableResolver) {
+        _experimentalEnableResolver(false);
+        _experimentalEnableResolver = null;
+    }
+
+    const overlay = document.getElementById('experimental-enable-modal-overlay');
+    const titleEl = document.getElementById('experimental-enable-modal-title');
+    const messageEl = document.getElementById('experimental-enable-modal-message');
+    const ack = document.getElementById('experimental-enable-ack-checkbox');
+    const confirmBtn = document.getElementById('experimental-enable-confirm-btn');
+    if (!overlay || !titleEl || !messageEl || !ack || !confirmBtn) {
+        return Promise.resolve(false);
+    }
+
+    titleEl.textContent = title || 'Enable experimental feature';
+    messageEl.textContent = message || '';
+    ack.checked = false;
+    confirmBtn.disabled = true;
+
+    const onAckChange = () => {
+        confirmBtn.disabled = !ack.checked;
+    };
+    ack.onchange = onAckChange;
+
+    overlay.classList.remove('hidden');
+
+    return new Promise((resolve) => {
+        _experimentalEnableResolver = (result) => {
+            ack.onchange = null;
+            resolve(result);
+        };
+    });
+}
+
+function resolveExperimentalEnableDialog(confirmed) {
+    const overlay = document.getElementById('experimental-enable-modal-overlay');
+    const ack = document.getElementById('experimental-enable-ack-checkbox');
+    const confirmBtn = document.getElementById('experimental-enable-confirm-btn');
+    const ok = confirmed && ack?.checked;
+
+    if (overlay) overlay.classList.add('hidden');
+    if (ack) ack.checked = false;
+    if (confirmBtn) confirmBtn.disabled = true;
+
+    if (_experimentalEnableResolver) {
+        _experimentalEnableResolver(ok);
+        _experimentalEnableResolver = null;
+    }
+}
+
+function syncJiosaavnEnrichmentBubble(enabled) {
+    const container = document.querySelector('.jiosaavn-button-container');
+    if (container) container.style.display = enabled ? '' : 'none';
+    if (typeof refreshRateMonitorExperimentalVisibility === 'function') {
+        refreshRateMonitorExperimentalVisibility();
+    }
+    if (enabled && typeof renderEnrichmentRail === 'function') {
+        renderEnrichmentRail();
+    }
+    if (window._lastStatusPayload?.enrichment && typeof renderEnrichmentCards === 'function') {
+        renderEnrichmentCards(window._lastStatusPayload.enrichment);
+    }
+}
+
+async function onExperimentalJiosaavnToggle(checkbox) {
+    if (!checkbox) return;
+
+    if (!checkbox.checked) {
+        syncJiosaavnMetadataSourceOption(false);
+        syncJiosaavnEnrichmentBubble(false);
+        debouncedAutoSaveSettings();
+        return;
+    }
+
+    checkbox.checked = false;
+
+    const acknowledged = await showExperimentalEnableDialog({
+        title: 'Enable JioSaavn',
+        message: 'JioSaavn uses a third-party public API proxy. Coverage and availability may change without notice. Once enabled, JioSaavn will appear as a metadata source on the Connections tab and in search.',
+    });
+
+    if (!acknowledged) return;
+
+    checkbox.checked = true;
+    syncJiosaavnMetadataSourceOption(true);
+    syncJiosaavnEnrichmentBubble(true);
+    debouncedAutoSaveSettings();
+}
+
+async function onExperimentalBandcampToggle(checkbox) {
+    if (!checkbox) return;
+
+    if (!checkbox.checked) {
+        debouncedAutoSaveSettings();
+        return;
+    }
+
+    checkbox.checked = false;
+
+    const acknowledged = await showExperimentalEnableDialog({
+        title: 'Enable Bandcamp',
+        message: 'Bandcamp has no official public search/metadata API — this uses Bandcamp\'s own public search and release-page endpoints. Coverage and availability may change without notice. Once enabled, Bandcamp will appear as a search source in Discover and as a metadata enrichment source for downloaded tracks.',
+    });
+
+    if (!acknowledged) return;
+
+    checkbox.checked = true;
+    debouncedAutoSaveSettings();
+}
+
+function _metadataSourceFallback(source) {
+    if (source === 'spotify') return 'deezer';
+    return 'deezer';
+}
+
+function focusServiceSettingsSection(service, message) {
+    const card = document.querySelector(`#settings-page .stg-service[data-service="${service}"]`);
+    if (!card) return;
+
+    const header = card.querySelector('.stg-service-header');
+    if (!card.classList.contains('expanded') && header) {
+        toggleStgService(header);
+    }
+
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+    const firstControl = card.querySelector('input, button');
+    if (firstControl) {
+        firstControl.focus({ preventScroll: true });
+    }
+
+    if (message) {
+        showToast(message, 'warning');
+    }
+}
+
+function sanitizeMetadataSourceSelection({ quiet = true } = {}) {
+    const select = document.getElementById('metadata-fallback-source');
+    if (!select) return false;
+
+    const selectedSource = select.value || 'deezer';
+    if (_isMetadataSourceSelectable(selectedSource)) {
+        select.dataset.lastValidSource = selectedSource;
+        return false;
+    }
+
+    const lastValid = select.dataset.lastValidSource;
+    const fallbackSource = lastValid && lastValid !== selectedSource && _isMetadataSourceSelectable(lastValid)
+        ? lastValid
+        : _metadataSourceFallback(selectedSource);
+
+    if (fallbackSource && fallbackSource !== selectedSource) {
+        select.value = fallbackSource;
+    }
+    select.dataset.lastValidSource = fallbackSource;
+
+    if (!quiet) {
+        const message = selectedSource === 'discogs'
+            ? 'Discogs requires a personal access token before it can be selected as the primary metadata source.'
+            : 'Spotify must be authenticated before it can be selected as the primary metadata source.';
+        focusServiceSettingsSection(selectedSource, message);
+    }
+
+    return true;
+}
+
+function handleMetadataSourceChange(event) {
+    const select = event.target;
+    if (!select || select.id !== 'metadata-fallback-source') return;
+
+    const selectedSource = select.value;
+    if (_isMetadataSourceSelectable(selectedSource)) {
+        select.dataset.lastValidSource = selectedSource;
+        return;
+    }
+
+    sanitizeMetadataSourceSelection({ quiet: false });
+}
+
+let _settingsInitialized = false;
+// Tell password-manager extensions (Bitwarden / 1Password / LastPass) to ignore
+// this app's credential inputs. The settings page is full of API-key / token /
+// secret fields; password managers treat them as login forms and re-scan the
+// whole (large, constantly-mutating) DOM on every change, which can peg the main
+// thread for seconds. These attributes make them skip the fields entirely.
+function _markCredentialFieldsNoAutofill(root) {
+    const scope = root || document;
+    scope.querySelectorAll('input, textarea').forEach((el) => {
+        if (el.dataset.bwignore !== undefined) return; // already tagged
+        el.setAttribute('data-bwignore', '');          // Bitwarden
+        el.setAttribute('data-1p-ignore', '');         // 1Password
+        el.setAttribute('data-lpignore', 'true');      // LastPass
+        if (!el.getAttribute('autocomplete')) el.setAttribute('autocomplete', 'off');
+    });
+}
+// Run once on load (inputs exist from page load — all pages are mounted).
+if (document.readyState !== 'loading') _markCredentialFieldsNoAutofill();
+else document.addEventListener('DOMContentLoaded', () => _markCredentialFieldsNoAutofill());
+
+function initializeSettings() {
+    // This function is called when the settings page is loaded.
+    // It attaches event listeners to all interactive elements on the page.
+    // Listeners are stable for the page lifetime, so wiring them once avoids
+    // re-scanning the ~960-node settings subtree on every revisit (scroll jank).
+    if (_settingsInitialized) return;
+    _settingsInitialized = true;
+
+    // Re-tag in case any inputs were added dynamically since page load.
+    _markCredentialFieldsNoAutofill(document.getElementById('settings-page'));
+
+    // Accent color listeners (live preview + custom picker toggle)
+    initAccentColorListeners();
+
+    // Main save button (manual save, non-quiet)
+    // Uses named function reference so addEventListener deduplicates across repeated calls
+    const saveButton = document.getElementById('save-settings');
+    if (saveButton) {
+        saveButton.addEventListener('click', handleManualSaveClick);
+    }
+
+    // Debounced auto-save on all settings inputs
+    // Uses named function reference (debouncedAutoSaveSettings) so addEventListener deduplicates
+    const settingsPage = document.getElementById('settings-page');
+    if (settingsPage) {
+        settingsPage.querySelectorAll('input[type="text"], input[type="url"], input[type="password"], input[type="number"], input[type="range"]').forEach(input => {
+            input.addEventListener('input', debouncedAutoSaveSettings);
+        });
+        settingsPage.querySelectorAll('input[type="checkbox"], select').forEach(input => {
+            input.addEventListener('change', debouncedAutoSaveSettings);
+        });
+    }
+
+    const metadataSourceSelect = document.getElementById('metadata-fallback-source');
+    if (metadataSourceSelect) {
+        metadataSourceSelect.addEventListener('change', handleMetadataSourceChange);
+    }
+    const discogsTokenInput = document.getElementById('discogs-token');
+    if (discogsTokenInput) {
+        discogsTokenInput.addEventListener('input', () => {
+            if (typeof syncPrimaryMetadataSourceAvailability === 'function') {
+                syncPrimaryMetadataSourceAvailability(_lastStatusPayload?.spotify || null);
+            }
+            sanitizeMetadataSourceSelection({ quiet: true });
+        });
+    }
+
+    // Server toggle buttons
+    const plexToggle = document.getElementById('plex-toggle');
+    if (plexToggle) {
+        plexToggle.addEventListener('click', () => toggleServer('plex'));
+    }
+    const jellyfinToggle = document.getElementById('jellyfin-toggle');
+    if (jellyfinToggle) {
+        jellyfinToggle.addEventListener('click', () => toggleServer('jellyfin'));
+    }
+
+    // Auto-detect buttons
+    const detectSlskdBtn = document.querySelector('#soulseek-url + .detect-button');
+    if (detectSlskdBtn) {
+        detectSlskdBtn.addEventListener('click', autoDetectSlskd);
+    }
+    const detectPlexBtn = document.querySelector('#plex-container .detect-button');
+    if (detectPlexBtn) {
+        detectPlexBtn.addEventListener('click', autoDetectPlex);
+    }
+    const detectJellyfinBtn = document.querySelector('#jellyfin-container .detect-button');
+    if (detectJellyfinBtn) {
+        detectJellyfinBtn.addEventListener('click', autoDetectJellyfin);
+    }
+
+    // Test connection buttons
+    // Test button event listeners removed - they use onclick attributes in HTML to avoid double firing
+
+    if (typeof syncPrimaryMetadataSourceAvailability === 'function') {
+        syncPrimaryMetadataSourceAvailability(_lastStatusPayload?.spotify || null);
+    }
+    syncSpotifySettingsAuthState(_lastStatusPayload?.spotify || null);
+    syncMetadataSourceSelection(_lastStatusPayload?.metadata_source?.source);
+    sanitizeMetadataSourceSelection({ quiet: true });
+    if (metadataSourceSelect) {
+        metadataSourceSelect.dataset.lastValidSource = metadataSourceSelect.value;
+    }
+}
+
+function resetFileOrganizationTemplates() {
+    // Reset templates to defaults
+    const defaults = {
+        album: '$albumartist/$albumartist - $album/$track - $title',
+        single: '$artist/$artist - $title/$title',
+        playlist: '$playlist/$artist - $title',
+        video: '$artist/$title-video'
+    };
+
+    document.getElementById('template-album-path').value = defaults.album;
+    document.getElementById('template-single-path').value = defaults.single;
+    document.getElementById('template-playlist-path').value = defaults.playlist;
+    document.getElementById('template-video-path').value = defaults.video;
+
+    debouncedAutoSaveSettings();
+}
+
+function validateFileOrganizationTemplates() {
+    const errors = [];
+
+    // Valid variables for each template type
+    const validVars = {
+        album: ['$artist', '$albumartist', '$artistletter', '$album', '$albumtype', '$title', '$track', '$disc', '$discnum', '$cdnum', '$year', '$quality'],
+        single: ['$artist', '$albumartist', '$artistletter', '$album', '$albumtype', '$title', '$track', '$year', '$quality'],
+        playlist: ['$artist', '$artistletter', '$playlist', '$title', '$year', '$quality'],
+        video: ['$artist', '$artistletter', '$title', '$year']
+    };
+
+    // Get template values
+    const albumPath = document.getElementById('template-album-path').value.trim();
+    const singlePath = document.getElementById('template-single-path').value.trim();
+    const playlistPath = document.getElementById('template-playlist-path').value.trim();
+
+    // Validate album template
+    if (albumPath) {
+        if (albumPath.endsWith('/')) {
+            errors.push('Album template cannot end with /');
+        }
+        if (albumPath.startsWith('/')) {
+            errors.push('Album template cannot start with /');
+        }
+        if (!albumPath.includes('/')) {
+            errors.push('Album template must include at least one folder (use / separator)');
+        }
+        if (albumPath.includes('//')) {
+            errors.push('Album template cannot have consecutive slashes //');
+        }
+        // Check for likely typos of valid variables (case-insensitive to catch $Album, $ARTIST, etc.)
+        const albumVarPattern = /\$\{([a-zA-Z]+)\}|\$([a-zA-Z]+)/g;
+        const foundVars = albumPath.match(albumVarPattern) || [];
+        foundVars.forEach(v => {
+            // Normalize ${var} to $var for validation
+            const normalized = v.startsWith('${') ? '$' + v.slice(2, -1) : v;
+            const lowerVar = normalized.toLowerCase();
+            // Check if lowercase version exists in valid vars
+            const isValid = validVars.album.some(validVar => validVar.toLowerCase() === lowerVar);
+            if (!isValid) {
+                errors.push(`Invalid variable "${normalized}" in album template. Valid: ${validVars.album.join(', ')}`);
+            } else if (normalized !== lowerVar && validVars.album.includes(lowerVar)) {
+                // Variable is valid but has wrong case
+                errors.push(`Variable "${normalized}" should be lowercase: "${lowerVar}"`);
+            }
+        });
+    }
+
+    // Validate single template
+    if (singlePath) {
+        if (singlePath.endsWith('/')) {
+            errors.push('Single template cannot end with /');
+        }
+        if (singlePath.startsWith('/')) {
+            errors.push('Single template cannot start with /');
+        }
+        // Note: single template is allowed to have no slash (flat file: "$artist - $title")
+        if (singlePath.includes('//')) {
+            errors.push('Single template cannot have consecutive slashes //');
+        }
+        const singleVarPattern = /\$\{([a-zA-Z]+)\}|\$([a-zA-Z]+)/g;
+        const foundVars = singlePath.match(singleVarPattern) || [];
+        foundVars.forEach(v => {
+            const normalized = v.startsWith('${') ? '$' + v.slice(2, -1) : v;
+            const lowerVar = normalized.toLowerCase();
+            const isValid = validVars.single.some(validVar => validVar.toLowerCase() === lowerVar);
+            if (!isValid) {
+                errors.push(`Invalid variable "${normalized}" in single template. Valid: ${validVars.single.join(', ')}`);
+            } else if (normalized !== lowerVar && validVars.single.includes(lowerVar)) {
+                errors.push(`Variable "${normalized}" should be lowercase: "${lowerVar}"`);
+            }
+        });
+    }
+
+    // Validate playlist template
+    if (playlistPath) {
+        if (playlistPath.endsWith('/')) {
+            errors.push('Playlist template cannot end with /');
+        }
+        if (playlistPath.startsWith('/')) {
+            errors.push('Playlist template cannot start with /');
+        }
+        if (!playlistPath.includes('/')) {
+            errors.push('Playlist template must include at least one folder (use / separator)');
+        }
+        if (playlistPath.includes('//')) {
+            errors.push('Playlist template cannot have consecutive slashes //');
+        }
+        const playlistVarPattern = /\$\{([a-zA-Z]+)\}|\$([a-zA-Z]+)/g;
+        const foundVars = playlistPath.match(playlistVarPattern) || [];
+        foundVars.forEach(v => {
+            const normalized = v.startsWith('${') ? '$' + v.slice(2, -1) : v;
+            const lowerVar = normalized.toLowerCase();
+            const isValid = validVars.playlist.some(validVar => validVar.toLowerCase() === lowerVar);
+            if (!isValid) {
+                errors.push(`Invalid variable "${normalized}" in playlist template. Valid: ${validVars.playlist.join(', ')}`);
+            } else if (normalized !== lowerVar && validVars.playlist.includes(lowerVar)) {
+                errors.push(`Variable "${normalized}" should be lowercase: "${lowerVar}"`);
+            }
+        });
+    }
+
+    return errors;
+}
+
+// Settings redesign — tab switching + service accordions
+function switchSettingsTab(tab) {
+    // Update tab bar
+    document.querySelectorAll('.stg-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+    // Show/hide settings groups and section headers by data-stg attribute
+    document.querySelectorAll('#settings-page [data-stg]').forEach(g => {
+        g.style.display = g.dataset.stg === tab ? '' : 'none';
+    });
+    // Re-apply collapsed state on section bodies (tab switch resets inline display)
+    document.querySelectorAll('#settings-page .settings-section-body.collapsed').forEach(b => {
+        b.style.display = 'none';
+    });
+    // Also hide/show the column wrappers if they're empty in this tab
+    document.querySelectorAll('#settings-page .settings-left-column, #settings-page .settings-right-column, #settings-page .settings-third-column').forEach(col => {
+        const hasVisible = Array.from(col.querySelectorAll('.settings-group[data-stg]')).some(g => g.style.display !== 'none');
+        col.style.display = hasVisible ? '' : 'none';
+    });
+    // Re-apply conditional visibility (quality profile, source containers, etc.)
+    if (typeof updateDownloadSourceUI === 'function') {
+        try { updateDownloadSourceUI(); } catch (e) { }
+    }
+    // Load DB maintenance info when switching to Advanced tab
+    if (tab === 'advanced' && typeof loadDbMaintenanceInfo === 'function') {
+        try { loadDbMaintenanceInfo(); } catch (e) { }
+    }
+    // First time the Downloads tab is shown, auto-probe source status so the
+    // dots reflect real connection state without a manual "Test all sources".
+    if (tab === 'downloads' && typeof autoTestSourcesOnce === 'function') {
+        autoTestSourcesOnce();
+    }
+    // Initialize live log viewer when switching to Logs tab
+    if (tab === 'logs') {
+        _logViewerInit();
+    } else {
+        _logViewerStop();
+    }
+    // Refresh the green/yellow header gradient when arriving on Connections
+    if (tab === 'connections') {
+        try { applyServiceStatusGradients(); } catch (e) { }
+    }
+}
+
+// ── Settings → Connections: per-service status gradient + verify wiring ──
+// Gradient shows green when the user has filled in credentials, yellow when empty.
+// It's based purely on config presence (cheap, no API calls). The verify layer —
+// which runs on expand / Expand All — surfaces whether those credentials actually
+// work, via an inline warning bar inside the expanded panel.
+
+let _stgServiceStatusState = {};  // service -> {configured: bool}
+let _stgServiceVerifyInFlight = {};  // service -> true while a verify call is running
+
+async function applyServiceStatusGradients() {
+    try {
+        const resp = await fetch('/api/settings/config-status');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        _stgServiceStatusState = data || {};
+        document.querySelectorAll('#settings-page .stg-service[data-service]').forEach(card => {
+            const service = card.getAttribute('data-service');
+            const header = card.querySelector('.stg-service-header');
+            if (!service || !header) return;
+            const configured = !!(data[service] && data[service].configured);
+            header.classList.toggle('status-configured', configured);
+            header.classList.toggle('status-missing', !configured);
+            // Ensure the header has a spinner placeholder for the verify-checking state
+            if (!header.querySelector('.stg-service-verify-spinner')) {
+                const spinner = document.createElement('span');
+                spinner.className = 'stg-service-verify-spinner';
+                // Insert before the chevron on the right
+                const chevron = header.querySelector('.stg-service-chevron');
+                if (chevron) header.insertBefore(spinner, chevron);
+                else header.appendChild(spinner);
+            }
+        });
+        syncSpotifySettingsAuthState(_lastStatusPayload?.spotify || null);
+    } catch (e) {
+        console.warn('[Settings Status] Failed to apply gradients:', e);
+    }
+}
+
+function syncSpotifySettingsAuthState(statusData) {
+    if (!statusData) return;
+
+    const card = document.querySelector('#settings-page .stg-service[data-service="spotify"]');
+    if (!card) return;
+
+    const header = card.querySelector('.stg-service-header');
+    const dot = card.querySelector('.stg-service-dot');
+    if (!header && !dot) return;
+
+    const authenticated = statusData?.authenticated === true;
+    const rateLimited = !!(statusData?.rate_limited && statusData?.rate_limit);
+    const cooldown = !!(statusData?.post_ban_cooldown > 0);
+    const needsAttention = !authenticated || rateLimited || cooldown;
+
+    if (header) {
+        header.classList.toggle('status-configured', !needsAttention);
+        header.classList.toggle('status-missing', needsAttention);
+    }
+
+    if (dot) {
+        dot.style.color = needsAttention ? '#f1c40f' : '#1DB954';
+    }
+}
+
+function _stgSetCheckingState(service, isChecking) {
+    const card = document.querySelector(`#settings-page .stg-service[data-service="${service}"]`);
+    if (!card) return;
+    const header = card.querySelector('.stg-service-header');
+    const body = card.querySelector('.stg-service-body');
+    if (header) {
+        header.classList.toggle('status-checking', !!isChecking);
+        // Lazy-create the spinner element so it's there even if
+        // applyServiceStatusGradients() hasn't run yet.
+        if (!header.querySelector('.stg-service-verify-spinner')) {
+            const spinner = document.createElement('span');
+            spinner.className = 'stg-service-verify-spinner';
+            const chevron = header.querySelector('.stg-service-chevron');
+            if (chevron) header.insertBefore(spinner, chevron);
+            else header.appendChild(spinner);
+        }
+    }
+    if (!body) return;
+    const existing = body.querySelector('.stg-service-verify-status');
+    if (isChecking) {
+        if (!existing) {
+            const status = document.createElement('div');
+            status.className = 'stg-service-verify-status';
+            status.textContent = 'Testing connection…';
+            body.insertBefore(status, body.firstChild);
+        }
+    } else if (existing) {
+        existing.remove();
+    }
+}
+
+function _stgShowVerifyWarning(service, message) {
+    const card = document.querySelector(`#settings-page .stg-service[data-service="${service}"]`);
+    if (!card) return;
+    const body = card.querySelector('.stg-service-body');
+    if (!body) return;
+    const existing = body.querySelector('.stg-service-warning');
+    if (existing) existing.remove();
+    const warning = document.createElement('div');
+    warning.className = 'stg-service-warning';
+    warning.innerHTML = `
+        <span class="stg-service-warning-icon">&#9888;</span>
+        <span class="stg-service-warning-text"></span>
+    `;
+    warning.querySelector('.stg-service-warning-text').textContent =
+        message || 'Connection test failed.';
+    body.insertBefore(warning, body.firstChild);
+}
+
+function _stgClearVerifyWarning(service) {
+    const card = document.querySelector(`#settings-page .stg-service[data-service="${service}"]`);
+    if (!card) return;
+    const existing = card.querySelector('.stg-service-warning');
+    if (existing) existing.remove();
+}
+
+async function _stgRefreshAfterSave() {
+    // Called after a successful settings save. Cheap gradient refresh always,
+    // plus re-verify any cards the user currently has expanded (so they see
+    // immediate feedback on credentials they just edited). Collapsed cards
+    // keep their cached verify result until the user expands them.
+    try {
+        await applyServiceStatusGradients();
+        const expandedServices = Array.from(
+            document.querySelectorAll('#settings-page .stg-service.expanded[data-service]')
+        )
+            .map(card => card.getAttribute('data-service'))
+            .filter(Boolean);
+        if (expandedServices.length > 0) {
+            _stgVerifyServices(expandedServices, { force: true });
+        }
+    } catch (e) {
+        console.warn('[Settings Status] Post-save refresh failed:', e);
+    }
+}
+
+async function _stgVerifyServices(services, { force = false } = {}) {
+    if (!services || !services.length) return {};
+    // Mark all as checking immediately so the user sees spinners/status lines
+    services.forEach(svc => {
+        _stgServiceVerifyInFlight[svc] = true;
+        _stgSetCheckingState(svc, true);
+        _stgClearVerifyWarning(svc);
+    });
+    try {
+        const url = '/api/settings/verify' + (force ? '?force=true' : '');
+        const resp = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ services })
+        });
+        const data = await resp.json();
+        services.forEach(svc => {
+            _stgServiceVerifyInFlight[svc] = false;
+            _stgSetCheckingState(svc, false);
+            const result = data[svc];
+            if (result && result.success === false) {
+                _stgShowVerifyWarning(svc, result.error || result.message || '');
+            }
+        });
+        return data;
+    } catch (e) {
+        console.warn('[Settings Verify] Network error:', e);
+        services.forEach(svc => {
+            _stgServiceVerifyInFlight[svc] = false;
+            _stgSetCheckingState(svc, false);
+            _stgShowVerifyWarning(svc, 'Unable to reach the verification endpoint.');
+        });
+        return {};
+    }
+}
+
+function toggleStgService(el) {
+    const service = el.closest('.stg-service');
+    if (service) {
+        const wasExpanded = service.classList.contains('expanded');
+        service.classList.toggle('expanded');
+        // Fire verify when expanding a single card (not on collapse). The backend
+        // caches per service for 5 min, so rapid expand/collapse won't re-ping.
+        if (!wasExpanded) {
+            const serviceName = service.getAttribute('data-service');
+            if (serviceName && !_stgServiceVerifyInFlight[serviceName]) {
+                _stgVerifyServices([serviceName]);
+            }
+        }
+    }
+}
+function toggleAllServiceAccordions(btn) {
+    const services = document.querySelectorAll('#settings-page .stg-service');
+    const allExpanded = Array.from(services).every(s => s.classList.contains('expanded'));
+    const willExpand = !allExpanded;
+    services.forEach(s => s.classList.toggle('expanded', willExpand));
+    btn.textContent = allExpanded ? 'Expand All' : 'Collapse All';
+
+    // On Expand All, fire a single batched verify for every service that has a
+    // data-service attribute. Backend caps concurrency at 3 to avoid rate limits.
+    // Skipped on Collapse All.
+    if (willExpand) {
+        const serviceNames = Array.from(services)
+            .map(s => s.getAttribute('data-service'))
+            .filter(Boolean)
+            .filter(name => !_stgServiceVerifyInFlight[name]);
+        if (serviceNames.length > 0) {
+            _stgVerifyServices(serviceNames);
+        }
+    }
+}
+
+// ── Hybrid source priority list (drag-and-drop) ──
+const HYBRID_SOURCES = [
+    { id: 'soulseek', name: 'Soulseek', icon: '/static/img/brands/slskd.png', emoji: '🎵' },
+    { id: 'youtube', name: 'YouTube', icon: '/static/img/brands/youtube.svg', emoji: '▶️' },
+    { id: 'tidal', name: 'Tidal', icon: '/static/img/brands/tidal.svg', emoji: '🌊' },
+    { id: 'qobuz', name: 'Qobuz', icon: '/static/img/brands/qobuz.svg', emoji: '🎧' },
+    { id: 'hifi', name: 'HiFi', icon: null, emoji: '🎶' },
+    { id: 'deezer_dl', name: 'Deezer', icon: '/static/img/brands/deezer.png', emoji: '🎧' },
+    { id: 'amazon', name: 'Amazon Music', icon: null, emoji: '🛒' },
+    { id: 'lidarr', name: 'Lidarr', icon: null, emoji: '📦' },
+    { id: 'soundcloud', name: 'SoundCloud', icon: '/static/img/brands/soundcloud.png', emoji: '☁️' },
+    { id: 'torrent', name: 'Torrent', icon: null, emoji: '🧲' },
+    { id: 'usenet', name: 'Usenet', icon: null, emoji: '📰' },
+];
+const ALBUM_LEVEL_HYBRID_SOURCES = new Set(['soulseek', 'torrent', 'usenet']);
+
+let _hybridSourceOrder = ['soulseek', 'youtube'];
+let _hybridSourceEnabled = { soulseek: true, youtube: true, tidal: false, qobuz: false, hifi: false, deezer_dl: false, amazon: false, lidarr: false, soundcloud: false, torrent: false, usenet: false };
+// Enabled-but-not-fully-configured sources (per the server's status):
+// shown with a "needs setup" chip instead of being silently unchecked.
+let _hybridSourceUnready = {};
+let _hybridVisualOrder = null; // Full visual order including disabled sources
+// In hybrid mode, only one source's config panel is shown at a time (clicked
+// open from its row), so the long per-source config blocks don't all stack up.
+let _expandedHybridSource = null;
+
+function toggleHybridSourceConfig(srcId) {
+    _expandedHybridSource = (_expandedHybridSource === srcId) ? null : srcId;
+    buildHybridSourceList();
+    updateDownloadSourceUI();
+    // Bring the freshly opened config panel into view.
+    if (_expandedHybridSource) {
+        const map = {
+            soulseek: 'soulseek-settings-container', youtube: 'youtube-settings-container',
+            tidal: 'tidal-download-settings-container', qobuz: 'qobuz-settings-container',
+            hifi: 'hifi-download-settings-container', deezer_dl: 'deezer-download-settings-container',
+            amazon: 'amazon-download-settings-container', lidarr: 'lidarr-download-settings-container',
+            soundcloud: 'soundcloud-download-settings-container', torrent: 'prowlarr-source-redirect',
+            usenet: 'prowlarr-source-redirect',
+        };
+        const el = document.getElementById(map[_expandedHybridSource]);
+        if (el) setTimeout(() => el.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 60);
+    }
+}
+
+// ── Per-source live connection status (shown as a dot in the hybrid list and
+// driven by the "Test all sources" button). srcId -> 'unknown'|'testing'|'ok'|'fail'|'na'
+let _hybridSourceStatus = {};
+
+async function _ssJson(url, opts) {
+    const r = await fetch(url, opts);
+    return await r.json();
+}
+function _ssTestConn(service) {
+    return _ssJson(API.testConnection || '/api/test-connection', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ service })
+    }).then(j => !!j.success);
+}
+// Each probe returns a boolean (connected/ok). Endpoints mirror the per-source
+// "Test Connection" buttons so the results match what those buttons would show.
+const HYBRID_SOURCE_PROBE = {
+    soulseek:   () => _ssTestConn('soulseek'),
+    tidal:      () => _ssTestConn('tidal'),
+    qobuz:      () => _ssJson('/api/qobuz/auth/status').then(j => j.authenticated === true),
+    hifi:       () => _ssJson('/api/hifi/status').then(j => j.available === true),
+    // POST (the endpoint is POST-only) with an empty body so it tests the SAVED ARL; a GET here
+    // 405s and the probe throws -> the dot goes red even though Deezer downloads fine.
+    deezer_dl:  () => _ssJson('/api/deezer-download/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }).then(j => j.success === true),
+    amazon:     () => _ssJson('/api/amazon/test-connection').then(j => j.connected === true),
+    lidarr:     () => _ssTestConn('lidarr'),
+    soundcloud: () => _ssJson('/api/soundcloud/status').then(j => j.available === true && j.reachable === true),
+    torrent:    () => _ssTestConn('torrent_client'),
+    usenet:     () => _ssTestConn('usenet_client'),
+    youtube:    () => Promise.resolve(true),  // no auth required
+};
+// Configured metadata / server connections that support a generic test.
+const CONNECTION_TEST_SERVICES = ['spotify', 'server', 'tidal', 'qobuz', 'lastfm', 'genius', 'listenbrainz', 'acoustid', 'discogs'];
+
+async function testAllSources(opts = {}) {
+    const silent = opts.silent === true;          // no toast / no connection sweep (used for auto-run on load)
+    const btn = document.getElementById('test-all-sources-btn');
+    if (btn && !silent) { btn.disabled = true; btn.dataset._label = btn.textContent; btn.textContent = 'Testing…'; }
+
+    // Which download sources to test: the enabled hybrid sources, or the single
+    // selected source in non-hybrid mode.
+    const mode = document.getElementById('download-source-mode')?.value;
+    const sources = new Set();
+    if (mode === 'hybrid') {
+        (typeof getHybridOrder === 'function' ? getHybridOrder() : []).forEach(s => sources.add(s));
+    } else if (mode) {
+        sources.add(mode);
+    }
+    if (sources.size === 0) sources.add('soulseek');
+
+    // Torrent/Usenet downloads go through Prowlarr — its connection must be
+    // established first or those source tests fail. Probe Prowlarr up front.
+    if (sources.has('torrent') || sources.has('usenet')) {
+        try { await _ssTestConn('prowlarr'); } catch (e) { /* surfaced via the per-source test below */ }
+    }
+
+    for (const id of sources) _hybridSourceStatus[id] = 'testing';
+    buildHybridSourceList();
+
+    let ok = 0, fail = 0;
+    for (const id of sources) {
+        const probe = HYBRID_SOURCE_PROBE[id];
+        if (!probe) { _hybridSourceStatus[id] = 'na'; continue; }
+        try { const good = await probe(); _hybridSourceStatus[id] = good ? 'ok' : 'fail'; good ? ok++ : fail++; }
+        catch (e) { _hybridSourceStatus[id] = 'fail'; fail++; }
+        buildHybridSourceList();
+    }
+
+    // Also test the metadata / server connections the user has configured
+    // (skipped on the silent auto-run to keep page load light).
+    let connOk = 0, connFail = 0;
+    if (!silent) {
+        try {
+            const cfg = await _ssJson('/api/settings/config-status');
+            for (const svc of CONNECTION_TEST_SERVICES) {
+                const configured = svc === 'server' ? true : (cfg && cfg[svc] && cfg[svc].configured);
+                if (!configured) continue;
+                try { const good = await _ssTestConn(svc); good ? connOk++ : connFail++; } catch (e) { connFail++; }
+            }
+        } catch (e) { /* config-status unavailable — skip connection sweep */ }
+    }
+
+    if (btn && !silent) { btn.disabled = false; btn.textContent = btn.dataset._label || 'Test all sources'; }
+    if (!silent) {
+        const parts = [`sources ${ok}✓${fail ? ' / ' + fail + '✗' : ''}`];
+        if (connOk || connFail) parts.push(`connections ${connOk}✓${connFail ? ' / ' + connFail + '✗' : ''}`);
+        showToast('Tested ' + parts.join(', '), (fail || connFail) ? 'error' : 'success');
+    }
+}
+window.testAllSources = testAllSources;
+
+// Auto-populate the source status dots once after the page settles, so they
+// reflect real state after a restart without the user having to click Test.
+let _sourcesAutoTested = false;
+function autoTestSourcesOnce() {
+    if (_sourcesAutoTested) return;
+    _sourcesAutoTested = true;
+    setTimeout(() => { try { testAllSources({ silent: true }); } catch (e) { } }, 1200);
+}
+
+function buildHybridSourceList() {
+    const container = document.getElementById('hybrid-source-list');
+    if (!container) return;
+
+    container.innerHTML = '';
+    // Build visual order: use persisted visual order, or enabled first + disabled at bottom
+    if (!_hybridVisualOrder) {
+        _hybridVisualOrder = [..._hybridSourceOrder];
+        for (const src of HYBRID_SOURCES) {
+            if (!_hybridVisualOrder.includes(src.id)) _hybridVisualOrder.push(src.id);
+        }
+    }
+    const allIds = _hybridVisualOrder;
+
+    allIds.forEach((srcId, idx) => {
+        const src = HYBRID_SOURCES.find(s => s.id === srcId);
+        if (!src) return;
+        const enabled = _hybridSourceEnabled[srcId] !== false;
+        const isInOrder = _hybridSourceOrder.includes(srcId);
+        const priorityNum = isInOrder && enabled ? _hybridSourceOrder.indexOf(srcId) + 1 : '';
+        const canOwnAlbum = enabled && priorityNum === 1 && ALBUM_LEVEL_HYBRID_SOURCES.has(srcId);
+        const sourceLevel = canOwnAlbum ? 'Album-level' : 'Track-level';
+        const sourceLevelClass = canOwnAlbum ? 'album' : 'track';
+        const sourceLevelTitle = canOwnAlbum
+            ? 'This first source can download a whole album release before per-track fallback.'
+            : 'This source runs as per-track fallback in the current hybrid order.';
+        const sourceLevelBadge = `<span class="hybrid-source-badge hybrid-source-badge-${sourceLevelClass}" title="${sourceLevelTitle}">${sourceLevel}</span>`;
+        // Enabled but the server says it can't run yet (e.g. usenet/torrent
+        // need Prowlarr AND a download client). Stays enabled — downloads
+        // skip unready sources — but the row says why it won't fire.
+        const unreadyHints = {
+            usenet: 'Usenet needs Prowlarr (indexers) AND a usenet client (e.g. SABnzbd) configured. Downloads skip this source until both are set up — click ⚙ to finish.',
+            torrent: 'Torrents need Prowlarr (indexers) AND a torrent client configured. Downloads skip this source until both are set up — click ⚙ to finish.',
+        };
+        const unreadyBadge = (enabled && _hybridSourceUnready[srcId])
+            ? `<span class="hybrid-source-badge hybrid-source-unready" title="${unreadyHints[srcId] || 'This source is not fully configured yet — downloads skip it until it is. Click ⚙ to configure.'}">⚠ needs setup</span>`
+            : '';
+
+        const item = document.createElement('div');
+        const isExpanded = enabled && _expandedHybridSource === srcId;
+        item.className = `hybrid-source-item${enabled ? '' : ' disabled'}${isExpanded ? ' config-open' : ''}`;
+        item.draggable = true;
+        item.dataset.sourceId = srcId;
+
+        // The name + a config chevron open this source's settings panel inline
+        // (only one at a time), so the long config blocks don't all stack up.
+        const clickConfig = enabled ? `onclick="toggleHybridSourceConfig('${srcId}')"` : '';
+        item.innerHTML = `
+            <span class="hybrid-source-handle" title="Drag to reorder">⠿</span>
+            <span class="hybrid-source-arrows">
+                <button class="hybrid-arrow-btn" onclick="moveHybridSource('${srcId}', -1)" title="Move up">▲</button>
+                <button class="hybrid-arrow-btn" onclick="moveHybridSource('${srcId}', 1)" title="Move down">▼</button>
+            </span>
+            ${src.icon
+                ? `<img class="hybrid-source-icon" src="${src.icon}" alt="${src.name}" onerror="this.outerHTML='<span class=\\'hybrid-source-icon emoji-icon\\'>${src.emoji}</span>'">`
+                : `<span class="hybrid-source-icon emoji-icon">${src.emoji}</span>`
+            }
+            <span class="hybrid-source-name" ${clickConfig} style="${enabled ? 'cursor:pointer;' : ''}">${src.name}</span>
+            ${sourceLevelBadge}${unreadyBadge}
+            <span class="hybrid-source-priority">${priorityNum}</span>
+            <span class="hybrid-source-status hss-${_hybridSourceStatus[srcId] || 'unknown'}" title="${({ unknown: 'Not tested yet', testing: 'Testing…', ok: 'Connected', fail: 'Connection failed', na: 'No connection test for this source' })[_hybridSourceStatus[srcId] || 'unknown']}"></span>
+            ${enabled ? `<button class="hybrid-source-config-btn" ${clickConfig} title="Configure ${src.name}">⚙</button>` : ''}
+            <label class="hybrid-source-toggle">
+                <input type="checkbox" ${enabled ? 'checked' : ''} onchange="toggleHybridSource('${srcId}', this.checked)">
+                <span class="toggle-track"></span>
+            </label>
+        `;
+
+        // Real drag-to-reorder (the help text promised it; previously only the
+        // arrow buttons worked — item.draggable was set with no handlers).
+        item.addEventListener('dragstart', (e) => {
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', srcId);
+            item.classList.add('dragging');
+        });
+        item.addEventListener('dragend', () => {
+            item.classList.remove('dragging');
+            container.querySelectorAll('.hybrid-source-item').forEach(el => el.classList.remove('drag-over'));
+        });
+        item.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; item.classList.add('drag-over'); });
+        item.addEventListener('dragleave', () => item.classList.remove('drag-over'));
+        item.addEventListener('drop', (e) => {
+            e.preventDefault();
+            item.classList.remove('drag-over');
+            const draggedId = e.dataTransfer.getData('text/plain');
+            if (draggedId && draggedId !== srcId) _reorderHybridSource(draggedId, srcId);
+        });
+
+        container.appendChild(item);
+    });
+
+    // Sync hidden selects for backward compat
+    _syncHybridHiddenSelects();
+}
+
+function moveHybridSource(srcId, direction) {
+    if (!_hybridVisualOrder) return;
+    const idx = _hybridVisualOrder.indexOf(srcId);
+    if (idx < 0) return;
+    const newIdx = idx + direction;
+    if (newIdx < 0 || newIdx >= _hybridVisualOrder.length) return;
+
+    // Swap in visual order
+    [_hybridVisualOrder[idx], _hybridVisualOrder[newIdx]] = [_hybridVisualOrder[newIdx], _hybridVisualOrder[idx]];
+
+    // Rebuild enabled order from visual order
+    _hybridSourceOrder = _hybridVisualOrder.filter(id => _hybridSourceEnabled[id] !== false);
+    buildHybridSourceList();
+    updateDownloadSourceUI();
+    debouncedAutoSaveSettings();
+}
+
+function _reorderHybridSource(draggedId, targetId) {
+    // Move draggedId to just before targetId in the visual order, then rebuild
+    // the enabled subset + persist — same model moveHybridSource uses.
+    if (!_hybridVisualOrder) return;
+    const from = _hybridVisualOrder.indexOf(draggedId);
+    if (from < 0) return;
+    _hybridVisualOrder.splice(from, 1);
+    const to = _hybridVisualOrder.indexOf(targetId);
+    if (to < 0) { _hybridVisualOrder.splice(from, 0, draggedId); return; }  // target gone — undo
+    _hybridVisualOrder.splice(to, 0, draggedId);
+    _hybridSourceOrder = _hybridVisualOrder.filter(id => _hybridSourceEnabled[id] !== false);
+    buildHybridSourceList();
+    updateDownloadSourceUI();
+    debouncedAutoSaveSettings();
+}
+
+function toggleHybridSource(srcId, enabled) {
+    _hybridSourceEnabled[srcId] = enabled;
+    // If the source we just disabled had its config panel open, close it.
+    if (!enabled && _expandedHybridSource === srcId) _expandedHybridSource = null;
+    // Rebuild enabled order from visual order so priority matches position
+    if (_hybridVisualOrder) {
+        _hybridSourceOrder = _hybridVisualOrder.filter(id => _hybridSourceEnabled[id] !== false);
+    }
+    buildHybridSourceList();
+    updateDownloadSourceUI();
+    debouncedAutoSaveSettings();
+}
+
+function _syncHybridOrderFromDOM() {
+    const container = document.getElementById('hybrid-source-list');
+    if (!container) return;
+    const items = container.querySelectorAll('.hybrid-source-item');
+    const newOrder = [];
+    items.forEach(item => {
+        const id = item.dataset.sourceId;
+        if (_hybridSourceEnabled[id] !== false) {
+            newOrder.push(id);
+        }
+    });
+    _hybridSourceOrder = newOrder;
+}
+
+function _syncHybridHiddenSelects() {
+    // Keep hidden selects in sync for backward compat with saveSettings
+    const primary = document.getElementById('hybrid-primary-source');
+    const secondary = document.getElementById('hybrid-secondary-source');
+    if (primary && _hybridSourceOrder.length > 0) primary.value = _hybridSourceOrder[0];
+    if (secondary && _hybridSourceOrder.length > 1) secondary.value = _hybridSourceOrder[1];
+}
+
+function getHybridOrder() {
+    return _hybridSourceOrder.filter(s => _hybridSourceEnabled[s] !== false);
+}
+
+// ---- Preferred album-art sources (reuses the hybrid-source-list styling) ----
+const ART_SOURCES = [
+    { id: 'caa', name: 'Cover Art Archive', icon: '/static/img/brands/musicbrainz.png', emoji: '🎨' },
+    { id: 'deezer', name: 'Deezer', icon: '/static/img/brands/deezer.png', emoji: '🎧' },
+    { id: 'itunes', name: 'iTunes', icon: '/static/img/brands/itunes.png', emoji: '🍎' },
+    { id: 'spotify', name: 'Spotify', icon: '/static/img/brands/spotify.png', emoji: '🟢' },
+    { id: 'audiodb', name: 'TheAudioDB', icon: null, emoji: '💿' },
+];
+let _artSourceEnabled = {};   // id -> bool
+let _artVisualOrder = [];      // available source ids, in display order
+let _artAvailable = [];        // ids the user is connected to
+
+function buildArtSourceList() {
+    const container = document.getElementById('art-source-list');
+    if (!container) return;
+    container.innerHTML = '';
+    if (!_artVisualOrder.length) {
+        container.innerHTML = '<div style="padding:10px;color:var(--text-secondary,#888);font-size:13px;">No connected art sources available.</div>';
+        return;
+    }
+    const enabledOrder = getArtOrder();
+    _artVisualOrder.forEach((srcId) => {
+        const src = ART_SOURCES.find(s => s.id === srcId);
+        if (!src) return;
+        const enabled = _artSourceEnabled[srcId] === true;
+        const priorityNum = enabled ? enabledOrder.indexOf(srcId) + 1 : '';
+        const item = document.createElement('div');
+        item.className = `hybrid-source-item${enabled ? '' : ' disabled'}`;
+        item.dataset.sourceId = srcId;
+        item.innerHTML = `
+            <span class="hybrid-source-arrows">
+                <button class="hybrid-arrow-btn" onclick="moveArtSource('${srcId}', -1)" title="Move up">▲</button>
+                <button class="hybrid-arrow-btn" onclick="moveArtSource('${srcId}', 1)" title="Move down">▼</button>
+            </span>
+            ${src.icon
+                ? `<img class="hybrid-source-icon" src="${src.icon}" alt="${src.name}" onerror="this.outerHTML='<span class=\\'hybrid-source-icon emoji-icon\\'>${src.emoji}</span>'">`
+                : `<span class="hybrid-source-icon emoji-icon">${src.emoji}</span>`
+            }
+            <span class="hybrid-source-name">${src.name}</span>
+            <span class="hybrid-source-priority">${priorityNum}</span>
+            <label class="hybrid-source-toggle">
+                <input type="checkbox" ${enabled ? 'checked' : ''} onchange="toggleArtSource('${srcId}', this.checked)">
+                <span class="toggle-track"></span>
+            </label>
+        `;
+        container.appendChild(item);
+    });
+}
+
+function moveArtSource(srcId, direction) {
+    const idx = _artVisualOrder.indexOf(srcId);
+    if (idx < 0) return;
+    const newIdx = idx + direction;
+    if (newIdx < 0 || newIdx >= _artVisualOrder.length) return;
+    [_artVisualOrder[idx], _artVisualOrder[newIdx]] = [_artVisualOrder[newIdx], _artVisualOrder[idx]];
+    buildArtSourceList();
+    if (typeof debouncedAutoSaveSettings === 'function') debouncedAutoSaveSettings();
+}
+
+function toggleArtSource(srcId, enabled) {
+    _artSourceEnabled[srcId] = enabled;
+    buildArtSourceList();
+    if (typeof debouncedAutoSaveSettings === 'function') debouncedAutoSaveSettings();
+}
+
+// Saved value: enabled sources in their displayed order.
+function getArtOrder() {
+    return _artVisualOrder.filter(id => _artSourceEnabled[id] === true);
+}
+
+async function loadArtSourceOrder(settings) {
+    const valid = new Set(ART_SOURCES.map(s => s.id));
+    const saved = (settings && settings.metadata_enhancement
+                   && Array.isArray(settings.metadata_enhancement.album_art_order))
+        ? settings.metadata_enhancement.album_art_order : [];
+
+    // Populate the saved order SYNCHRONOUSLY, filtered to known art sources
+    // (NOT by availability). This guarantees a save that fires before the
+    // availability fetch resolves — or while a saved source is temporarily
+    // disconnected — can never wipe the user's saved order. The backend skips
+    // any unavailable source at resolution time, and it re-activates on
+    // reconnect, so keeping it in the list is safe and preserves intent.
+    _artSourceEnabled = {};
+    _artVisualOrder = [];
+    saved.forEach(id => {
+        if (valid.has(id) && !_artVisualOrder.includes(id)) {
+            _artVisualOrder.push(id);
+            _artSourceEnabled[id] = true;
+        }
+    });
+    buildArtSourceList();
+
+    // Then fetch which sources are actually connected and append any that
+    // aren't already listed (shown disabled, ready to enable).
+    try {
+        const resp = await fetch('/api/metadata/art-sources');
+        const data = await resp.json();
+        _artAvailable = (data.available || []).map(s => (s && s.id) ? s.id : s);
+    } catch (e) {
+        _artAvailable = [];
+    }
+    _artAvailable.forEach(id => {
+        if (valid.has(id) && !_artVisualOrder.includes(id)) {
+            _artVisualOrder.push(id);
+            _artSourceEnabled[id] = false;
+        }
+    });
+    buildArtSourceList();
+}
+
+function loadHybridSourceOrder(settings) {
+    const order = settings.download_source?.hybrid_order;
+    const sourceStatus = settings._source_status || {};
+
+    if (order && Array.isArray(order) && order.length > 0) {
+        _hybridSourceOrder = order;
+        _hybridSourceEnabled = {};
+        for (const src of HYBRID_SOURCES) {
+            _hybridSourceEnabled[src.id] = order.includes(src.id);
+        }
+    } else {
+        // Legacy: fall back to primary/secondary
+        const primary = settings.download_source?.hybrid_primary || 'soulseek';
+        const secondary = settings.download_source?.hybrid_secondary || 'youtube';
+        _hybridSourceOrder = [primary, secondary];
+        _hybridSourceEnabled = {};
+        for (const src of HYBRID_SOURCES) {
+            _hybridSourceEnabled[src.id] = src.id === primary || src.id === secondary;
+        }
+    }
+
+    // Sources the server reports as not-fully-configured are NOT silently
+    // unchecked anymore (Fl3m: enabling Usenet "didn't save" — the save
+    // worked; THIS loader erased it on every page load, and the next save
+    // then persisted the loss). Usenet/torrent need Prowlarr on top of the
+    // download client, so a half-configured source was constantly re-disabled
+    // with zero explanation. Keep the user's saved intent and mark the row
+    // unready instead — the backend's configured_clients() already skips
+    // unready sources at download time, so an enabled toggle is harmless.
+    _hybridSourceUnready = {};
+    for (const src of HYBRID_SOURCES) {
+        if (_hybridSourceEnabled[src.id] && sourceStatus[src.id] === false) {
+            _hybridSourceUnready[src.id] = true;
+        }
+    }
+
+    _hybridVisualOrder = null; // Reset so buildHybridSourceList rebuilds it
+    buildHybridSourceList();
+}
+
+function updateLossyBitrateOptions() {
+    const codec = document.getElementById('lossy-copy-codec')?.value || 'mp3';
+    const bitrateSelect = document.getElementById('lossy-copy-bitrate');
+    if (!bitrateSelect) return;
+    const opt320 = bitrateSelect.querySelector('option[value="320"]');
+    if (codec === 'opus') {
+        // Opus max is 256kbps per channel — hide 320 option
+        if (opt320) opt320.disabled = true;
+        if (bitrateSelect.value === '320') bitrateSelect.value = '256';
+    } else {
+        if (opt320) opt320.disabled = false;
+    }
+}
+
+function updatePlexConfigurationButtons() {
+    const plexUrl = document.getElementById('plex-url');
+    const plexToken = document.getElementById('plex-token');
+    const hasPlexConfig = Boolean((plexUrl?.value || '').trim() || (plexToken?.value || '').trim());
+    const plexViewConfigButton = document.getElementById('plex-view-config-button');
+    const plexLinkToPlexButton = document.getElementById('plex-link-to-plex-button');
+    const plexManualConfigButton = document.getElementById('plex-manual-config-button');
+    const plexUrlActions = document.getElementById('plex-url-actions');
+    const plexTokenActions = document.getElementById('plex-token-actions');
+    const plexPinAuthFlow = document.getElementById('plex-pin-auth-flow');
+
+    if (plexViewConfigButton) plexViewConfigButton.style.display = hasPlexConfig ? '' : 'none';
+    if (plexLinkToPlexButton) plexLinkToPlexButton.style.display = hasPlexConfig ? 'none' : '';
+    if (plexManualConfigButton) plexManualConfigButton.style.display = hasPlexConfig ? 'none' : '';
+    if (plexUrlActions) plexUrlActions.style.display = hasPlexConfig ? 'none' : 'flex';
+    if (plexTokenActions) plexTokenActions.style.display = hasPlexConfig ? 'none' : 'flex';
+    if (plexPinAuthFlow) plexPinAuthFlow.style.display = 'none';
+}
+
+async function loadSettingsData() {
+    try {
+        const response = await fetch(API.settings);
+        const settings = await response.json();
+
+        // #879: a failed GET /api/settings returns an error body (e.g. {"error":
+        // "..."} on a 500), NOT real settings. Populating from it blanks every
+        // field to its default ('settings.spotify?.x || ""'), and the next
+        // (auto)save then overwrites the user's real config. Abort BEFORE
+        // touching any field and flag it so saves stay blocked until a good load.
+        if (!response.ok || !settings || typeof settings !== 'object' || settings.error) {
+            window._settingsLoadFailed = true;
+            throw new Error('settings load failed (HTTP ' + response.status + '): ' +
+                ((settings && settings.error) || 'unexpected response'));
+        }
+        window._settingsLoadFailed = false;  // good load → saving is safe again
+        window._settingsPayload = settings;
+
+        // Populate Spotify settings
+        document.getElementById('spotify-client-id').value = settings.spotify?.client_id || '';
+        document.getElementById('spotify-client-secret').value = settings.spotify?.client_secret || '';
+        document.getElementById('spotify-redirect-uri').value = settings.spotify?.redirect_uri || 'http://127.0.0.1:8888/callback';
+        document.getElementById('spotify-callback-display').textContent = settings.spotify?.redirect_uri || 'http://127.0.0.1:8888/callback';
+
+        // Populate Tidal settings
+        document.getElementById('tidal-client-id').value = settings.tidal?.client_id || '';
+        document.getElementById('tidal-client-secret').value = settings.tidal?.client_secret || '';
+        document.getElementById('tidal-redirect-uri').value = settings.tidal?.redirect_uri || 'http://127.0.0.1:8889/tidal/callback';
+        document.getElementById('tidal-callback-display').textContent = settings.tidal?.redirect_uri || 'http://127.0.0.1:8889/tidal/callback';
+
+        // Populate Deezer OAuth settings
+        document.getElementById('deezer-app-id').value = settings.deezer?.app_id || '';
+        document.getElementById('deezer-app-secret').value = settings.deezer?.app_secret || '';
+        document.getElementById('deezer-redirect-uri').value = settings.deezer?.redirect_uri || 'http://127.0.0.1:8008/deezer/callback';
+        document.getElementById('deezer-callback-display').textContent = settings.deezer?.redirect_uri || 'http://127.0.0.1:8008/deezer/callback';
+
+        // Add event listeners to update display URLs when input changes
+        document.getElementById('spotify-redirect-uri').addEventListener('input', function () {
+            document.getElementById('spotify-callback-display').textContent = this.value || 'http://127.0.0.1:8888/callback';
+        });
+
+        document.getElementById('tidal-redirect-uri').addEventListener('input', function () {
+            document.getElementById('tidal-callback-display').textContent = this.value || 'http://127.0.0.1:8889/tidal/callback';
+        });
+
+        document.getElementById('deezer-redirect-uri').addEventListener('input', function () {
+            document.getElementById('deezer-callback-display').textContent = this.value || 'http://127.0.0.1:8008/deezer/callback';
+        });
+
+        // Populate Plex settings
+        const plexUrlInput = document.getElementById('plex-url');
+        const plexTokenInput = document.getElementById('plex-token');
+        if (plexUrlInput) plexUrlInput.value = settings.plex?.base_url || '';
+        if (plexTokenInput) plexTokenInput.value = settings.plex?.token || '';
+        if (plexUrlInput) plexUrlInput.addEventListener('input', updatePlexConfigurationButtons);
+        if (plexTokenInput) plexTokenInput.addEventListener('input', updatePlexConfigurationButtons);
+        updatePlexConfigurationButtons();
+
+        // Populate Jellyfin settings
+        document.getElementById('jellyfin-url').value = settings.jellyfin?.base_url || '';
+        document.getElementById('jellyfin-api-key').value = settings.jellyfin?.api_key || '';
+        document.getElementById('jellyfin-timeout').value = settings.jellyfin?.api_timeout || 120;
+
+        // Populate Navidrome settings
+        document.getElementById('navidrome-url').value = settings.navidrome?.base_url || '';
+        document.getElementById('navidrome-username').value = settings.navidrome?.username || '';
+        document.getElementById('navidrome-password').value = settings.navidrome?.password || '';
+
+        // Set active server and toggle visibility
+        const activeServer = settings.active_media_server || 'plex';
+        // Remember the persisted music server so a save from the VIDEO side keeps
+        // it unchanged (the toggle there is for opening a config panel, not picking
+        // the music server).
+        window._persistedActiveServer = activeServer;
+        toggleServer(activeServer);
+
+        // Load Plex music libraries if Plex is the active server
+        if (activeServer === 'plex') {
+            loadPlexMusicLibraries();
+        }
+
+        // Load Jellyfin users and music libraries if Jellyfin is the active server
+        if (activeServer === 'jellyfin') {
+            loadJellyfinUsers().then(() => loadJellyfinMusicLibraries());
+        }
+
+        // Load Navidrome music folders if Navidrome is the active server
+        if (activeServer === 'navidrome') {
+            loadNavidromeMusicFolders();
+        }
+
+        // Populate Soulseek settings
+        document.getElementById('soulseek-url').value = settings.soulseek?.slskd_url || '';
+        document.getElementById('soulseek-api-key').value = settings.soulseek?.api_key || '';
+        document.getElementById('soulseek-search-timeout').value = settings.soulseek?.search_timeout || 60;
+        document.getElementById('soulseek-search-timeout-buffer').value = settings.soulseek?.search_timeout_buffer || 15;
+        document.getElementById('soulseek-search-min-delay-seconds').value = settings.soulseek?.search_min_delay_seconds ?? 0;
+        document.getElementById('soulseek-min-peer-speed').value = settings.soulseek?.min_peer_upload_speed || 0;
+        document.getElementById('soulseek-max-peer-queue').value = settings.soulseek?.max_peer_queue || 0;
+        document.getElementById('soulseek-download-timeout').value = Math.round((settings.soulseek?.download_timeout || 600) / 60);
+        document.getElementById('soulseek-auto-clear-searches').checked = settings.soulseek?.auto_clear_searches !== false;
+
+        // Populate ListenBrainz settings
+        document.getElementById('listenbrainz-base-url').value = settings.listenbrainz?.base_url || '';
+        document.getElementById('listenbrainz-token').value = settings.listenbrainz?.token || '';
+
+        // Populate AcoustID settings
+        document.getElementById('acoustid-api-key').value = settings.acoustid?.api_key || '';
+        document.getElementById('acoustid-enabled').checked = settings.acoustid?.enabled || false;
+        const _acoustidRequireVerified = document.getElementById('acoustid-require-verified');
+        if (_acoustidRequireVerified) _acoustidRequireVerified.checked = settings.acoustid?.require_verified === true;
+        // Show the "require verified" toggle (under Quality Profile) only when AcoustID is on.
+        if (typeof syncAcoustidRequireVerifiedVisibility === 'function') syncAcoustidRequireVerifiedVisibility();
+
+        // Populate Last.fm settings
+        document.getElementById('lastfm-api-key').value = settings.lastfm?.api_key || '';
+        document.getElementById('lastfm-api-secret').value = settings.lastfm?.api_secret || '';
+        document.getElementById('lastfm-scrobble-enabled').checked = settings.lastfm?.scrobble_enabled === true;
+        const lfmStatus = document.getElementById('lastfm-scrobble-status');
+        if (lfmStatus) {
+            lfmStatus.textContent = settings.lastfm?.session_key ? 'Authorized' : 'Not authorized';
+        }
+
+        // Populate ListenBrainz scrobble toggle
+        document.getElementById('listenbrainz-scrobble-enabled').checked = settings.listenbrainz?.scrobble_enabled === true;
+
+        // Populate Genius settings
+        document.getElementById('genius-access-token').value = settings.genius?.access_token || '';
+
+        // Populate iTunes settings
+        document.getElementById('itunes-country').value = settings.itunes?.country || 'US';
+
+        // Populate Discogs settings
+        document.getElementById('discogs-token').value = settings.discogs?.token || '';
+
+        // Populate Metadata source setting. 'Spotify Free' is stored as
+        // fallback_source='spotify' + spotify_free=true (so all downstream
+        // 'spotify' routing is unchanged) — map it back to the dropdown value.
+        const _fbSrc = settings.metadata?.fallback_source || 'deezer';
+        const _metaSel = (_fbSrc === 'spotify' && settings.metadata?.spotify_free === true)
+            ? 'spotify_free' : _fbSrc;
+        document.getElementById('metadata-fallback-source').value = _metaSel;
+        const _efEl = document.getElementById('metadata-spotify-free-enrichment');
+        // Default ON: unset (undefined) reads as enabled, matching the worker's
+        // config default (metadata.spotify_free_enrichment defaults True).
+        if (_efEl) _efEl.checked = settings.metadata?.spotify_free_enrichment !== false;
+
+        const _jiosaavnExp = document.getElementById('experimental-jiosaavn-enabled');
+        const jiosaavnEnabled = settings.experimental?.jiosaavn_enabled === true;
+        if (_jiosaavnExp) _jiosaavnExp.checked = jiosaavnEnabled;
+        syncJiosaavnMetadataSourceOption(jiosaavnEnabled);
+        syncJiosaavnEnrichmentBubble(jiosaavnEnabled);
+        if (jiosaavnEnabled && _metaSel === 'jiosaavn') {
+            document.getElementById('metadata-fallback-source').value = 'jiosaavn';
+        }
+
+        const _bandcampExp = document.getElementById('experimental-bandcamp-enabled');
+        if (_bandcampExp) _bandcampExp.checked = settings.experimental?.bandcamp_enabled === true;
+
+        // Populate Hydrabase settings
+        const hbConfig = settings.hydrabase || {};
+        document.getElementById('hydrabase-url').value = hbConfig.url || '';
+        document.getElementById('hydrabase-api-key').value = hbConfig.api_key || '';
+        document.getElementById('hydrabase-auto-connect').checked = hbConfig.auto_connect || false;
+        // Check live connection status + add Hydrabase to fallback dropdown if connected
+        fetch('/api/hydrabase/status').then(r => r.json()).then(s => {
+            const btn = document.getElementById('hydrabase-connect-btn');
+            const statusEl = document.getElementById('hydrabase-settings-status');
+            if (s.connected) {
+                if (btn) btn.textContent = 'Disconnect';
+                if (statusEl) { statusEl.textContent = 'Connected'; statusEl.style.color = '#4caf50'; }
+                // Add Hydrabase to fallback source dropdown
+                const fbSelect = document.getElementById('metadata-fallback-source');
+                if (fbSelect && !fbSelect.querySelector('option[value="hydrabase"]')) {
+                    const opt = document.createElement('option');
+                    opt.value = 'hydrabase';
+                    opt.textContent = 'Hydrabase (P2P)';
+                    fbSelect.appendChild(opt);
+                }
+                // Restore selection if it was hydrabase
+                if ((settings.metadata?.fallback_source) === 'hydrabase') {
+                    fbSelect.value = 'hydrabase';
+                }
+            }
+        }).catch(() => { });
+
+        // Populate Download settings (right column)
+        document.getElementById('download-path').value = settings.soulseek?.download_path || './downloads';
+        document.getElementById('transfer-path').value = settings.soulseek?.transfer_path || './Transfer';
+        const minFree = document.getElementById('min-free-disk-gb');
+        if (minFree) minFree.value = settings.soulseek?.min_free_disk_gb ?? 5;
+        applyPathsEnvironment(settings);
+        document.getElementById('staging-path').value = settings.import?.staging_path || './Staging';
+        document.getElementById('music-videos-path').value = settings.library?.music_videos_path || './MusicVideos';
+        document.getElementById('playlists-materialize-path').value = settings.playlists?.materialize_path || './Playlists';
+        document.getElementById('playlists-materialize-mode').value = settings.playlists?.materialize_mode || 'symlink';
+
+        // Populate Download Source settings
+        document.getElementById('download-source-mode').value = settings.download_source?.mode || 'soulseek';
+        document.getElementById('stream-source').value = settings.download_source?.stream_source || 'youtube';
+        document.getElementById('max-concurrent-downloads').value = settings.download_source?.max_concurrent || '3';
+        // #1056 — 0/blank = each source's built-in default
+        const _sst = document.getElementById('source-search-timeout');
+        if (_sst) _sst.value = settings.download_source?.source_search_timeout || '';
+        loadHybridSourceOrder(settings);
+        loadArtSourceOrder(settings);
+        // Per-source download quality is now derived from the global Quality
+        // Profile (ranked targets) — the per-source quality selects were removed.
+        loadHiFiInstances();
+        document.getElementById('deezer-download-arl').value = settings.deezer_download?.arl || '';
+        document.getElementById('lidarr-url').value = settings.lidarr_download?.url || '';
+        document.getElementById('lidarr-api-key').value = settings.lidarr_download?.api_key || '';
+        const _prowUrl = document.getElementById('prowlarr-url');
+        const _prowKey = document.getElementById('prowlarr-api-key');
+        const _prowIds = document.getElementById('prowlarr-indexer-ids');
+        if (_prowUrl) _prowUrl.value = settings.prowlarr?.url || '';
+        if (_prowKey) _prowKey.value = settings.prowlarr?.api_key || '';
+        if (_prowIds) _prowIds.value = settings.prowlarr?.indexer_ids || '';
+        const _tcType = document.getElementById('torrent-client-type');
+        const _tcUrl = document.getElementById('torrent-client-url');
+        const _tcUser = document.getElementById('torrent-client-username');
+        const _tcPass = document.getElementById('torrent-client-password');
+        const _tcCat = document.getElementById('torrent-client-category');
+        const _tcPath = document.getElementById('torrent-client-save-path');
+        if (_tcType) _tcType.value = settings.torrent_client?.type || 'qbittorrent';
+        if (_tcUrl) _tcUrl.value = settings.torrent_client?.url || '';
+        if (_tcUser) _tcUser.value = settings.torrent_client?.username || '';
+        if (_tcPass) _tcPass.value = settings.torrent_client?.password || '';
+        if (_tcCat) _tcCat.value = settings.torrent_client?.category || 'soulsync';
+        if (_tcPath) _tcPath.value = settings.torrent_client?.save_path || '';
+        // Seeding goals (torrent grabs) — off (0) by default, mirrors the video side.
+        const _tcRatio = document.getElementById('music-seed-ratio');
+        const _tcHours = document.getElementById('music-seed-hours');
+        const _tcRemove = document.getElementById('music-seed-remove-data');
+        if (_tcRatio) _tcRatio.value = settings.torrent_client?.seed_ratio_goal != null ? settings.torrent_client.seed_ratio_goal : 0;
+        if (_tcHours) _tcHours.value = settings.torrent_client?.seed_time_goal_hours != null ? settings.torrent_client.seed_time_goal_hours : 0;
+        if (_tcRemove) _tcRemove.checked = settings.torrent_client?.seed_remove_data !== false;
+        const _tcSeedMode = document.getElementById('music-seed-mode');
+        if (_tcSeedMode) _tcSeedMode.value = settings.torrent_client?.seed_mode || 'soulsync';
+        // Stalled-torrent knobs live under download_source but render in the
+        // torrent client section. Timeout is stored in SECONDS, shown in MINUTES.
+        const _tcStall = document.getElementById('torrent-stall-timeout');
+        const _tcStallAct = document.getElementById('torrent-stall-action');
+        if (_tcStall) {
+            const secs = settings.download_source?.torrent_stall_timeout_seconds;
+            _tcStall.value = (secs === undefined || secs === null) ? 10 : Math.round(Number(secs) / 60);
+        }
+        if (_tcStallAct) _tcStallAct.value = settings.download_source?.torrent_stall_action || 'abandon';
+        const _tcDlPath = document.getElementById('torrent-download-path');
+        if (_tcDlPath) _tcDlPath.value = settings.download_source?.torrent_download_path || '';
+        const _ucType = document.getElementById('usenet-client-type');
+        const _ucUrl = document.getElementById('usenet-client-url');
+        const _ucKey = document.getElementById('usenet-client-api-key');
+        const _ucUser = document.getElementById('usenet-client-username');
+        const _ucPass = document.getElementById('usenet-client-password');
+        const _ucCat = document.getElementById('usenet-client-category');
+        if (_ucType) _ucType.value = settings.usenet_client?.type || 'sabnzbd';
+        if (_ucUrl) _ucUrl.value = settings.usenet_client?.url || '';
+        if (_ucKey) _ucKey.value = settings.usenet_client?.api_key || '';
+        if (_ucUser) _ucUser.value = settings.usenet_client?.username || '';
+        if (_ucPass) _ucPass.value = settings.usenet_client?.password || '';
+        if (_ucCat) _ucCat.value = settings.usenet_client?.category || 'soulsync';
+        const _ucDlPath = document.getElementById('usenet-download-path');
+        if (_ucDlPath) _ucDlPath.value = settings.download_source?.usenet_download_path || '';
+        if (typeof updateUsenetClientUI === 'function') updateUsenetClientUI();
+        // Sync ARL to connections tab field + bidirectional listeners
+        const _connArl = document.getElementById('deezer-connection-arl');
+        const _dlArl = document.getElementById('deezer-download-arl');
+        if (_connArl) _connArl.value = settings.deezer_download?.arl || '';
+        if (_connArl && _dlArl) {
+            _connArl.addEventListener('input', () => { _dlArl.value = _connArl.value; });
+            _dlArl.addEventListener('input', () => { _connArl.value = _dlArl.value; });
+        }
+
+        // Populate YouTube settings
+        document.getElementById('youtube-cookies-browser').value = settings.youtube?.cookies_browser || '';
+        document.getElementById('youtube-download-delay').value = settings.youtube?.download_delay ?? 3;
+        // Show the cookies.txt paste box only in "custom" mode. We never echo the
+        // stored cookie back to the UI (it's secret + lives in a file, not config);
+        // if one is already saved, say so via placeholder so a blank save won't wipe it.
+        const _ytCookieSel = document.getElementById('youtube-cookies-browser');
+        const _ytPasteBox = document.getElementById('youtube-cookies-paste');
+        const _ytPasteGroup = document.getElementById('youtube-cookies-paste-group');
+        if (_ytCookieSel && _ytPasteGroup) {
+            const _toggleYtPaste = () => {
+                _ytPasteGroup.style.display = _ytCookieSel.value === 'custom' ? '' : 'none';
+            };
+            if (_ytPasteBox && settings.youtube?.cookies_file) {
+                _ytPasteBox.placeholder = 'A cookies.txt is saved. Paste again to replace it, or leave blank to keep it.';
+            }
+            _toggleYtPaste();
+            if (!_ytCookieSel.dataset.pasteToggleBound) {
+                _ytCookieSel.addEventListener('change', _toggleYtPaste);
+                _ytCookieSel.dataset.pasteToggleBound = '1';
+            }
+        }
+
+        // Update UI based on download source mode
+        updateDownloadSourceUI();
+
+        // Populate Database settings
+        document.getElementById('max-workers').value = settings.database?.max_workers || '5';
+
+        // Populate Post-Processing settings
+        document.getElementById('metadata-enabled').checked = settings.metadata_enhancement?.enabled !== false;
+        document.getElementById('embed-album-art').checked = settings.metadata_enhancement?.embed_album_art !== false;
+        document.getElementById('cover-art-download').checked = settings.metadata_enhancement?.cover_art_download !== false;
+        document.getElementById('prefer-caa-art').checked = settings.metadata_enhancement?.prefer_caa_art === true;
+        document.getElementById('single-to-album-enabled').checked = settings.metadata_enhancement?.single_to_album === true;
+        document.getElementById('lrclib-enabled').checked = settings.metadata_enhancement?.lrclib_enabled !== false;
+        document.getElementById('replaygain-enabled').checked = settings.post_processing?.replaygain_enabled === true;
+        document.getElementById('audio-completeness-check').checked = settings.post_processing?.audio_completeness_check === true;
+        document.getElementById('duration-tolerance-seconds').value = settings.post_processing?.duration_tolerance_seconds ?? 0;
+        document.getElementById('retry-next-candidate').checked = settings.post_processing?.retry_next_candidate_on_mismatch !== false;
+        document.getElementById('retry-exhaustive').checked = settings.post_processing?.retry_exhaustive === true;
+        document.getElementById('retries-per-query').value = settings.post_processing?.retries_per_query ?? 5;
+        document.getElementById('accept-version-mismatch-fallback').checked = settings.post_processing?.accept_version_mismatch_fallback === true;
+        document.getElementById('version-mismatch-min-count').value = settings.post_processing?.version_mismatch_min_count ?? 2;
+        if (typeof syncRetryConditionalRows === 'function') syncRetryConditionalRows();
+        // Load service master toggles
+        document.getElementById('embed-spotify').checked = settings.spotify?.embed_tags !== false;
+        document.getElementById('embed-itunes').checked = settings.itunes?.embed_tags !== false;
+        document.getElementById('embed-musicbrainz').checked = settings.musicbrainz?.embed_tags !== false;
+        document.getElementById('embed-deezer').checked = settings.deezer?.embed_tags !== false;
+        document.getElementById('embed-audiodb').checked = settings.audiodb?.embed_tags !== false;
+        document.getElementById('embed-tidal').checked = settings.tidal?.embed_tags !== false;
+        document.getElementById('embed-qobuz').checked = settings.qobuz?.embed_tags !== false;
+        document.getElementById('embed-lastfm').checked = settings.lastfm?.embed_tags !== false;
+        document.getElementById('embed-genius').checked = settings.genius?.embed_tags !== false;
+        document.getElementById('embed-hifi').checked = settings.hifi?.embed_tags !== false;
+        // Load per-tag toggles from data-config attributes
+        document.querySelectorAll('[data-config]').forEach(cb => {
+            const path = cb.dataset.config.split('.');
+            let val = settings;
+            for (const key of path) { val = val?.[key]; }
+            cb.checked = val !== false;
+        });
+        // Apply service disabled state to child tags
+        ['spotify', 'itunes', 'musicbrainz', 'deezer', 'audiodb', 'tidal', 'qobuz', 'lastfm', 'genius', 'hifi'].forEach(svc => {
+            const master = document.getElementById('embed-' + svc);
+            if (master) toggleServiceTags(master, svc);
+        });
+        document.getElementById('post-processing-options').style.display = settings.metadata_enhancement?.enabled !== false ? 'block' : 'none';
+
+        // Populate File Organization settings
+        document.getElementById('file-organization-enabled').checked = settings.file_organization?.enabled !== false;
+        document.getElementById('template-album-path').value = settings.file_organization?.templates?.album_path || '$albumartist/$albumartist - $album/$track - $title';
+        // $albumartist honors the Collaborative Album Artist mode; the old
+        // $artist default filed multi-artist singles under "A, B & C". A
+        // stored old-default upgrades server-side too (core/imports/paths.py).
+        {
+            const _sp = settings.file_organization?.templates?.single_path;
+            document.getElementById('template-single-path').value =
+                (!_sp || _sp === '$artist/$artist - $title/$title')
+                    ? '$albumartist/$albumartist - $title/$title' : _sp;
+        }
+        document.getElementById('template-playlist-path').value = settings.file_organization?.templates?.playlist_path || '$playlist/$artist - $title';
+        document.getElementById('template-playlist-item').value = settings.file_organization?.templates?.playlist_item || '';
+        document.getElementById('template-video-path').value = settings.file_organization?.templates?.video_path || '$artist/$title-video';
+        document.getElementById('disc-label').value = settings.file_organization?.disc_label || 'Disc';
+        document.getElementById('collab-artist-mode').value = settings.file_organization?.collab_artist_mode || 'first';
+        document.getElementById('artist-separator').value = settings.metadata_enhancement?.tags?.artist_separator || ', ';
+        document.getElementById('write-multi-artist').checked = settings.metadata_enhancement?.tags?.write_multi_artist || false;
+        document.getElementById('feat-in-title').checked = settings.metadata_enhancement?.tags?.feat_in_title || false;
+        document.getElementById('allow-duplicate-tracks').checked = settings.wishlist?.allow_duplicate_tracks !== false;
+        const _wlTtl = document.getElementById('wishlist-ignore-ttl');
+        if (_wlTtl) _wlTtl.value = settings.wishlist?.ignore_ttl_days ?? 30;
+
+        // Populate Playlist Sync settings
+        document.getElementById('create-backup').checked = settings.playlist_sync?.create_backup !== false;
+        const _syncModeEl = document.getElementById('playlist-sync-mode');
+        if (_syncModeEl) _syncModeEl.value = settings.playlist_sync?.mode || 'replace';
+
+        // Populate Post-Download Conversion settings
+        document.getElementById('downsample-hires').checked = settings.lossy_copy?.downsample_hires === true;
+        document.getElementById('lossy-copy-enabled').checked = settings.lossy_copy?.enabled === true;
+        document.getElementById('lossy-copy-codec').value = settings.lossy_copy?.codec || 'mp3';
+        document.getElementById('lossy-copy-bitrate').value = settings.lossy_copy?.bitrate || '320';
+        updateLossyBitrateOptions();
+        document.getElementById('lossy-copy-delete-original').checked = settings.lossy_copy?.delete_original === true;
+
+        // Album Publishing (#999) — atomic album publish, opt-in, default off.
+        const _atomicPub = document.getElementById('album-atomic-publish');
+        if (_atomicPub) _atomicPub.checked = settings.album_downloads?.atomic_publish === true;
+
+        // Populate Listening Stats settings
+        document.getElementById('listening-stats-enabled').checked = settings.listening_stats?.enabled === true;
+        document.getElementById('listening-stats-interval').value = settings.listening_stats?.poll_interval || 30;
+        const _advEl = document.getElementById('discover-adventurousness');
+        if (_advEl) {
+            const _adv = settings.discover?.adventurousness;
+            _advEl.value = (typeof _adv === 'number') ? _adv : 0.3;
+            const _advVal = document.getElementById('discover-adventurousness-val');
+            if (_advVal) _advVal.textContent = parseFloat(_advEl.value).toFixed(2);
+        }
+        document.getElementById('lossy-copy-options').style.display =
+            settings.lossy_copy?.enabled ? 'block' : 'none';
+
+        // Populate Music Library Paths
+        const _musicPaths = settings.library?.music_paths || [];
+        renderMusicPaths(_musicPaths);
+
+        // Populate Content Filter settings
+        document.getElementById('allow-explicit').checked = settings.content_filter?.allow_explicit !== false;
+        document.getElementById('prefer-explicit').checked = settings.content_filter?.prefer_explicit === true;
+        syncPreferExplicitState();
+
+        // Populate Genre Whitelist
+        const gwEnabled = settings.genre_whitelist?.enabled === true;
+        document.getElementById('genre-whitelist-enabled').checked = gwEnabled;
+        const gwContainer = document.getElementById('genre-whitelist-container');
+        if (gwContainer) gwContainer.style.display = gwEnabled ? '' : 'none';
+        if (gwEnabled) {
+            _genreWhitelistRender(settings.genre_whitelist?.genres || []);
+        }
+
+        // Populate Import settings
+        document.getElementById('import-replace-lower-quality').checked = settings.import?.replace_lower_quality === true;
+        // Default ON (legacy Artist/Album staging behavior) when the key is absent.
+        const _folderArtistEl = document.getElementById('import-folder-artist-override');
+        if (_folderArtistEl) _folderArtistEl.checked = settings.import?.folder_artist_override !== false;
+        const _transferPermEl = document.getElementById('import-transfer-permanent');
+        if (_transferPermEl) _transferPermEl.checked = settings.import?.transfer_is_permanent === true;
+
+        // Populate M3U Export settings
+        document.getElementById('m3u-export-enabled').checked = settings.m3u_export?.enabled === true;
+        document.getElementById('m3u-entry-base-path').value = settings.m3u_export?.entry_base_path || '';
+        const _libM3uEn = document.getElementById('library-m3u-enabled');
+        if (_libM3uEn) _libM3uEn.checked = settings.m3u_export?.library_enabled === true;
+        const _libM3uPath = document.getElementById('library-m3u-path');
+        if (_libM3uPath) _libM3uPath.value = settings.m3u_export?.library_path || '';
+
+        // Populate UI Appearance settings
+        const accentPreset = settings.ui_appearance?.accent_preset || '#1db954';
+        const accentCustom = settings.ui_appearance?.accent_color || '#1db954';
+        const presetSelect = document.getElementById('accent-preset');
+        const customPicker = document.getElementById('accent-custom-color');
+        const customGroup = document.getElementById('custom-color-group');
+        if (presetSelect) {
+            // Check if the saved preset matches a dropdown option
+            const presetOptions = Array.from(presetSelect.options).map(o => o.value);
+            if (presetOptions.includes(accentPreset)) {
+                presetSelect.value = accentPreset;
+            } else {
+                presetSelect.value = 'custom';
+            }
+            if (presetSelect.value === 'custom') {
+                if (customGroup) customGroup.style.display = '';
+                if (customPicker) customPicker.value = accentCustom;
+                applyAccentColor(accentCustom);
+            } else {
+                if (customGroup) customGroup.style.display = 'none';
+                applyAccentColor(accentPreset);
+            }
+        }
+
+        // Sidebar visualizer type
+        const vizType = settings.ui_appearance?.sidebar_visualizer || 'bars';
+        const vizSelect = document.getElementById('sidebar-visualizer-type');
+        if (vizSelect) vizSelect.value = vizType;
+        sidebarVisualizerType = vizType;
+
+        // Background particles toggle
+        const particlesEnabled = settings.ui_appearance?.particles_enabled === true; // default OFF (GPU cost)
+        const particlesCheckbox = document.getElementById('particles-enabled');
+        if (particlesCheckbox) particlesCheckbox.checked = particlesEnabled;
+        applyParticlesSetting(particlesEnabled);
+
+        // Worker orbs toggle. When the user hasn't saved a preference, reflect the
+        // server-decided browser-aware default (window._workerOrbsEnabled — OFF on
+        // Firefox for perf) so saving settings doesn't silently flip a first-time
+        // Firefox user's orbs back on. An explicit saved config value always wins.
+        const _orbsCfg = settings.ui_appearance?.worker_orbs_enabled;
+        const workerOrbsEnabled = (_orbsCfg === undefined || _orbsCfg === null)
+            ? (window._workerOrbsEnabled !== false)
+            : (_orbsCfg !== false);
+        const workerOrbsCheckbox = document.getElementById('worker-orbs-enabled');
+        if (workerOrbsCheckbox) workerOrbsCheckbox.checked = workerOrbsEnabled;
+        applyWorkerOrbsSetting(workerOrbsEnabled);
+
+        // Reduce effects toggle. This flag is device-scoped: localStorage (set by the
+        // live toggle and by weak-hardware auto-detect) is the source of truth for THIS
+        // machine; the server value is only the cross-device default used when this
+        // device has never chosen. Prefer localStorage when present so opening Settings
+        // doesn't clobber an auto-enabled (or manually-set) per-device choice.
+        const serverReduce = settings.ui_appearance?.reduce_effects === true; // default false
+        const localReduce = localStorage.getItem('soulsync-reduce-effects'); // '1' | '0' | null
+        const reduceEffects = localReduce !== null ? (localReduce === '1') : serverReduce;
+        const reduceCheckbox = document.getElementById('reduce-effects-enabled');
+        if (reduceCheckbox) reduceCheckbox.checked = reduceEffects;
+        applyReduceEffects(reduceEffects);
+
+        // Max Performance — same device-scoped resolution as reduce-effects:
+        // localStorage is the per-device truth, server value the cross-device default.
+        // Applied last so it can lock/override the dependent toggles above when on.
+        const serverMaxPerf = settings.ui_appearance?.max_performance === true; // default false
+        const localMaxPerf = localStorage.getItem('soulsync-max-performance'); // '1' | '0' | null
+        const maxPerf = localMaxPerf !== null ? (localMaxPerf === '1') : serverMaxPerf;
+        const maxPerfCheckbox = document.getElementById('max-performance-enabled');
+        if (maxPerfCheckbox) maxPerfCheckbox.checked = maxPerf;
+        applyMaxPerformance(maxPerf);
+
+        // Populate Logging information
+        const logLevelSelect = document.getElementById('log-level-select');
+        if (logLevelSelect) logLevelSelect.value = settings.logging?.level || 'INFO';
+        document.getElementById('log-path-display').textContent = settings.logging?.path || 'logs/app.log';
+
+        // Load Discovery Lookback Period setting
+        try {
+            const lookbackResponse = await fetch('/api/discovery/lookback-period');
+            const lookbackData = await lookbackResponse.json();
+            if (lookbackData.period) {
+                document.getElementById('discovery-lookback-period').value = lookbackData.period;
+            }
+        } catch (error) {
+            console.error('Error loading discovery lookback period:', error);
+        }
+
+        // Load Hemisphere setting
+        try {
+            const hemiResponse = await fetch('/api/discovery/hemisphere');
+            const hemiData = await hemiResponse.json();
+            if (hemiData.hemisphere) {
+                document.getElementById('discovery-hemisphere').value = hemiData.hemisphere;
+            }
+        } catch (error) {
+            console.error('Error loading hemisphere setting:', error);
+        }
+
+        // Load current log level
+        try {
+            const logLevelResponse = await fetch('/api/settings/log-level');
+            const logLevelData = await logLevelResponse.json();
+            if (logLevelData.success && logLevelData.level) {
+                document.getElementById('log-level-select').value = logLevelData.level;
+            }
+        } catch (error) {
+            console.error('Error loading log level:', error);
+        }
+
+        // Load security settings
+        try {
+            const requirePin = settings.security?.require_pin_on_launch || false;
+            document.getElementById('security-require-pin').checked = requirePin;
+
+            // CORS origins — stored verbatim as the user typed (string).
+            const corsOrigins = settings.security?.cors_origins || '';
+            const corsField = document.getElementById('security-cors-origins');
+            if (corsField) corsField.value = corsOrigins;
+
+            // Reverse-proxy mode + auth-proxy header (default off / empty).
+            const trustProxy = document.getElementById('security-trust-proxy');
+            if (trustProxy) trustProxy.checked = settings.security?.trust_reverse_proxy || false;
+            const authHeader = document.getElementById('security-auth-proxy-header');
+            if (authHeader) authHeader.value = settings.security?.auth_proxy_header || '';
+            const reqLogin = document.getElementById('security-require-login');
+            if (reqLogin) reqLogin.checked = settings.security?.require_login || false;
+
+            // Check if admin has a PIN set
+            const profilesRes = await fetch('/api/profiles');
+            const profilesData = await profilesRes.json();
+            const adminProfile = (profilesData.profiles || []).find(p => p.is_admin);
+            const adminHasPin = adminProfile?.has_pin || false;
+
+            // Show/hide PIN setup vs change sections
+            document.getElementById('security-pin-setup').style.display = adminHasPin ? 'none' : 'block';
+            document.getElementById('security-change-pin-section').style.display = adminHasPin ? 'block' : 'none';
+
+            // If no PIN, disable the toggle
+            if (!adminHasPin) {
+                document.getElementById('security-require-pin').checked = false;
+                document.getElementById('security-require-pin').disabled = true;
+            }
+
+            // Login: the "Require login" toggle is gated on an admin password —
+            // visually locked until Step 1 is done (anti-lockout, made obvious).
+            updateRequireLoginGate(adminProfile?.has_password || false);
+            // Show already-saved password/recovery state (vs looking unset).
+            applyLoginSavedState(adminProfile);
+        } catch (error) {
+            console.error('Error loading security settings:', error);
+        }
+
+        // Check dev mode status
+        try {
+            const devResponse = await fetch('/api/dev-mode');
+            const devData = await devResponse.json();
+            if (devData.enabled) {
+                document.getElementById('dev-mode-status').textContent = 'Active';
+                document.getElementById('dev-mode-status').style.color = 'rgb(var(--accent-light-rgb))';
+                document.getElementById('hydrabase-nav').style.display = '';
+                document.getElementById('hydrabase-button-container').style.display = '';
+            }
+        } catch (error) {
+            console.error('Error checking dev mode:', error);
+        }
+
+        // Secret fields now arrive masked as REDACTED_SECRET_SENTINEL (#832
+        // follow-up) — wire them so editing replaces the mask instead of typing
+        // on top of it, and an untouched field re-masks on blur (round-trips the
+        // sentinel, which the server treats as "keep existing").
+        _wireRedactedSecrets();
+
+    } catch (error) {
+        console.error('Error loading settings:', error);
+        // #879: any load failure → block saves so a blank/partial form can't be
+        // written over the real config. Cleared on the next successful load.
+        window._settingsLoadFailed = true;
+        showToast('Failed to load settings — reload the page before saving (your saved config is untouched)', 'error');
+    }
+}
+
+// Mirrors ConfigManager.REDACTED_SENTINEL — secrets are never sent to the
+// browser; configured ones come back as this placeholder (rendered as dots in
+// the password inputs).
+const REDACTED_SECRET_SENTINEL = '__redacted_unchanged__';
+
+function _wireRedactedSecrets() {
+    document.querySelectorAll('input[type="password"]').forEach(el => {
+        if (el.dataset.redactWired === '1') return;
+        el.dataset.redactWired = '1';
+        // Clear the mask on focus so the user types a fresh value, not on top
+        // of the sentinel.
+        el.addEventListener('focus', () => {
+            if (el.value === REDACTED_SECRET_SENTINEL) {
+                el.value = '';
+                el.dataset.wasRedacted = '1';
+            }
+        });
+        // Untouched (focused but not edited, left empty) → restore the mask so
+        // save round-trips the sentinel and the real secret is kept.
+        el.addEventListener('blur', () => {
+            if (el.dataset.wasRedacted === '1' && el.value === '') {
+                el.value = REDACTED_SECRET_SENTINEL;
+                el.dataset.wasRedacted = '';
+            }
+        });
+        // Real typing means a genuine change/clear — drop the redacted mark so
+        // blur won't re-mask (an emptied field then saves as a real clear).
+        el.addEventListener('input', () => { el.dataset.wasRedacted = ''; });
+    });
+}
+
+async function changeLogLevel() {
+    const selector = document.getElementById('log-level-select');
+    const level = selector.value;
+
+    try {
+        const response = await fetch('/api/settings/log-level', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ level: level })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            showToast(`Log level changed to ${level}`, 'success');
+            console.log(`Log level changed to: ${level}`);
+        } else {
+            showToast(`Failed to change log level: ${data.error}`, 'error');
+        }
+    } catch (error) {
+        console.error('Error changing log level:', error);
+        showToast('Failed to change log level', 'error');
+    }
+}
+
+function updateMediaServerFields() {
+    const serverType = document.getElementById('media-server-type').value;
+    const urlInput = document.getElementById('media-server-url');
+    const tokenInput = document.getElementById('media-server-token');
+
+    if (serverType === 'plex') {
+        urlInput.placeholder = 'http://localhost:32400';
+        tokenInput.placeholder = 'Plex Token';
+    } else {
+        urlInput.placeholder = 'http://localhost:8096';
+        tokenInput.placeholder = 'Jellyfin API Key';
+    }
+}
+
+let _plexPinAuthRequestId = null;
+let _plexPinAuthPollInterval = null;
+
+function showPlexConfiguration(disableFields = false, isManualConfig = false) {
+    stopPlexPinAuthPolling();
+    const plexConfig = document.getElementById('plex-configuration');
+    const plexSetup = document.getElementById('plex-setup');
+    const plexPinAuthFlow = document.getElementById('plex-pin-auth-flow');
+    const plexUrl = document.getElementById('plex-url');
+    const plexToken = document.getElementById('plex-token');
+    const plexLibraryContainer = document.getElementById('plex-library-selector-container');
+
+    if (plexConfig) plexConfig.style.display = '';
+    if (plexSetup) plexSetup.style.display = 'none';
+    if (plexPinAuthFlow) plexPinAuthFlow.style.display = 'none';
+    if (plexUrl) plexUrl.disabled = disableFields;
+    if (plexToken) plexToken.disabled = disableFields;
+    if (plexLibraryContainer && isManualConfig) {
+        plexLibraryContainer.style.display = 'none';
+    }
+    setPlexConfigActionButton(isManualConfig);
+    updatePlexConfigurationButtons();
+}
+
+function showPlexSetup() {
+    const plexConfig = document.getElementById('plex-configuration');
+    const plexSetup = document.getElementById('plex-setup');
+    const plexPinAuthFlow = document.getElementById('plex-pin-auth-flow');
+    const plexLibraryContainer = document.getElementById('plex-library-selector-container');
+
+    if (plexConfig) plexConfig.style.display = 'none';
+    if (plexSetup) plexSetup.style.display = '';
+    if (plexPinAuthFlow) plexPinAuthFlow.style.display = 'none';
+    if (plexLibraryContainer) plexLibraryContainer.style.display = 'none';
+    setPlexConfigActionButton(false);
+}
+
+function setPlexConfigActionButton(isManualConfig) {
+    const actionButton = document.getElementById('plex-config-action-button');
+    if (!actionButton) return;
+
+    if (isManualConfig) {
+        actionButton.textContent = 'Cancel';
+        actionButton.onclick = showPlexSetup;
+        actionButton.title = 'Cancel manual Plex configuration';
+    } else {
+        actionButton.textContent = 'Clear Configuration';
+        actionButton.onclick = clearPlexConfiguration;
+        actionButton.title = 'Clear saved Plex configuration';
+    }
+}
+
+async function startPlexPinAuth() {
+    const setupButtons = document.getElementById('plex-setup-buttons');
+    const authFlow = document.getElementById('plex-pin-auth-flow');
+    const statusEl = document.getElementById('plex-pin-status');
+    if (setupButtons) setupButtons.style.display = 'none';
+    if (authFlow) authFlow.style.display = '';
+    if (statusEl) statusEl.textContent = 'Starting Plex authorization...';
+
+    try {
+        showLoadingOverlay('Starting Plex authorization...');
+        const response = await fetch('/api/plex/pin/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        const result = await response.json();
+        if (!result.success) {
+            throw new Error(result.error || 'Failed to start Plex PIN flow');
+        }
+
+        _plexPinAuthRequestId = result.request_id;
+        const pinCodeEl = document.getElementById('plex-pin-code');
+        if (pinCodeEl) pinCodeEl.textContent = result.code || '';
+        if (statusEl) {
+            statusEl.textContent = result.expires_in
+                ? `Enter this code at plex.tv/link. Code expires in ${result.expires_in} seconds.`
+                : 'Enter this code at plex.tv/link. Waiting for authorization...';
+        }
+
+        startPlexPinAuthPolling();
+    } catch (error) {
+        console.error('Plex PIN auth start failed:', error);
+        showToast(error.message || 'Failed to start Plex authorization', 'error');
+        cancelPlexPinAuth();
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+function startPlexPinAuthPolling() {
+    stopPlexPinAuthPolling();
+    if (!_plexPinAuthRequestId) return;
+    _plexPinAuthPollInterval = setInterval(pollPlexPinAuthStatus, 5000);
+    pollPlexPinAuthStatus();
+}
+
+function stopPlexPinAuthPolling() {
+    if (_plexPinAuthPollInterval) {
+        clearInterval(_plexPinAuthPollInterval);
+        _plexPinAuthPollInterval = null;
+    }
+}
+
+async function pollPlexPinAuthStatus() {
+    if (!_plexPinAuthRequestId) return;
+    try {
+        const response = await fetch(`/api/plex/pin/status?request_id=${encodeURIComponent(_plexPinAuthRequestId)}`);
+        const result = await response.json();
+        const statusEl = document.getElementById('plex-pin-status');
+
+        if (!result.success && result.expired) {
+            if (statusEl) statusEl.textContent = 'PIN code expired. Generate a new code to continue.';
+            stopPlexPinAuthPolling();
+            return;
+        }
+
+        if (result.success) {
+            stopPlexPinAuthPolling();
+            if (statusEl) statusEl.textContent = 'Authorization complete! Saving Plex configuration...';
+            document.getElementById('plex-url').value = result.found_url || '';
+            document.getElementById('plex-token').value = result.token || '';
+            if (typeof saveSettings === 'function') {
+                await saveSettings(true);
+            }
+            showToast('Plex successfully linked', 'success');
+            showPlexConfiguration(true);
+            await testConnection('plex');
+            return;
+        }
+
+        if (result.status) {
+            if (statusEl) statusEl.textContent = result.status;
+            return;
+        }
+
+        if (result.error) {
+            if (statusEl) statusEl.textContent = result.error;
+            return;
+        }
+    } catch (error) {
+        console.error('Error polling Plex PIN status:', error);
+        const statusEl = document.getElementById('plex-pin-status');
+        if (statusEl) statusEl.textContent = 'Unable to contact Plex auth status. Retrying...';
+    }
+}
+
+function cancelPlexPinAuth() {
+    stopPlexPinAuthPolling();
+    _plexPinAuthRequestId = null;
+    const setupButtons = document.getElementById('plex-setup-buttons');
+    const authFlow = document.getElementById('plex-pin-auth-flow');
+    if (setupButtons) setupButtons.style.display = '';
+    if (authFlow) authFlow.style.display = 'none';
+}
+
+function restartPlexPinAuth() {
+    cancelPlexPinAuth();
+    startPlexPinAuth();
+}
+
+async function clearPlexConfiguration() {
+    cancelPlexPinAuth();
+    const plexUrl = document.getElementById('plex-url');
+    const plexToken = document.getElementById('plex-token');
+    const plexConfig = document.getElementById('plex-configuration');
+    const plexSetup = document.getElementById('plex-setup');
+    const plexSetupButtons = document.getElementById('plex-setup-buttons');
+    const plexViewConfigButton = document.getElementById('plex-view-config-button');
+    const plexLinkToPlexButton = document.getElementById('plex-link-to-plex-button');
+    const plexManualConfigButton = document.getElementById('plex-manual-config-button');
+
+    if (plexUrl) plexUrl.value = '';
+    if (plexToken) plexToken.value = '';
+    if (plexConfig) plexConfig.style.display = 'none';
+    if (plexSetup) plexSetup.style.display = '';
+    if (plexSetupButtons) plexSetupButtons.style.display = '';
+    if (plexViewConfigButton) plexViewConfigButton.style.display = 'none';
+    if (plexLinkToPlexButton) plexLinkToPlexButton.style.display = '';
+    if (plexManualConfigButton) plexManualConfigButton.style.display = '';
+
+    const plexLibraryContainer = document.getElementById('plex-library-selector-container');
+    const plexLibrarySelect = document.getElementById('plex-music-library');
+    if (plexLibrarySelect) {
+        plexLibrarySelect.innerHTML = '<option value="">Select a music library</option>';
+    }
+    if (plexLibraryContainer) {
+        plexLibraryContainer.style.display = 'none';
+    }
+
+    updatePlexConfigurationButtons();
+
+    try {
+        await fetch('/api/plex/clear-library', { method: 'POST' });
+    } catch (e) {
+        console.warn('Failed to clear Plex library preference:', e);
+    }
+
+    if (typeof saveSettings === 'function') {
+        saveSettings(true);
+    }
+    if (typeof showToast === 'function') {
+        showToast('Plex configuration cleared', 'success');
+    }
+}
+
+function toggleServer(serverType) {
+    // Update toggle buttons
+    document.getElementById('plex-toggle').classList.remove('active');
+    document.getElementById('jellyfin-toggle').classList.remove('active');
+    document.getElementById('navidrome-toggle').classList.remove('active');
+    document.getElementById('soulsync-toggle')?.classList.remove('active');
+    document.getElementById(`${serverType}-toggle`)?.classList.add('active');
+
+    // Show/hide server containers
+    document.getElementById('plex-container').classList.toggle('hidden', serverType !== 'plex');
+    document.getElementById('jellyfin-container').classList.toggle('hidden', serverType !== 'jellyfin');
+    document.getElementById('navidrome-container').classList.toggle('hidden', serverType !== 'navidrome');
+    document.getElementById('soulsync-container')?.classList.toggle('hidden', serverType !== 'soulsync');
+
+    // Show Plex setup when Plex is selected; otherwise hide both Plex panels
+    const plexConfig = document.getElementById('plex-configuration');
+    const plexSetup = document.getElementById('plex-setup');
+    if (plexConfig) plexConfig.style.display = serverType === 'plex' ? 'none' : '';
+    if (plexSetup) plexSetup.style.display = serverType === 'plex' ? '' : 'none';
+
+    // Load Plex music libraries when switching to Plex
+    if (serverType === 'plex') {
+        loadPlexMusicLibraries();
+    }
+
+    // Load Jellyfin users and music libraries when switching to Jellyfin
+    if (serverType === 'jellyfin') {
+        loadJellyfinUsers().then(() => loadJellyfinMusicLibraries());
+    }
+
+    // Load Navidrome music folders when switching to Navidrome
+    if (serverType === 'navidrome') {
+        loadNavidromeMusicFolders();
+    }
+
+    // Auto-save after server toggle change
+    debouncedAutoSaveSettings();
+}
+
+function updateDownloadSourceUI() {
+    const mode = document.getElementById('download-source-mode').value;
+    const hybridContainer = document.getElementById('hybrid-settings-container');
+    const soulseekContainer = document.getElementById('soulseek-settings-container');
+    const tidalContainer = document.getElementById('tidal-download-settings-container');
+    const qobuzContainer = document.getElementById('qobuz-settings-container');
+    const youtubeContainer = document.getElementById('youtube-settings-container');
+    const hifiContainer = document.getElementById('hifi-download-settings-container');
+    const deezerDlContainer = document.getElementById('deezer-download-settings-container');
+    const amazonContainer = document.getElementById('amazon-download-settings-container');
+    const lidarrContainer = document.getElementById('lidarr-download-settings-container');
+    const soundcloudContainer = document.getElementById('soundcloud-download-settings-container');
+
+    hybridContainer.style.display = mode === 'hybrid' ? 'block' : 'none';
+
+    // Determine which sources are active
+    let activeSources = new Set();
+    if (mode === 'hybrid') {
+        const order = getHybridOrder();
+        for (const src of order) activeSources.add(src);
+        // Fallback: if no sources enabled, at least show soulseek
+        if (activeSources.size === 0) activeSources.add('soulseek');
+    } else {
+        activeSources.add(mode);
+    }
+
+    // In single-source mode the one config block is shown directly. In hybrid
+    // mode there can be many active sources, so we only reveal the one the user
+    // clicked open in the priority list (accordion-style) — no endless stack.
+    const isHybrid = mode === 'hybrid';
+    const showCfg = (src) => activeSources.has(src) && (!isHybrid || _expandedHybridSource === src);
+
+    soulseekContainer.style.display = showCfg('soulseek') ? 'block' : 'none';
+    tidalContainer.style.display = showCfg('tidal') ? 'block' : 'none';
+    qobuzContainer.style.display = showCfg('qobuz') ? 'block' : 'none';
+    youtubeContainer.style.display = showCfg('youtube') ? 'block' : 'none';
+    hifiContainer.style.display = showCfg('hifi') ? 'block' : 'none';
+    if (deezerDlContainer) deezerDlContainer.style.display = showCfg('deezer_dl') ? 'block' : 'none';
+    if (amazonContainer) amazonContainer.style.display = showCfg('amazon') ? 'block' : 'none';
+    if (lidarrContainer) lidarrContainer.style.display = showCfg('lidarr') ? 'block' : 'none';
+    if (soundcloudContainer) soundcloudContainer.style.display = showCfg('soundcloud') ? 'block' : 'none';
+    const prowlarrRedirect = document.getElementById('prowlarr-source-redirect');
+    if (prowlarrRedirect) {
+        const showProwlarr = showCfg('torrent') || showCfg('usenet');
+        prowlarrRedirect.style.display = showProwlarr ? 'block' : 'none';
+    }
+
+    // Indexers & Downloaders: torrent/usenet setup (Prowlarr + the Torrent and
+    // Usenet client tiles) is shared config — keep it always reachable on the
+    // Downloads tab for BOTH the music and video sides, like the Advanced /
+    // Appearance tabs. (It used to be gated on an active torrent/usenet source,
+    // which hid it from anyone whose source was something else — and from the video
+    // side entirely, whose source lives on a separate dropdown.) Only tab-gated so
+    // it never leaks onto another tab.
+    const onDownloadsTab = document.querySelector('.stg-tab.active')?.dataset.tab === 'downloads';
+    const indSection = document.getElementById('indexers-downloaders-section');
+    if (indSection) indSection.style.display = onDownloadsTab ? '' : 'none';
+    const torrentTile = document.getElementById('torrent-tile');
+    if (torrentTile) torrentTile.style.display = '';
+    const usenetTile = document.getElementById('usenet-tile');
+    if (usenetTile) usenetTile.style.display = '';
+
+    // Quality profile is now a GLOBAL system — the same ranked-target list
+    // drives every source (Soulseek, Tidal, Qobuz, HiFi, Deezer, …), so it is
+    // no longer Soulseek-gated. Show the whole collapsible tile whenever the
+    // downloads tab is active (gated as a unit so there's never an empty
+    // expandable shell).
+    const qualityProfileTile = document.getElementById('quality-profile-tile');
+    if (qualityProfileTile) {
+        const activeTab = document.querySelector('.stg-tab.active');
+        const onQualityTab = activeTab && activeTab.dataset.tab === 'quality';
+        qualityProfileTile.style.display = onQualityTab ? '' : 'none';
+    }
+
+    // Only auto-probe a source's live status when its config panel is visible
+    // (always in single-source mode; only the opened one in hybrid mode).
+    if (showCfg('tidal')) {
+        checkTidalDownloadAuthStatus();
+    }
+    if (showCfg('qobuz')) {
+        checkQobuzAuthStatus();
+    }
+    if (showCfg('hifi')) {
+        testHiFiConnection();
+    }
+    if (showCfg('amazon')) {
+        testAmazonConnection();
+    }
+    if (showCfg('soundcloud')) {
+        testSoundcloudConnection();
+    }
+}
+
+function updateHybridSecondaryOptions() {
+    const primary = document.getElementById('hybrid-primary-source').value;
+    const secondary = document.getElementById('hybrid-secondary-source');
+    const currentValue = secondary.value;
+    const allSources = [
+        { value: 'soulseek', label: 'Soulseek' },
+        { value: 'youtube', label: 'YouTube' },
+        { value: 'tidal', label: 'Tidal' },
+        { value: 'qobuz', label: 'Qobuz' },
+        { value: 'hifi', label: 'HiFi' },
+        { value: 'deezer_dl', label: 'Deezer' },
+        { value: 'amazon', label: 'Amazon Music' },
+        { value: 'lidarr', label: 'Lidarr' },
+        { value: 'soundcloud', label: 'SoundCloud' },
+    ];
+
+    secondary.innerHTML = '';
+    for (const source of allSources) {
+        if (source.value === primary) continue;
+        const opt = document.createElement('option');
+        opt.value = source.value;
+        opt.textContent = source.label;
+        secondary.appendChild(opt);
+    }
+
+    // Restore previous selection if still valid, otherwise pick first available
+    if (currentValue !== primary) {
+        secondary.value = currentValue;
+    }
+
+    // Refresh source-specific settings visibility based on new primary/secondary
+    updateDownloadSourceUI();
+}
+
+// ===============================
+// QUALITY PROFILE FUNCTIONS
+// ===============================
+
+let currentQualityProfile = null;
+let qualityProfileAutoSaveTimer = null;
+
+// Which profile the tiles currently show. null = "the live default", the
+// only state that existed before profiles were previewable — autosave keeps
+// writing straight into the active default/global config exactly as always.
+// Set to a specific id by previewQualityProfile() when the user clicks a
+// DIFFERENT (non-default) profile's row to look at/edit it; in that state
+// autosave must NOT touch the live default — see debouncedSaveQualityProfile.
+let _qpEditingProfileId = null;
+
+function _qpDefaultProfileId() {
+    const def = _qpProfileRows.find(p => p.is_default);
+    return def ? def.id : null;
+}
+
+// Save just the quality profile (not the whole settings page). Used for quality
+// target edits so reordering a target doesn't re-init every backend client.
+function debouncedSaveQualityProfile() {
+    if (window._suppressSettingsAutoSave) return;
+    if (window._settingsLoadFailed) return;
+    // Previewing a specific NON-default profile: the legacy save endpoint
+    // below always writes the LIVE default row + pushes into global config —
+    // autosaving here would silently overwrite the active profile (and
+    // anything downloading right now under it) while the user is just
+    // looking at/tweaking a different one. Edits only persist once the user
+    // explicitly clicks that profile row's Update (✎) button.
+    if (_qpEditingProfileId !== null && _qpEditingProfileId !== _qpDefaultProfileId()) {
+        qpShowEditingBanner();
+        return;
+    }
+    if (qualityProfileAutoSaveTimer) clearTimeout(qualityProfileAutoSaveTimer);
+    qualityProfileAutoSaveTimer = setTimeout(() => saveQualityProfile(), 800);
+}
+
+async function loadQualityProfile() {
+    try {
+        const response = await fetch('/api/quality-profile');
+        const data = await response.json();
+
+        if (data.success) {
+            currentQualityProfile = data.profile;
+            populateQualityProfileUI(currentQualityProfile);
+        }
+    } catch (error) {
+        console.error('Error loading quality profile:', error);
+    }
+    await loadCustomQualityProfiles();
+}
+
+// v3: the working copy of the ordered target list. Mirrors the DOM rows
+// and is the single source of truth that collectQualityProfileFromUI reads.
+let currentRankedTargets = [];
+
+function rtLabel(t) {
+    const fmt = (t.format || 'any').toUpperCase();
+    if (RT_LOSSLESS_FORMATS.includes(t.format)) {
+        const bd = t.bit_depth ? `${t.bit_depth}-bit` : '';
+        const sr = t.min_sample_rate ? `≥${t.min_sample_rate / 1000}kHz` : '';
+        const detail = [bd, sr].filter(Boolean).join('/');
+        return detail ? `${fmt} ${detail}` : fmt;
+    }
+    return t.min_bitrate ? `${fmt} ≥${t.min_bitrate}kbps` : fmt;
+}
+
+function populateQualityProfileUI(profile) {
+    // Update preset buttons
+    document.querySelectorAll('.preset-button').forEach(btn => btn.classList.remove('active'));
+    const activePresetBtn = document.querySelector(`.preset-button[onclick*="${profile.preset}"]`);
+    if (activePresetBtn) activePresetBtn.classList.add('active');
+
+    // The API migrates v2 → v3, so ranked_targets is always present.
+    currentRankedTargets = Array.isArray(profile.ranked_targets)
+        ? profile.ranked_targets.map(t => ({ ...t }))
+        : [];
+    renderRankedTargets();
+
+    const fallbackCheckbox = document.getElementById('quality-fallback-enabled');
+    if (fallbackCheckbox) fallbackCheckbox.checked = profile.fallback_enabled !== false;
+
+    const searchModeSelect = document.getElementById('quality-search-mode');
+    if (searchModeSelect) searchModeSelect.value = profile.search_mode === 'best_quality' ? 'best_quality' : 'priority';
+
+    const rankCandidatesCheckbox = document.getElementById('quality-rank-candidates');
+    if (rankCandidatesCheckbox) rankCandidatesCheckbox.checked = profile.rank_candidates_by_quality === true;
+
+    const upgradePolicySelect = document.getElementById('quality-upgrade-policy');
+    if (upgradePolicySelect) {
+        upgradePolicySelect.value = ['until_cutoff', 'until_top'].includes(profile.upgrade_policy)
+            ? 'until_cutoff'
+            : 'acceptable';
+    }
+    renderUpgradeCutoffOptions(profile.upgrade_cutoff_index);
+
+    onSearchModeChange();
+    onUpgradePolicyChange();
+}
+
+// Hide the "rank-based download order" toggle when Best quality is active —
+// that mode always ranks by quality, so the toggle would be meaningless there.
+function onSearchModeChange() {
+    const mode = document.getElementById('quality-search-mode')?.value;
+    const group = document.getElementById('quality-rank-candidates-group');
+    if (group) group.style.display = mode === 'best_quality' ? 'none' : '';
+}
+
+function renderUpgradeCutoffOptions(selectedIndex = null) {
+    const select = document.getElementById('quality-upgrade-cutoff');
+    if (!select) return;
+    const current = selectedIndex ?? parseInt(select.value || '0', 10);
+    const maxIdx = Math.max(0, currentRankedTargets.length - 1);
+    const clamped = Number.isFinite(current) ? Math.min(Math.max(current, 0), maxIdx) : 0;
+    if (!currentRankedTargets.length) {
+        select.innerHTML = '<option value="0">Top ranked target</option>';
+        select.value = '0';
+        return;
+    }
+    select.innerHTML = currentRankedTargets.map((target, index) => (
+        `<option value="${index}">${index + 1}. ${escapeHtml(rtLabel(target))}</option>`
+    )).join('');
+    select.value = String(clamped);
+}
+
+function onUpgradePolicyChange() {
+    const policy = document.getElementById('quality-upgrade-policy')?.value || 'acceptable';
+    const cutoffGroup = document.getElementById('quality-upgrade-cutoff-group');
+    if (cutoffGroup) cutoffGroup.style.display = policy === 'until_cutoff' ? '' : 'none';
+    renderUpgradeCutoffOptions();
+}
+
+// Toggle the collapsible help text below a setting's ⓘ icon. Walks forward from
+// the icon's row to the next .setting-help-body sibling, so it works whether the
+// body is the immediate next element or sits after a control (e.g. a <select>),
+// and regardless of any wrapping container.
+function toggleSettingHelp(iconEl) {
+    // Locate the help body to toggle. Search order:
+    //  1) the next .setting-help-body sibling after the icon's row (icon + body
+    //     both inside the same .form-group / .setting-row),
+    //  2) the element right after the enclosing .form-group (help wall that sits
+    //     as a sibling just below the group — the common always-visible case).
+    const row = iconEl.closest('.setting-row') || iconEl;
+    let el = row.nextElementSibling;
+    while (el && !el.classList.contains('setting-help-body')) {
+        el = el.nextElementSibling;
+    }
+    if (!el) {
+        const fg = iconEl.closest('.form-group');
+        let sib = fg ? fg.nextElementSibling : null;
+        // Only accept an immediately-following help body — never reach across
+        // into the next setting/group.
+        if (sib && sib.classList.contains('setting-help-body')) el = sib;
+    }
+    if (el) {
+        el.hidden = !el.hidden;
+        // Reflect open state on the icon itself (filled badge) so it's clear
+        // which help panel is currently revealed.
+        const icon = iconEl.classList.contains('info-icon') ? iconEl : row.querySelector('.info-icon');
+        if (icon) icon.classList.toggle('open', !el.hidden);
+    }
+}
+
+function renderRankedTargets() {
+    const list = document.getElementById('ranked-targets-list');
+    if (!list) return;
+    list.innerHTML = '';
+
+    if (currentRankedTargets.length === 0) {
+        list.innerHTML = '<div class="ranked-targets-empty">No targets yet — add one below. '
+            + 'With fallback off this would reject every download.</div>';
+        renderUpgradeCutoffOptions();
+        return;
+    }
+
+    currentRankedTargets.forEach((t, i) => {
+        const row = document.createElement('div');
+        row.className = 'ranked-target-row';
+        row.draggable = true;
+        row.dataset.index = String(i);
+        row.innerHTML = `
+            <span class="rt-handle" title="Drag to reorder">⠿</span>
+            <span class="rt-rank">${i + 1}</span>
+            <span class="rt-label">${rtLabel(t)}</span>
+            <span class="rt-spacer"></span>
+            <button type="button" class="rt-move" title="Move up" onclick="moveRankedTarget(${i}, -1)">▲</button>
+            <button type="button" class="rt-move" title="Move down" onclick="moveRankedTarget(${i}, 1)">▼</button>
+            <button type="button" class="rt-del" title="Remove" onclick="deleteRankedTarget(${i})">🗑</button>
+        `;
+        row.addEventListener('dragstart', e => {
+            e.dataTransfer.setData('text/plain', String(i));
+            row.classList.add('rt-dragging');
+        });
+        row.addEventListener('dragend', () => row.classList.remove('rt-dragging'));
+        row.addEventListener('dragover', e => { e.preventDefault(); row.classList.add('rt-dragover'); });
+        row.addEventListener('dragleave', () => row.classList.remove('rt-dragover'));
+        row.addEventListener('drop', e => {
+            e.preventDefault();
+            row.classList.remove('rt-dragover');
+            const from = parseInt(e.dataTransfer.getData('text/plain'), 10);
+            if (!Number.isNaN(from) && from !== i) reorderRankedTarget(from, i);
+        });
+        list.appendChild(row);
+    });
+    renderUpgradeCutoffOptions();
+}
+
+function reorderRankedTarget(from, to) {
+    const [moved] = currentRankedTargets.splice(from, 1);
+    currentRankedTargets.splice(to, 0, moved);
+    renderRankedTargets();
+    debouncedSaveQualityProfile();
+}
+
+function moveRankedTarget(i, dir) {
+    const j = i + dir;
+    if (j < 0 || j >= currentRankedTargets.length) return;
+    [currentRankedTargets[i], currentRankedTargets[j]] = [currentRankedTargets[j], currentRankedTargets[i]];
+    renderRankedTargets();
+    debouncedSaveQualityProfile();
+}
+
+function deleteRankedTarget(i) {
+    currentRankedTargets.splice(i, 1);
+    renderRankedTargets();
+    debouncedSaveQualityProfile();
+}
+
+// Lossless formats take bit-depth + sample-rate constraints; lossy take a
+// minimum bitrate. Single source of truth for the add-target field toggle.
+const RT_LOSSLESS_FORMATS = ['flac', 'alac', 'wav', 'dsf'];
+const RT_LOSSY_FORMATS = ['mp3', 'aac', 'ogg', 'opus', 'wma'];
+// "group:" selections are a UI convenience: picking one + constraints expands
+// into individual per-format targets at that slot (the backend still works
+// purely on concrete per-format targets). The user reorders/prunes after.
+const RT_GROUPS = { 'group:lossless': RT_LOSSLESS_FORMATS, 'group:lossy': RT_LOSSY_FORMATS };
+
+function rtSelectionIsLossless(val) {
+    return val === 'group:lossless' || RT_LOSSLESS_FORMATS.includes(val);
+}
+
+function onRtAddFormatChange() {
+    const lossless = rtSelectionIsLossless(document.getElementById('rt-add-format')?.value);
+    const llFields = document.querySelector('.rt-lossless-fields');
+    const lyFields = document.querySelector('.rt-lossy-fields');
+    if (llFields) llFields.style.display = lossless ? '' : 'none';
+    if (lyFields) lyFields.style.display = lossless ? 'none' : '';
+    onRtBitrateChange();   // keep the custom-bitrate field in sync
+}
+
+// Reveal the manual bitrate input only when the dropdown is on "Custom…".
+function onRtBitrateChange() {
+    const wrap = document.getElementById('rt-add-bitrate-custom-wrap');
+    if (!wrap) return;
+    const isCustom = document.getElementById('rt-add-bitrate')?.value === 'custom';
+    wrap.style.display = isCustom ? '' : 'none';
+}
+
+function addRankedTarget() {
+    const val = document.getElementById('rt-add-format')?.value || 'flac';
+
+    // Collect the constraints once; they apply to every format we add.
+    const constraints = {};
+    if (rtSelectionIsLossless(val)) {
+        const bd = document.getElementById('rt-add-bitdepth')?.value;
+        const sr = document.getElementById('rt-add-samplerate')?.value;
+        if (bd) constraints.bit_depth = parseInt(bd, 10);
+        if (sr) constraints.min_sample_rate = parseInt(sr, 10);
+    } else {
+        let br = document.getElementById('rt-add-bitrate')?.value;
+        if (br === 'custom') br = document.getElementById('rt-add-bitrate-custom')?.value;
+        if (br) constraints.min_bitrate = parseInt(br, 10);
+    }
+
+    // A group expands into one concrete target per format; a single format is
+    // just a one-element list. Skip a format that already has an identical
+    // target so re-adding a group doesn't pile up duplicates.
+    const formats = RT_GROUPS[val] || [val];
+    const sig = (t) => `${t.format}|${t.bit_depth || ''}|${t.min_sample_rate || ''}|${t.min_bitrate || ''}`;
+    const existing = new Set(currentRankedTargets.map(sig));
+    formats.forEach(fmt => {
+        const t = { format: fmt, ...constraints };
+        if (existing.has(sig(t))) return;
+        t.label = rtLabel(t);
+        currentRankedTargets.push(t);
+        existing.add(sig(t));
+    });
+    renderRankedTargets();
+    debouncedSaveQualityProfile();
+}
+
+const PRESET_LABELS = { audiophile: 'Audiophile', balanced: 'Balanced', space_saver: 'Space Saver' };
+
+// Switch to a preset. The backend restores the preset's saved edits (or factory
+// defaults if untouched) and persists it as the active profile, so there is no
+// follow-up save here and no full-page loading overlay (which caused the flicker).
+async function applyQualityPreset(presetName) {
+    // Drop any queued auto-save so a stale-target write can't land after the switch.
+    if (settingsAutoSaveTimer) { clearTimeout(settingsAutoSaveTimer); settingsAutoSaveTimer = null; }
+    if (qualityProfileAutoSaveTimer) { clearTimeout(qualityProfileAutoSaveTimer); qualityProfileAutoSaveTimer = null; }
+
+    // Previewing a specific NON-default profile: POST /preset/<name> below
+    // always overwrites the LIVE default row, no matter what's on screen —
+    // clicking a Quick-Set button while just looking at a different profile
+    // would silently destroy the real default's settings and then swap the
+    // tiles to show it instead (looks like the preview "jumps" to a random
+    // profile). Load the preset's values locally instead — read-only, never
+    // touches the server — same as previewQualityProfile; it only persists
+    // once the user explicitly clicks that profile row's Update (✎).
+    if (_qpEditingProfileId !== null && _qpEditingProfileId !== _qpDefaultProfileId()) {
+        try {
+            const response = await fetch('/api/quality-profile/presets');
+            const data = await response.json();
+            const preset = data.success ? data.presets?.[presetName] : null;
+            if (!preset) {
+                showToast(`Failed to load '${presetName}' preset`, 'error');
+                return;
+            }
+            // Same carry-forward as the live-default path below: the search
+            // strategy is a global choice, not part of the preset itself.
+            const uiState = collectQualityProfileFromUI();
+            const merged = {
+                ...preset,
+                search_mode: uiState.search_mode,
+                rank_candidates_by_quality: uiState.rank_candidates_by_quality,
+            };
+            window._suppressSettingsAutoSave = true;
+            try {
+                populateQualityProfileUI(merged);
+            } finally {
+                window._suppressSettingsAutoSave = false;
+            }
+            showToast(`Previewing '${PRESET_LABELS[presetName] || presetName}' — click ✎ on the profile row to save it here`, 'success');
+        } catch (error) {
+            console.error('Error loading quality preset:', error);
+            showToast('Failed to load preset', 'error');
+        }
+        return;
+    }
+
+    try {
+        const response = await fetch(`/api/quality-profile/preset/${presetName}`, { method: 'POST' });
+        const data = await response.json();
+
+        if (data.success) {
+            currentQualityProfile = data.profile;
+            // Suppress the global change→auto-save listener while we programmatically
+            // set checkbox + select values — these aren't user edits.
+            window._suppressSettingsAutoSave = true;
+            try {
+                populateQualityProfileUI(currentQualityProfile);
+            } finally {
+                window._suppressSettingsAutoSave = false;
+            }
+            renderCustomQualityProfiles(_qpProfileRows);
+            showToast(`Switched to '${PRESET_LABELS[presetName] || presetName}'`, 'success');
+        } else {
+            showToast(`Failed to apply preset: ${data.error}`, 'error');
+        }
+    } catch (error) {
+        console.error('Error applying quality preset:', error);
+        showToast('Failed to apply preset', 'error');
+    }
+}
+
+// Discard the active preset's saved edits and restore its factory defaults.
+async function resetActiveQualityPreset() {
+    // "Reset to factory" is a concept the 3 built-in presets have (a
+    // separate stash of saved customizations per preset name) — a named
+    // custom profile (Test/Main/whatever) has no factory counterpart to
+    // reset to. The backend call below would ALSO always write into the
+    // live default row regardless of what's being previewed, same class of
+    // bug as applyQualityPreset — refuse instead of doing that silently.
+    if (_qpEditingProfileId !== null && _qpEditingProfileId !== _qpDefaultProfileId()) {
+        showToast("Reset to defaults only applies to the live default profile — this one has no factory preset to reset to", 'info');
+        return;
+    }
+    const presetName = currentQualityProfile?.preset;
+    if (!presetName || !(presetName in PRESET_LABELS)) {
+        showToast('No preset selected to reset', 'info');
+        return;
+    }
+    if (settingsAutoSaveTimer) { clearTimeout(settingsAutoSaveTimer); settingsAutoSaveTimer = null; }
+    if (qualityProfileAutoSaveTimer) { clearTimeout(qualityProfileAutoSaveTimer); qualityProfileAutoSaveTimer = null; }
+
+    try {
+        const response = await fetch(`/api/quality-profile/preset/${presetName}/reset`, { method: 'POST' });
+        const data = await response.json();
+        if (data.success) {
+            currentQualityProfile = data.profile;
+            window._suppressSettingsAutoSave = true;
+            try {
+                populateQualityProfileUI(currentQualityProfile);
+            } finally {
+                window._suppressSettingsAutoSave = false;
+            }
+            showToast(`Reset '${PRESET_LABELS[presetName] || presetName}' to defaults`, 'success');
+        } else {
+            showToast(`Failed to reset preset: ${data.error}`, 'error');
+        }
+    } catch (error) {
+        console.error('Error resetting quality preset:', error);
+        showToast('Failed to reset preset', 'error');
+    }
+}
+
+function collectQualityProfileFromUI() {
+    // v3: ordered target list. Drop empty/None fields so each target stays
+    // minimal (matches QualityTarget.to_dict on the backend).
+    const ranked_targets = currentRankedTargets.map(t => {
+        const out = { format: t.format };
+        if (t.label) out.label = t.label;
+        if (t.bit_depth) out.bit_depth = t.bit_depth;
+        if (t.min_sample_rate) out.min_sample_rate = t.min_sample_rate;
+        if (t.min_bitrate) out.min_bitrate = t.min_bitrate;
+        return out;
+    });
+
+    return {
+        version: 3,
+        preset: (currentQualityProfile && currentQualityProfile.preset) || 'custom',
+        fallback_enabled: document.getElementById('quality-fallback-enabled')?.checked ?? true,
+        search_mode: document.getElementById('quality-search-mode')?.value === 'best_quality' ? 'best_quality' : 'priority',
+        rank_candidates_by_quality: document.getElementById('quality-rank-candidates')?.checked ?? false,
+        upgrade_policy: document.getElementById('quality-upgrade-policy')?.value === 'until_cutoff' ? 'until_cutoff' : 'acceptable',
+        upgrade_cutoff_index: parseInt(document.getElementById('quality-upgrade-cutoff')?.value || '0', 10) || 0,
+        ranked_targets,
+    };
+}
+
+async function saveQualityProfile() {
+    // Same guard as debouncedSaveQualityProfile, enforced here too — this is
+    // also called directly by the page-wide "Save Settings" button
+    // (saveSettings), which bypasses the debounce path entirely. Without
+    // this, clicking Save Settings for some unrelated setting while merely
+    // PREVIEWING a different profile would still silently push what's on
+    // screen into the live default. Returns true (not false/"failed") —
+    // the banner already explains the skip; saveSettings() would otherwise
+    // report it as an error toast, which it isn't.
+    if (_qpEditingProfileId !== null && _qpEditingProfileId !== _qpDefaultProfileId()) {
+        qpShowEditingBanner();
+        return true;
+    }
+    try {
+        const profile = collectQualityProfileFromUI();
+
+        const response = await fetch('/api/quality-profile', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(profile)
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            currentQualityProfile = profile;
+            console.log('Quality profile saved successfully');
+            return true;
+        } else {
+            console.error('Failed to save quality profile:', data.error);
+            return false;
+        }
+    } catch (error) {
+        console.error('Error saving quality profile:', error);
+        return false;
+    }
+}
+
+// ── Named global profiles (assignable to Wishlist items / per-context
+// overrides like Auto-Import, not just the single active default) ───────
+//
+// Rendered as a detached, sticky side panel (.qp-side-panel — see the
+// Downloads page's .adl-batch-panel for the same pattern), not a control
+// strip above the tiles it governs. Every action here is inline (a row
+// switching into an edit-in-place `<input>`) or the app's own themed
+// showConfirmDialog() — never a native prompt()/confirm() popup.
+
+let _qpAutoImportProfileId = null; // cached so re-renders don't re-fetch
+let _qpProfileRows = [];
+
+function normalizeQualityProfileId(profileId) {
+    if (profileId === null || profileId === undefined || profileId === '' || profileId === 0 || profileId === '0') {
+        return null;
+    }
+    const numericId = parseInt(profileId, 10);
+    return Number.isFinite(numericId) && numericId > 0 ? numericId : null;
+}
+
+async function loadCustomQualityProfiles() {
+    try {
+        const [profilesRes, autoImportRes] = await Promise.all([
+            fetch('/api/quality-profile/custom'),
+            fetch('/api/auto-import/settings').catch(() => null),
+        ]);
+        const data = await profilesRes.json();
+        if (autoImportRes && autoImportRes.ok) {
+            const aiData = await autoImportRes.json();
+            _qpAutoImportProfileId = normalizeQualityProfileId(aiData.quality_profile_id);
+        }
+        if (data.success) {
+            _qpProfileRows = data.profiles || [];
+            renderCustomQualityProfiles(_qpProfileRows);
+        }
+    } catch (error) {
+        console.error('Error loading custom quality profiles:', error);
+    }
+}
+
+// One-line what's-in-it summary under each profile row (Lidarr shows the
+// allowed qualities on its profile cards for the same reason: a name alone
+// says nothing about what the profile actually does).
+function qpProfileSummary(profile) {
+    let targets = [];
+    try { targets = JSON.parse(profile.ranked_targets || '[]'); } catch (e) { /* unreadable → treat as empty */ }
+    const parts = [];
+    if (targets.length) {
+        const first = targets[0]?.label || 'Top target';
+        parts.push(targets.length === 1 ? first : `${first} +${targets.length - 1} more`);
+    } else {
+        parts.push('Accepts anything');
+    }
+    if (profile.acoustid_required) parts.push('strict AcoustID');
+    if (profile.deep_audio_verify) parts.push('deep verify');
+    if (profile.downsample_enabled) parts.push('downsample');
+    if (profile.lossy_copy_enabled) parts.push(`lossy copy ${(profile.lossy_copy_codec || 'mp3').toUpperCase()}`);
+    if (['until_cutoff', 'until_top'].includes(profile.upgrade_policy)) {
+        const cutoffIndex = Math.min(Math.max(parseInt(profile.upgrade_cutoff_index || '0', 10) || 0, 0), Math.max(targets.length - 1, 0));
+        const cutoff = targets[cutoffIndex]?.label || 'top target';
+        parts.push(`upgrade until ${cutoff}`);
+    }
+    return parts.join(' · ');
+}
+
+function renderCustomQualityProfiles(profiles) {
+    const wrap = document.getElementById('qp-profile-list');
+    if (!wrap) return;
+    wrap.innerHTML = '';
+
+    if (!profiles.length) {
+        wrap.innerHTML = '<span class="qp-profile-list-empty">No profiles yet.</span>';
+        return;
+    }
+
+    // Only tag Auto-Import when the Import page has an explicit override.
+    // Falling back to the default profile is not a real assignment.
+    const autoImportTarget = _qpAutoImportProfileId;
+
+    profiles.forEach(profile => {
+        const row = document.createElement('div');
+        const isEditing = profile.id === _qpEditingProfileId && !profile.is_default;
+        row.className = 'qp-profile-row' + (profile.is_default ? ' active' : '') + (isEditing ? ' editing' : '');
+
+        // The dot is the ONLY control that actually flips the live default —
+        // deliberately separate from clicking the name/summary below, which
+        // just previews the profile's settings. Conflating the two was the
+        // bug: opening a profile to look at it was silently making it live
+        // for every in-flight download.
+        const dot = document.createElement('span');
+        dot.className = 'qp-profile-dot';
+        dot.title = profile.is_default
+            ? 'Currently the active default'
+            : `Set '${profile.name}' as the active default (applies immediately, incl. anything downloading right now)`;
+        dot.onclick = () => confirmSetDefaultQualityProfile(profile.id, profile.name);
+        row.appendChild(dot);
+
+        const text = document.createElement('span');
+        text.className = 'qp-profile-text';
+        text.title = profile.is_default
+            ? "View this profile's settings (it's already the active default)"
+            : `View/edit '${profile.name}'s settings — does not activate it`;
+        text.onclick = () => previewQualityProfile(profile.id);
+
+        const name = document.createElement('span');
+        name.className = 'qp-profile-name';
+        name.textContent = profile.name;
+        text.appendChild(name);
+
+        const sub = document.createElement('span');
+        sub.className = 'qp-profile-sub';
+        sub.textContent = qpProfileSummary(profile);
+        text.appendChild(sub);
+
+        row.appendChild(text);
+
+        if (profile.is_default || profile.id === autoImportTarget) {
+            const tags = document.createElement('span');
+            tags.className = 'qp-profile-tags';
+            // Mirrors the Auto-Import tag below: at-a-glance visibility of
+            // what's actually governing normal downloads right now, without
+            // needing to open Manage.
+            if (profile.is_default) {
+                const dtag = document.createElement('span');
+                dtag.className = 'qp-profile-tag qp-tag-default';
+                dtag.textContent = 'Downloads';
+                dtag.title = 'Used by normal downloads and Wishlist items right now';
+                tags.appendChild(dtag);
+            }
+            if (profile.id === autoImportTarget) {
+                const tag = document.createElement('span');
+                tag.className = 'qp-profile-tag qp-tag-autoimport';
+                tag.textContent = 'Auto-Import';
+                tag.title = 'Also used by Auto-Import (Settings → Import)';
+                tags.appendChild(tag);
+            }
+            row.appendChild(tags);
+        }
+
+        const actions = document.createElement('span');
+        actions.className = 'qp-profile-actions';
+
+        // Assign this profile to Auto-Import (Settings → Import), independent
+        // of the app-wide default used by normal downloads/Wishlist items.
+        // Toggle: click again on the currently-assigned profile to clear it
+        // back to "use the default".
+        const isAutoImport = profile.id === autoImportTarget;
+        const ai = document.createElement('button');
+        ai.type = 'button';
+        ai.className = 'qp-profile-action qp-action-autoimport' + (isAutoImport ? ' active' : '');
+        ai.textContent = '⇩';
+        ai.title = isAutoImport
+            ? `Stop using '${profile.name}' for Auto-Import (revert to the default profile)`
+            : `Use '${profile.name}' for Auto-Import`;
+        ai.onclick = (e) => {
+            e.stopPropagation();
+            toggleAutoImportQualityProfile(profile.id);
+        };
+        actions.appendChild(ai);
+
+        const ren = document.createElement('button');
+        ren.type = 'button';
+        ren.className = 'qp-profile-action qp-action-rename';
+        ren.textContent = '✏';
+        ren.title = `Rename '${profile.name}'`;
+        ren.onclick = (e) => {
+            e.stopPropagation();
+            qpStartRename(row, profile);
+        };
+        actions.appendChild(ren);
+
+        // Update: overwrite this profile's stored settings with whatever is
+        // currently on the page (edit-in-place, keeps the name). Allowed on
+        // every profile, including the starter ones — it's an overwrite,
+        // not a delete.
+        const upd = document.createElement('button');
+        upd.type = 'button';
+        upd.className = 'qp-profile-action qp-action-update';
+        upd.textContent = '✎';
+        upd.title = `Update '${profile.name}' with the current page settings`;
+        upd.onclick = (e) => {
+            e.stopPropagation();
+            updateCustomQualityProfile(profile.id, profile.name);
+        };
+        actions.appendChild(upd);
+
+        // Any profile can be deleted (including the starter ones) as long as
+        // it isn't the very last one left — mirrors the backend guard in
+        // MusicDatabase.delete_quality_profile.
+        if (profiles.length > 1) {
+            const del = document.createElement('button');
+            del.type = 'button';
+            del.className = 'qp-profile-action qp-action-delete';
+            del.textContent = '×';
+            del.title = `Delete '${profile.name}'`;
+            del.onclick = (e) => {
+                e.stopPropagation();
+                deleteCustomQualityProfile(profile.id, profile.name);
+            };
+            actions.appendChild(del);
+        }
+
+        row.appendChild(actions);
+        wrap.appendChild(row);
+    });
+}
+
+// Turns a profile row's name into an inline, in-place text input — no
+// native prompt(). Enter/blur commits via the PUT rename endpoint, Escape
+// cancels back to the plain label.
+function qpStartRename(row, profile) {
+    if (row.querySelector('.qp-profile-name-input')) return; // already editing
+
+    const nameEl = row.querySelector('.qp-profile-name');
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'qp-profile-name-input';
+    input.value = profile.name;
+    // The name sits inside the clickable row text — typing/clicking in the
+    // input must not bubble up and apply the profile.
+    input.onclick = (e) => e.stopPropagation();
+    nameEl.replaceWith(input);
+    input.focus();
+    input.select();
+
+    let settled = false;
+    const commit = async () => {
+        if (settled) return;
+        settled = true;
+        const newName = input.value.trim();
+        if (!newName || newName === profile.name) {
+            await loadCustomQualityProfiles();
+            return;
+        }
+        try {
+            const response = await fetch(`/api/quality-profile/custom/${profile.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: newName }),
+            });
+            const data = await response.json();
+            if (data.success) {
+                _qpProfileRows = data.profiles || []; // keep the cache in sync — see saveCurrentAsQualityProfile
+                renderCustomQualityProfiles(_qpProfileRows);
+                renderQualityProfileManager();
+                showToast(`Renamed to '${newName}'`, 'success');
+            } else {
+                showToast(`Failed to rename: ${data.error}`, 'error');
+                await loadCustomQualityProfiles();
+            }
+        } catch (error) {
+            console.error('Error renaming quality profile:', error);
+            showToast('Failed to rename profile', 'error');
+            await loadCustomQualityProfiles();
+        }
+    };
+    const cancel = () => {
+        if (settled) return;
+        settled = true;
+        loadCustomQualityProfiles();
+    };
+
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); commit(); }
+        else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+    });
+    input.addEventListener('blur', commit);
+}
+
+// Inline "+ New profile" control — swaps the button for a text input, no
+// native prompt().
+function qpShowNewProfileInput() {
+    const wrap = document.getElementById('qp-profile-new');
+    if (!wrap || wrap.querySelector('.qp-profile-new-input')) return;
+    wrap.innerHTML = `
+        <div class="qp-profile-new-row">
+            <input type="text" class="qp-profile-new-input" id="qp-profile-new-input" placeholder="Profile name" autocomplete="off" spellcheck="false">
+        </div>
+    `;
+    const input = document.getElementById('qp-profile-new-input');
+    input.focus();
+
+    let settled = false;
+    const commit = async () => {
+        if (settled) return;
+        const name = input.value.trim();
+        if (!name) { qpResetNewProfileControl(); return; }
+        settled = true;
+        await saveCurrentAsQualityProfile(name);
+    };
+    const cancel = () => {
+        if (settled) return;
+        settled = true;
+        qpResetNewProfileControl();
+    };
+
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); commit(); }
+        else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+    });
+    input.addEventListener('blur', () => { if (!settled) cancel(); });
+}
+
+function qpResetNewProfileControl() {
+    const wrap = document.getElementById('qp-profile-new');
+    if (!wrap) return;
+    wrap.innerHTML = '<button type="button" class="qp-profile-new-btn" id="qp-profile-new-btn" onclick="qpShowNewProfileInput()">+ New profile</button>';
+}
+
+// Everything a "Global Quality Profile" now captures: the ranked-target
+// ladder (collectQualityProfileFromUI) PLUS every other toggle scattered
+// across Quality on Import / Post-Download Conversion / Audio Verification
+// that conceptually belongs to "what quality means to me" — see
+// core/quality/schema.py's QUALITY_PROFILES_DDL docstring for the same list.
+function collectFullQualityBundleFromUI() {
+    const base = collectQualityProfileFromUI();
+    return {
+        ...base,
+        acoustid_required: document.getElementById('acoustid-require-verified')?.checked === true,
+        downsample_enabled: document.getElementById('downsample-hires')?.checked === true,
+        deep_audio_verify: document.getElementById('audio-completeness-check')?.checked === true,
+        replace_lower_quality: document.getElementById('import-replace-lower-quality')?.checked === true,
+        lossy_copy_enabled: document.getElementById('lossy-copy-enabled')?.checked === true,
+        lossy_copy_codec: document.getElementById('lossy-copy-codec')?.value || 'mp3',
+        lossy_copy_bitrate: document.getElementById('lossy-copy-bitrate')?.value || '320',
+        lossy_copy_delete_original: document.getElementById('lossy-copy-delete-original')?.checked === true,
+    };
+}
+
+// The inverse of collectFullQualityBundleFromUI: reflect an applied profile's
+// full bundle back onto every toggle it captures, so the page never shows
+// stale state after switching profiles (which would otherwise get written
+// back over the just-applied config on the next autosave tick).
+function applyFullQualityBundleToDom(profile) {
+    const set = (id, value) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        if (el.type === 'checkbox') el.checked = value === true;
+        else el.value = value;
+    };
+    set('acoustid-require-verified', profile.acoustid_required);
+    set('downsample-hires', profile.downsample_enabled);
+    set('audio-completeness-check', profile.deep_audio_verify);
+    set('import-replace-lower-quality', profile.replace_lower_quality);
+    set('lossy-copy-enabled', profile.lossy_copy_enabled);
+    set('lossy-copy-codec', profile.lossy_copy_codec);
+    set('lossy-copy-bitrate', profile.lossy_copy_bitrate);
+    set('lossy-copy-delete-original', profile.lossy_copy_delete_original);
+    const lossyOptions = document.getElementById('lossy-copy-options');
+    if (lossyOptions) lossyOptions.style.display = profile.lossy_copy_enabled ? 'block' : 'none';
+}
+
+async function saveCurrentAsQualityProfile(name) {
+    name = (name || '').trim();
+    if (!name) return;
+
+    try {
+        const profile = collectFullQualityBundleFromUI();
+        const response = await fetch('/api/quality-profile/custom', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...profile, name }),
+        });
+        const data = await response.json();
+        if (data.success) {
+            // Bug: this only ever re-rendered with the response's list
+            // without updating the cached _qpProfileRows — every OTHER
+            // function that reads that cache (previewQualityProfile's
+            // default-id check, the Manage modal, the editing banner) kept
+            // seeing the list from before this profile existed, which is
+            // exactly what made a freshly created profile look like it
+            // "vanished" / previewed as an unresolvable "this profile".
+            _qpProfileRows = data.profiles || [];
+            // The tiles already show exactly what was just saved — treat the
+            // new profile as the one now being previewed, same as clicking
+            // its row would.
+            _qpEditingProfileId = data.id ?? null;
+            renderCustomQualityProfiles(_qpProfileRows);
+            qpResetNewProfileControl();
+            if (_qpEditingProfileId !== null && _qpEditingProfileId !== _qpDefaultProfileId()) {
+                qpShowEditingBanner();
+            } else {
+                qpHideEditingBanner();
+            }
+            showToast(`Saved profile '${name}'`, 'success');
+        } else {
+            showToast(`Failed to save profile: ${data.error}`, 'error');
+            qpResetNewProfileControl();
+        }
+    } catch (error) {
+        console.error('Error saving custom quality profile:', error);
+        showToast('Failed to save profile', 'error');
+        qpResetNewProfileControl();
+    }
+}
+
+async function updateCustomQualityProfile(profileId, name) {
+    if (!await showConfirmDialog({
+        title: 'Update Profile',
+        message: `Update '${name}' with the current page settings? This overwrites what was saved before.`,
+        confirmText: 'Update',
+    })) return;
+
+    try {
+        const profile = collectFullQualityBundleFromUI();
+        const response = await fetch(`/api/quality-profile/custom/${profileId}/update`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(profile),
+        });
+        const data = await response.json();
+        if (data.success) {
+            _qpProfileRows = data.profiles || []; // keep the cache in sync — see saveCurrentAsQualityProfile
+            renderCustomQualityProfiles(_qpProfileRows);
+            renderQualityProfileManager();
+            showToast(`Updated '${name}'`, 'success');
+        } else {
+            showToast(`Failed to update profile: ${data.error}`, 'error');
+        }
+    } catch (error) {
+        console.error('Error updating custom quality profile:', error);
+        showToast('Failed to update profile', 'error');
+    }
+}
+
+async function applyCustomQualityProfile(profileId, name) {
+    try {
+        const response = await fetch(`/api/quality-profile/custom/${profileId}/apply`, { method: 'POST' });
+        const data = await response.json();
+        if (data.success) {
+            currentQualityProfile = data.profile;
+            _qpEditingProfileId = null; // tiles now show the (new) live default again
+            window._suppressSettingsAutoSave = true;
+            try {
+                populateQualityProfileUI(currentQualityProfile);
+                applyFullQualityBundleToDom(data.profile);
+            } finally {
+                window._suppressSettingsAutoSave = false;
+            }
+            await loadCustomQualityProfiles();
+            qpHideEditingBanner();
+            showToast(`Now using '${name}' (all Quality-page settings updated)`, 'success');
+        } else {
+            showToast(`Failed to apply profile: ${data.error}`, 'error');
+        }
+    } catch (error) {
+        console.error('Error applying custom quality profile:', error);
+        showToast('Failed to apply profile', 'error');
+    }
+}
+
+// The ONLY path that makes a profile the live default. Anything with no
+// profile of its own (a brand-new download, or a library track whose
+// `quality_profile_id` is still NULL) resolves to this default immediately.
+// Existing Wishlist rows do NOT switch: `add_to_wishlist` pins a concrete,
+// resolved profile id on the row at insert time (see
+// `MusicDatabase._resolve_quality_profile_id`), so they keep following
+// whichever profile was default when they were queued — only NEW Wishlist
+// adds pick up this change. Deliberately gated behind a confirmation: the
+// side panel's row-text click below only PREVIEWS a profile's settings and
+// must never have this side effect (that conflation was the bug — clicking
+// a profile to look at/edit it was silently making it live).
+async function confirmSetDefaultQualityProfile(profileId, name) {
+    if (!await showConfirmDialog({
+        title: 'Set Active Profile',
+        message: `Make '${name}' the active default profile? New downloads and anything without its own profile follow it immediately — existing Wishlist items keep the profile they were queued with.`,
+        confirmText: 'Set Active',
+    })) return;
+    await applyCustomQualityProfile(profileId, name);
+    renderQualityProfileManager();
+}
+
+// onclick-safe wrapper for the Manage modal's rows (numeric id only —
+// avoids embedding a profile name, which may contain quotes, into an inline
+// HTML attribute).
+function confirmSetDefaultQualityProfileById(profileId) {
+    const profile = _qpProfileRows.find(p => p.id === profileId);
+    if (profile) confirmSetDefaultQualityProfile(profileId, profile.name);
+}
+
+// Load a profile's settings into the tile editor for viewing/editing —
+// purely read-only against the DB (a dedicated GET, not the mutating
+// /apply endpoint) so it can never make the previewed profile the live
+// default or touch anything mid-download. Edits made while previewing are
+// local until the row's Update (✎) button explicitly saves them into THIS
+// profile — see debouncedSaveQualityProfile.
+async function previewQualityProfile(profileId) {
+    try {
+        const response = await fetch(`/api/quality-profile/custom/${profileId}`);
+        const data = await response.json();
+        if (!data.success) {
+            showToast(`Failed to load profile: ${data.error}`, 'error');
+            return;
+        }
+        // Keep this in sync with what's actually on screen — collectQualityProfileFromUI
+        // reads currentQualityProfile.preset, and resetActiveQualityPreset reads it to
+        // decide what "reset" even means; leaving it pointed at whatever was loaded
+        // before previewing this profile was exactly the kind of drift that made
+        // preset actions apply to the wrong thing.
+        currentQualityProfile = data.profile;
+        _qpEditingProfileId = profileId;
+        window._suppressSettingsAutoSave = true;
+        try {
+            populateQualityProfileUI(data.profile);
+            applyFullQualityBundleToDom(data.profile);
+        } finally {
+            window._suppressSettingsAutoSave = false;
+        }
+        renderCustomQualityProfiles(_qpProfileRows);
+        qpShowEditingBanner();
+    } catch (error) {
+        console.error('Error previewing quality profile:', error);
+        showToast('Failed to load profile', 'error');
+    }
+}
+
+// Persistent notice (not a toast — it needs to stay visible for as long as
+// the state holds) telling the user the tiles show a profile that ISN'T the
+// active default, so edits need an explicit Update click. Directly answers
+// "how do I know what's actually live right now" without needing the
+// Manage overview open.
+function qpShowEditingBanner() {
+    const banner = document.getElementById('qp-editing-banner');
+    if (!banner) return;
+    const profile = _qpProfileRows.find(p => p.id === _qpEditingProfileId);
+    // The id not resolving means the cache is stale or the profile is gone —
+    // showing a nameless "viewing this profile" is just confusing; hide
+    // instead of guessing.
+    if (!profile) {
+        banner.style.display = 'none';
+        return;
+    }
+    banner.querySelector('.qp-editing-banner-name').textContent = profile.name;
+    banner.style.display = '';
+}
+
+function qpHideEditingBanner() {
+    const banner = document.getElementById('qp-editing-banner');
+    if (banner) banner.style.display = 'none';
+}
+
+async function deleteCustomQualityProfile(profileId, name) {
+    if (!await showConfirmDialog({
+        title: 'Delete Profile',
+        message: `Delete '${name}'? This cannot be undone. Anything still assigned to it (Wishlist items, Auto-Import) automatically falls back to your active profile.`,
+        confirmText: 'Delete',
+        destructive: true,
+    })) return;
+
+    try {
+        const response = await fetch(`/api/quality-profile/custom/${profileId}`, { method: 'DELETE' });
+        const data = await response.json();
+        if (data.success) {
+            // Deleting the profile currently being previewed would otherwise
+            // leave _qpEditingProfileId pointing at a row that no longer
+            // exists — fall back to "showing the live default" like a fresh
+            // page load.
+            if (_qpEditingProfileId === profileId) {
+                _qpEditingProfileId = null;
+                qpHideEditingBanner();
+            }
+            // Full reload (not just re-render): deleting may have cleared the
+            // Auto-Import override and/or promoted a new default — both feed
+            // the row tags, so refresh them from the server.
+            await loadCustomQualityProfiles();
+            showToast(`Deleted '${name}'`, 'success');
+        } else {
+            showToast(`Failed to delete profile: ${data.error}`, 'error');
+        }
+    } catch (error) {
+        console.error('Error deleting custom quality profile:', error);
+        showToast('Failed to delete profile', 'error');
+    }
+}
+
+// Quick inline toggle in the row list (see the qp-action-autoimport button
+// in renderCustomQualityProfiles). The Manage modal below shows the same
+// assignment plus the app-wide default side by side, as the one place that
+// answers "what governs what right now" — this stays for one-click access
+// from the row a user is already looking at.
+async function toggleAutoImportQualityProfile(profileId) {
+    const nowAssigned = _qpAutoImportProfileId === profileId;
+    try {
+        const response = await fetch('/api/auto-import/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ quality_profile_id: nowAssigned ? null : profileId }),
+        });
+        const data = await response.json();
+        if (!data.success) throw new Error(data.error || 'Failed to update Auto-Import');
+        _qpAutoImportProfileId = nowAssigned ? null : profileId;
+        renderCustomQualityProfiles(_qpProfileRows);
+        renderQualityProfileManager();
+        showToast(nowAssigned
+            ? 'Auto-Import now uses the default profile'
+            : 'Auto-Import profile updated', 'success');
+    } catch (error) {
+        console.error('Error updating Auto-Import quality profile:', error);
+        showToast('Failed to update Auto-Import profile', 'error');
+    }
+}
+
+// ── Manage overview modal ────────────────────────────────────────────────
+// The single place that answers "which profile does what right now": the
+// app-wide Default (new downloads and anything with no profile of its own —
+// existing Wishlist rows keep whichever profile was default when they were
+// queued, see confirmSetDefaultQualityProfile) and the Auto-Import override
+// (Settings → Import, falls back to Default when unset). Both assignments
+// are also reachable
+// inline from the row list (the dot / the ⇩ button); this is the overview +
+// explanation surface, not a second way to edit a profile's own settings —
+// that only ever happens via previewQualityProfile + a row's Update (✎).
+function qpManagerOverlay() {
+    let overlay = document.getElementById('qp-manager-overlay');
+    if (overlay) return overlay;
+    overlay = document.createElement('div');
+    overlay.id = 'qp-manager-overlay';
+    overlay.className = 'modal-overlay hidden';
+    overlay.onclick = (event) => { if (event.target === overlay) closeQualityProfileManager(); };
+    overlay.innerHTML = `
+        <div class="enhanced-bulk-modal qp-manager-modal" onclick="event.stopPropagation()">
+            <div class="enhanced-bulk-modal-header">
+                <h3>Quality Profiles — Manage</h3>
+                <button class="enhanced-bulk-modal-close" onclick="closeQualityProfileManager()">&times;</button>
+            </div>
+            <div class="enhanced-bulk-modal-body qp-manager-body">
+                <div class="qp-manager-info-row setting-row">
+                    <span class="qp-manager-info-label">What does this manage?</span>
+                    <span class="info-icon" role="button" tabindex="0" title="What's this?"
+                        onclick="toggleSettingHelp(this)"
+                        onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSettingHelp(this);}">i</span>
+                </div>
+                <div class="help-text setting-help-body qp-manager-info" hidden>
+                    Two things read a profile today: normal downloads/Wishlist
+                    items always follow the <strong>Default</strong> below,
+                    and Auto-Import can optionally use a different one instead
+                    (falls back to Default when unset). A profile's
+                    "Upgrade until" setting controls exactly how far below
+                    it counts as needing an upgrade — the Quality Upgrade
+                    Finder then actively searches for and proposes a
+                    replacement, while Quality Check only flags (you choose
+                    re-download/delete/ignore per finding); both read the
+                    cutoff live, same as the download pipeline. Per-artist/
+                    album/track assignment is planned for the Library
+                    Manager; it will plug into this exact mechanism.
+                </div>
+                <div id="qp-manager-rows" class="qp-manager-rows"></div>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+    return overlay;
+}
+
+// Renders two clearly SEPARATE things — mixing them into one flat list of
+// identical-looking rows was exactly what confused a user into thinking
+// "Auto-Import" was itself a saved profile:
+//   1. "Active now" — the CONTEXTS that consume a profile (Downloads/
+//      Wishlist always via the Default; Auto-Import optionally via its own
+//      override). Read-only status here; changed from the Profiles rows
+//      below, never from here.
+//   2. "Profiles" — the actual named, selectable quality_profiles rows,
+//      with the Set default / Use for import actions.
+function renderQualityProfileManager() {
+    const rows = document.getElementById('qp-manager-rows');
+    if (!rows) return; // modal not open — nothing to refresh
+    if (!_qpProfileRows.length) {
+        rows.innerHTML = '<div class="qp-profile-list-empty">No profiles yet.</div>';
+        return;
+    }
+    const explicitAutoImport = _qpAutoImportProfileId || null;
+    const defaultProfile = _qpProfileRows.find(p => p.is_default);
+    const defaultName = defaultProfile ? defaultProfile.name : '—';
+    const autoImportName = explicitAutoImport
+        ? (_qpProfileRows.find(profile => profile.id === explicitAutoImport)?.name || 'Unknown profile')
+        : `Uses Default (${defaultName})`;
+
+    rows.innerHTML = `
+        <div class="qp-manager-section-title">Active now</div>
+        <div class="qp-manager-status-row">
+            <span class="qp-manager-status-label">Downloads &amp; Wishlist</span>
+            <span class="qp-manager-status-value">${escapeHtml(defaultName)}</span>
+        </div>
+        <div class="qp-manager-status-row">
+            <span class="qp-manager-status-label">Auto-Import</span>
+            <span class="qp-manager-status-value">${escapeHtml(autoImportName)}</span>
+            ${explicitAutoImport ? '<button type="button" class="qp-manager-action clear" onclick="clearAutoImportQualityProfileFromManager()">Use default</button>' : ''}
+        </div>
+
+        <div class="qp-manager-section-title">Profiles</div>
+        ${_qpProfileRows.map(profile => `
+            <div class="qp-manager-row">
+                <div class="qp-manager-row-main">
+                    <span class="qp-manager-row-name">${escapeHtml(profile.name)}</span>
+                    <span class="qp-manager-row-sub">${escapeHtml(qpProfileSummary(profile))}</span>
+                </div>
+                <button type="button" class="qp-manager-action ${profile.is_default ? 'active' : ''}" onclick="confirmSetDefaultQualityProfileById(${profile.id})">
+                    ${profile.is_default ? 'Default' : 'Set default'}
+                </button>
+                <button type="button" class="qp-manager-action ${explicitAutoImport === profile.id ? 'active' : ''}" onclick="toggleAutoImportQualityProfile(${profile.id})">
+                    ${explicitAutoImport === profile.id ? 'Auto-Import' : 'Use for import'}
+                </button>
+            </div>
+        `).join('')}
+    `;
+}
+
+async function clearAutoImportQualityProfileFromManager() {
+    if (_qpAutoImportProfileId != null) await toggleAutoImportQualityProfile(_qpAutoImportProfileId);
+}
+
+async function openQualityProfileManager() {
+    const overlay = qpManagerOverlay();
+    try {
+        await loadCustomQualityProfiles();
+        renderQualityProfileManager();
+        overlay.classList.remove('hidden');
+    } catch (error) {
+        console.error('Error opening quality profile manager:', error);
+        showToast('Failed to open profile manager', 'error');
+    }
+}
+
+function closeQualityProfileManager() {
+    document.getElementById('qp-manager-overlay')?.classList.add('hidden');
+}
+
+// ===============================
+// END QUALITY PROFILE FUNCTIONS
+// ===============================
+
+async function toggleHydrabaseFromSettings() {
+    const statusEl = document.getElementById('hydrabase-settings-status');
+    const btn = document.getElementById('hydrabase-connect-btn');
+    const url = document.getElementById('hydrabase-url').value.trim();
+    const apiKey = document.getElementById('hydrabase-api-key').value.trim();
+
+    if (!url || !apiKey) {
+        if (statusEl) statusEl.textContent = 'URL and API Key required';
+        return;
+    }
+
+    // Save settings first
+    await saveSettings(true);
+
+    try {
+        // Check current status
+        const statusRes = await fetch('/api/hydrabase/status');
+        const statusData = await statusRes.json();
+
+        if (statusData.connected) {
+            // Disconnect
+            await fetch('/api/hydrabase/disconnect', { method: 'POST' });
+            if (btn) btn.textContent = 'Connect';
+            if (statusEl) { statusEl.textContent = 'Disconnected'; statusEl.style.color = 'rgba(255,255,255,0.4)'; }
+            // Remove from fallback dropdown + reset to iTunes if was selected
+            const fbSel2 = document.getElementById('metadata-fallback-source');
+            if (fbSel2) {
+                const hbOpt = fbSel2.querySelector('option[value="hydrabase"]');
+                if (hbOpt) {
+                    if (fbSel2.value === 'hydrabase') fbSel2.value = 'itunes';
+                    hbOpt.remove();
+                }
+            }
+            showToast('Hydrabase disconnected', 'info');
+        } else {
+            // Connect
+            const res = await fetch('/api/hydrabase/connect', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url, api_key: apiKey })
+            });
+            const data = await res.json();
+            if (data.success) {
+                if (btn) btn.textContent = 'Disconnect';
+                if (statusEl) { statusEl.textContent = 'Connected'; statusEl.style.color = '#4caf50'; }
+                // Add to fallback dropdown
+                const fbSel = document.getElementById('metadata-fallback-source');
+                if (fbSel && !fbSel.querySelector('option[value="hydrabase"]')) {
+                    const opt = document.createElement('option');
+                    opt.value = 'hydrabase';
+                    opt.textContent = 'Hydrabase (P2P)';
+                    fbSel.appendChild(opt);
+                }
+                showToast('Hydrabase connected', 'success');
+            } else {
+                if (statusEl) statusEl.textContent = data.error || 'Connection failed';
+                showToast('Hydrabase connection failed', 'error');
+            }
+        }
+    } catch (e) {
+        if (statusEl) statusEl.textContent = 'Error';
+        showToast('Hydrabase connection error', 'error');
+    }
+}
+
+// ── Music Library Paths ──
+function renderMusicPaths(paths) {
+    const container = document.getElementById('music-paths-list');
+    if (!container) return;
+    if (!paths || paths.length === 0) {
+        container.innerHTML = '<div style="color: rgba(255,255,255,0.3); font-size: 0.85em; padding: 4px 0;">No paths configured. Click "Add Path" to add your music folder(s).</div>';
+        return;
+    }
+    container.innerHTML = paths.map((p, i) => `
+        <div class="form-group music-path-row" style="margin-bottom: 4px;">
+            <input type="text" class="music-path-input" value="${escapeHtml(p)}" placeholder="/music or C:\\Music" style="flex:1;">
+            <button class="test-button" onclick="_removeMusicPathRow(this)" style="padding: 8px 12px; color: #ef5350; border-color: rgba(239,83,80,0.3);">&times;</button>
+        </div>
+    `).join('');
+    // Attach auto-save to dynamically rendered inputs
+    container.querySelectorAll('.music-path-input').forEach(input => {
+        input.addEventListener('change', () => { if (typeof debouncedAutoSaveSettings === 'function') debouncedAutoSaveSettings(); });
+    });
+}
+
+function addMusicPathRow() {
+    const container = document.getElementById('music-paths-list');
+    if (!container) return;
+    // Clear the "no paths" message if present
+    const placeholder = container.querySelector('div[style*="color: rgba"]');
+    if (placeholder && !container.querySelector('.music-path-row')) placeholder.remove();
+    const row = document.createElement('div');
+    row.className = 'form-group music-path-row';
+    row.style.marginBottom = '4px';
+    row.innerHTML = `
+        <input type="text" class="music-path-input" value="" placeholder="/music or C:\\Music" style="flex:1;">
+        <button class="test-button" onclick="_removeMusicPathRow(this)" style="padding: 8px 12px; color: #ef5350; border-color: rgba(239,83,80,0.3);">&times;</button>
+    `;
+    container.appendChild(row);
+    const input = row.querySelector('input');
+    input.focus();
+    // Auto-save when the user finishes typing a path
+    input.addEventListener('change', () => { if (typeof debouncedAutoSaveSettings === 'function') debouncedAutoSaveSettings(); });
+}
+
+function _removeMusicPathRow(btn) {
+    btn.closest('.music-path-row').remove();
+    // Auto-save after removing a path
+    if (typeof debouncedAutoSaveSettings === 'function') debouncedAutoSaveSettings();
+}
+
+function collectMusicPaths() {
+    const inputs = document.querySelectorAll('.music-path-input');
+    const paths = [];
+    inputs.forEach(input => {
+        const val = input.value.trim();
+        if (val) paths.push(val);
+    });
+    return paths;
+}
+
+// ── Genre Whitelist ──
+let _genreWhitelistCache = [];
+
+function _genreWhitelistRender(genres) {
+    _genreWhitelistCache = genres && genres.length ? genres : [];
+    const container = document.getElementById('genre-whitelist-chips');
+    const countEl = document.getElementById('genre-whitelist-count');
+    if (!container) return;
+    if (!_genreWhitelistCache.length) {
+        container.innerHTML = '<div style="color:rgba(255,255,255,0.3);font-size:13px;padding:4px 0;">No genres configured. Click "Reset to Defaults" to load the default whitelist.</div>';
+        if (countEl) countEl.textContent = '';
+        return;
+    }
+    const searchVal = (document.getElementById('genre-whitelist-search')?.value || '').toLowerCase();
+    const filtered = searchVal ? _genreWhitelistCache.filter(g => g.toLowerCase().includes(searchVal)) : _genreWhitelistCache;
+    container.innerHTML = filtered.map(g =>
+        `<span class="genre-chip">${escapeHtml(g)}<button class="genre-chip-x" data-genre="${escapeHtml(g)}">&times;</button></span>`
+    ).join('');
+    if (countEl) countEl.textContent = `${_genreWhitelistCache.length} genres`;
+    _initGenreChipClickHandler();
+}
+
+function _initGenreChipClickHandler() {
+    const container = document.getElementById('genre-whitelist-chips');
+    if (!container) return;
+    container.onclick = (e) => {
+        const btn = e.target.closest('.genre-chip-x');
+        if (btn) {
+            e.preventDefault();
+            _genreWhitelistRemove(btn.dataset.genre);
+        }
+    };
+}
+
+function _genreWhitelistRemove(genre) {
+    _genreWhitelistCache = _genreWhitelistCache.filter(g => g !== genre);
+    _genreWhitelistRender(_genreWhitelistCache);
+    if (typeof debouncedAutoSaveSettings === 'function') debouncedAutoSaveSettings();
+}
+
+function _genreWhitelistAdd(genre) {
+    genre = genre.trim();
+    if (!genre) return;
+    if (_genreWhitelistCache.some(g => g.toLowerCase() === genre.toLowerCase())) return;
+    _genreWhitelistCache.push(genre);
+    _genreWhitelistCache.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+    _genreWhitelistRender(_genreWhitelistCache);
+    if (typeof debouncedAutoSaveSettings === 'function') debouncedAutoSaveSettings();
+}
+
+async function _genreWhitelistReset() {
+    try {
+        const resp = await fetch('/api/genre-whitelist/defaults');
+        const data = await resp.json();
+        if (data.genres) {
+            _genreWhitelistCache = data.genres;
+            _genreWhitelistRender(_genreWhitelistCache);
+            if (typeof debouncedAutoSaveSettings === 'function') debouncedAutoSaveSettings();
+            showToast(`Loaded ${data.genres.length} default genres`, 'success');
+        }
+    } catch (e) {
+        showToast('Failed to load defaults', 'error');
+    }
+}
+
+// Toggle whitelist container visibility + init
+document.addEventListener('change', (e) => {
+    if (e.target.id === 'genre-whitelist-enabled') {
+        const container = document.getElementById('genre-whitelist-container');
+        if (container) container.style.display = e.target.checked ? '' : 'none';
+        // Auto-populate with defaults on first enable if empty
+        if (e.target.checked && _genreWhitelistCache.length === 0) {
+            _genreWhitelistReset();
+        }
+    }
+});
+
+// Search/add handler
+document.addEventListener('keydown', (e) => {
+    if (e.target.id === 'genre-whitelist-search' && e.key === 'Enter') {
+        e.preventDefault();
+        _genreWhitelistAdd(e.target.value);
+        e.target.value = '';
+    }
+});
+document.addEventListener('input', (e) => {
+    if (e.target.id === 'genre-whitelist-search') {
+        _genreWhitelistRender(_genreWhitelistCache);
+    }
+});
+
+function _collectGenreWhitelist() {
+    return _genreWhitelistCache;
+}
+
+// ── Live Log Viewer ──
+let _logViewerActive = false;
+let _logViewerFilter = '';
+let _logViewerSource = 'app';
+let _logViewerSearch = '';
+const _LOG_MAX_LINES = 2000;
+
+function _logClassify(line) {
+    // Exact logger format first
+    if (line.includes(' - DEBUG - ')) return 'DEBUG';
+    if (line.includes(' - INFO - ')) return 'INFO';
+    if (line.includes(' - WARNING - ')) return 'WARNING';
+    if (line.includes(' - ERROR - ') || line.includes(' - CRITICAL - ')) return 'ERROR';
+    // Heuristic for print() output
+    const ll = line.toLowerCase();
+    if (ll.includes('error') || ll.includes('traceback') || ll.includes('exception') || ll.includes('failed')) return 'ERROR';
+    if (ll.includes('warning') || ll.includes('warn')) return 'WARNING';
+    if (ll.includes('debug')) return 'DEBUG';
+    return 'INFO';
+}
+
+function _logClassToCSS(level) {
+    return { DEBUG: 'log-debug', INFO: 'log-info', WARNING: 'log-warning', ERROR: 'log-error' }[level] || 'log-plain';
+}
+
+async function _logViewerInit() {
+    if (_logViewerActive) return;
+    _logViewerActive = true;
+    _logViewerSource = document.getElementById('log-viewer-source')?.value || 'app';
+
+    // Fetch initial tail
+    try {
+        const params = new URLSearchParams({ source: _logViewerSource, lines: 300 });
+        if (_logViewerFilter) params.set('level', _logViewerFilter);
+        if (_logViewerSearch) params.set('search', _logViewerSearch);
+        const resp = await fetch(`/api/logs/tail?${params}`);
+        const data = await resp.json();
+        if (data.lines) {
+            const container = document.getElementById('log-viewer-lines');
+            if (container) {
+                container.innerHTML = '';
+                _logViewerAppendLines(data.lines);
+            }
+        }
+    } catch (e) {
+        console.warn('Failed to load initial logs:', e);
+    }
+
+    // Subscribe to live updates
+    if (typeof socket !== 'undefined' && socket && socket.connected) {
+        socket.emit('logs:subscribe', { source: _logViewerSource });
+        socket.on('logs:live', _logViewerOnLive);
+    }
+}
+
+function _logViewerStop() {
+    if (!_logViewerActive) return;
+    _logViewerActive = false;
+    if (typeof socket !== 'undefined' && socket) {
+        socket.off('logs:live', _logViewerOnLive);
+        socket.emit('logs:unsubscribe', {});
+    }
+}
+
+function _logViewerOnLive(data) {
+    if (!_logViewerActive || !data.lines) return;
+    if (data.source !== _logViewerSource) return;
+    let lines = data.lines;
+    // Apply level filter client-side for live lines
+    if (_logViewerFilter) {
+        lines = lines.filter(l => _logClassify(l) === _logViewerFilter);
+    }
+    // Apply search filter
+    if (_logViewerSearch) {
+        const s = _logViewerSearch.toLowerCase();
+        lines = lines.filter(l => l.toLowerCase().includes(s));
+    }
+    if (lines.length > 0) _logViewerAppendLines(lines);
+}
+
+function _logViewerAppendLines(lines) {
+    const container = document.getElementById('log-viewer-lines');
+    if (!container) return;
+    const autoScroll = document.getElementById('log-viewer-autoscroll')?.checked;
+    const terminal = document.getElementById('log-viewer-terminal');
+
+    const frag = document.createDocumentFragment();
+    for (const line of lines) {
+        const div = document.createElement('div');
+        div.className = 'log-line ' + _logClassToCSS(_logClassify(line));
+        div.textContent = line;
+        frag.appendChild(div);
+    }
+    container.appendChild(frag);
+
+    // Trim old lines
+    while (container.children.length > _LOG_MAX_LINES) {
+        container.removeChild(container.firstChild);
+    }
+
+    // Update count
+    const countEl = document.getElementById('log-viewer-line-count');
+    if (countEl) countEl.textContent = `${container.children.length} lines`;
+
+    // Auto-scroll
+    if (autoScroll && terminal) {
+        terminal.scrollTop = terminal.scrollHeight;
+    }
+}
+
+async function _logViewerChangeSource() {
+    _logViewerStop();
+    _logViewerSource = document.getElementById('log-viewer-source')?.value || 'app';
+    const container = document.getElementById('log-viewer-lines');
+    if (container) container.innerHTML = '<div class="log-line log-info">Loading...</div>';
+    await _logViewerInit();
+}
+
+function _logViewerFilterLevel(btn) {
+    document.querySelectorAll('.log-filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    _logViewerFilter = btn.dataset.level || '';
+    _logViewerReload();
+}
+
+let _logSearchDebounce = null;
+function _logViewerOnSearch(input) {
+    clearTimeout(_logSearchDebounce);
+    _logSearchDebounce = setTimeout(() => {
+        _logViewerSearch = (input.value || '').trim();
+        _logViewerReload();
+    }, 300);
+}
+
+function _logViewerReload() {
+    _logViewerStop();
+    const container = document.getElementById('log-viewer-lines');
+    if (container) container.innerHTML = '<div class="log-line log-info">Loading...</div>';
+    _logViewerInit();
+}
+
+function _logViewerCopy() {
+    const container = document.getElementById('log-viewer-lines');
+    if (!container) return;
+    const text = Array.from(container.children).map(el => el.textContent).join('\n');
+    if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(() => showToast('Logs copied', 'success'));
+    } else {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.cssText = 'position:fixed;left:-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        showToast('Logs copied', 'success');
+    }
+}
+
+function _logViewerClear() {
+    const container = document.getElementById('log-viewer-lines');
+    if (container) container.innerHTML = '';
+    const countEl = document.getElementById('log-viewer-line-count');
+    if (countEl) countEl.textContent = '0 lines';
+}
+
+// ── Database Maintenance ──
+async function loadDbMaintenanceInfo() {
+    try {
+        const resp = await fetch('/api/database/maintenance/info');
+        const data = await resp.json();
+        if (!data.success) return;
+        const sizeEl = document.getElementById('db-size-display');
+        const freeEl = document.getElementById('db-freepages-display');
+        const vacEl = document.getElementById('db-autovacuum-display');
+        if (sizeEl) sizeEl.textContent = data.total_size_display;
+        if (freeEl) freeEl.textContent = data.free_pages > 0
+            ? `${data.free_pages.toLocaleString()} (${data.free_size_display} reclaimable)`
+            : 'None — database is fully compacted';
+        if (vacEl) vacEl.textContent = data.auto_vacuum_label;
+        // Hide enable button if already incremental
+        const incBtn = document.getElementById('db-incvacuum-btn');
+        if (incBtn && data.auto_vacuum === 2) {
+            incBtn.textContent = 'Incremental Vacuum Enabled';
+            incBtn.disabled = true;
+            incBtn.style.opacity = '0.5';
+        }
+    } catch (e) { console.error('Error loading DB maintenance info:', e); }
+}
+
+async function runDatabaseVacuum() {
+    const btn = document.getElementById('db-vacuum-btn');
+    const status = document.getElementById('db-vacuum-status');
+    if (!confirm('This will compact the database by rewriting it. The database will be locked during this operation. For large databases this may take over a minute. Continue?')) return;
+    btn.disabled = true;
+    btn.textContent = 'Compacting...';
+    if (status) { status.style.display = 'block'; status.style.background = 'rgba(255,255,255,0.04)'; status.style.color = 'rgba(255,255,255,0.6)'; status.textContent = 'Running VACUUM — this may take a while...'; }
+    try {
+        const resp = await fetch('/api/database/maintenance/vacuum', { method: 'POST' });
+        const data = await resp.json();
+        if (data.success) {
+            showToast(`Database compacted in ${data.elapsed_seconds}s — saved ${data.saved_display}`, 'success');
+            if (status) { status.style.color = '#4caf50'; status.textContent = `Done in ${data.elapsed_seconds}s. Saved ${data.saved_display}.`; }
+            loadDbMaintenanceInfo();
+        } else {
+            showToast('Vacuum failed: ' + (data.error || 'Unknown error'), 'error');
+            if (status) { status.style.color = '#ef5350'; status.textContent = 'Failed: ' + (data.error || 'Unknown error'); }
+        }
+    } catch (e) {
+        showToast('Vacuum failed: ' + e.message, 'error');
+        if (status) { status.style.color = '#ef5350'; status.textContent = 'Failed: ' + e.message; }
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Compact Database (VACUUM)';
+    }
+}
+
+async function enableIncrementalVacuum() {
+    const btn = document.getElementById('db-incvacuum-btn');
+    const status = document.getElementById('db-vacuum-status');
+    if (!confirm('This will enable incremental vacuum mode. It requires a one-time full VACUUM to activate, which locks the database and may take over a minute on large databases. Continue?')) return;
+    btn.disabled = true;
+    btn.textContent = 'Enabling...';
+    if (status) { status.style.display = 'block'; status.style.background = 'rgba(255,255,255,0.04)'; status.style.color = 'rgba(255,255,255,0.6)'; status.textContent = 'Enabling incremental vacuum — this may take a while...'; }
+    try {
+        const resp = await fetch('/api/database/maintenance/enable-incremental-vacuum', { method: 'POST' });
+        const data = await resp.json();
+        if (data.success) {
+            const msg = data.already_enabled ? 'Already enabled' : `Enabled in ${data.elapsed_seconds}s — saved ${data.saved_display}`;
+            showToast(msg, 'success');
+            if (status) { status.style.color = '#4caf50'; status.textContent = msg; }
+            loadDbMaintenanceInfo();
+        } else {
+            showToast('Failed: ' + (data.error || 'Unknown error'), 'error');
+            if (status) { status.style.color = '#ef5350'; status.textContent = 'Failed: ' + (data.error || 'Unknown error'); }
+        }
+    } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+        if (status) { status.style.color = '#ef5350'; status.textContent = 'Failed: ' + e.message; }
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Enable Incremental Vacuum';
+    }
+}
+
+async function activateDevMode() {
+    const password = document.getElementById('dev-mode-password').value;
+    try {
+        const response = await fetch('/api/dev-mode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password })
+        });
+        const data = await response.json();
+        if (data.success) {
+            document.getElementById('dev-mode-status').textContent = 'Active';
+            document.getElementById('dev-mode-status').style.color = 'rgb(var(--accent-light-rgb))';
+            document.getElementById('hydrabase-nav').style.display = '';
+            document.getElementById('hydrabase-button-container').style.display = '';
+            document.getElementById('dev-mode-password').value = '';
+            showToast('Dev mode activated', 'success');
+        } else {
+            showToast('Invalid password', 'error');
+        }
+    } catch (e) {
+        showToast('Failed to activate dev mode', 'error');
+    }
+}
+
+// ── Hydrabase Functions ──
+
+let _hydrabaseConnected = false;
+
+async function hydrabaseToggleConnection() {
+    if (_hydrabaseConnected) {
+        await hydrabaseDisconnect();
+    } else {
+        await hydrabaseConnect();
+    }
+}
+
+async function hydrabaseConnect() {
+    const url = document.getElementById('hydra-ws-url').value.trim();
+    const apiKey = document.getElementById('hydra-api-key').value.trim();
+    if (!url || !apiKey) {
+        showToast('URL and API key required', 'error');
+        return;
+    }
+    const statusEl = document.getElementById('hydra-connection-status');
+    const btn = document.getElementById('hydra-connect-btn');
+    statusEl.textContent = 'Connecting...';
+    statusEl.style.color = '#f0ad4e';
+    try {
+        const response = await fetch('/api/hydrabase/connect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url, api_key: apiKey })
+        });
+        const data = await response.json();
+        if (data.success) {
+            _hydrabaseConnected = true;
+            statusEl.textContent = 'Connected';
+            statusEl.style.color = 'rgb(var(--accent-light-rgb))';
+            btn.textContent = 'Disconnect';
+            showToast('Connected to Hydrabase', 'success');
+        } else {
+            statusEl.textContent = 'Failed';
+            statusEl.style.color = '#f44336';
+            showToast(data.error || 'Connection failed', 'error');
+        }
+    } catch (e) {
+        statusEl.textContent = 'Error';
+        statusEl.style.color = '#f44336';
+        showToast('Connection error', 'error');
+    }
+}
+
+async function hydrabaseDisconnect() {
+    try {
+        await fetch('/api/hydrabase/disconnect', { method: 'POST' });
+    } catch (e) { }
+    _hydrabaseConnected = false;
+    document.getElementById('hydra-connection-status').textContent = 'Disconnected';
+    document.getElementById('hydra-connection-status').style.color = '#888';
+    document.getElementById('hydra-connect-btn').textContent = 'Connect';
+    // Dev mode is disabled on disconnect — hide Hydrabase nav and update settings status
+    document.getElementById('hydrabase-nav').style.display = 'none';
+    document.getElementById('hydrabase-button-container').style.display = 'none';
+    const devStatus = document.getElementById('dev-mode-status');
+    if (devStatus) {
+        devStatus.textContent = 'Inactive';
+        devStatus.style.color = '#888';
+    }
+    showToast('Disconnected — dev mode disabled', 'success');
+    navigateToPage('settings');
+}
+
+async function loadHydrabaseComparisons() {
+    const container = document.getElementById('hydra-comparisons-container');
+    if (!container) return;
+    try {
+        const response = await fetch('/api/hydrabase/comparisons');
+        const data = await response.json();
+        if (!data.success || !data.comparisons?.length) {
+            container.innerHTML = '<p style="color: #666; font-size: 13px;">No comparisons yet. Search with Hydrabase active to generate comparisons.</p>';
+            return;
+        }
+        let html = '';
+        for (const comp of data.comparisons) {
+            const time = new Date(comp.timestamp * 1000).toLocaleTimeString();
+            html += `<div style="background: rgba(30, 30, 30, 0.6); border-radius: 8px; padding: 10px; margin-bottom: 8px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                    <strong style="color: #fff;">"${comp.query}"</strong>
+                    <span style="color: #666; font-size: 11px;">${time}</span>
+                </div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; font-size: 12px;">
+                    <div style="padding: 6px 8px; border-radius: 6px; background: rgba(99, 102, 241, 0.15); border: 1px solid rgba(99, 102, 241, 0.3);">
+                        <div style="color: rgba(139, 92, 246, 1); font-weight: 600; margin-bottom: 2px;">Hydrabase</div>
+                        <div style="color: #aaa;">${comp.hydrabase?.tracks || 0}T / ${comp.hydrabase?.artists || 0}A / ${comp.hydrabase?.albums || 0}Al</div>
+                    </div>
+                    <div style="padding: 6px 8px; border-radius: 6px; background: rgba(29, 185, 84, 0.15); border: 1px solid rgba(29, 185, 84, 0.3);">
+                        <div style="color: rgb(var(--accent-light-rgb)); font-weight: 600; margin-bottom: 2px;">Spotify</div>
+                        <div style="color: #aaa;">${comp.spotify?.tracks || 0}T / ${comp.spotify?.artists || 0}A / ${comp.spotify?.albums || 0}Al</div>
+                    </div>
+                    <div style="padding: 6px 8px; border-radius: 6px; background: rgba(251, 93, 93, 0.15); border: 1px solid rgba(251, 93, 93, 0.3);">
+                        <div style="color: #fb5d5d; font-weight: 600; margin-bottom: 2px;">${comp.fallback_source === 'deezer' ? 'Deezer' : 'iTunes'}</div>
+                        <div style="color: #aaa;">${(comp.fallback || comp.itunes)?.tracks || 0}T / ${(comp.fallback || comp.itunes)?.artists || 0}A / ${(comp.fallback || comp.itunes)?.albums || 0}Al</div>
+                    </div>
+                </div>
+            </div>`;
+        }
+        container.innerHTML = html;
+    } catch (e) {
+        container.innerHTML = '<p style="color: #f44336; font-size: 13px;">Failed to load comparisons.</p>';
+    }
+}
+
+async function hydrabaseSendRaw(textareaId) {
+    const textarea = document.getElementById(textareaId);
+    const raw = textarea.value.trim();
+    if (!raw) {
+        showToast('Payload is empty', 'error');
+        return;
+    }
+    if (!_hydrabaseConnected) {
+        showToast('Not connected to Hydrabase', 'error');
+        return;
+    }
+    let payload;
+    try {
+        payload = JSON.parse(raw);
+    } catch (e) {
+        showToast('Invalid JSON payload', 'error');
+        return;
+    }
+    // Auto-inject a fresh nonce if not set or zero
+    if (!payload.nonce) {
+        payload.nonce = Date.now();
+    }
+    const responseArea = document.getElementById('hydra-response');
+    responseArea.textContent = 'Sending...';
+    try {
+        const response = await fetch('/api/hydrabase/send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ payload })
+        });
+        const data = await response.json();
+        if (data.success) {
+            responseArea.textContent = JSON.stringify(data.data, null, 2);
+        } else {
+            responseArea.textContent = 'Error: ' + (data.error || 'Unknown error');
+            if (data.error && data.error.includes('Not connected')) {
+                _hydrabaseConnected = false;
+                document.getElementById('hydra-connection-status').textContent = 'Disconnected';
+                document.getElementById('hydra-connection-status').style.color = '#888';
+                document.getElementById('hydra-connect-btn').textContent = 'Connect';
+            }
+        }
+    } catch (e) {
+        responseArea.textContent = 'Error: ' + e.message;
+    }
+}
+
+// ── Tag embedding accordion helpers ──
+function toggleTagGroup(header) {
+    const body = header.nextElementSibling;
+    const arrow = header.querySelector('.tag-group-arrow');
+    if (body.style.display === 'none') {
+        body.style.display = 'block';
+        arrow.classList.add('open');
+    } else {
+        body.style.display = 'none';
+        arrow.classList.remove('open');
+    }
+}
+
+function toggleServiceTags(masterCheckbox, serviceName) {
+    const group = masterCheckbox.closest('.tag-service-group');
+    if (!group) return;
+    const body = group.querySelector('.tag-service-body');
+    if (!body) return;
+    const childCheckboxes = body.querySelectorAll('input[type="checkbox"]');
+    childCheckboxes.forEach(cb => {
+        const label = cb.closest('.checkbox-label');
+        if (masterCheckbox.checked) {
+            if (label) label.classList.remove('disabled-tag');
+            cb.disabled = false;
+        } else {
+            if (label) label.classList.add('disabled-tag');
+            cb.disabled = true;
+        }
+    });
+}
+
+function _collectServiceTags(serviceName) {
+    const tags = {};
+    document.querySelectorAll(`[data-config^="${serviceName}.tags."]`).forEach(cb => {
+        const key = cb.dataset.config.split('.').pop();
+        tags[key] = cb.checked;
+    });
+    return tags;
+}
+
+function _getTagConfig(path) {
+    const el = document.querySelector(`[data-config="${path}"]`);
+    return el ? el.checked : true;
+}
+
+async function saveSettings(quiet = false) {
+    // #879: refuse to save if the settings never loaded successfully — the form
+    // is showing defaults, not the user's real config, so saving would wipe it.
+    // Cleared automatically on the next successful load (reload the page).
+    if (window._settingsLoadFailed) {
+        if (!quiet && typeof showToast === 'function') {
+            showToast("Settings didn't load — reload the page before saving (your config is untouched)", 'error');
+        }
+        return;
+    }
+
+    // Validate file organization templates before saving
+    const validationErrors = validateFileOrganizationTemplates();
+    if (validationErrors.length > 0) {
+        if (!quiet) showToast('Template validation failed: ' + validationErrors.join(', '), 'error');
+        return;
+    }
+
+    // Determine active server from toggle buttons
+    let activeServer = 'plex';
+    if (document.getElementById('jellyfin-toggle').classList.contains('active')) {
+        activeServer = 'jellyfin';
+    } else if (document.getElementById('navidrome-toggle').classList.contains('active')) {
+        activeServer = 'navidrome';
+    } else if (document.getElementById('soulsync-toggle')?.classList.contains('active')) {
+        activeServer = 'soulsync';
+    }
+    // ISOLATION: this page is reused on the video side. Connection details (Plex/
+    // Jellyfin creds) ARE shared and save fine — but the video side must NEVER
+    // change the MUSIC active server. So when saving from the video side, keep
+    // active_media_server exactly as it was persisted (the toggle there only opens
+    // a config panel; it does not pick the music server).
+    if (document.body.getAttribute('data-side') === 'video' && window._persistedActiveServer) {
+        activeServer = window._persistedActiveServer;
+    }
+
+    const metadataSourceSelect = document.getElementById('metadata-fallback-source');
+    const discogsTokenInput = document.getElementById('discogs-token');
+    const discogsTokenPresent = !!discogsTokenInput?.value?.trim();
+    let metadataSource = metadataSourceSelect?.value || 'deezer';
+    const spotifySessionActive = _lastStatusPayload?.spotify?.authenticated === true;
+    const spotifyFreeInstalled = _lastStatusPayload?.spotify?.free_installed === true;
+    if (metadataSource === 'spotify' && !spotifySessionActive) {
+        metadataSource = _metadataSourceFallback('spotify');
+        if (metadataSourceSelect) metadataSourceSelect.value = metadataSource;
+        if (!quiet) {
+            showToast('Spotify is disconnected, so the primary metadata source was switched.', 'warning');
+        }
+    } else if (metadataSource === 'spotify_free' && !spotifyFreeInstalled) {
+        metadataSource = _metadataSourceFallback('spotify_free');
+        if (metadataSourceSelect) metadataSourceSelect.value = metadataSource;
+        if (!quiet) {
+            showToast('Spotify Free needs the SpotipyFree package installed.', 'warning');
+        }
+    } else if (metadataSource === 'discogs' && !discogsTokenPresent) {
+        metadataSource = _metadataSourceFallback('discogs');
+        if (metadataSourceSelect) metadataSourceSelect.value = metadataSource;
+        if (!quiet) {
+            showToast('Discogs requires a personal access token before it can be selected as the primary metadata source.', 'warning');
+        }
+    } else if (metadataSource === 'jiosaavn' && !document.getElementById('experimental-jiosaavn-enabled')?.checked) {
+        metadataSource = 'deezer';
+        if (metadataSourceSelect) metadataSourceSelect.value = metadataSource;
+        if (!quiet) {
+            showToast('JioSaavn is not enabled — turn it on under Advanced → Experimental.', 'warning');
+        }
+    }
+
+    // Validate the optional "Playlist File Naming" template before saving: it's a
+    // filename (no path separator) and must include $title — mirrors the server-side
+    // rule so a broken value can't be stored. Empty = feature off (allowed).
+    const _plItemTpl = (document.getElementById('template-playlist-item')?.value || '').trim();
+    if (_plItemTpl) {
+        if (_plItemTpl.includes('/') || _plItemTpl.includes('\\')) {
+            showToast('Playlist File Naming can\'t contain a folder separator ( / or \\ ) — it names the file, not a path.', 'error');
+            return;
+        }
+        if (!_plItemTpl.includes('$title')) {
+            showToast('Playlist File Naming must include $title so every file has a name.', 'error');
+            return;
+        }
+    }
+
+    const settings = {
+        active_media_server: activeServer,
+        spotify: {
+            client_id: document.getElementById('spotify-client-id').value,
+            client_secret: document.getElementById('spotify-client-secret').value,
+            redirect_uri: document.getElementById('spotify-redirect-uri').value,
+            embed_tags: document.getElementById('embed-spotify').checked,
+            tags: _collectServiceTags('spotify')
+        },
+        tidal: {
+            client_id: document.getElementById('tidal-client-id').value,
+            client_secret: document.getElementById('tidal-client-secret').value,
+            redirect_uri: document.getElementById('tidal-redirect-uri').value,
+            embed_tags: document.getElementById('embed-tidal').checked,
+            tags: _collectServiceTags('tidal')
+        },
+        plex: {
+            base_url: document.getElementById('plex-url').value,
+            token: document.getElementById('plex-token').value
+        },
+        jellyfin: {
+            base_url: document.getElementById('jellyfin-url').value,
+            api_key: document.getElementById('jellyfin-api-key').value,
+            api_timeout: parseInt(document.getElementById('jellyfin-timeout').value) || 30
+        },
+        navidrome: {
+            base_url: document.getElementById('navidrome-url').value,
+            username: document.getElementById('navidrome-username').value,
+            password: document.getElementById('navidrome-password').value
+        },
+        soulseek: {
+            slskd_url: document.getElementById('soulseek-url').value,
+            api_key: document.getElementById('soulseek-api-key').value,
+            download_path: document.getElementById('download-path').value,
+            transfer_path: document.getElementById('transfer-path').value,
+            min_free_disk_gb: Math.max(0, parseFloat(document.getElementById('min-free-disk-gb')?.value) || 0),
+            search_timeout: parseInt(document.getElementById('soulseek-search-timeout').value) || 60,
+            search_timeout_buffer: parseInt(document.getElementById('soulseek-search-timeout-buffer').value) || 15,
+            search_min_delay_seconds: parseInt(document.getElementById('soulseek-search-min-delay-seconds').value) || 0,
+            min_peer_upload_speed: parseInt(document.getElementById('soulseek-min-peer-speed').value) || 0,
+            max_peer_queue: parseInt(document.getElementById('soulseek-max-peer-queue').value) || 0,
+            download_timeout: (parseInt(document.getElementById('soulseek-download-timeout').value) || 10) * 60,
+            auto_clear_searches: document.getElementById('soulseek-auto-clear-searches').checked
+        },
+        listenbrainz: {
+            base_url: document.getElementById('listenbrainz-base-url').value,
+            token: document.getElementById('listenbrainz-token').value,
+            scrobble_enabled: document.getElementById('listenbrainz-scrobble-enabled').checked,
+        },
+        acoustid: {
+            api_key: document.getElementById('acoustid-api-key').value,
+            enabled: document.getElementById('acoustid-enabled').checked,
+            require_verified: document.getElementById('acoustid-require-verified')?.checked === true
+        },
+        lastfm: {
+            api_key: document.getElementById('lastfm-api-key').value,
+            api_secret: document.getElementById('lastfm-api-secret').value,
+            scrobble_enabled: document.getElementById('lastfm-scrobble-enabled').checked,
+            embed_tags: document.getElementById('embed-lastfm').checked,
+            tags: _collectServiceTags('lastfm')
+        },
+        genius: {
+            access_token: document.getElementById('genius-access-token').value,
+            embed_tags: document.getElementById('embed-genius').checked,
+            tags: _collectServiceTags('genius')
+        },
+        itunes: {
+            country: document.getElementById('itunes-country').value || 'US',
+            embed_tags: document.getElementById('embed-itunes').checked,
+            tags: _collectServiceTags('itunes')
+        },
+        discogs: {
+            token: document.getElementById('discogs-token').value,
+        },
+        metadata: {
+            // 'Spotify Free' is stored as the spotify source + a flag, so all
+            // downstream 'spotify' routing is unchanged.
+            fallback_source: metadataSource === 'spotify_free' ? 'spotify' : metadataSource,
+            spotify_free: metadataSource === 'spotify_free',
+            // Independent opt-in: run the enrichment worker on Spotify Free even
+            // when an official account is connected (spares the official quota).
+            spotify_free_enrichment: document.getElementById('metadata-spotify-free-enrichment')?.checked || false
+        },
+        experimental: {
+            jiosaavn_enabled: document.getElementById('experimental-jiosaavn-enabled')?.checked === true,
+            bandcamp_enabled: document.getElementById('experimental-bandcamp-enabled')?.checked === true,
+        },
+        hydrabase: {
+            url: document.getElementById('hydrabase-url').value,
+            api_key: document.getElementById('hydrabase-api-key').value,
+            auto_connect: document.getElementById('hydrabase-auto-connect').checked
+        },
+        download_source: {
+            mode: document.getElementById('download-source-mode').value,
+            hybrid_primary: document.getElementById('hybrid-primary-source').value,
+            hybrid_secondary: document.getElementById('hybrid-secondary-source').value,
+            hybrid_order: getHybridOrder(),
+            stream_source: document.getElementById('stream-source').value,
+            max_concurrent: parseInt(document.getElementById('max-concurrent-downloads').value) || 3,
+            // #1056 — streaming-source search timeout override; 0 = source defaults
+            source_search_timeout: parseInt(document.getElementById('source-search-timeout')?.value) || 0,
+            // Stalled-torrent knobs (rendered in the torrent client section).
+            // UI is in MINUTES; stored in SECONDS. Blank/NaN → 10 min default;
+            // 0 stays 0 (disabled).
+            torrent_stall_timeout_seconds: (() => {
+                const m = parseInt(document.getElementById('torrent-stall-timeout')?.value, 10);
+                return (Number.isFinite(m) && m >= 0 ? m : 10) * 60;
+            })(),
+            torrent_stall_action: document.getElementById('torrent-stall-action')?.value || 'abandon',
+            // In-container path(s) where SoulSync reads finished torrent/usenet
+            // downloads (#857). Rendered in the torrent/usenet client sections.
+            torrent_download_path: document.getElementById('torrent-download-path')?.value || '',
+            usenet_download_path: document.getElementById('usenet-download-path')?.value || '',
+        },
+        tidal_download: {
+            // quality derived from the global Quality Profile (ranked targets); allow_fallback always true
+        },
+        hifi_download: {
+            // quality derived from the global Quality Profile (ranked targets); allow_fallback always true
+        },
+        hifi: {
+            embed_tags: document.getElementById('embed-hifi').checked,
+            tags: _collectServiceTags('hifi')
+        },
+        deezer_download: {
+            arl: document.getElementById('deezer-download-arl').value || '',
+        },
+        amazon_download: {
+            // quality derived from the global Quality Profile (ranked targets); allow_fallback always true
+        },
+        lidarr_download: {
+            url: document.getElementById('lidarr-url').value || '',
+            api_key: document.getElementById('lidarr-api-key').value || '',
+        },
+        prowlarr: {
+            url: document.getElementById('prowlarr-url')?.value || '',
+            api_key: document.getElementById('prowlarr-api-key')?.value || '',
+            indexer_ids: document.getElementById('prowlarr-indexer-ids')?.value || '',
+        },
+        torrent_client: {
+            type: document.getElementById('torrent-client-type')?.value || 'qbittorrent',
+            url: document.getElementById('torrent-client-url')?.value || '',
+            username: document.getElementById('torrent-client-username')?.value || '',
+            password: document.getElementById('torrent-client-password')?.value || '',
+            category: document.getElementById('torrent-client-category')?.value || 'soulsync',
+            save_path: document.getElementById('torrent-client-save-path')?.value || '',
+            seed_ratio_goal: parseFloat(document.getElementById('music-seed-ratio')?.value) || 0,
+            seed_time_goal_hours: parseInt(document.getElementById('music-seed-hours')?.value, 10) || 0,
+            seed_remove_data: !!(document.getElementById('music-seed-remove-data') || {}).checked,
+            seed_mode: document.getElementById('music-seed-mode')?.value || 'soulsync',
+        },
+        usenet_client: {
+            type: document.getElementById('usenet-client-type')?.value || 'sabnzbd',
+            url: document.getElementById('usenet-client-url')?.value || '',
+            api_key: document.getElementById('usenet-client-api-key')?.value || '',
+            username: document.getElementById('usenet-client-username')?.value || '',
+            password: document.getElementById('usenet-client-password')?.value || '',
+            category: document.getElementById('usenet-client-category')?.value || 'soulsync',
+        },
+        soundcloud_download: {
+            // No knobs yet — anonymous-only. Keeping the key present so
+            // future tier-2 OAuth wiring (Go+ session token) doesn't have
+            // to migrate existing configs.
+        },
+        qobuz: {
+            embed_tags: document.getElementById('embed-qobuz').checked,
+            tags: _collectServiceTags('qobuz'),
+        },
+        database: {
+            max_workers: parseInt(document.getElementById('max-workers').value)
+        },
+        metadata_enhancement: {
+            enabled: document.getElementById('metadata-enabled').checked,
+            embed_album_art: document.getElementById('embed-album-art').checked,
+            cover_art_download: document.getElementById('cover-art-download').checked,
+            prefer_caa_art: document.getElementById('prefer-caa-art').checked,
+            album_art_order: getArtOrder(),
+            single_to_album: document.getElementById('single-to-album-enabled').checked,
+            lrclib_enabled: document.getElementById('lrclib-enabled').checked,
+            tags: {
+                quality_tag: _getTagConfig('metadata_enhancement.tags.quality_tag'),
+                genre_merge: _getTagConfig('metadata_enhancement.tags.genre_merge'),
+                artist_separator: document.getElementById('artist-separator').value,
+                write_multi_artist: document.getElementById('write-multi-artist').checked,
+                feat_in_title: document.getElementById('feat-in-title').checked
+            }
+        },
+        musicbrainz: {
+            embed_tags: document.getElementById('embed-musicbrainz').checked,
+            tags: _collectServiceTags('musicbrainz')
+        },
+        deezer: {
+            app_id: document.getElementById('deezer-app-id').value,
+            app_secret: document.getElementById('deezer-app-secret').value,
+            redirect_uri: document.getElementById('deezer-redirect-uri').value,
+            embed_tags: document.getElementById('embed-deezer').checked,
+            tags: _collectServiceTags('deezer')
+        },
+        audiodb: {
+            embed_tags: document.getElementById('embed-audiodb').checked,
+            tags: _collectServiceTags('audiodb')
+        },
+        file_organization: {
+            enabled: document.getElementById('file-organization-enabled').checked,
+            disc_label: document.getElementById('disc-label').value,
+            collab_artist_mode: document.getElementById('collab-artist-mode').value,
+            templates: {
+                album_path: document.getElementById('template-album-path').value,
+                single_path: document.getElementById('template-single-path').value,
+                playlist_path: document.getElementById('template-playlist-path').value,
+                playlist_item: document.getElementById('template-playlist-item').value,
+                video_path: document.getElementById('template-video-path').value
+            }
+        },
+        wishlist: {
+            allow_duplicate_tracks: document.getElementById('allow-duplicate-tracks').checked,
+            ignore_ttl_days: Math.max(1, Math.min(365,
+                parseInt(document.getElementById('wishlist-ignore-ttl')?.value, 10) || 30)),
+        },
+        playlist_sync: {
+            create_backup: document.getElementById('create-backup').checked,
+            mode: document.getElementById('playlist-sync-mode')?.value || 'replace'
+        },
+        content_filter: {
+            allow_explicit: document.getElementById('allow-explicit').checked,
+            prefer_explicit: document.getElementById('prefer-explicit').checked
+        },
+        genre_whitelist: {
+            enabled: document.getElementById('genre-whitelist-enabled').checked,
+            genres: _collectGenreWhitelist(),
+        },
+        post_processing: {
+            replaygain_enabled: document.getElementById('replaygain-enabled').checked,
+            audio_completeness_check: document.getElementById('audio-completeness-check').checked,
+            duration_tolerance_seconds: parseFloat(document.getElementById('duration-tolerance-seconds').value) || 0,
+            retry_next_candidate_on_mismatch: document.getElementById('retry-next-candidate').checked,
+            retry_exhaustive: document.getElementById('retry-exhaustive').checked,
+            retries_per_query: Math.max(1, parseInt(document.getElementById('retries-per-query').value, 10) || 5),
+            accept_version_mismatch_fallback: document.getElementById('accept-version-mismatch-fallback').checked,
+            version_mismatch_min_count: Math.max(1, parseInt(document.getElementById('version-mismatch-min-count').value, 10) || 2),
+        },
+        library: {
+            music_paths: collectMusicPaths(),
+            music_videos_path: document.getElementById('music-videos-path').value || './MusicVideos'
+        },
+        import: {
+            replace_lower_quality: document.getElementById('import-replace-lower-quality').checked,
+            folder_artist_override: document.getElementById('import-folder-artist-override')?.checked !== false,
+            transfer_is_permanent: document.getElementById('import-transfer-permanent')?.checked === true,
+            staging_path: document.getElementById('staging-path').value || './Staging'
+        },
+        playlists: {
+            materialize_path: document.getElementById('playlists-materialize-path').value || './Playlists',
+            materialize_mode: document.getElementById('playlists-materialize-mode').value || 'symlink'
+        },
+        lossy_copy: {
+            enabled: document.getElementById('lossy-copy-enabled').checked,
+            codec: document.getElementById('lossy-copy-codec').value,
+            bitrate: document.getElementById('lossy-copy-bitrate').value,
+            delete_original: document.getElementById('lossy-copy-delete-original').checked,
+            downsample_hires: document.getElementById('downsample-hires').checked
+        },
+        album_downloads: {
+            // Atomic album publishing (#999) — opt-in, default off.
+            atomic_publish: document.getElementById('album-atomic-publish')?.checked === true
+        },
+        listening_stats: {
+            enabled: document.getElementById('listening-stats-enabled').checked,
+            poll_interval: parseInt(document.getElementById('listening-stats-interval').value) || 30,
+        },
+        discover: {
+            // Adventurousness dial (0 safe .. 1 obscure) — drives the Discover popularity penalty.
+            // Use the slider's value directly (0 is valid; don't `|| 0.3` it away).
+            adventurousness: document.getElementById('discover-adventurousness')
+                ? parseFloat(document.getElementById('discover-adventurousness').value)
+                : 0.3,
+        },
+        m3u_export: {
+            enabled: document.getElementById('m3u-export-enabled').checked,
+            entry_base_path: document.getElementById('m3u-entry-base-path').value || '',
+            library_enabled: document.getElementById('library-m3u-enabled')?.checked === true,
+            library_path: document.getElementById('library-m3u-path')?.value || ''
+        },
+        ui_appearance: {
+            accent_preset: document.getElementById('accent-preset')?.value || '#1db954',
+            accent_color: document.getElementById('accent-custom-color')?.value || '#1db954',
+            sidebar_visualizer: document.getElementById('sidebar-visualizer-type')?.value || 'bars',
+            // Read the runtime flags / localStorage, not the checkboxes: while Max
+            // Performance is on it locks those boxes visually-off, but the user's real
+            // saved prefs live in the flags — so saving must not clobber them.
+            particles_enabled: window._particlesEnabled !== false,
+            worker_orbs_enabled: window._workerOrbsEnabled !== false,
+            reduce_effects: window._reduceEffectsActive === true,
+            max_performance: window._maxPerfActive === true
+        },
+        youtube: {
+            cookies_browser: document.getElementById('youtube-cookies-browser').value,
+            download_delay: parseInt(document.getElementById('youtube-download-delay').value) || 3,
+            // Raw cookies.txt blob — backend validates, writes it to a file, and stores
+            // only the path (never echoed back). Blank = keep any already-saved file.
+            cookies_paste: document.getElementById('youtube-cookies-paste')?.value || '',
+        },
+        security: {
+            require_pin_on_launch: document.getElementById('security-require-pin')?.checked || false,
+            cors_origins: document.getElementById('security-cors-origins')?.value?.trim() || '',
+            trust_reverse_proxy: document.getElementById('security-trust-proxy')?.checked || false,
+            auth_proxy_header: document.getElementById('security-auth-proxy-header')?.value?.trim() || '',
+            require_login: document.getElementById('security-require-login')?.checked || false,
+        }
+    };
+
+    // Validate cors_origins entries — backend silently filters malformed
+    // values, so warn the user up-front if any line doesn't look like a
+    // URL (or the special '*' token). One-shot toast; doesn't block save.
+    const corsRaw = settings.security.cors_origins;
+    if (corsRaw) {
+        const entries = corsRaw.replace(/\n/g, ',').split(',')
+            .map(s => s.trim())
+            .filter(s => s);
+        const invalid = entries.filter(e => {
+            if (e === '*') return false;
+            // Accept scheme://host[:port] only — no path, query, or fragment.
+            // Engineio compares Origin against {scheme}://{host} exactly.
+            return !/^https?:\/\/[^\s/?#]+$/i.test(e);
+        });
+        if (invalid.length) {
+            showToast(
+                `Allowed Origins: ${invalid.length} entr${invalid.length === 1 ? 'y looks' : 'ies look'} malformed (need full URL like https://soulsync.example.com, no trailing slash). Saving anyway — they\'ll be ignored.`,
+                'warning'
+            );
+        }
+    }
+
+    // Previewing a non-default profile shows ITS acoustid/lossy-copy/deep-verify/
+    // replace-lower-quality values in the same DOM fields this whole-page save
+    // reads (collectFullQualityBundleFromUI's fields, above). The server mirrors
+    // whatever comes through in these sections straight into the ACTIVE default
+    // profile (see web_server.py's settings handler calling
+    // sync_default_quality_profile_from_config) — so without this, just clicking
+    // Save Settings while previewing another profile would silently overwrite the
+    // live default with the previewed profile's values. Substitute the real
+    // default's stored values back in before sending, so this save is a no-op for
+    // those keys regardless of what's currently on screen.
+    if (_qpEditingProfileId !== null && _qpEditingProfileId !== _qpDefaultProfileId()) {
+        const def = _qpProfileRows.find(p => p.is_default);
+        if (def) {
+            settings.acoustid.require_verified = !!def.acoustid_required;
+            settings.lossy_copy.downsample_hires = !!def.downsample_enabled;
+            settings.lossy_copy.enabled = !!def.lossy_copy_enabled;
+            settings.lossy_copy.codec = def.lossy_copy_codec || 'mp3';
+            settings.lossy_copy.bitrate = def.lossy_copy_bitrate || '320';
+            settings.lossy_copy.delete_original = !!def.lossy_copy_delete_original;
+            settings.post_processing.audio_completeness_check = !!def.deep_audio_verify;
+            settings.import.replace_lower_quality = !!def.replace_lower_quality;
+        }
+    }
+
+    try {
+        if (!quiet) showLoadingOverlay('Saving settings...');
+
+        // Save main settings
+        const response = await fetch(API.settings, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(settings)
+        });
+
+        const result = await response.json();
+
+        // Save quality profile
+        const qualityProfileSaved = await saveQualityProfile();
+
+        // Save discovery lookback period
+        let lookbackSaved = true;
+        try {
+            const lookbackPeriod = document.getElementById('discovery-lookback-period').value;
+            const lookbackResponse = await fetch('/api/discovery/lookback-period', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ period: lookbackPeriod })
+            });
+            const lookbackResult = await lookbackResponse.json();
+            lookbackSaved = lookbackResult.success === true;
+        } catch (error) {
+            console.error('Error saving discovery lookback period:', error);
+            lookbackSaved = false;
+        }
+
+        // Save hemisphere setting
+        try {
+            const hemisphere = document.getElementById('discovery-hemisphere').value;
+            await fetch('/api/discovery/hemisphere', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ hemisphere })
+            });
+        } catch (error) {
+            console.error('Error saving hemisphere setting:', error);
+        }
+
+        if (result.success && qualityProfileSaved && lookbackSaved) {
+            showToast(quiet ? 'Settings auto-saved' : 'Settings saved successfully', 'success');
+            _forceServiceStatusRefresh();
+            _stgRefreshAfterSave();
+        } else if (result.success && qualityProfileSaved && !lookbackSaved) {
+            showToast('Settings saved, but discovery lookback period failed to save', 'warning');
+            _forceServiceStatusRefresh();
+            _stgRefreshAfterSave();
+        } else if (result.success && !qualityProfileSaved) {
+            showToast('Settings saved, but quality profile failed to save', 'warning');
+            _forceServiceStatusRefresh();
+            _stgRefreshAfterSave();
+        } else {
+            showToast(`Failed to save settings: ${result.error}`, 'error', 'set-services');
+        }
+    } catch (error) {
+        console.error('Error saving settings:', error);
+        showToast('Failed to save settings', 'error', 'set-services');
+    } finally {
+        if (!quiet) hideLoadingOverlay();
+    }
+}
+
+async function authorizeLastfmScrobbling() {
+    try {
+        // Save settings first so API secret is stored
+        await saveSettings();
+        const resp = await fetch('/api/lastfm/auth-url');
+        const data = await resp.json();
+        if (data.success && data.url) {
+            window.open(data.url, '_blank', 'width=600,height=500');
+            showToast('Authorize SoulSync in the Last.fm window that opened', 'info');
+        } else {
+            showToast(data.error || 'Could not generate auth URL', 'error');
+        }
+    } catch (e) {
+        showToast('Failed to start Last.fm authorization', 'error');
+    }
+}
+
+async function testConnection(service) {
+    try {
+        showLoadingOverlay(`Testing ${service} connection...`);
+
+        const response = await fetch(API.testConnection, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ service })
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            // Use backend's message which contains dynamic source name
+            showToast(result.message || `${service} connection successful`, 'success');
+
+            // Load music libraries after successful connection
+            if (service === 'plex') {
+                loadPlexMusicLibraries();
+            } else if (service === 'jellyfin') {
+                loadJellyfinUsers().then(() => loadJellyfinMusicLibraries());
+            } else if (service === 'navidrome') {
+                loadNavidromeMusicFolders();
+            }
+        } else {
+            showToast(`${service} connection failed: ${result.error}`, 'error', 'gs-connecting');
+        }
+    } catch (error) {
+        console.error(`Error testing ${service} connection:`, error);
+        showToast(`Failed to test ${service} connection`, 'error', 'gs-connecting');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+async function clearQuarantine() {
+    if (!await showConfirmDialog({ title: 'Clear Quarantine', message: 'Delete all files in the quarantine folder? This cannot be undone.', confirmText: 'Delete', destructive: true })) return;
+    try {
+        showLoadingOverlay('Clearing quarantine folder...');
+        const response = await fetch('/api/quarantine/clear', { method: 'POST' });
+        const result = await response.json();
+        if (result.success) {
+            showToast(result.message || 'Quarantine cleared', 'success');
+        } else {
+            showToast(`Failed to clear quarantine: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        console.error('Error clearing quarantine:', error);
+        showToast('Failed to clear quarantine', 'error');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+// ======================== API Key Management ========================
+
+async function loadApiKeys() {
+    const container = document.getElementById('api-keys-list');
+    if (!container) return;
+
+    try {
+        const response = await fetch('/api/v1/api-keys-internal');
+        if (response.ok) {
+            const data = await response.json();
+            renderApiKeys(data.data?.keys || []);
+        } else {
+            container.innerHTML = '<div style="color: #666; font-size: 13px;">No API keys configured.</div>';
+        }
+    } catch (e) {
+        container.innerHTML = '<div style="color: #666; font-size: 13px;">No API keys configured.</div>';
+    }
+}
+
+function renderApiKeys(keys) {
+    const container = document.getElementById('api-keys-list');
+    if (!container) return;
+
+    if (!keys || keys.length === 0) {
+        container.innerHTML = '<div style="color: #666; font-size: 13px; padding: 4px 0;">No API keys yet. Generate one below.</div>';
+        return;
+    }
+
+    container.innerHTML = keys.map(k => `
+        <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; margin-bottom: 4px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 6px;">
+            <div style="flex: 1; min-width: 0;">
+                <div style="font-size: 13px; color: #e0e0e0; font-weight: 500;">${escapeHtml(k.label || 'Unnamed')}</div>
+                <div style="font-size: 11px; color: #666; margin-top: 2px;">
+                    <code>${escapeHtml(k.key_prefix || 'sk_...')}...</code>
+                    &middot; Created ${k.created_at ? new Date(k.created_at).toLocaleDateString() : 'unknown'}
+                    ${k.last_used_at ? '&middot; Last used ' + new Date(k.last_used_at).toLocaleDateString() : ''}
+                </div>
+            </div>
+            <button class="revoke-api-key-btn" data-key-id="${escapeHtml(k.id)}" data-key-label="${escapeHtml(k.label || 'this key')}"
+                style="padding: 4px 10px; background: rgba(255,82,82,0.1); border: 1px solid rgba(255,82,82,0.2); color: #ff5252; border-radius: 4px; cursor: pointer; font-size: 11px; white-space: nowrap;">
+                Revoke
+            </button>
+        </div>
+    `).join('');
+    _initApiKeyClickHandler();
+}
+
+function _initApiKeyClickHandler() {
+    const container = document.getElementById('api-keys-list');
+    if (!container) return;
+    container.onclick = (e) => {
+        const btn = e.target.closest('.revoke-api-key-btn');
+        if (btn) {
+            e.preventDefault();
+            revokeApiKey(btn.dataset.keyId, btn.dataset.keyLabel);
+        }
+    };
+}
+
+async function generateApiKey() {
+    const labelInput = document.getElementById('api-key-label');
+    const label = labelInput ? labelInput.value.trim() : '';
+
+    try {
+        const response = await fetch('/api/v1/api-keys-internal/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ label: label || 'Default' })
+        });
+        const data = await response.json();
+
+        if (data.success && data.data?.key) {
+            const keyDisplay = document.getElementById('api-key-generated');
+            const keyValue = document.getElementById('api-key-value');
+            if (keyDisplay && keyValue) {
+                keyValue.textContent = data.data.key;
+                keyDisplay.style.display = 'block';
+            }
+            if (labelInput) labelInput.value = '';
+            showToast('API key generated! Copy it now.', 'success');
+            loadApiKeys();
+        } else {
+            showToast(data.error?.message || 'Failed to generate API key', 'error');
+        }
+    } catch (error) {
+        console.error('Error generating API key:', error);
+        showToast('Failed to generate API key', 'error');
+    }
+}
+
+function copyApiKey() {
+    const keyValue = document.getElementById('api-key-value');
+    if (keyValue) {
+        navigator.clipboard.writeText(keyValue.textContent).then(() => {
+            showToast('API key copied to clipboard', 'success');
+        }).catch(() => {
+            // Fallback for older browsers
+            const range = document.createRange();
+            range.selectNode(keyValue);
+            window.getSelection().removeAllRanges();
+            window.getSelection().addRange(range);
+            document.execCommand('copy');
+            showToast('API key copied', 'success');
+        });
+    }
+}
+
+async function revokeApiKey(keyId, label) {
+    if (!await showConfirmDialog({ title: 'Revoke API Key', message: `Revoke API key "${label}"? Any apps using this key will stop working.`, confirmText: 'Revoke', destructive: true })) return;
+
+    try {
+        const response = await fetch(`/api/v1/api-keys-internal/revoke/${keyId}`, { method: 'DELETE' });
+        const data = await response.json();
+        if (data.success) {
+            showToast('API key revoked', 'success');
+            loadApiKeys();
+        } else {
+            showToast(data.error?.message || 'Failed to revoke key', 'error');
+        }
+    } catch (error) {
+        console.error('Error revoking API key:', error);
+        showToast('Failed to revoke key', 'error');
+    }
+}
+
+// Dashboard-specific test functions that create activity items
+async function testDashboardConnection(service) {
+    // 'spotify_free' is a display-only label for the no-auth composite; the real
+    // service to test is 'spotify'.
+    if (service === 'spotify_free') service = 'spotify';
+    try {
+        showLoadingOverlay(`Testing ${service} service...`);
+
+        const response = await fetch(API.testDashboardConnection, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ service })
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            // Use backend's message which contains dynamic source name
+            showToast(result.message || `${service} service verified`, 'success');
+            // Refresh status indicators immediately so UI reflects the new state
+            fetchAndUpdateServiceStatus();
+        } else {
+            showToast(`${service} service check failed: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        console.error(`Error testing ${service} service:`, error);
+        showToast(`Failed to test ${service} service`, 'error');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+// Individual Auto-detect functions - same as GUI
+async function autoDetectPlex() {
+    try {
+        showLoadingOverlay('Auto-detecting Plex server...');
+
+        const response = await fetch('/api/detect-media-server', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ server_type: 'plex' })
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            document.getElementById('plex-url').value = result.found_url;
+            showToast(`Plex server detected: ${result.found_url}`, 'success');
+        } else {
+            showToast(result.error, 'error');
+        }
+
+    } catch (error) {
+        console.error('Error auto-detecting Plex:', error);
+        showToast('Failed to auto-detect Plex server', 'error');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+async function autoDetectJellyfin() {
+    try {
+        showLoadingOverlay('Auto-detecting Jellyfin server...');
+
+        const response = await fetch('/api/detect-media-server', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ server_type: 'jellyfin' })
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            document.getElementById('jellyfin-url').value = result.found_url;
+            showToast(`Jellyfin server detected: ${result.found_url}`, 'success');
+        } else {
+            showToast(result.error, 'error');
+        }
+
+    } catch (error) {
+        console.error('Error auto-detecting Jellyfin:', error);
+        showToast('Failed to auto-detect Jellyfin server', 'error');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+async function autoDetectNavidrome() {
+    try {
+        showLoadingOverlay('Auto-detecting Navidrome server...');
+
+        const response = await fetch('/api/detect-media-server', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ server_type: 'navidrome' })
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            document.getElementById('navidrome-url').value = result.found_url;
+            showToast(`Navidrome server detected: ${result.found_url}`, 'success');
+        } else {
+            showToast(result.error, 'error');
+        }
+
+    } catch (error) {
+        console.error('Error auto-detecting Navidrome:', error);
+        showToast('Failed to auto-detect Navidrome server', 'error');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+async function autoDetectSlskd() {
+    try {
+        showLoadingOverlay('Auto-detecting Soulseek (slskd) server...');
+
+        const response = await fetch('/api/detect-soulseek', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            document.getElementById('soulseek-url').value = result.found_url;
+            showToast(`Soulseek server detected: ${result.found_url}`, 'success');
+        } else {
+            showToast(result.error, 'error');
+        }
+
+    } catch (error) {
+        console.error('Error auto-detecting Soulseek:', error);
+        showToast('Failed to auto-detect Soulseek server', 'error');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+
+function cancelDetection(service) {
+    const progressDiv = document.getElementById(`${service}-detection-progress`);
+    progressDiv.classList.add('hidden');
+    showToast(`${service} detection cancelled`, 'error');
+}
+
+function updateStatusDisplays() {
+    // Update status displays based on current service status
+    // This would be called after status updates
+    const services = ['spotify', 'media-server', 'soulseek'];
+    services.forEach(service => {
+        const display = document.getElementById(`${service}-status-display`);
+        if (display) {
+            // Status will be updated by the regular status monitoring
+        }
+    });
+}
+
+async function authenticateSpotify() {
+    try {
+        showLoadingOverlay('Saving credentials and starting Spotify authentication...');
+        // Save settings first to ensure client_id/client_secret are persisted
+        await saveSettings();
+        showToast('Spotify authentication started', 'success');
+        window._spotifyAuthWindow = window.open('/auth/spotify', '_blank');
+    } catch (error) {
+        console.error('Error authenticating Spotify:', error);
+        showToast('Failed to start Spotify authentication', 'error', 'gs-connecting');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+async function disconnectSpotify() {
+    if (!await showConfirmDialog({
+        title: 'Disconnect Spotify',
+        message: 'Disconnect Spotify? Spotify-specific actions will stop until you reauthenticate.'
+    })) {
+        return;
+    }
+    try {
+        showLoadingOverlay('Disconnecting Spotify...');
+        const response = await fetch('/api/spotify/disconnect', { method: 'POST' });
+        const data = await response.json();
+        if (data.success) {
+            showToast(data.message || 'Spotify disconnected.', 'success');
+            syncMetadataSourceSelection(data.source || 'deezer');
+            // Immediately refresh status to update UI
+            await fetchAndUpdateServiceStatus();
+        } else {
+            showToast(`Failed to disconnect: ${data.error}`, 'error');
+        }
+    } catch (error) {
+        console.error('Error disconnecting Spotify:', error);
+        showToast('Failed to disconnect Spotify', 'error');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+// ── Spotify Rate Limit Handling ───────────────────────────────────────────
+let _spotifyRateLimitShown = false;
+let _spotifyInCooldown = false;
+let _rateLimitModalOpen = false;
+let _rateLimitCountdownInterval = null;
+let _rateLimitExpiresAt = 0;
+
+function handleSpotifyRateLimit(rateLimitInfo) {
+    if (!rateLimitInfo || !rateLimitInfo.active) {
+        if (_spotifyRateLimitShown) {
+            _spotifyRateLimitShown = false;
+            closeRateLimitModal();
+            showToast('Spotify access restored', 'success');
+            // Refresh discover page if user is on it — data source switched back to Spotify
+            if (currentPage === 'discover') {
+                console.log('Spotify restored — refreshing discover page data');
+                loadDiscoverPage();
+            }
+        }
+        return;
+    }
+    // Update countdown if modal is open (status pushes every 10s keep it accurate)
+    if (_rateLimitModalOpen && rateLimitInfo.remaining_seconds) {
+        _rateLimitExpiresAt = Date.now() + (rateLimitInfo.remaining_seconds * 1000);
+    }
+    if (!_spotifyRateLimitShown) {
+        _spotifyRateLimitShown = true;
+        _spotifyInCooldown = false;
+        showRateLimitModal(rateLimitInfo);
+        // Refresh discover page if user is on it — data source switched to iTunes
+        if (currentPage === 'discover') {
+            console.log('Spotify rate limited — refreshing discover page with iTunes data');
+            loadDiscoverPage();
+        }
+    }
+}
+
+function showRateLimitModal(rateLimitInfo) {
+    const overlay = document.getElementById('rate-limit-modal-overlay');
+    if (!overlay) return;
+
+    // Populate details
+    const banDuration = document.getElementById('rate-limit-ban-duration');
+    const endpoint = document.getElementById('rate-limit-endpoint');
+    const countdown = document.getElementById('rate-limit-countdown');
+
+    banDuration.textContent = formatRateLimitDuration(rateLimitInfo.retry_after || rateLimitInfo.remaining_seconds);
+    endpoint.textContent = rateLimitInfo.endpoint || 'unknown';
+    countdown.textContent = formatRateLimitDuration(rateLimitInfo.remaining_seconds);
+
+    // Set expiry for live countdown
+    _rateLimitExpiresAt = Date.now() + (rateLimitInfo.remaining_seconds * 1000);
+
+    // Start live countdown timer
+    if (_rateLimitCountdownInterval) clearInterval(_rateLimitCountdownInterval);
+    _rateLimitCountdownInterval = setInterval(() => {
+        const remaining = Math.max(0, Math.round((_rateLimitExpiresAt - Date.now()) / 1000));
+        countdown.textContent = formatRateLimitDuration(remaining);
+        if (remaining <= 0) {
+            clearInterval(_rateLimitCountdownInterval);
+            _rateLimitCountdownInterval = null;
+        }
+    }, 1000);
+
+    overlay.classList.remove('hidden');
+    _rateLimitModalOpen = true;
+}
+
+function closeRateLimitModal() {
+    const overlay = document.getElementById('rate-limit-modal-overlay');
+    if (overlay) overlay.classList.add('hidden');
+    if (_rateLimitCountdownInterval) {
+        clearInterval(_rateLimitCountdownInterval);
+        _rateLimitCountdownInterval = null;
+    }
+    _rateLimitModalOpen = false;
+}
+
+async function disconnectSpotifyFromRateLimit() {
+    closeRateLimitModal();
+    try {
+        showLoadingOverlay('Disconnecting Spotify...');
+        const response = await fetch('/api/spotify/disconnect', { method: 'POST' });
+        const data = await response.json();
+        if (data.success) {
+            _spotifyRateLimitShown = false;
+            showToast(data.message || 'Spotify disconnected.', 'success');
+            syncMetadataSourceSelection(data.source || 'deezer');
+            await fetchAndUpdateServiceStatus();
+            if (currentPage === 'discover') {
+                loadDiscoverPage();
+            }
+        } else {
+            showToast(`Failed to disconnect: ${data.error}`, 'error');
+        }
+    } catch (error) {
+        console.error('Error disconnecting Spotify:', error);
+        showToast('Failed to disconnect Spotify', 'error');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+function formatRateLimitDuration(seconds) {
+    if (!seconds || seconds <= 0) return '0s';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+}
+
+async function authenticateTidal() {
+    try {
+        showLoadingOverlay('Saving credentials and starting Tidal authentication...');
+        // Save settings first to ensure credentials are persisted
+        await saveSettings();
+        showToast('Tidal authentication started', 'success');
+        window.open('/auth/tidal', '_blank');
+    } catch (error) {
+        console.error('Error authenticating Tidal:', error);
+        showToast('Failed to start Tidal authentication', 'error');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+async function disconnectTidal() {
+    // Clear saved Tidal token. Use when re-authentication doesn't pick
+    // up newly-added scopes (existing token predates a scope expansion
+    // and `prompt=consent` alone isn't forcing fresh consent on this
+    // user's auth flow). After disconnect, click Authenticate again
+    // for a clean grant.
+    if (!confirm('Disconnect Tidal? Saved token will be cleared and you\'ll need to re-authenticate.')) {
+        return;
+    }
+    try {
+        showLoadingOverlay('Disconnecting Tidal...');
+        const resp = await fetch('/api/tidal/disconnect', { method: 'POST' });
+        const data = await resp.json();
+        if (resp.ok && data.success) {
+            showToast('Tidal disconnected. Click Authenticate to reconnect with current scopes.', 'success');
+        } else {
+            showToast(`Disconnect failed: ${data.error || 'unknown error'}`, 'error');
+        }
+    } catch (error) {
+        console.error('Error disconnecting Tidal:', error);
+        showToast('Failed to disconnect Tidal', 'error');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+async function authenticateDeezer() {
+    try {
+        showLoadingOverlay('Saving credentials and starting Deezer authentication...');
+        await saveSettings();
+        showToast('Deezer authentication started', 'success');
+        window.open('/auth/deezer', '_blank');
+    } catch (error) {
+        console.error('Error authenticating Deezer:', error);
+        showToast('Failed to start Deezer authentication', 'error');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+// ===== Tidal Download Auth (Device Flow) =====
+
+async function testHiFiConnection() {
+    const statusEl = document.getElementById('hifi-connection-status');
+    const btn = document.getElementById('hifi-test-btn');
+    if (!statusEl) return;
+    statusEl.textContent = 'Checking...';
+    statusEl.style.color = '#aaa';
+    try {
+        const resp = await fetch('/api/hifi/status');
+        const data = await resp.json();
+        if (data.available) {
+            statusEl.textContent = `Connected (v${data.version || '?'})`;
+            statusEl.style.color = '#4caf50';
+        } else {
+            statusEl.textContent = 'No instances reachable';
+            statusEl.style.color = '#ff9800';
+        }
+    } catch (e) {
+        statusEl.textContent = 'Connection error';
+        statusEl.style.color = '#f44336';
+    }
+}
+
+async function testSoundcloudConnection() {
+    const statusEl = document.getElementById('soundcloud-connection-status');
+    if (!statusEl) return;
+    statusEl.textContent = 'Checking...';
+    statusEl.style.color = '#aaa';
+    try {
+        const resp = await fetch('/api/soundcloud/status');
+        const data = await resp.json();
+        if (data.available && data.reachable) {
+            statusEl.textContent = 'Connected (anonymous)';
+            statusEl.style.color = '#4caf50';
+        } else if (data.available) {
+            // Client up but the live probe failed — likely a SoundCloud
+            // outage or a transient yt-dlp parse error. Surface plainly.
+            statusEl.textContent = 'Reachable check failed — try again';
+            statusEl.style.color = '#ff9800';
+        } else {
+            statusEl.textContent = data.error || 'Unavailable';
+            statusEl.style.color = '#f44336';
+        }
+    } catch (e) {
+        statusEl.textContent = 'Connection error';
+        statusEl.style.color = '#f44336';
+    }
+}
+
+async function testLidarrConnection() {
+    const statusEl = document.getElementById('lidarr-connection-status');
+    if (!statusEl) return;
+    statusEl.textContent = 'Checking...';
+    statusEl.style.color = '#aaa';
+    try {
+        // Save settings first so the backend has the URL/key
+        await saveSettings();
+        const resp = await fetch('/api/test-connection', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ service: 'lidarr' })
+        });
+        const data = await resp.json();
+        if (data.success) {
+            statusEl.textContent = 'Connected';
+            statusEl.style.color = '#4caf50';
+        } else {
+            statusEl.textContent = data.error || 'Connection failed';
+            statusEl.style.color = '#f44336';
+        }
+    } catch (e) {
+        statusEl.textContent = 'Connection error';
+        statusEl.style.color = '#f44336';
+    }
+}
+
+function _setIndStatusDot(dotId, state) {
+    const dot = document.getElementById(dotId);
+    if (!dot) return;
+    dot.classList.remove('ind-status-dot-unknown', 'ind-status-dot-connected', 'ind-status-dot-error');
+    if (state === 'connected') {
+        dot.classList.add('ind-status-dot-connected');
+        dot.title = 'Connected';
+    } else if (state === 'error') {
+        dot.classList.add('ind-status-dot-error');
+        dot.title = 'Connection failed';
+    } else {
+        dot.classList.add('ind-status-dot-unknown');
+        dot.title = 'Not tested';
+    }
+}
+
+async function testProwlarrConnection() {
+    const statusEl = document.getElementById('prowlarr-connection-status');
+    if (!statusEl) return;
+    statusEl.textContent = 'Checking...';
+    statusEl.style.color = '#aaa';
+    try {
+        await saveSettings();
+        const resp = await fetch('/api/test-connection', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ service: 'prowlarr' })
+        });
+        const data = await resp.json();
+        if (data.success) {
+            statusEl.textContent = data.message || 'Connected';
+            statusEl.style.color = '#4caf50';
+            _setIndStatusDot('prowlarr-status-dot', 'connected');
+            loadProwlarrIndexers();
+        } else {
+            statusEl.textContent = data.error || 'Connection failed';
+            statusEl.style.color = '#f44336';
+            _setIndStatusDot('prowlarr-status-dot', 'error');
+        }
+    } catch (e) {
+        statusEl.textContent = 'Connection error';
+        statusEl.style.color = '#f44336';
+        _setIndStatusDot('prowlarr-status-dot', 'error');
+    }
+}
+
+function updateUsenetClientUI() {
+    const type = document.getElementById('usenet-client-type')?.value || 'sabnzbd';
+    const apikeyGroup = document.getElementById('usenet-apikey-group');
+    const userGroup = document.getElementById('usenet-username-group');
+    const passGroup = document.getElementById('usenet-password-group');
+    if (type === 'sabnzbd') {
+        if (apikeyGroup) apikeyGroup.style.display = '';
+        if (userGroup) userGroup.style.display = 'none';
+        if (passGroup) passGroup.style.display = 'none';
+    } else {
+        if (apikeyGroup) apikeyGroup.style.display = 'none';
+        if (userGroup) userGroup.style.display = '';
+        if (passGroup) passGroup.style.display = '';
+    }
+}
+
+async function testUsenetClientConnection() {
+    const statusEl = document.getElementById('usenet-client-connection-status');
+    if (!statusEl) return;
+    statusEl.textContent = 'Checking...';
+    statusEl.style.color = '#aaa';
+    try {
+        await saveSettings();
+        const resp = await fetch('/api/test-connection', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ service: 'usenet_client' })
+        });
+        const data = await resp.json();
+        if (data.success) {
+            statusEl.textContent = data.message || 'Connected';
+            statusEl.style.color = '#4caf50';
+            _setIndStatusDot('usenet-client-status-dot', 'connected');
+        } else {
+            statusEl.textContent = data.error || 'Connection failed';
+            statusEl.style.color = '#f44336';
+            _setIndStatusDot('usenet-client-status-dot', 'error');
+        }
+    } catch (e) {
+        statusEl.textContent = 'Connection error';
+        statusEl.style.color = '#f44336';
+        _setIndStatusDot('usenet-client-status-dot', 'error');
+    }
+}
+
+async function testTorrentClientConnection() {
+    const statusEl = document.getElementById('torrent-client-connection-status');
+    if (!statusEl) return;
+    statusEl.textContent = 'Checking...';
+    statusEl.style.color = '#aaa';
+    try {
+        await saveSettings();
+        const resp = await fetch('/api/test-connection', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ service: 'torrent_client' })
+        });
+        const data = await resp.json();
+        if (data.success) {
+            statusEl.textContent = data.message || 'Connected';
+            statusEl.style.color = '#4caf50';
+            _setIndStatusDot('torrent-client-status-dot', 'connected');
+        } else {
+            statusEl.textContent = data.error || 'Connection failed';
+            statusEl.style.color = '#f44336';
+            _setIndStatusDot('torrent-client-status-dot', 'error');
+        }
+    } catch (e) {
+        statusEl.textContent = 'Connection error';
+        statusEl.style.color = '#f44336';
+        _setIndStatusDot('torrent-client-status-dot', 'error');
+    }
+}
+
+async function loadProwlarrIndexers() {
+    const listEl = document.getElementById('prowlarr-indexer-list');
+    if (!listEl) return;
+    listEl.innerHTML = '<em>Loading…</em>';
+    try {
+        const resp = await fetch('/api/prowlarr/indexers');
+        const data = await resp.json();
+        if (!data.success) {
+            listEl.innerHTML = `<em style="color:#f44336;">${data.error || 'Prowlarr not configured.'}</em>`;
+            return;
+        }
+        if (!data.indexers || data.indexers.length === 0) {
+            listEl.innerHTML = '<em>No indexers configured in Prowlarr yet. Add some in Prowlarr → Indexers.</em>';
+            return;
+        }
+        const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        const rows = data.indexers.map(idx => {
+            const protoClass = idx.protocol === 'usenet' ? 'ind-indexer-card-proto-usenet' : 'ind-indexer-card-proto-torrent';
+            const protoLabel = idx.protocol === 'usenet' ? 'Usenet' : 'Torrent';
+            const privacyHTML = idx.privacy ? `<span class="ind-indexer-card-privacy">${esc(idx.privacy)}</span>` : '';
+            const disabledClass = idx.enable ? '' : ' ind-indexer-card-disabled';
+            return `<div class="ind-indexer-card${disabledClass}">
+                <span class="ind-indexer-card-id">#${esc(idx.id)}</span>
+                <span class="ind-indexer-card-name">${esc(idx.name)}</span>
+                ${privacyHTML}
+                <span class="ind-indexer-card-proto ${protoClass}">${protoLabel}</span>
+            </div>`;
+        }).join('');
+        listEl.innerHTML = rows;
+    } catch (e) {
+        listEl.innerHTML = `<em style="color:#f44336;">Failed to load indexers: ${e.message}</em>`;
+    }
+}
+
+async function loadHiFiInstances() {
+    const listEl = document.getElementById('hifi-instances-list');
+    if (!listEl) return;
+    try {
+        const resp = await fetch('/api/hifi/instances/list');
+        const data = await resp.json();
+        if (!data.instances || data.instances.length === 0) {
+            listEl.innerHTML = '<div style="color: rgba(255,255,255,0.4); font-size: 0.85em;">No instances configured.</div>';
+            return;
+        }
+        listEl.innerHTML = data.instances.map((inst, i) => {
+            const enabledClass = inst.enabled ? '' : 'hifi-instance-disabled';
+            const checkHtml = inst.enabled
+                ? `<span class="hifi-instance-toggle on" data-url="${escapeHtml(inst.url)}" title="Click to disable">&#x2714;</span>`
+                : `<span class="hifi-instance-toggle off" data-url="${escapeHtml(inst.url)}" title="Click to enable">&#x2718;</span>`;
+            return `<div class="hifi-instance-item${inst.enabled ? '' : ' disabled'}" draggable="true" data-url="${escapeHtml(inst.url)}">
+                <span class="hifi-instance-grip">&#x2630;</span>
+                <span class="hifi-instance-url">${escapeHtml(inst.url)}</span>
+                ${checkHtml}
+                <span class="hifi-instance-remove" data-url="${escapeHtml(inst.url)}" title="Remove instance">&#x2716;</span>
+            </div>`;
+        }).join('');
+        _initHiFiDragDrop();
+        _initHiFiClickHandlers();
+    } catch (e) {
+        listEl.innerHTML = `<div style="color:#f44336;font-size:0.85em;">Error loading instances: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function _initHiFiDragDrop() {
+    const listEl = document.getElementById('hifi-instances-list');
+    if (!listEl) return;
+    let dragIdx = null;
+
+    listEl.querySelectorAll('.hifi-instance-item').forEach((item, idx) => {
+        item.addEventListener('dragstart', (e) => {
+            dragIdx = idx;
+            item.classList.add('dragging');
+            e.dataTransfer.effectAllowed = 'move';
+        });
+        item.addEventListener('dragend', () => {
+            item.classList.remove('dragging');
+            dragIdx = null;
+            listEl.querySelectorAll('.hifi-instance-item').forEach(i => i.classList.remove('drag-over'));
+        });
+        item.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            item.classList.add('drag-over');
+        });
+        item.addEventListener('dragleave', () => {
+            item.classList.remove('drag-over');
+        });
+        item.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            item.classList.remove('drag-over');
+            if (dragIdx === null) return;
+            const items = [...listEl.querySelectorAll('.hifi-instance-item')];
+            const dragged = items[dragIdx];
+            if (dragIdx !== idx) {
+                if (dragIdx < idx) {
+                    item.after(dragged);
+                } else {
+                    item.before(dragged);
+                }
+                const urls = [...listEl.querySelectorAll('.hifi-instance-item')].map(el => el.dataset.url);
+                await _saveHiFiInstanceOrder(urls);
+            }
+        });
+    });
+}
+
+function _initHiFiClickHandlers() {
+    const listEl = document.getElementById('hifi-instances-list');
+    if (!listEl) return;
+    listEl.onclick = (e) => {
+        const toggle = e.target.closest('.hifi-instance-toggle');
+        if (toggle) {
+            e.preventDefault();
+            toggleHiFiInstance(toggle.dataset.url);
+            return;
+        }
+        const remove = e.target.closest('.hifi-instance-remove');
+        if (remove) {
+            e.preventDefault();
+            removeHiFiInstance(remove.dataset.url);
+        }
+    };
+}
+
+async function _saveHiFiInstanceOrder(urls) {
+    try {
+        await fetch('/api/hifi/instances/reorder', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ urls })
+        });
+    } catch (e) {
+        console.error('Failed to save HiFi instance order:', e);
+    }
+}
+
+async function toggleHiFiInstance(url) {
+    const listEl = document.getElementById('hifi-instances-list');
+    if (!listEl) return;
+    const item = listEl.querySelector(`.hifi-instance-item[data-url="${url}"]`);
+    const toggle = item?.querySelector('.hifi-instance-toggle');
+    const currentlyEnabled = toggle?.classList.contains('on');
+    const newEnabled = !currentlyEnabled;
+    try {
+        const resp = await fetch('/api/hifi/instances/toggle', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url, enabled: newEnabled })
+        });
+        const data = await resp.json();
+        if (data.success) {
+            loadHiFiInstances();
+        } else {
+            alert(data.error || 'Failed to toggle instance');
+        }
+    } catch (e) {
+        alert(`Error: ${e.message}`);
+    }
+}
+
+async function addHiFiInstance() {
+    const input = document.getElementById('hifi-new-instance');
+    if (!input) return;
+    const url = input.value.trim();
+    if (!url) return;
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        alert('URL must start with http:// or https://');
+        return;
+    }
+    try {
+        const resp = await fetch('/api/hifi/instances', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url })
+        });
+        const data = await resp.json();
+        if (data.success) {
+            input.value = '';
+            loadHiFiInstances();
+        } else {
+            alert(data.error || 'Failed to add instance');
+        }
+    } catch (e) {
+        alert(`Error: ${e.message}`);
+    }
+}
+
+async function restoreDefaultHiFiInstances() {
+    const btn = document.getElementById('hifi-instances-restore-btn');
+    const orig = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = 'Restoring…'; }
+    try {
+        const resp = await fetch('/api/hifi/instances/reset', { method: 'POST' });
+        const data = await resp.json();
+        if (data.success) {
+            loadHiFiInstances();
+            const n = data.restored || 0;
+            if (typeof showToast === 'function') {
+                showToast(n ? `Restored ${n} default instance${n === 1 ? '' : 's'}`
+                            : 'All default instances are already present', 'success');
+            }
+        } else {
+            alert(data.error || 'Failed to restore defaults');
+        }
+    } catch (e) {
+        alert(`Error: ${e.message}`);
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = orig || 'Restore Defaults'; }
+    }
+}
+
+async function removeHiFiInstance(url) {
+    try {
+        const resp = await fetch(`/api/hifi/instances?url=${encodeURIComponent(url)}`, {
+            method: 'DELETE'
+        });
+        const data = await resp.json();
+        if (data.success) {
+            loadHiFiInstances();
+        } else {
+            alert(data.error || 'Failed to remove instance');
+        }
+    } catch (e) {
+        alert(`Error: ${e.message}`);
+    }
+}
+
+async function checkHiFiInstances() {
+    const panel = document.getElementById('hifi-instances-status-panel');
+    const btn = document.getElementById('hifi-instances-check-btn');
+    if (!panel) return;
+    panel.style.display = 'block';
+    panel.innerHTML = '<div style="color: rgba(255,255,255,0.4); font-size: 0.85em; padding: 8px 0;">Checking instances...</div>';
+    if (btn) { btn.disabled = true; btn.textContent = 'Checking...'; }
+    try {
+        const resp = await fetch('/api/hifi/instances');
+        const data = await resp.json();
+        if (!data.instances || data.instances.length === 0) {
+            panel.innerHTML = '<div style="color: #ff9800; font-size: 0.85em;">No instances configured.</div>';
+            return;
+        }
+        const _statusIcon = (inst) => {
+            if (inst.can_download) return '<span style="color:#4caf50">● Download</span>';
+            if (inst.can_search) return '<span style="color:#ff9800">● Search only</span>';
+            if (inst.status === 'online') return '<span style="color:#ff9800">● Online (limited)</span>';
+            if (inst.status === 'ssl_error') return '<span style="color:#f44336">● SSL error</span>';
+            if (inst.status === 'timeout') return '<span style="color:#f44336">● Timeout</span>';
+            if (inst.status === 'offline') return '<span style="color:#f44336">● Offline</span>';
+            return `<span style="color:#f44336">● ${escapeHtml(inst.status)}</span>`;
+        };
+        panel.innerHTML = data.instances.map(inst => {
+            const isActive = inst.url === data.active;
+            const ver = inst.version ? ` v${inst.version}` : '';
+            const activeTag = isActive ? ' <span style="color:rgb(var(--accent-rgb));font-weight:600;font-size:0.75em;">(ACTIVE)</span>' : '';
+            return `<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.04);font-size:0.82em;">
+                <span style="color:rgba(255,255,255,0.6);font-family:monospace;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(inst.url)}${ver}${activeTag}</span>
+                <span style="flex-shrink:0;margin-left:12px;">${_statusIcon(inst)}</span>
+            </div>`;
+        }).join('');
+    } catch (e) {
+        panel.innerHTML = `<div style="color:#f44336;font-size:0.85em;">Error checking instances: ${escapeHtml(e.message)}</div>`;
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Check All Instances'; }
+    }
+}
+
+async function testDeezerDownloadConnection() {
+    const statusEl = document.getElementById('deezer-download-status');
+    if (!statusEl) return;
+    statusEl.textContent = 'Checking...';
+    statusEl.style.color = '#aaa';
+    try {
+        let arl = document.getElementById('deezer-download-arl')?.value || '';
+        // An untouched field holds the redaction sentinel (a token IS saved) —
+        // send empty so the backend tests the SAVED token instead of the mask,
+        // which the source would reject (#870).
+        if (arl === REDACTED_SECRET_SENTINEL) arl = '';
+        const resp = await fetch('/api/deezer-download/test', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ arl }),
+        });
+        const data = await resp.json();
+        if (data.success) {
+            statusEl.textContent = `Connected as ${data.user || 'Unknown'} (${data.tier || 'Free'})`;
+            statusEl.style.color = '#4caf50';
+        } else {
+            statusEl.textContent = data.error || 'Authentication failed';
+            statusEl.style.color = '#f44336';
+        }
+    } catch (e) {
+        statusEl.textContent = 'Connection error';
+        statusEl.style.color = '#f44336';
+    }
+}
+
+async function testAmazonConnection() {
+    const statusEl = document.getElementById('amazon-connection-status');
+    if (!statusEl) return;
+    statusEl.textContent = 'Checking...';
+    statusEl.style.color = '#aaa';
+    try {
+        const resp = await fetch('/api/amazon/test-connection');
+        const data = await resp.json();
+        if (data.connected) {
+            statusEl.textContent = '✓ Connected — T2Tunes up';
+            statusEl.style.color = '#4caf50';
+        } else {
+            statusEl.textContent = '✗ ' + (data.error || 'T2Tunes unreachable');
+            statusEl.style.color = '#f44336';
+        }
+    } catch (e) {
+        statusEl.textContent = '✗ Connection error';
+        statusEl.style.color = '#f44336';
+    }
+}
+
+async function checkTidalDownloadAuthStatus() {
+    const statusEl = document.getElementById('tidal-download-auth-status');
+    const btn = document.getElementById('tidal-download-auth-btn');
+    try {
+        const resp = await fetch('/api/tidal/download/auth/status');
+        const data = await resp.json();
+        if (data.authenticated) {
+            statusEl.textContent = 'Authenticated';
+            statusEl.style.color = '#4caf50';
+            btn.textContent = 'Re-link Tidal Account';
+        } else {
+            statusEl.textContent = 'Not authenticated';
+            statusEl.style.color = '#ff9800';
+            btn.textContent = 'Link Tidal Account';
+        }
+    } catch (e) {
+        statusEl.textContent = '';
+    }
+}
+
+let _tidalAuthPollTimer = null;
+
+async function startTidalDownloadAuth() {
+    const btn = document.getElementById('tidal-download-auth-btn');
+    const statusEl = document.getElementById('tidal-download-auth-status');
+    const codeEl = document.getElementById('tidal-download-auth-code');
+
+    btn.disabled = true;
+    btn.textContent = 'Starting...';
+    statusEl.textContent = '';
+
+    try {
+        const resp = await fetch('/api/tidal/download/auth/start', { method: 'POST' });
+        const data = await resp.json();
+
+        if (!resp.ok || !data.success) {
+            throw new Error(data.error || 'Failed to start auth');
+        }
+
+        // Show the link/code to the user
+        const uri = data.verification_uri || '';
+        const code = data.user_code || '';
+        codeEl.style.display = 'block';
+        codeEl.innerHTML = `Go to <a href="${uri}" target="_blank" style="color:rgb(var(--accent-rgb));">${uri}</a> and enter code: <strong>${code}</strong>`;
+        btn.textContent = 'Waiting for approval...';
+        statusEl.textContent = 'Waiting...';
+        statusEl.style.color = '#ff9800';
+
+        // Poll for completion
+        if (_tidalAuthPollTimer) clearInterval(_tidalAuthPollTimer);
+        _tidalAuthPollTimer = setInterval(async () => {
+            try {
+                const checkResp = await fetch('/api/tidal/download/auth/check');
+                const checkData = await checkResp.json();
+
+                if (checkData.status === 'completed') {
+                    clearInterval(_tidalAuthPollTimer);
+                    _tidalAuthPollTimer = null;
+                    codeEl.style.display = 'none';
+                    statusEl.textContent = 'Authenticated';
+                    statusEl.style.color = '#4caf50';
+                    btn.disabled = false;
+                    btn.textContent = 'Re-link Tidal Account';
+                    showToast('Tidal download account linked successfully', 'success');
+                } else if (checkData.status === 'error') {
+                    clearInterval(_tidalAuthPollTimer);
+                    _tidalAuthPollTimer = null;
+                    codeEl.style.display = 'none';
+                    statusEl.textContent = 'Auth failed';
+                    statusEl.style.color = '#f44336';
+                    btn.disabled = false;
+                    btn.textContent = 'Link Tidal Account';
+                    showToast('Tidal auth failed: ' + (checkData.message || 'Unknown error'), 'error');
+                }
+                // status === 'pending' — keep polling
+            } catch (pollErr) {
+                console.error('Tidal auth poll error:', pollErr);
+            }
+        }, 3000);
+
+    } catch (error) {
+        console.error('Tidal download auth error:', error);
+        showToast('Failed to start Tidal auth: ' + error.message, 'error');
+        btn.disabled = false;
+        btn.textContent = 'Link Tidal Account';
+        codeEl.style.display = 'none';
+    }
+}
+
+// ===============================
+// QOBUZ AUTH FUNCTIONS
+// ===============================
+
+async function checkQobuzAuthStatus() {
+    try {
+        const resp = await fetch('/api/qobuz/auth/status');
+        const data = await resp.json();
+
+        // Update downloads tab section
+        const formEl = document.getElementById('qobuz-auth-form');
+        const loggedInEl = document.getElementById('qobuz-auth-logged-in');
+        const userInfoEl = document.getElementById('qobuz-auth-user-info');
+
+        // Update connections tab section
+        const connFormEl = document.getElementById('qobuz-connection-form');
+        const connLoggedInEl = document.getElementById('qobuz-connection-logged-in');
+        const connUserInfoEl = document.getElementById('qobuz-connection-user-info');
+
+        if (data.authenticated) {
+            const user = data.user || {};
+            const label = `Connected: ${user.display_name || 'Qobuz User'} (${user.subscription || 'Active'})`;
+
+            if (userInfoEl) { userInfoEl.textContent = label; }
+            if (loggedInEl) loggedInEl.style.display = 'flex';
+            if (formEl) formEl.style.display = 'none';
+
+            if (connUserInfoEl) { connUserInfoEl.textContent = label; }
+            if (connLoggedInEl) connLoggedInEl.style.display = 'flex';
+            if (connFormEl) connFormEl.style.display = 'none';
+        } else {
+            if (loggedInEl) loggedInEl.style.display = 'none';
+            if (formEl) formEl.style.display = 'block';
+
+            if (connLoggedInEl) connLoggedInEl.style.display = 'none';
+            if (connFormEl) connFormEl.style.display = 'block';
+        }
+    } catch (e) {
+        console.error('Qobuz auth status check failed:', e);
+    }
+}
+
+async function loginQobuzFromConnections() {
+    const btn = document.getElementById('qobuz-connection-login-btn');
+    const statusEl = document.getElementById('qobuz-connection-status');
+    const email = document.getElementById('qobuz-connection-email').value.trim();
+    const password = document.getElementById('qobuz-connection-password').value;
+
+    if (!email || !password) {
+        showToast('Please enter your Qobuz email and password', 'warning');
+        return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = 'Connecting...';
+    statusEl.textContent = '';
+
+    try {
+        const resp = await fetch('/api/qobuz/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password }),
+        });
+        const data = await resp.json();
+
+        if (data.success) {
+            showToast('Qobuz connected successfully!', 'success');
+            document.getElementById('qobuz-connection-password').value = '';
+            checkQobuzAuthStatus();
+        } else {
+            statusEl.textContent = data.error || 'Login failed';
+            statusEl.style.color = '#ff5555';
+            showToast(data.error || 'Qobuz login failed', 'error');
+        }
+    } catch (error) {
+        console.error('Qobuz login error:', error);
+        statusEl.textContent = 'Connection error';
+        statusEl.style.color = '#ff5555';
+        showToast('Failed to connect to Qobuz', 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Connect Qobuz';
+    }
+}
+
+async function loginQobuzWithToken() {
+    const btn = document.getElementById('qobuz-token-login-btn');
+    const statusEl = document.getElementById('qobuz-token-status');
+    const token = document.getElementById('qobuz-connection-token').value.trim();
+
+    if (!token) {
+        showToast('Please paste your Qobuz auth token', 'warning');
+        return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = 'Connecting...';
+    if (statusEl) statusEl.textContent = '';
+
+    try {
+        const resp = await fetch('/api/qobuz/auth/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token }),
+        });
+        const data = await resp.json();
+
+        if (data.success) {
+            showToast('Qobuz connected via token!', 'success');
+            document.getElementById('qobuz-connection-token').value = '';
+            checkQobuzAuthStatus();
+        } else {
+            if (statusEl) { statusEl.textContent = data.error || 'Token login failed'; statusEl.style.color = '#ff5555'; }
+            showToast(data.error || 'Qobuz token login failed', 'error');
+        }
+    } catch (error) {
+        console.error('Qobuz token login error:', error);
+        if (statusEl) { statusEl.textContent = 'Connection error'; statusEl.style.color = '#ff5555'; }
+        showToast('Failed to connect to Qobuz', 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Connect with Token';
+    }
+}
+
+async function loginQobuzWithTokenFromDownloads() {
+    const btn = document.getElementById('qobuz-download-token-btn');
+    const statusEl = document.getElementById('qobuz-download-token-status');
+    const token = document.getElementById('qobuz-download-token').value.trim();
+
+    if (!token) {
+        showToast('Please paste your Qobuz auth token', 'warning');
+        return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = 'Connecting...';
+    if (statusEl) statusEl.textContent = '';
+
+    try {
+        const resp = await fetch('/api/qobuz/auth/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token }),
+        });
+        const data = await resp.json();
+
+        if (data.success) {
+            showToast('Qobuz connected via token!', 'success');
+            document.getElementById('qobuz-download-token').value = '';
+            checkQobuzAuthStatus();
+        } else {
+            if (statusEl) { statusEl.textContent = data.error || 'Token login failed'; statusEl.style.color = '#ff5555'; }
+            showToast(data.error || 'Qobuz token login failed', 'error');
+        }
+    } catch (error) {
+        console.error('Qobuz token login error:', error);
+        if (statusEl) { statusEl.textContent = 'Connection error'; statusEl.style.color = '#ff5555'; }
+        showToast('Failed to connect to Qobuz', 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Connect with Token';
+    }
+}
+
+async function loginQobuz() {
+    const btn = document.getElementById('qobuz-login-btn');
+    const statusEl = document.getElementById('qobuz-auth-status');
+    const email = document.getElementById('qobuz-email').value.trim();
+    const password = document.getElementById('qobuz-password').value;
+
+    if (!email || !password) {
+        showToast('Please enter your Qobuz email and password', 'warning');
+        return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = 'Connecting...';
+    statusEl.textContent = '';
+
+    try {
+        const resp = await fetch('/api/qobuz/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password }),
+        });
+
+        const data = await resp.json();
+
+        if (data.success) {
+            showToast('Qobuz connected successfully!', 'success');
+            // Clear password field
+            document.getElementById('qobuz-password').value = '';
+            checkQobuzAuthStatus();
+        } else {
+            statusEl.textContent = data.error || 'Login failed';
+            statusEl.style.color = '#ff5555';
+            showToast(data.error || 'Qobuz login failed', 'error');
+        }
+    } catch (error) {
+        console.error('Qobuz login error:', error);
+        statusEl.textContent = 'Connection error';
+        statusEl.style.color = '#ff5555';
+        showToast('Failed to connect to Qobuz', 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Connect Qobuz';
+    }
+}
+
+async function logoutQobuz() {
+    try {
+        await fetch('/api/qobuz/auth/logout', { method: 'POST' });
+        showToast('Qobuz disconnected', 'success');
+        checkQobuzAuthStatus();
+    } catch (e) {
+        console.error('Qobuz logout error:', e);
+    }
+}
+
+const PATH_INPUT_IDS = {
+    download: 'download-path',
+    transfer: 'transfer-path',
+    staging: 'staging-path',
+    'music-videos': 'music-videos-path',
+    'playlists-materialize': 'playlists-materialize-path',
+    'm3u-entry-base': 'm3u-entry-base-path'
+};
+
+// Deployment-aware folder-paths guidance (+ the fresh-install disk landmine).
+// Docker installs must NOT touch the container paths; bare-metal/LXC installs
+// MUST edit them. A non-Docker install still on the ./Transfer default is
+// silently filling the install disk (a Proxmox LXC root is typically 8GB and
+// hangs when full — reported live on Discord), so that state warns loudly.
+function applyPathsEnvironment(settings) {
+    const docker = !!(settings._environment && settings._environment.docker);
+    document.querySelectorAll('[data-paths-guide]').forEach(el => {
+        el.classList.toggle('hidden', (el.getAttribute('data-paths-guide') === 'docker') !== docker);
+    });
+    const warn = document.querySelector('[data-paths-default-warning]');
+    if (warn) {
+        const out = (settings.soulseek?.transfer_path || './Transfer').trim();
+        const isDefault = out === '' || out === '.' || out.startsWith('./') || out.startsWith('.\\');
+        warn.classList.toggle('hidden', docker || !isDefault);
+    }
+}
+
+function togglePathLock(pathType, btn) {
+    const input = document.getElementById(PATH_INPUT_IDS[pathType]);
+    if (!input) return;
+    const isLocked = input.hasAttribute('readonly');
+    if (isLocked) {
+        input.removeAttribute('readonly');
+        input.focus();
+        btn.textContent = 'Lock';
+        btn.classList.remove('locked');
+    } else {
+        input.setAttribute('readonly', '');
+        btn.textContent = 'Unlock';
+        btn.classList.add('locked');
+    }
+}
+
+// Manually (re)build every "organize by playlist" folder from current library
+// ownership — mirrors the automatic rebuild that runs after a playlist download.
+async function rebuildPlaylistFolders() {
+    const btn = document.getElementById('playlists-rebuild-btn');
+    const status = document.getElementById('playlists-rebuild-status');
+    if (!btn) return;
+    const original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Rebuilding…';
+    if (status) { status.style.color = ''; status.textContent = 'Rebuilding playlist folders…'; }
+    try {
+        const res = await fetch('/api/playlists/materialize/rebuild', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}'
+        });
+        const data = await res.json();
+        if (!res.ok || !data.success) throw new Error(data.error || 'Rebuild failed');
+        const n = data.count || 0;
+        let linked = 0, copied = 0, removed = 0;
+        (data.results || []).forEach(r => {
+            linked += r.linked || 0; copied += r.copied || 0; removed += r.removed_stale || 0;
+        });
+        if (status) {
+            status.style.color = '#4caf50';
+            status.textContent = (n === 0)
+                ? 'No "organize by playlist" playlists to rebuild yet.'
+                : `Rebuilt ${n} playlist folder${n === 1 ? '' : 's'} — ${linked} linked, ${copied} copied, ${removed} stale removed.`;
+        }
+        if (typeof showToast === 'function') showToast('Playlist folders rebuilt', 'success');
+    } catch (e) {
+        if (status) { status.style.color = '#f44336'; status.textContent = 'Rebuild failed: ' + (e.message || e); }
+        if (typeof showToast === 'function') showToast('Playlist rebuild failed', 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+    }
+}
+
+
+// ===============================

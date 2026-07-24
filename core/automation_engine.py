@@ -1,0 +1,1609 @@
+"""
+Automation Engine — trigger → action → then scheduler for SoulSync.
+
+Architecture:
+- Triggers (WHEN): schedule timer, event-based, signal-based (signal_received)
+- Actions (DO): real SoulSync operations registered by web_server.py
+- Then (THEN): 1–3 post-action steps — notifications (Discord/Pushbullet/Telegram) and/or fire_signal
+- Conditions: optional filters on event data (artist contains, title equals, etc.)
+- Signals: user-named events that chain automations together (fire_signal → signal_received)
+
+Uses threading.Timer pattern for schedule triggers.
+Event triggers react to emit() calls from web_server.py hook points.
+"""
+
+import json
+import re
+import time
+import threading
+import requests
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+from utils.logging_config import get_logger
+
+from core.automation.schedule import next_run_at
+
+logger = get_logger("automation_engine")
+
+
+def _utcnow():
+    """Return current UTC time as timezone-aware datetime."""
+    return datetime.now(timezone.utc)
+
+def _utcnow_str():
+    """Return current UTC time as naive string for DB storage (consistent with SQLite CURRENT_TIMESTAMP)."""
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+def _utc_after(seconds):
+    """Return UTC time N seconds from now as naive string for DB storage."""
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _dt_to_db_str(dt: datetime) -> str:
+    """Convert an aware-UTC datetime to the naive-UTC string the DB
+    ``next_run`` column stores. Centralised so a tz mistake here
+    surfaces in one place, not scattered through every caller of
+    ``next_run_at``."""
+    if dt.tzinfo is None:
+        return dt.strftime('%Y-%m-%d %H:%M:%S')
+    return dt.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _resolve_system_default_tz() -> str:
+    """Return the IANA tz name the engine uses when a schedule's
+    trigger config doesn't carry an explicit ``tz`` field.
+
+    Existing daily / weekly rows pre-date the ``tz`` field — the
+    historic engine computed delays from naive ``datetime.now()``,
+    which is implicitly the server's local timezone. Falling back to
+    that same tz here preserves "every Monday at 09:00" running at
+    09:00 server local for rows that already exist in the DB.
+    Without ``tzlocal`` installed (or a system without a discoverable
+    tz), falls back to UTC."""
+    try:
+        import tzlocal
+        return tzlocal.get_localzone_name() or 'UTC'
+    except Exception:
+        return 'UTC'
+
+
+# Server-local tz cached at import time. Re-reading per-call is
+# pointless: the host's timezone doesn't change while the process is
+# running. Tests that need a different default tz inject it through
+# the engine's ``_default_tz`` attribute or via the
+# ``automation.default_timezone`` config key.
+_SYSTEM_DEFAULT_TZ = _resolve_system_default_tz()
+
+SYSTEM_AUTOMATIONS = [
+    {
+        'name': 'Auto-Process Wishlist',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 30, 'unit': 'minutes'},
+        'action_type': 'process_wishlist',
+        'initial_delay': 60,  # 1 minute after startup
+    },
+    {
+        'name': 'Auto-Scan Watchlist',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 24, 'unit': 'hours'},
+        'action_type': 'scan_watchlist',
+        'initial_delay': 300,  # 5 minutes after startup
+    },
+    # Event-based system automations (no initial_delay/next_run needed)
+    {
+        'name': 'Auto-Scan After Downloads',
+        'trigger_type': 'batch_complete',
+        'trigger_config': {},
+        'action_type': 'scan_library',
+    },
+    {
+        'name': 'Auto-Update Database After Scan',
+        'trigger_type': 'library_scan_completed',
+        'trigger_config': {},
+        'action_type': 'start_database_update',
+    },
+    # Maintenance automations
+    {
+        'name': 'Refresh Beatport Cache',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 24, 'unit': 'hours'},
+        'action_type': 'refresh_beatport_cache',
+        'initial_delay': 120,
+    },
+    {
+        'name': 'Clean Search History',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 1, 'unit': 'hours'},
+        'action_type': 'clean_search_history',
+        'initial_delay': 600,
+    },
+    {
+        'name': 'Clean Completed Downloads',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 5, 'unit': 'minutes'},
+        'action_type': 'clean_completed_downloads',
+        'initial_delay': 300,
+    },
+    {
+        'name': 'Seeding Sweep',                       # release music torrents once seed goals are met
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 30, 'unit': 'minutes'},
+        'action_type': 'seeding_sweep',
+        'initial_delay': 1080,
+    },
+    {
+        'name': 'Auto-Deep Scan Library',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 7, 'unit': 'days'},
+        'action_type': 'deep_scan_library',
+        'initial_delay': 900,  # 15 min after startup
+    },
+    {
+        'name': 'Auto-Backup Database',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 3, 'unit': 'days'},
+        'action_type': 'backup_database',
+        'initial_delay': 600,  # 10 min after startup
+    },
+    {
+        'name': 'Full Cleanup',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 12, 'unit': 'hours'},
+        'action_type': 'full_cleanup',
+        'initial_delay': 900,  # 15 min after startup
+    },
+    # ── Video side (isolated app, shared engine) ──────────────────────────
+    # owned_by='video' keeps these OFF the music automations page (it filters
+    # them out) and ON the video Automations page (it shows only these).
+    # Schedule-based for now; a video-download-complete event trigger can
+    # replace the schedule once that event is wired into the engine.
+    # (No standalone scheduled scan — the post-download chain below keeps the library
+    # fresh. The 'video_scan_library' action/block still exist for a custom automation.)
+    # Post-download chain (video twin of music's batch_complete → scan_library →
+    # library_scan_completed → start_database_update). Event-based, so a finished
+    # video download refreshes the server then pulls the new media into video.db.
+    {
+        'name': 'Auto-Scan Video After Downloads',
+        'trigger_type': 'video_batch_complete',
+        'trigger_config': {},
+        'action_type': 'video_scan_server',
+        'owned_by': 'video',
+    },
+    {
+        'name': 'Auto-Update Video Database After Scan',
+        'trigger_type': 'video_library_scan_completed',
+        'trigger_config': {},
+        'action_type': 'video_update_database',
+        'action_config': {'mode': 'incremental'},
+        'owned_by': 'video',
+    },
+    # Safety net: re-read the server hourly too, so MANUAL library additions (which Plex
+    # auto-scans) appear within the hour instead of waiting for the weekly deep scan. Same
+    # cheap incremental read as the after-scan one.
+    {
+        'name': 'Auto-Update Video Database (Hourly)',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 1, 'unit': 'hours'},
+        'action_type': 'video_update_database_hourly',
+        'action_config': {'mode': 'incremental'},
+        'initial_delay': 900,
+        'owned_by': 'video',
+    },
+    # Sonarr-style: once a day at 1am (server-local), wishlist every episode airing
+    # today for the shows you follow (skipping ones already owned) so the day's episodes
+    # are queued overnight. A fixed wall-clock 'daily_time' (not a rolling 24h interval
+    # that drifts with restarts) — the seeder now arms timed system triggers, and
+    # _fix_airing_automation_schedule migrates the old 24h-interval row.
+    # Runs before the airing automation so the calendar it reads is current — re-pulls
+    # TMDB episode schedules for still-airing watchlist shows (the airing read is LOCAL).
+    {
+        'name': 'Refresh Airing TV Schedules',
+        'trigger_type': 'daily_time',
+        'trigger_config': {'time': '23:00'},
+        'action_type': 'video_refresh_airing_schedules',
+        'owned_by': 'video',
+    },
+    {
+        'name': 'Auto-Wishlist Episodes Airing Today',
+        'trigger_type': 'daily_time',
+        'trigger_config': {'time': '01:00'},
+        'action_type': 'video_add_airing_episodes',
+        'owned_by': 'video',
+    },
+    # Freshness: every 6 hours, re-enrich the stalest matched library items (oldest-refreshed
+    # first, capped per run, skipping anything touched in the last 2 weeks) so ratings drift,
+    # newly-written overviews, late-arriving art and episode air-dates roll in over time. Rolling
+    # rather than a monthly big-bang — the whole library cycles through without spiking TMDB/OMDb.
+    # A 900s initial delay keeps it off the boot path.
+    {
+        'name': 'Refresh Stale Metadata',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 6, 'unit': 'hours'},
+        'action_type': 'video_reenrich_stale',
+        'action_config': {'batch_size': 500, 'movie_stale_days': 30, 'show_stale_days': 30},
+        'initial_delay': 900,
+        'owned_by': 'video',
+    },
+    # Daily: re-apply overlays to the library. Reads the per-scope overlay settings
+    # (movie/show/season/episode assignments) and touches ONLY enabled scopes; the
+    # applier skips items whose template + art + consumed data are unchanged since
+    # last run, so a nightly pass re-renders just what changed. Runs at 4am, after
+    # the airing/wishlist jobs and the overnight scans have refreshed the data.
+    {
+        'name': 'Auto-Update Overlays',
+        'trigger_type': 'daily_time',
+        'trigger_config': {'time': '04:00'},
+        'action_type': 'video_apply_overlays',
+        'owned_by': 'video',
+    },
+    # Daily: keep SoulSync-managed collections in sync with the library. Resolves
+    # each enabled collection's members and pushes add/remove to the server,
+    # skipping collections whose members + settings are unchanged. Runs at 4:30am,
+    # after the overnight scans + overlay pass so it sees fresh library state.
+    {
+        'name': 'Sync Collections',
+        'trigger_type': 'daily_time',
+        'trigger_config': {'time': '04:30'},
+        'action_type': 'video_sync_collections',
+        'owned_by': 'video',
+    },
+    # Weekly: reclaim the Plex space that overlay re-uploads accumulate (Plex keeps
+    # every uploaded poster in its bundles). Runs Empty Trash → Clean Bundles →
+    # Optimize DB via the API. Weekly + a big initial delay so it never overlaps the
+    # nightly overlay run (Plex warns against concurrent bundle cleanup).
+    {
+        'name': 'Clean Up Plex Images',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 7, 'unit': 'days'},
+        'action_type': 'video_clean_plex_images',
+        'initial_delay': 1800,
+        'owned_by': 'video',
+    },
+    # Video twins of the music maintenance jobs — same schedule + shared handler,
+    # distinct action_type + owned_by='video' so they seed as separate rows and
+    # show on the video Automations page (music's copies are untouched).
+    {
+        'name': 'Clean Search History',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 1, 'unit': 'hours'},
+        'action_type': 'video_clean_search_history',
+        'initial_delay': 600,
+        'owned_by': 'video',
+    },
+    {
+        'name': 'Clean Completed Downloads',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 5, 'unit': 'minutes'},
+        'action_type': 'video_clean_completed_downloads',
+        'initial_delay': 300,
+        'owned_by': 'video',
+    },
+    {
+        'name': 'Full Cleanup',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 12, 'unit': 'hours'},
+        'action_type': 'video_full_cleanup',
+        'initial_delay': 900,
+        'owned_by': 'video',
+    },
+    {
+        'name': 'Auto-Backup Database',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 3, 'unit': 'days'},
+        'action_type': 'video_backup_database',
+        'initial_delay': 600,
+        'owned_by': 'video',
+    },
+    # Video twin of music's 'Auto-Deep Scan Library', split into TWO because Movies
+    # and TV are independent libraries — a TV scan never pulls in new movies and
+    # vice-versa. Fixed weekly deep scan (re-read + prune removed) at 02:00 server-
+    # local: TV Mondays, Movies Tuesdays — different days so they never overlap. The
+    # seeder arms timed system triggers; _fix_deep_scan_schedules migrates the
+    # original rolling-7-day rows. (Busy guard in the scanner is still a safety net.)
+    {
+        'name': 'Auto-Deep Scan TV Library',
+        'trigger_type': 'weekly_time',
+        'trigger_config': {'time': '02:00', 'days': ['mon']},
+        'action_type': 'video_deep_scan_tv',
+        'action_config': {'mode': 'deep', 'media_type': 'show'},
+        'owned_by': 'video',
+    },
+    {
+        'name': 'Auto-Deep Scan Movie Library',
+        'trigger_type': 'weekly_time',
+        'trigger_config': {'time': '02:00', 'days': ['tue']},
+        'action_type': 'video_deep_scan_movies',
+        'action_config': {'mode': 'deep', 'media_type': 'movie'},
+        'owned_by': 'video',
+    },
+    # ── Watchlist → Wishlist pipeline ─────────────────────────────────────────
+    # Stage 1: SCANS that FILL the wishlist from what you follow. (The airing-episodes
+    # scan above is the show equivalent.) All no-op cleanly if you follow nobody.
+    {
+        'name': 'Auto-Scan Watchlist People',          # followed actors/directors → wished movies
+        'trigger_type': 'daily_time',                  # daily; filmographies change slowly
+        'trigger_config': {'time': '03:00'},           # after airing/deep-scan jobs, no overlap
+        'action_type': 'video_scan_watchlist_people',
+        'owned_by': 'video',
+    },
+    {
+        'name': 'Auto-Scan Watchlist Studios',         # followed studios → wished movies
+        'trigger_type': 'daily_time',                  # daily; catalogs change slowly
+        'trigger_config': {'time': '03:30'},           # staggered off the people scan
+        'action_type': 'video_scan_watchlist_studios',
+        'initial_delay': 1500,
+        'owned_by': 'video',
+    },
+    {
+        'name': 'Auto-Scan Watchlist Channels',        # followed YouTube channels → wished videos
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 6, 'unit': 'hours'},   # YouTube posts at all hours
+        'action_type': 'video_scan_watchlist_channels',
+        # backfill_count omitted → inherits the global "videos to grab" setting (Settings → Library)
+        'initial_delay': 1200,
+        'owned_by': 'video',
+    },
+    {
+        'name': 'Auto-Scan Watchlist Playlists',       # followed playlists (mirror-all) → wished videos
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 6, 'unit': 'hours'},
+        'action_type': 'video_scan_watchlist_playlists',
+        'initial_delay': 1320,
+        'owned_by': 'video',
+    },
+    # Stage 2: PROCESSORS that DRAIN the wishlist by downloading. Hourly; each skips
+    # quietly until its library folder (+ slskd, for movie/episode) is configured.
+    {
+        'name': 'Auto-Process Movie Wishlist',         # wished movies → slskd search/pick/grab
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 1, 'unit': 'hours'},
+        'action_type': 'video_process_movie_wishlist',
+        'action_config': {'max_concurrent': 3},
+        'initial_delay': 1620,
+        'owned_by': 'video',
+    },
+    {
+        'name': 'Auto-Process Episode Wishlist',       # wished episodes → slskd search/pick/grab
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 1, 'unit': 'hours'},
+        'action_type': 'video_process_episode_wishlist',
+        'action_config': {'max_concurrent': 3},
+        'initial_delay': 1740,
+        'owned_by': 'video',
+    },
+    {
+        'name': 'Auto-Process YouTube Wishlist',       # wished YouTube videos → yt-dlp download
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 1, 'unit': 'hours'},
+        'action_type': 'video_process_youtube_wishlist',
+        'action_config': {'max_concurrent': 3},
+        'initial_delay': 1500,
+        'owned_by': 'video',
+    },
+    {
+        'name': 'RSS Sync (Instant Grabs)',            # indexers' newest releases vs the wishlist
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 15, 'unit': 'minutes'},
+        'action_type': 'video_rss_sync',
+        'initial_delay': 900,
+        'owned_by': 'video',
+    },
+    {
+        'name': 'Seeding Sweep',                       # release torrents once seed goals are met
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 30, 'unit': 'minutes'},
+        'action_type': 'video_seeding_sweep',
+        'initial_delay': 1080,
+        'owned_by': 'video',
+    },
+    {
+        'name': 'Sync Import Lists',                   # external lists → wishlist/watchlist
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 6, 'unit': 'hours'},
+        'action_type': 'video_import_lists',
+        'initial_delay': 1860,
+        'owned_by': 'video',
+    },
+    # YouTube retention: delete channel episodes outside each channel's keep window. No-op
+    # unless a channel opts in (cog modal → Keep); default keeps everything, so safe to seed.
+    {
+        'name': 'Auto-Clean Old YouTube Episodes',
+        'trigger_type': 'daily_time',
+        'trigger_config': {'time': '04:00'},
+        'action_type': 'video_clean_youtube_episodes',
+        'owned_by': 'video',
+    },
+]
+
+
+class AutomationEngine:
+    def __init__(self, db):
+        self.db = db
+        self._timers = {}       # automation_id → threading.Timer
+        self._lock = threading.Lock()
+        self._running = False
+
+        # Action handlers registered by web_server.py (avoids circular imports)
+        # Format: {type: {'handler': fn(config)->dict, 'guard': fn()->bool or None}}
+        self._action_handlers = {}
+
+        # Progress tracking callbacks (registered by web_server.py)
+        self._progress_init_fn = None
+        self._progress_finish_fn = None
+        self._progress_update_fn = None
+        self._history_record_fn = None
+
+        # Event trigger cache: trigger_type → [automation_id, ...]
+        self._event_automations = {}
+        self._event_cache_dirty = True
+
+        # Signal safety: cooldown tracking and chain depth limit
+        self._signal_cooldowns = {}       # signal event key → last fire timestamp
+        self._max_chain_depth = 5
+        self._signal_cooldown_seconds = 10
+
+        # Default tz used when a schedule's ``trigger_config`` doesn't
+        # carry an explicit ``tz`` field — preserves historic behaviour
+        # for daily / weekly rows created before the field existed
+        # (engine used naive ``datetime.now()`` = server local). Reads
+        # from the ``automation.default_timezone`` config key first to
+        # let users override without touching env vars; falls back to
+        # the system-detected local tz.
+        try:
+            from config.settings import config_manager
+            self._default_tz = (config_manager.get('automation.default_timezone', '') or _SYSTEM_DEFAULT_TZ)
+        except Exception:
+            self._default_tz = _SYSTEM_DEFAULT_TZ
+
+        # Trigger registry: type → setup function (schedule only — events use emit())
+        self._trigger_handlers = {
+            'schedule': self._setup_schedule_trigger,
+            'daily_time': self._setup_daily_time_trigger,
+            'weekly_time': self._setup_weekly_time_trigger,
+            'monthly_time': self._setup_monthly_time_trigger,
+        }
+
+    # --- Global per-side pause (the Automations pages' master toggles) ---
+    # One switch per side. It does NOT touch individual automations' enabled
+    # flags — those stay exactly as the user set them — it just gates whether
+    # anything RUNS: scheduled slots are skipped (schedule stays alive) and
+    # event triggers are dropped while the side is paused. Manual "Run now"
+    # still executes — an explicit click outranks the pause.
+
+    # Stored in the engine DB's `metadata` KV (music_library.db — the same DB
+    # the automations themselves live in), NOT config.json.
+    MASTER_KEYS = {'music': 'automation_master_music_enabled',
+                   'video': 'automation_master_video_enabled'}
+    # Video ships paused: most installs predate the video side and only asked
+    # for music automation. Music keeps its historic always-on behaviour.
+    MASTER_DEFAULTS = {'music': True, 'video': False}
+
+    @staticmethod
+    def automation_side(auto) -> str:
+        """Which side an automation belongs to — 'video' when the system row is
+        video-owned or a custom automation uses a video trigger/action."""
+        auto = auto or {}
+        if auto.get('owned_by') == 'video':
+            return 'video'
+        if str(auto.get('action_type') or '').startswith('video_'):
+            return 'video'
+        if str(auto.get('trigger_type') or '').startswith('video_'):
+            return 'video'
+        return 'music'
+
+    def master_enabled(self, side: str) -> bool:
+        """Live DB read — flipping the toggle applies to the very next run.
+        An absent/unreadable key means the side's shipped default."""
+        key = self.MASTER_KEYS.get(side)
+        if not key:
+            return True
+        try:
+            raw = self.db.get_metadata(key)
+        except Exception:
+            raw = None
+        if raw is None or str(raw).strip() == '':
+            return self.MASTER_DEFAULTS.get(side, True)
+        return str(raw).strip().lower() in ('1', 'true', 'yes', 'on')
+
+    def set_master_enabled(self, side: str, enabled: bool) -> bool:
+        """Persist one side's master state to the engine DB. False on bad side."""
+        key = self.MASTER_KEYS.get(side)
+        if not key:
+            return False
+        self.db.set_metadata(key, '1' if enabled else '0')
+        return True
+
+    # --- Action Handler Registration ---
+
+    def register_action_handler(self, action_type, handler_fn, guard_fn=None):
+        """Register a callable for an action type.
+        handler_fn(config) -> dict with result data
+        guard_fn() -> bool (True = busy, should skip)
+        """
+        self._action_handlers[action_type] = {
+            'handler': handler_fn,
+            'guard': guard_fn,
+        }
+        logger.debug(f"Registered action handler: {action_type}")
+
+    def register_progress_callbacks(self, init_fn, finish_fn, update_fn=None, history_fn=None):
+        """Register callbacks for live progress tracking from web_server.py."""
+        self._progress_init_fn = init_fn
+        self._progress_finish_fn = finish_fn
+        self._progress_update_fn = update_fn
+        self._history_record_fn = history_fn
+
+    @staticmethod
+    def _sanitize_signal_name(name):
+        """Sanitize signal name: lowercase, alphanumeric + underscore/hyphen, max 50 chars."""
+        if not name:
+            return ''
+        name = name.lower().strip()
+        name = re.sub(r'[^a-z0-9_\-]', '_', name)
+        name = re.sub(r'_+', '_', name).strip('_')
+        return name[:50]
+
+    # --- System Automations ---
+
+    def ensure_system_automations(self):
+        """Create system automations if they don't exist, and schedule next_run respecting last_run."""
+        for spec in SYSTEM_AUTOMATIONS:
+            existing = self.db.get_system_automation_by_action(spec['action_type'])
+            if not existing:
+                aid = self.db.create_automation(
+                    name=spec['name'],
+                    trigger_type=spec['trigger_type'],
+                    trigger_config=json.dumps(spec['trigger_config']),
+                    action_type=spec['action_type'],
+                    action_config=json.dumps(spec.get('action_config', {})),
+                    profile_id=1,
+                    # owned_by tags the side that owns this automation (e.g.
+                    # 'video'), so the music page can exclude another side's rows.
+                    owned_by=spec.get('owned_by'),
+                )
+                if aid:
+                    self.db.update_automation(aid, is_system=1)
+                    logger.info(f"Created system automation: {spec['name']} (id={aid})")
+                existing = self.db.get_system_automation_by_action(spec['action_type'])
+
+            if existing:
+                if spec.get('initial_delay') is not None:
+                    # Compute full interval from trigger config
+                    full_interval = self._calc_delay_seconds(spec['trigger_config'])
+                    initial_delay = spec['initial_delay']
+
+                    # Only respect last_run for longer intervals (>= 1 hour).
+                    # Short-interval automations (wishlist 30min, clean downloads 5min) are cheap
+                    # and users may expect them to run shortly after startup.
+                    min_interval_for_skip = 3600  # 1 hour
+
+                    # Check if last_run exists and is recent enough to skip the startup scan
+                    last_run_str = existing.get('last_run')
+                    last_error = existing.get('last_error')
+                    if full_interval >= min_interval_for_skip and last_run_str and not last_error:
+                        try:
+                            last_run = datetime.strptime(last_run_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                            elapsed = (_utcnow() - last_run).total_seconds()
+
+                            if elapsed >= 0 and elapsed < full_interval:
+                                # Last run was recent and successful — schedule for when the interval naturally expires
+                                remaining = full_interval - elapsed
+                                nr = _utc_after(remaining)
+                                self.db.update_automation(existing['id'], next_run=nr)
+                                logger.info(f"System automation '{spec['name']}' last ran {elapsed/3600:.1f}h ago (ok), next run in {remaining/3600:.1f}h")
+                                continue
+                            else:
+                                # Overdue or clock skew — run after initial delay
+                                logger.info(f"System automation '{spec['name']}' last ran {elapsed/3600:.1f}h ago (overdue), running in {initial_delay}s")
+                        except (ValueError, TypeError):
+                            pass  # Malformed timestamp — fall through to initial delay
+                    elif last_run_str and last_error:
+                        logger.info(f"System automation '{spec['name']}' last run had error, retrying in {initial_delay}s")
+
+                    # No last_run or overdue — use initial delay
+                    nr = _utc_after(initial_delay)
+                    self.db.update_automation(existing['id'], next_run=nr)
+                    logger.info(f"System automation '{spec['name']}' next_run set to {initial_delay}s from now")
+                else:
+                    # No initial_delay. A timer-based timed trigger (daily/weekly/
+                    # monthly at a fixed wall-clock time) still needs its next_run
+                    # armed — compute it from the schedule. Genuinely event-based
+                    # triggers (batch_complete, scan_done) have no next_run, so
+                    # next_run_at returns None and we leave them alone. Don't clobber
+                    # an existing future next_run (manual edit / restart-resume).
+                    nr_dt = next_run_at(spec['trigger_type'], spec['trigger_config'],
+                                        now_utc=_utcnow(), default_tz=self._default_tz)
+                    if nr_dt is not None and not existing.get('next_run'):
+                        self.db.update_automation(existing['id'], next_run=_dt_to_db_str(nr_dt))
+                        logger.info(f"System automation '{spec['name']}' next_run armed for {_dt_to_db_str(nr_dt)} (timed)")
+                    else:
+                        logger.info(f"System automation '{spec['name']}' ready (event-based)")
+        self._fix_video_scan_default()
+        self._fix_airing_automation_schedule()
+        self._fix_deep_scan_schedules()
+        self._fix_wishlist_processor_rename()
+
+    def _fix_video_scan_default(self):
+        """Remove the obsolete standalone 'Scan Video Library' SYSTEM automation — it's
+        superseded by the post-download chain (Auto-Scan Video After Downloads →
+        Auto-Update Video Database After Scan).
+
+        ``get_system_automation_by_action`` matches ONLY a system-seeded row
+        (is_system=1), so a user's own scan automation is never touched. Idempotent —
+        safe to run on every startup; once the row is gone the lookup returns None and
+        it no-ops. (No flag guard: the old one could latch True without ever deleting,
+        which is exactly why the row survived earlier 'cleanups'.)"""
+        try:
+            auto = self.db.get_system_automation_by_action('video_scan_library')
+            if auto:
+                self.db.delete_automation(auto['id'])
+                logger.info("Removed superseded 'Scan Video Library' system automation (id=%s)",
+                            auto.get('id'))
+        except Exception:
+            logger.exception("video scan cleanup failed")
+
+    def _fix_wishlist_processor_rename(self):
+        """Migrate the wishlist processors' 'Download' → 'Process' rename so a DB seeded
+        under the old names doesn't show stale duplicates.
+
+        The movie/episode ACTIONS were renamed (``video_download_*`` → ``video_process_*``),
+        so the old seeded rows are now orphaned (dead action_type) while the new ones reseed
+        alongside them — delete the orphans. ``delete_automation`` refuses system rows, so
+        clear ``is_system`` first. The YouTube action kept its type but its label changed, so
+        rename that row in place. Idempotent — no-ops once the DB is clean."""
+        try:
+            for dead in ('video_download_movie_wishlist', 'video_download_episode_wishlist'):
+                auto = self.db.get_system_automation_by_action(dead)
+                if auto:
+                    self.db.update_automation(auto['id'], is_system=0)   # lift the delete guard
+                    self.db.delete_automation(auto['id'])
+                    logger.info("Removed orphaned '%s' system automation (renamed to process, id=%s)",
+                                auto.get('name'), auto.get('id'))
+            yt = self.db.get_system_automation_by_action('video_process_youtube_wishlist')
+            if yt and yt.get('name') == 'Auto-Download YouTube Wishlist':
+                self.db.update_automation(yt['id'], name='Auto-Process YouTube Wishlist')
+                logger.info("Renamed YouTube wishlist automation → 'Auto-Process YouTube Wishlist' (id=%s)",
+                            yt.get('id'))
+        except Exception:
+            logger.exception("wishlist processor rename migration failed")
+
+    def _fix_airing_automation_schedule(self):
+        """Migrate 'Auto-Wishlist Episodes Airing Today' from the old rolling 24h
+        interval to a fixed daily 1am run.
+
+        It originally shipped as a 'schedule'/24h interval because the seeder only
+        armed interval specs — a 'daily_time' spec sat idle and never fired. The 24h
+        interval fires reliably but at a time that drifts with every restart (5 min
+        after startup, then +24h). Now that the seeder arms timed triggers, rewrite
+        the live row to run at a fixed 1am (better for 'today's airings' — queues the
+        day overnight). Matches only the is_system row; idempotent (no-op once the row
+        is already daily_time)."""
+        try:
+            auto = self.db.get_system_automation_by_action('video_add_airing_episodes')
+            if not auto or auto.get('trigger_type') == 'daily_time':
+                return
+            cfg = {'time': '01:00'}
+            nr_dt = next_run_at('daily_time', cfg, now_utc=_utcnow(), default_tz=self._default_tz)
+            self.db.update_automation(
+                auto['id'], trigger_type='daily_time', trigger_config=json.dumps(cfg),
+                next_run=_dt_to_db_str(nr_dt) if nr_dt is not None else None)
+            logger.info("Migrated 'Auto-Wishlist Episodes Airing Today' to a fixed daily 01:00 (id=%s)",
+                        auto.get('id'))
+        except Exception:
+            logger.exception("airing automation schedule migration failed")
+
+    def _fix_deep_scan_schedules(self):
+        """Migrate the two video deep-scan system automations from the original
+        rolling 7-day interval to fixed weekly times — TV Mondays 02:00, Movies
+        Tuesdays 02:00 (different days so they never overlap). The seeder only
+        creates rows, never updates a drifted trigger; this rewrites the live rows.
+        Only converts the original interval rows (skips once trigger_type is already
+        weekly_time, so a hand-tuned day/time sticks). Idempotent."""
+        targets = {
+            'video_deep_scan_tv': {'time': '02:00', 'days': ['mon']},
+            'video_deep_scan_movies': {'time': '02:00', 'days': ['tue']},
+        }
+        for action_type, cfg in targets.items():
+            try:
+                auto = self.db.get_system_automation_by_action(action_type)
+                if not auto or auto.get('trigger_type') == 'weekly_time':
+                    continue
+                nr_dt = next_run_at('weekly_time', cfg, now_utc=_utcnow(), default_tz=self._default_tz)
+                self.db.update_automation(
+                    auto['id'], trigger_type='weekly_time', trigger_config=json.dumps(cfg),
+                    next_run=_dt_to_db_str(nr_dt) if nr_dt is not None else None)
+                logger.info("Set '%s' to weekly %s %s (id=%s)", auto.get('name'),
+                            cfg['days'], cfg['time'], auto.get('id'))
+            except Exception:
+                logger.exception("deep-scan schedule migration failed for %s", action_type)
+
+    def get_system_automation_next_run_seconds(self, action_type):
+        """Get seconds until next run for a system automation. Returns 0 if not found or disabled."""
+        auto = self.db.get_system_automation_by_action(action_type)
+        if not auto or not auto.get('enabled') or not auto.get('next_run'):
+            return 0
+        try:
+            next_run = datetime.strptime(auto['next_run'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+            remaining = (next_run - _utcnow()).total_seconds()
+            return max(0, int(remaining))
+        except (ValueError, TypeError):
+            return 0
+
+    # --- Lifecycle ---
+
+    def start(self):
+        """Load all enabled automations from DB and schedule them."""
+        self._running = True
+        self._event_cache_dirty = True
+        self.ensure_system_automations()
+        automations = self.db.get_automations()
+        scheduled = 0
+        event_count = 0
+        for auto in automations:
+            if auto.get('enabled'):
+                trigger_type = auto.get('trigger_type', '')
+                if trigger_type in self._trigger_handlers:
+                    self.schedule_automation(auto['id'])
+                    scheduled += 1
+                else:
+                    event_count += 1
+        # Pre-build event cache
+        self._rebuild_event_cache()
+        logger.info(f"AutomationEngine started — {scheduled} scheduled, {event_count} event-based")
+
+    def stop(self):
+        """Cancel all timers on shutdown."""
+        self._running = False
+        with self._lock:
+            for _aid, timer in self._timers.items():
+                timer.cancel()
+            count = len(self._timers)
+            self._timers.clear()
+        if count:
+            logger.info(f"AutomationEngine stopped — cancelled {count} timer(s)")
+
+    # --- Scheduling ---
+
+    def schedule_automation(self, automation_id):
+        """Set up timer for a single automation based on its trigger type."""
+        auto = self.db.get_automation(automation_id)
+        if not auto or not auto.get('enabled'):
+            return
+
+        trigger_type = auto.get('trigger_type')
+        setup_fn = self._trigger_handlers.get(trigger_type)
+
+        if not setup_fn:
+            # Event-based trigger — no timer needed, just invalidate cache
+            self._event_cache_dirty = True
+            return
+
+        try:
+            config = json.loads(auto.get('trigger_config') or '{}')
+        except json.JSONDecodeError:
+            config = {}
+
+        self.cancel_automation(automation_id)
+        setup_fn(automation_id, config)
+
+    def cancel_automation(self, automation_id):
+        """Cancel timer for an automation and invalidate event cache."""
+        with self._lock:
+            timer = self._timers.pop(automation_id, None)
+            if timer:
+                timer.cancel()
+        self._event_cache_dirty = True
+
+    # --- Event Bus ---
+
+    def emit(self, event_type, data):
+        """Called from web_server.py when events occur. Non-blocking."""
+        if not self._running:
+            return
+        thread = threading.Thread(
+            target=self._process_event,
+            args=(event_type, dict(data)),
+            daemon=True,
+            name=f'automation-event-{event_type}'
+        )
+        thread.start()
+
+    def is_event_action_enabled(self, event_type: str, action_type: str) -> bool:
+        """True if an ENABLED automation exists for (event_type → action_type).
+
+        Lets code paths that fire an effect DIRECTLY — e.g. the simple-download
+        library scan, which never forms a batch and so never emits
+        ``batch_complete`` — honor the user's automation toggle instead of always
+        running (#995 follow-up: 'Media scan completed' kept popping up with
+        Auto-Scan After Downloads turned off). Best-effort: any error returns
+        False so the caller can decide its own fallback.
+        """
+        try:
+            if self._event_cache_dirty:
+                self._rebuild_event_cache()
+            for aid in self._event_automations.get(event_type, []):
+                auto = self.db.get_automation(aid)
+                if auto and auto.get('enabled') and auto.get('action_type') == action_type:
+                    # Direct-effect callers honor the per-side master pause too —
+                    # otherwise a paused side's effects would still fire through
+                    # the code paths that never route via _run_event_automation.
+                    return self.master_enabled(self.automation_side(auto))
+            return False
+        except Exception as e:
+            logger.debug(f"is_event_action_enabled({event_type}, {action_type}) failed: {e}")
+            return False
+
+    def _process_event(self, event_type, data):
+        """Find matching automations and run them."""
+        try:
+            # Signal safety: chain depth limit and cooldown
+            if event_type.startswith('signal:'):
+                depth = data.get('_chain_depth', 0)
+                if depth >= self._max_chain_depth:
+                    logger.warning(f"Signal chain depth limit ({self._max_chain_depth}) reached for {event_type}, stopping")
+                    return
+                with self._lock:
+                    now = time.time()
+                    last = self._signal_cooldowns.get(event_type, 0)
+                    if now - last < self._signal_cooldown_seconds:
+                        logger.info(f"Signal {event_type} on cooldown ({self._signal_cooldown_seconds}s), skipping")
+                        return
+                    self._signal_cooldowns[event_type] = now
+
+            if self._event_cache_dirty:
+                self._rebuild_event_cache()
+
+            automation_ids = self._event_automations.get(event_type, [])
+            if not automation_ids:
+                logger.info(f"Event '{event_type}' — no automations registered in cache. Cache keys: {list(self._event_automations.keys())}")
+                return
+
+            logger.info(f"Event '{event_type}' — checking {len(automation_ids)} automation(s), data={data}")
+            for aid in automation_ids:
+                try:
+                    auto = self.db.get_automation(aid)
+                    if not auto or not auto.get('enabled'):
+                        logger.debug(f"Event '{event_type}' — automation {aid} disabled or not found, skipping")
+                        continue
+                    config = json.loads(auto.get('trigger_config') or '{}')
+                    if self._evaluate_conditions(config, data):
+                        logger.info(f"Event '{event_type}' MATCHED automation '{auto.get('name')}' (id={aid})")
+                        # Run in separate thread so delays don't block the event loop
+                        threading.Thread(
+                            target=self._run_event_automation,
+                            args=(auto, aid, data),
+                            daemon=True,
+                            name=f'automation-exec-{aid}'
+                        ).start()
+                    else:
+                        logger.info(f"Event '{event_type}' conditions NOT MET for automation '{auto.get('name')}' (id={aid}), config={config}, data={data}")
+                except Exception as e:
+                    logger.error(f"Event automation {aid} error: {e}")
+        except Exception as e:
+            logger.error(f"Event processing error for '{event_type}': {e}")
+
+    def _rebuild_event_cache(self):
+        """Cache which automations listen to which event types."""
+        new_cache = {}
+        try:
+            all_autos = self.db.get_automations()
+            for auto in all_autos:
+                if not auto.get('enabled'):
+                    continue
+                tt = auto.get('trigger_type', '')
+                if tt == 'signal_received':
+                    # Signal triggers map to 'signal:{name}' event key
+                    try:
+                        tc = json.loads(auto.get('trigger_config') or '{}')
+                    except (json.JSONDecodeError, TypeError):
+                        tc = {}
+                    sig = tc.get('signal_name', '')
+                    if sig:
+                        key = 'signal:' + self._sanitize_signal_name(sig)
+                        new_cache.setdefault(key, []).append(auto['id'])
+                elif tt and tt not in self._trigger_handlers:
+                    new_cache.setdefault(tt, []).append(auto['id'])
+        except Exception as e:
+            logger.error(f"Failed to rebuild event cache: {e}")
+        # Atomic swap — safe for concurrent readers
+        self._event_automations = new_cache
+        self._event_cache_dirty = False
+        logger.debug(f"Event cache rebuilt: {dict((k, len(v)) for k, v in self._event_automations.items())}")
+
+    def _evaluate_conditions(self, trigger_config, event_data):
+        """Check if event data matches trigger conditions. No conditions = always match."""
+        conditions = trigger_config.get('conditions', [])
+        if not conditions:
+            return True
+
+        match_mode = trigger_config.get('match', 'all')
+        results = []
+
+        for cond in conditions:
+            field = cond.get('field', '')
+            operator = cond.get('operator', 'contains')
+            value = cond.get('value', '').lower()
+            event_value = str(event_data.get(field, '')).lower()
+
+            if operator == 'contains':
+                results.append(value in event_value)
+            elif operator == 'equals':
+                results.append(value == event_value)
+            elif operator == 'starts_with':
+                results.append(event_value.startswith(value))
+            elif operator == 'not_contains':
+                results.append(value not in event_value)
+            else:
+                results.append(False)
+
+        if match_mode == 'any':
+            return any(results)
+        return all(results)
+
+    def _run_event_automation(self, auto, automation_id, event_data):
+        """Execute action for an event-triggered automation."""
+        # Global per-side pause — event triggers are simply dropped while the
+        # side is paused (nothing to reschedule; the next event fires normally
+        # once the master is back on).
+        side = self.automation_side(auto)
+        if not self.master_enabled(side):
+            logger.info(f"Event automation '{auto.get('name')}' skipped — {side} automations are paused")
+            return
+
+        action_type = auto.get('action_type')
+
+        # Check for action delay
+        try:
+            action_config = json.loads(auto.get('action_config') or '{}')
+        except json.JSONDecodeError:
+            action_config = {}
+
+        # Inject automation identity for progress tracking
+        action_config['_automation_id'] = automation_id
+        action_config['_automation_name'] = auto.get('name', '')
+        # Merge event data so action handlers can access trigger context
+        if event_data:
+            action_config['_event_data'] = event_data
+            # Forward playlist_id from event if action config doesn't have one set
+            if not action_config.get('playlist_id') and event_data.get('playlist_id'):
+                action_config['playlist_id'] = event_data['playlist_id']
+
+        delay_minutes = action_config.get('delay', 0)
+        _delay_already_inited = False
+        if delay_minutes and delay_minutes > 0:
+            # Initialize progress BEFORE delay so card glows during wait
+            if self._progress_init_fn:
+                try:
+                    self._progress_init_fn(automation_id, auto.get('name', ''), action_type)
+                except Exception as e:
+                    logger.debug("event progress init (delay): %s", e)
+                _delay_already_inited = True
+
+            delay_seconds = int(delay_minutes) * 60
+            logger.info(f"Event automation '{auto.get('name')}' delaying {delay_minutes}m before action")
+            for remaining in range(delay_seconds, 0, -1):
+                if not self._running:
+                    return
+                if self._progress_update_fn and remaining % 5 == 0:
+                    mins, secs = divmod(remaining, 60)
+                    self._progress_update_fn(automation_id,
+                        phase=f'Delay: {mins}m {secs}s remaining',
+                        progress=int((delay_seconds - remaining) / delay_seconds * 10))
+                time.sleep(1)
+
+        # notify_only = no action, just send notification with event data
+        if action_type == 'notify_only':
+            result = {'status': 'triggered'}
+        else:
+            handler_info = self._action_handlers.get(action_type)
+            if not handler_info:
+                result = {'status': 'error', 'error': f'No handler for {action_type}'}
+                logger.warning(f"No handler for action '{action_type}' on event automation {automation_id}")
+            else:
+                guard_fn = handler_info.get('guard')
+                if guard_fn and guard_fn():
+                    result = {'status': 'skipped', 'reason': f'{action_type} already running'}
+                    logger.info(f"Event automation '{auto.get('name')}' skipped — {action_type} busy")
+                    # If progress was initialized during delay, finalize it
+                    if _delay_already_inited and self._progress_finish_fn:
+                        try:
+                            self._progress_finish_fn(automation_id, result)
+                        except Exception as e:
+                            logger.debug("event progress finish (skipped): %s", e)
+                else:
+                    # Initialize progress tracking (skip if already done during delay)
+                    if not _delay_already_inited and self._progress_init_fn:
+                        try:
+                            self._progress_init_fn(automation_id, auto.get('name', ''), action_type)
+                        except Exception as e:
+                            logger.debug("event progress init: %s", e)
+                    try:
+                        result = handler_info['handler'](action_config) or {}
+                        logger.info(f"Event automation '{auto.get('name')}' executed: {result.get('status', 'ok')}")
+                    except Exception as e:
+                        result = {'status': 'error', 'error': str(e)}
+                        logger.error(f"Event automation '{auto.get('name')}' action failed: {e}")
+                    # Finalize progress tracking
+                    if self._progress_finish_fn:
+                        try:
+                            self._progress_finish_fn(automation_id, result)
+                        except Exception as e:
+                            logger.debug("event progress finish: %s", e)
+
+        # Merge event data into result for then-action variables
+        merged = {**event_data, **result}
+        chain_depth = event_data.get('_chain_depth', 0)
+
+        try:
+            self._execute_then_actions(auto, merged, chain_depth)
+        except Exception as e:
+            logger.error(f"Then-actions failed for event automation {automation_id}: {e}")
+
+        # Update run stats (no reschedule — event triggers don't use timers)
+        last_result = json.dumps({k: v for k, v in merged.items() if not k.startswith('_')})
+        # Surface every failure mode to last_error: handlers in this codebase use
+        # 'error', 'reason', or 'message' interchangeably when returning gracefully.
+        if result.get('status') == 'error':
+            error = (
+                result.get('error')
+                or result.get('reason')
+                or result.get('message')
+                or 'Handler reported failure'
+            )
+        else:
+            error = None
+        self.db.update_automation_run(automation_id, error=error, last_result=last_result)
+
+        if self._history_record_fn:
+            try:
+                self._history_record_fn(automation_id, result)
+            except Exception as e:
+                logger.debug("history record failed: %s", e)
+
+    # --- Schedule Execution (timer-based) ---
+
+    def run_automation(self, automation_id, skip_delay=False, profile_id=None):
+        """Execute: check guard → run action → send notification → update stats → reschedule."""
+        if not self._running:
+            return
+
+        auto = self.db.get_automation(automation_id)
+        if not auto or not auto.get('enabled'):
+            return
+
+        # Global per-side pause: a scheduled slot is skipped but the schedule
+        # stays alive (_finish_run computes the next natural slot), so flipping
+        # the master back on resumes at the normal cadence — no restart, no
+        # burst of catch-up runs. Manual run_now (skip_delay=True) bypasses.
+        if not skip_delay:
+            side = self.automation_side(auto)
+            if not self.master_enabled(side):
+                logger.info(f"Automation '{auto.get('name')}' skipped — {side} automations are paused")
+                self._finish_run(auto, automation_id,
+                                 {'status': 'skipped', 'reason': f'{side} automations are paused'},
+                                 error=None)
+                return
+
+        action_type = auto.get('action_type')
+
+        # notify_only for scheduled automations
+        if action_type == 'notify_only':
+            result = {'status': 'triggered'}
+            try:
+                self._execute_then_actions(auto, result, chain_depth=0)
+            except Exception as e:
+                logger.error(f"Then-actions failed for automation {automation_id}: {e}")
+            self._finish_run(auto, automation_id, result, error=None)
+            return
+
+        handler_info = self._action_handlers.get(action_type)
+        if not handler_info:
+            logger.warning(f"No handler for action '{action_type}' on automation {automation_id}")
+            self.db.update_automation_run(automation_id, error=f"No handler for action: {action_type}")
+            return
+
+        try:
+            action_config = json.loads(auto.get('action_config') or '{}')
+        except json.JSONDecodeError:
+            action_config = {}
+
+        # Inject automation identity for progress tracking
+        action_config['_automation_id'] = automation_id
+        action_config['_automation_name'] = auto.get('name', '')
+        if profile_id is not None:
+            action_config['_profile_id'] = profile_id
+        # The profile this run acts AS: an explicit trigger profile, else the
+        # automation's owner, else admin. System + admin automations are
+        # profile 1, so this is a no-op for them — only non-admin-owned
+        # automations gain their correct identity in the background.
+        _effective_profile_id = profile_id if profile_id is not None else (auto.get('profile_id') or 1)
+
+        # Action delay (skipped for manual run_now)
+        delay_minutes = action_config.get('delay', 0)
+        _delay_already_inited = False
+        if not skip_delay and delay_minutes and delay_minutes > 0:
+            # Initialize progress BEFORE delay so card glows during wait
+            if self._progress_init_fn:
+                try:
+                    self._progress_init_fn(automation_id, auto.get('name', ''), action_type)
+                except Exception as e:
+                    logger.debug("scheduled progress init (delay): %s", e)
+                _delay_already_inited = True
+
+            delay_seconds = int(delay_minutes) * 60
+            logger.info(f"Automation '{auto['name']}' delaying {delay_minutes}m before action")
+            for remaining in range(delay_seconds, 0, -1):
+                if not self._running:
+                    return
+                if self._progress_update_fn and remaining % 5 == 0:
+                    mins, secs = divmod(remaining, 60)
+                    self._progress_update_fn(automation_id,
+                        phase=f'Delay: {mins}m {secs}s remaining',
+                        progress=int((delay_seconds - remaining) / delay_seconds * 10))
+                time.sleep(1)
+
+        # Check guard (is the operation already running?)
+        guard_fn = handler_info.get('guard')
+        if guard_fn and guard_fn():
+            result = {'status': 'skipped', 'reason': f'{action_type} is already running'}
+            logger.info(f"Automation '{auto['name']}' skipped — {action_type} already running")
+            # If progress was initialized during delay, finalize it
+            if _delay_already_inited and self._progress_finish_fn:
+                try:
+                    self._progress_finish_fn(automation_id, result)
+                except Exception as e:
+                    logger.debug("scheduled progress finish (skipped): %s", e)
+            self._finish_run(auto, automation_id, result, error=None, retry_delay_seconds=300)
+            return
+
+        # Initialize progress tracking (skip if already done during delay)
+        if not _delay_already_inited and self._progress_init_fn:
+            try:
+                self._progress_init_fn(automation_id, auto.get('name', ''), action_type)
+            except Exception as e:
+                logger.debug("scheduled progress init: %s", e)
+
+        # Execute the action under the owner's profile so get_current_profile_id()
+        # (and the per-profile clients it resolves) act as the automation's owner
+        # in the background, not admin. Reset in finally so a pooled thread can't
+        # leak the override to the next job.
+        error = None
+        result = {}
+        from core.profile_context import set_background_profile, reset_background_profile
+        _bg_token = set_background_profile(_effective_profile_id)
+        try:
+            result = handler_info['handler'](action_config) or {}
+            logger.info(f"Automation '{auto['name']}' (id={automation_id}) executed: {result.get('status', 'ok')}")
+            # Handlers may signal failure by RETURNING {'status': 'error', ...} instead of
+            # raising. Surface that to the DB so `last_error` reflects every failure mode,
+            # not just uncaught exceptions. Falls back through ('error', 'reason', 'message')
+            # because handlers in this codebase aren't consistent about which key they set.
+            if result.get('status') == 'error':
+                error = (
+                    result.get('error')
+                    or result.get('reason')
+                    or result.get('message')
+                    or 'Handler reported failure'
+                )
+        except Exception as e:
+            error = str(e)
+            result = {'status': 'error', 'error': error}
+            logger.error(f"Automation '{auto['name']}' (id={automation_id}) failed: {e}")
+        finally:
+            reset_background_profile(_bg_token)
+
+        # Finalize progress tracking
+        if self._progress_finish_fn:
+            try:
+                self._progress_finish_fn(automation_id, result)
+            except Exception as e:
+                logger.debug("scheduled progress finish: %s", e)
+
+        # Execute then-actions (notifications + fire_signal)
+        try:
+            self._execute_then_actions(auto, result, chain_depth=0)
+        except Exception as e:
+            logger.error(f"Then-actions failed for automation {automation_id}: {e}")
+
+        self._finish_run(auto, automation_id, result, error)
+
+    def _finish_run(self, auto, automation_id, result, error, retry_delay_seconds=None):
+        """Update DB with run stats and reschedule."""
+        next_run_str = None
+        trigger_type = auto.get('trigger_type', '')
+        # Only compute next_run for timer-based triggers (event triggers don't have scheduled runs)
+        if trigger_type in self._trigger_handlers:
+            try:
+                trigger_config = json.loads(auto.get('trigger_config') or '{}')
+                if retry_delay_seconds:
+                    next_run_str = _utc_after(retry_delay_seconds)
+                else:
+                    # Single integration point with ``next_run_at``. The
+                    # helper handles every trigger type the engine
+                    # supports (interval / daily / weekly / monthly) and
+                    # returns aware-UTC; ``_dt_to_db_str`` normalises to
+                    # the naive-UTC string the DB column stores. Tests
+                    # injecting a different ``now_utc`` patch this same
+                    # path — no scattered ``datetime.now()`` calls left.
+                    next_run_dt = next_run_at(
+                        trigger_type, trigger_config,
+                        now_utc=_utcnow(),
+                        default_tz=self._default_tz,
+                    )
+                    if next_run_dt is not None:
+                        next_run_str = _dt_to_db_str(next_run_dt)
+            except Exception as e:
+                logger.debug("next run calc failed: %s", e)
+
+        last_result = json.dumps(result) if result else None
+        self.db.update_automation_run(automation_id, next_run=next_run_str, error=error, last_result=last_result)
+
+        if self._history_record_fn:
+            try:
+                self._history_record_fn(automation_id, result)
+            except Exception as e:
+                logger.debug("history record failed: %s", e)
+
+        if self._running:
+            self.schedule_automation(automation_id)
+
+    def run_now(self, automation_id, profile_id=None):
+        """Manual trigger — run immediately in a background thread.
+        Always uses run_automation (skips condition checks and action delay).
+
+        Args:
+            automation_id: ID of automation to run
+            profile_id: If provided, scopes the run to this profile (manual trigger from UI)
+        """
+        auto = self.db.get_automation(automation_id)
+        if not auto:
+            return False
+
+        thread = threading.Thread(
+            target=self.run_automation,
+            args=(automation_id, True, profile_id),
+            daemon=True,
+            name=f'automation-run-{automation_id}'
+        )
+        thread.start()
+        return True
+
+    # --- Trigger handlers ---
+
+    def _calc_delay_seconds(self, config):
+        """Calculate delay in seconds from schedule config."""
+        interval = config.get('interval', 1)
+        unit = config.get('unit', 'hours')
+        multipliers = {'minutes': 60, 'hours': 3600, 'days': 86400}
+        return max(int(interval), 1) * multipliers.get(unit, 3600)
+
+    def _setup_schedule_trigger(self, automation_id, config):
+        """Config: {"interval": 6, "unit": "hours"}"""
+        delay = self._calc_delay_seconds(config)
+
+        # If there's a next_run in the future, use remaining time instead
+        auto = self.db.get_automation(automation_id)
+        if auto and auto.get('next_run'):
+            try:
+                next_run = datetime.strptime(auto['next_run'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                remaining = (next_run - _utcnow()).total_seconds()
+                if remaining > 0:
+                    delay = remaining
+            except (ValueError, TypeError):
+                pass
+
+        next_run_str = _utc_after(delay)
+        self.db.update_automation(automation_id, next_run=next_run_str)
+
+        timer = threading.Timer(delay, self.run_automation, args=(automation_id,))
+        timer.daemon = True
+        timer.start()
+
+        with self._lock:
+            self._timers[automation_id] = timer
+
+        logger.debug(f"Scheduled automation {automation_id} in {delay:.0f}s")
+
+    def _setup_daily_time_trigger(self, automation_id, config):
+        """Config: ``{"time": "03:00", "tz": "<IANA>"}`` — runs daily
+        at the specified local time. Tz defaults to ``self._default_tz``
+        when absent."""
+        self._setup_timed_trigger(automation_id, 'daily_time', config,
+                                  label=f"Daily at {config.get('time', '00:00')}")
+
+    def _setup_weekly_time_trigger(self, automation_id, config):
+        """Config: ``{"time": "03:00", "days": ["mon","wed","fri"], "tz": "<IANA>"}``."""
+        day_names = ', '.join(config.get('days') or []) or 'every day'
+        self._setup_timed_trigger(automation_id, 'weekly_time', config,
+                                  label=f"Weekly {config.get('time', '00:00')} on {day_names}")
+
+    def _setup_monthly_time_trigger(self, automation_id, config):
+        """Config: ``{"time": "09:00", "day_of_month": 15, "tz": "<IANA>"}``.
+
+        Day clamped to [1, 31]; months too short for the target day
+        clamp to the last valid day (Feb 31 → Feb 28 / Feb 29 leap
+        year) per standard cron convention — see
+        ``core.automation.schedule._next_monthly`` for the rule."""
+        day = config.get('day_of_month', 1)
+        self._setup_timed_trigger(automation_id, 'monthly_time', config,
+                                  label=f"Monthly {config.get('time', '00:00')} on day {day}")
+
+    def _setup_timed_trigger(self, automation_id, trigger_type, config, *, label):
+        """Shared setup for daily / weekly / monthly time triggers.
+
+        All three flow through the same skeleton: compute next-run
+        via ``next_run_at``, persist to DB, arm a ``threading.Timer``
+        that fires the automation when the delay elapses. Lifting
+        these out of three near-identical methods means there's one
+        place to fix when (e.g.) timer rearm semantics need a tweak.
+
+        Honours an existing future ``next_run`` row in the DB —
+        prevents losing a hand-edited next_run when the engine
+        reschedules at startup. Same guard as the interval path."""
+        target_dt = next_run_at(
+            trigger_type, config or {},
+            now_utc=_utcnow(),
+            default_tz=self._default_tz,
+        )
+        if target_dt is None:
+            logger.warning(
+                f"Skip scheduling automation {automation_id}: next_run_at returned "
+                f"None for {trigger_type!r}",
+            )
+            return
+
+        delay = max(0.0, (target_dt - _utcnow()).total_seconds())
+
+        # If the DB already carries a future next_run, prefer it —
+        # matches the interval-path behaviour and lets manual edits
+        # or pending retries survive a process restart.
+        auto = self.db.get_automation(automation_id)
+        if auto and auto.get('next_run'):
+            try:
+                existing = datetime.strptime(
+                    auto['next_run'], '%Y-%m-%d %H:%M:%S',
+                ).replace(tzinfo=timezone.utc)
+                remaining = (existing - _utcnow()).total_seconds()
+                if remaining > 0:
+                    delay = remaining
+                    target_dt = existing
+            except (ValueError, TypeError):
+                pass
+
+        self.db.update_automation(automation_id, next_run=_dt_to_db_str(target_dt))
+
+        timer = threading.Timer(delay, self.run_automation, args=(automation_id,))
+        timer.daemon = True
+        timer.start()
+
+        with self._lock:
+            self._timers[automation_id] = timer
+
+        logger.debug(f"{label} automation {automation_id} scheduled (in {delay:.0f}s)")
+
+    # --- Then Actions (notifications + signals) ---
+
+    def _execute_then_actions(self, automation, action_result, chain_depth=0):
+        """Execute all THEN actions: notifications (Discord/Pushbullet/Telegram) and fire_signal."""
+        # Read then_actions array
+        try:
+            then_actions = json.loads(automation.get('then_actions') or '[]')
+        except (json.JSONDecodeError, TypeError):
+            then_actions = []
+
+        # Backward compat: fall back to notify_type/notify_config
+        if not then_actions:
+            nt = automation.get('notify_type')
+            if nt:
+                try:
+                    nc = json.loads(automation.get('notify_config') or '{}')
+                except (json.JSONDecodeError, TypeError):
+                    nc = {}
+                then_actions = [{'type': nt, 'config': nc}]
+
+        if not then_actions:
+            return
+
+        # Build template variables
+        variables = {
+            'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'name': automation.get('name', 'Automation'),
+            'run_count': str(automation.get('run_count', 0) + 1),
+            'status': action_result.get('status', 'unknown'),
+        }
+        for k, v in action_result.items():
+            if not k.startswith('_'):
+                variables[k] = str(v)
+
+        for item in then_actions:
+            try:
+                t = item.get('type', '')
+                c = item.get('config', {})
+                if t == 'discord_webhook':
+                    self._send_discord_notification(c, variables)
+                elif t == 'pushbullet':
+                    self._send_pushbullet_notification(c, variables)
+                elif t == 'telegram':
+                    self._send_telegram_notification(c, variables)
+                elif t == 'webhook':
+                    self._send_webhook(c, variables)
+                elif t == 'fire_signal':
+                    sig = self._sanitize_signal_name(c.get('signal_name', ''))
+                    if sig:
+                        emit_data = {k: v for k, v in action_result.items() if not k.startswith('_')}
+                        emit_data['_chain_depth'] = chain_depth + 1
+                        emit_data['signal_name'] = sig
+                        logger.info(f"Automation '{automation.get('name')}' firing signal: {sig} (depth={chain_depth + 1})")
+                        self.emit('signal:' + sig, emit_data)
+                elif t == 'run_script':
+                    handler = self._action_handlers.get('run_script')
+                    if handler:
+                        script_config = dict(c)
+                        # Pass action result as environment context
+                        script_config['_automation_name'] = automation.get('name', '')
+                        script_config['_event_data'] = {'type': 'then_action', 'result': {k: str(v) for k, v in action_result.items() if not k.startswith('_')}}
+                        handler['handler'](script_config)
+            except Exception as e:
+                logger.error(f"Then-action '{item.get('type')}' failed for automation {automation.get('id')}: {e}")
+
+    # --- Signal Cycle Detection ---
+
+    def detect_signal_cycles(self, automations_list):
+        """Build signal dependency graph from automations list, return cycle path or None.
+        Used by web_server.py to validate before saving an automation."""
+        # Build graph: signal listened → set of signals fired
+        graph = {}
+        for auto in automations_list:
+            if not auto.get('enabled', True):
+                continue
+            tt = auto.get('trigger_type', '')
+            if tt != 'signal_received':
+                continue
+            tc = auto.get('trigger_config') or {}
+            if isinstance(tc, str):
+                try:
+                    tc = json.loads(tc)
+                except (json.JSONDecodeError, TypeError):
+                    tc = {}
+            listen_sig = self._sanitize_signal_name(tc.get('signal_name', ''))
+            if not listen_sig:
+                continue
+            # What signals does this automation fire?
+            ta = auto.get('then_actions') or '[]'
+            if isinstance(ta, str):
+                try:
+                    ta = json.loads(ta)
+                except (json.JSONDecodeError, TypeError):
+                    ta = []
+            for item in ta:
+                if item.get('type') == 'fire_signal':
+                    fire_sig = self._sanitize_signal_name(item.get('config', {}).get('signal_name', ''))
+                    if fire_sig:
+                        graph.setdefault(listen_sig, set()).add(fire_sig)
+
+        # DFS cycle detection with ordered path for readable error messages
+        def has_cycle(node, visited, path_list, path_set):
+            if node in path_set:
+                # Extract the cycle portion from path_list
+                cycle_start = path_list.index(node)
+                return path_list[cycle_start:] + [node]
+            if node in visited:
+                return None
+            visited.add(node)
+            path_list.append(node)
+            path_set.add(node)
+            for neighbor in graph.get(node, []):
+                result = has_cycle(neighbor, visited, path_list, path_set)
+                if result:
+                    return result
+            path_list.pop()
+            path_set.discard(node)
+            return None
+
+        visited = set()
+        for start in graph:
+            cycle = has_cycle(start, visited, [], set())
+            if cycle:
+                return cycle
+        return None
+
+    def _send_discord_notification(self, config, variables):
+        """POST to Discord webhook with template variable substitution."""
+        url = config.get('webhook_url', '').strip()
+        if not url:
+            raise ValueError("No webhook URL configured")
+
+        message = config.get('message', '{name} completed with status: {status}')
+
+        # Substitute all variables
+        for key, value in variables.items():
+            message = message.replace('{' + key + '}', value)
+
+        resp = requests.post(url, json={"content": message}, timeout=10)
+        if resp.status_code not in (200, 204):
+            raise RuntimeError(f"Discord webhook returned {resp.status_code}: {resp.text[:200]}")
+
+    def _send_pushbullet_notification(self, config, variables):
+        """Send push notification via Pushbullet API."""
+        token = config.get('access_token', '').strip()
+        if not token:
+            raise ValueError("No Pushbullet access token configured")
+
+        title = config.get('title', '{name}')
+        message = config.get('message', 'Completed with status: {status}')
+
+        for key, value in variables.items():
+            title = title.replace('{' + key + '}', value)
+            message = message.replace('{' + key + '}', value)
+
+        resp = requests.post(
+            'https://api.pushbullet.com/v2/pushes',
+            json={"type": "note", "title": title, "body": message},
+            headers={"Access-Token": token},
+            timeout=10,
+        )
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(f"Pushbullet returned {resp.status_code}: {resp.text[:200]}")
+
+    def _send_telegram_notification(self, config, variables):
+        """Send message via Telegram Bot API."""
+        bot_token = config.get('bot_token', '').strip()
+        chat_id = config.get('chat_id', '').strip()
+        thread_id = config.get('thread_id', '').strip()
+        
+        if not bot_token or not chat_id:
+            raise ValueError("Bot token and chat ID are required for Telegram")
+
+        message = config.get('message', '{name} completed with status: {status}')
+
+        for key, value in variables.items():
+            message = message.replace('{' + key + '}', value)
+
+        payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+        if thread_id:
+            try:
+                payload["message_thread_id"] = int(thread_id)
+            except ValueError:
+                pass  # invalid — fall back to main chat
+
+        resp = requests.post(
+            f'https://api.telegram.org/bot{bot_token}/sendMessage',
+            json=payload,
+            timeout=10,
+        )
+        data = resp.json() if resp.status_code == 200 else {}
+        if not data.get('ok'):
+            raise RuntimeError(f"Telegram returned {resp.status_code}: {resp.text[:200]}")
+
+    def _send_webhook(self, config, variables):
+        """Send a POST request to a user-configured webhook URL with JSON payload."""
+        url = config.get('url', '').strip()
+        if not url:
+            raise ValueError("No webhook URL configured")
+
+        # Build headers — always include Content-Type, plus optional custom headers
+        headers = {'Content-Type': 'application/json'}
+        custom_headers = config.get('headers', '').strip()
+        if custom_headers:
+            for line in custom_headers.split('\n'):
+                line = line.strip()
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    # Substitute variables in header values
+                    for vk, vv in variables.items():
+                        value = value.replace('{' + vk + '}', vv)
+                    headers[key.strip()] = value.strip()
+
+        # Build JSON payload with all variables
+        payload = dict(variables)
+
+        # Add custom message if configured
+        message = config.get('message', '').strip()
+        if message:
+            for key, value in variables.items():
+                message = message.replace('{' + key + '}', value)
+            payload['message'] = message
+
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Webhook returned {resp.status_code}: {resp.text[:200]}")

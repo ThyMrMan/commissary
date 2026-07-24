@@ -1,0 +1,152 @@
+import { createMemoryHistory } from '@tanstack/react-router';
+import { render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import {
+  SHELL_PROFILE_CONTEXT_CHANGED_EVENT,
+  type ShellProfileContext,
+  type ShellPageId,
+} from '@/platform/shell/bridge';
+import { HttpResponse, http, server } from '@/test/msw';
+import { createTestQueryClient } from '@/test/query-client';
+import { createShellBridge } from '@/test/shell-bridge';
+
+import { AppRouterProvider, createAppRouter } from './router';
+
+describe('createAppRouter', () => {
+  beforeEach(() => {
+    server.use(
+      http.get('/api/issues/counts', () =>
+        HttpResponse.json({
+          success: true,
+          counts: { open: 2, in_progress: 1, resolved: 0, dismissed: 0, total: 3 },
+        }),
+      ),
+      http.get('/api/issues', () =>
+        HttpResponse.json({
+          success: true,
+          total: 1,
+          issues: [
+            {
+              id: 7,
+              entity_type: 'album',
+              entity_id: 'album-7',
+              category: 'wrong_cover',
+              title: 'Wrong cover art',
+              status: 'open',
+              priority: 'normal',
+              snapshot_data: '{}',
+            },
+          ],
+        }),
+      ),
+    );
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    window.SoulSyncWebShellBridge = undefined;
+    window.SoulSyncIssueDomain = undefined;
+  });
+
+  it('creates one shared query client and applies router defaults', () => {
+    const queryClient = createTestQueryClient();
+    const router = createAppRouter({ queryClient });
+
+    expect(router.options.context?.queryClient).toBe(queryClient);
+    expect(router.options.defaultPreload).toBe('intent');
+    expect(router.options.defaultPreloadStaleTime).toBe(0);
+    expect(router.options.scrollRestoration).toBe(true);
+    expect(router.options.defaultErrorComponent).toBeDefined();
+    expect(router.options.defaultNotFoundComponent).toBeDefined();
+  });
+
+  it('renders migrated React routes directly and updates shell chrome', async () => {
+    window.SoulSyncWebShellBridge = createShellBridge();
+
+    const queryClient = createTestQueryClient();
+    const history = createMemoryHistory({ initialEntries: ['/issues'] });
+    const router = createAppRouter({ history, queryClient });
+
+    render(<AppRouterProvider router={router} queryClient={queryClient} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('issues-board')).toBeInTheDocument();
+    });
+
+    expect(window.SoulSyncWebShellBridge?.showReactHost).toHaveBeenCalledWith('issues');
+    expect(window.SoulSyncWebShellBridge?.setActivePageChrome).toHaveBeenCalledWith('issues');
+    expect(window.SoulSyncWebShellBridge?.activateLegacyPath).not.toHaveBeenCalled();
+  });
+
+  it('routes non-migrated paths through the legacy fallback handler', async () => {
+    window.SoulSyncWebShellBridge = createShellBridge();
+
+    const queryClient = createTestQueryClient();
+    const history = createMemoryHistory({ initialEntries: ['/search'] });
+    const router = createAppRouter({ history, queryClient });
+
+    render(<AppRouterProvider router={router} queryClient={queryClient} />);
+
+    await waitFor(() => {
+      expect(window.SoulSyncWebShellBridge?.activateLegacyPath).toHaveBeenCalledWith('/search');
+    });
+  });
+
+  it('redirects disallowed React routes back to the profile home page', async () => {
+    window.SoulSyncWebShellBridge = createShellBridge({
+      isPageAllowed: vi.fn((pageId) => pageId !== 'issues'),
+    });
+
+    const queryClient = createTestQueryClient();
+    const history = createMemoryHistory({ initialEntries: ['/issues'] });
+    const router = createAppRouter({ history, queryClient });
+
+    render(<AppRouterProvider router={router} queryClient={queryClient} />);
+
+    await waitFor(() => {
+      expect(history.location.pathname).toBe('/discover');
+    });
+  });
+
+  it('waits for profile context before rendering React routes', async () => {
+    const getCurrentProfileContext = vi.fn<() => ShellProfileContext | null>(() => null);
+    window.SoulSyncWebShellBridge = createShellBridge({
+      getCurrentProfileContext,
+    });
+
+    const queryClient = createTestQueryClient();
+    const history = createMemoryHistory({ initialEntries: ['/issues'] });
+    const router = createAppRouter({ history, queryClient });
+
+    render(<AppRouterProvider router={router} queryClient={queryClient} />);
+
+    expect(screen.queryByTestId('issues-board')).not.toBeInTheDocument();
+
+    getCurrentProfileContext.mockReturnValue({ profileId: 1, isAdmin: false });
+    window.dispatchEvent(new CustomEvent(SHELL_PROFILE_CONTEXT_CHANGED_EVENT));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('issues-board')).toBeInTheDocument();
+    });
+  });
+
+  it('redirects the root route to the profile home page', async () => {
+    window.SoulSyncWebShellBridge = createShellBridge({
+      getProfileHomePage: vi.fn<() => ShellPageId>(() => 'search'),
+    });
+
+    const queryClient = createTestQueryClient();
+    const history = createMemoryHistory({ initialEntries: ['/'] });
+    const router = createAppRouter({ history, queryClient });
+
+    render(<AppRouterProvider router={router} queryClient={queryClient} />);
+
+    await waitFor(() => {
+      expect(window.SoulSyncWebShellBridge?.activateLegacyPath).toHaveBeenCalledWith('/search');
+    });
+
+    expect(history.location.pathname).toBe('/search');
+  });
+});

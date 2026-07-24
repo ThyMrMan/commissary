@@ -1,0 +1,462 @@
+"""Wishlist payload normalization helpers."""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Dict, Optional
+
+from utils.logging_config import get_logger
+
+
+logger = get_logger("wishlist.payloads")
+
+
+def sanitize_track_data_for_processing(track_data):
+    """
+    Sanitizes track data from wishlist service to ensure consistent format.
+    Preserves album dict to retain full metadata (images, id, etc.) and normalizes artist field.
+    """
+    if not isinstance(track_data, dict):
+        logger.info(f"[Sanitize] Unexpected track data type: {type(track_data)}")
+        return track_data
+
+    sanitized = track_data.copy()
+
+    raw_album = sanitized.get('album', '')
+    if not isinstance(raw_album, (dict, str)):
+        sanitized['album'] = str(raw_album)
+
+    raw_artists = sanitized.get('artists', [])
+    if isinstance(raw_artists, list):
+        processed_artists = []
+        for artist in raw_artists:
+            if isinstance(artist, str):
+                processed_artists.append(artist)
+            elif isinstance(artist, dict) and 'name' in artist:
+                processed_artists.append(artist['name'])
+            else:
+                processed_artists.append(str(artist))
+        sanitized['artists'] = processed_artists
+    else:
+        logger.info(f"[Sanitize] Unexpected artists format: {type(raw_artists)}")
+        sanitized['artists'] = [str(raw_artists)] if raw_artists else []
+
+    return sanitized
+
+
+def get_track_artist_name(track_info):
+    """Extract artist name from track info, handling different data formats."""
+    if not track_info:
+        return "Unknown Artist"
+
+    artists = track_info.get('artists', [])
+    if artists and len(artists) > 0:
+        first_artist = artists[0]
+        if isinstance(first_artist, dict) and 'name' in first_artist:
+            return first_artist['name']
+        if isinstance(first_artist, str):
+            return first_artist
+
+    artist = track_info.get('artist')
+    if artist:
+        return artist
+
+    return "Unknown Artist"
+
+
+def ensure_wishlist_track_format(track_info):
+    """
+    Ensure track_info has a consistent wishlist track structure.
+
+    This keeps the legacy Spotify-shaped fields because the download pipeline
+    still expects them, but the helper itself is provider-agnostic.
+    """
+    if not track_info:
+        return {}
+
+    if isinstance(track_info.get('artists'), list) and len(track_info.get('artists', [])) > 0:
+        first_artist = track_info['artists'][0]
+        if isinstance(first_artist, dict) and 'name' in first_artist:
+            return track_info
+
+    artists_list = []
+    artists = track_info.get('artists', [])
+    if artists:
+        if isinstance(artists, list):
+            for artist in artists:
+                if isinstance(artist, dict) and 'name' in artist:
+                    artists_list.append({'name': artist['name']})
+                elif isinstance(artist, str):
+                    artists_list.append({'name': artist})
+                else:
+                    artists_list.append({'name': str(artist)})
+        else:
+            artists_list.append({'name': str(artists)})
+    else:
+        artist = track_info.get('artist')
+        if artist:
+            artists_list.append({'name': str(artist)})
+        else:
+            artists_list.append({'name': 'Unknown Artist'})
+
+    album_data = track_info.get('album', {})
+    if isinstance(album_data, dict):
+        album = dict(album_data)
+        album.setdefault('name', 'Unknown Album')
+    else:
+        album = {
+            'name': str(album_data) if album_data else track_info.get('name', 'Unknown Album'),
+            'release_date': '',
+        }
+    album.setdefault('images', [])
+    album.setdefault('album_type', 'album')
+    album.setdefault('total_tracks', 0)
+
+    return {
+        'id': track_info.get('id', f"webui_{hash(str(track_info))}"),
+        'name': track_info.get('name', 'Unknown Track'),
+        'artists': artists_list,
+        'album': album,
+        'duration_ms': track_info.get('duration_ms', 0),
+        # track/disc numbers preserved as-is (no default-to-1 fallback).
+        # Defaulting to 1 here poisons the downstream chain — the import
+        # pipeline at ``core/imports/pipeline.py:645`` only runs its
+        # ``extract_track_number_from_filename`` fallback when this
+        # value is None, so a pre-filled 1 would lock every wishlist
+        # re-attempt to track 01 regardless of source filename. Leave
+        # missing values explicit so the pipeline can detect-and-recover.
+        'track_number': track_info.get('track_number'),
+        'disc_number': track_info.get('disc_number'),
+        'preview_url': track_info.get('preview_url'),
+        'external_urls': track_info.get('external_urls', {}),
+        'popularity': track_info.get('popularity', 0),
+        'source': track_info.get('source', 'webui_modal'),
+    }
+
+
+def ensure_spotify_track_format(track_info):
+    """Backward-compatible wrapper for `ensure_wishlist_track_format`."""
+    return ensure_wishlist_track_format(track_info)
+
+
+def build_cancelled_task_wishlist_payload(task, profile_id: int = 1):
+    """Build the wishlist payload for a cancelled download task."""
+    if not task:
+        return {}
+
+    track_info = task.get('track_info', {})
+    artists_data = track_info.get('artists', [])
+    formatted_artists = []
+
+    for artist in artists_data:
+        if isinstance(artist, str):
+            formatted_artists.append({'name': artist})
+        elif isinstance(artist, dict):
+            if 'name' in artist and isinstance(artist['name'], str):
+                formatted_artists.append(artist)
+            elif 'name' in artist and isinstance(artist['name'], dict) and 'name' in artist['name']:
+                formatted_artists.append({'name': artist['name']['name']})
+            else:
+                formatted_artists.append({'name': str(artist)})
+        else:
+            formatted_artists.append({'name': str(artist)})
+
+    album_raw = track_info.get('album', {})
+    if isinstance(album_raw, dict):
+        # Full-dict shape — copy as-is so release_date / id / total_tracks
+        # / artists survive the round-trip. Earlier this only ``setdefault``ed
+        # name/album_type/images, but ``dict(album_raw)`` already
+        # preserves every other key the source carries; the setdefaults
+        # only fill blanks. release_date in particular MUST survive so
+        # the import path-template renders the year in the folder name.
+        album_data = dict(album_raw)
+        album_data.setdefault('name', 'Unknown Album')
+        album_data.setdefault('album_type', track_info.get('album_type', 'album'))
+        if 'images' not in album_data and track_info.get('album_image_url'):
+            album_data['images'] = [{'url': track_info.get('album_image_url')}]
+    else:
+        # String-shape album — preserve every adjacent track_info field
+        # we know about so the constructed dict is still usable
+        # downstream. Pre-fix this only set name + album_type, dropping
+        # release_date / total_tracks / id even when the caller had them.
+        album_data = {
+            'name': str(album_raw) if album_raw else 'Unknown Album',
+            'album_type': track_info.get('album_type', 'album'),
+        }
+        if track_info.get('album_image_url'):
+            album_data['images'] = [{'url': track_info.get('album_image_url')}]
+        if track_info.get('album_release_date') or track_info.get('release_date'):
+            album_data['release_date'] = (
+                track_info.get('album_release_date')
+                or track_info.get('release_date')
+            )
+
+    track_data = {
+        'id': track_info.get('id'),
+        'name': track_info.get('name'),
+        'artists': formatted_artists,
+        'album': album_data,
+        'duration_ms': track_info.get('duration_ms'),
+        # Preserve track / disc position so a cancellation→re-add doesn't
+        # lock the next attempt to track 01. ``None`` is intentional —
+        # downstream ``core/imports/pipeline.py:645`` reads None as
+        # "extract from filename instead", which is what we want when
+        # the position genuinely isn't known.
+        'track_number': track_info.get('track_number'),
+        'disc_number': track_info.get('disc_number'),
+    }
+
+    source_context = {
+        'playlist_name': task.get('playlist_name', 'Unknown Playlist'),
+        'playlist_id': task.get('playlist_id'),
+        'added_from': 'modal_cancellation_v2',
+    }
+
+    return {
+        'spotify_track_data': track_data,
+        'track_data': track_data,
+        'failure_reason': 'Download cancelled by user (v2)',
+        'source_type': 'playlist',
+        'source_context': source_context,
+        'profile_id': profile_id,
+    }
+
+
+def build_failed_track_wishlist_context(
+    track_info,
+    *,
+    track_index: int = 0,
+    retry_count: int = 0,
+    failure_reason: str = 'Download failed',
+    candidates=None,
+):
+    """Build the track-info payload used when queue tasks get added back to wishlist."""
+    track_info = track_info or {}
+    return {
+        'download_index': track_index,
+        'table_index': track_index,
+        'track_name': track_info.get('name', 'Unknown Track'),
+        'artist_name': get_track_artist_name(track_info),
+        'retry_count': retry_count,
+        'spotify_track': ensure_wishlist_track_format(track_info),
+        'track_data': ensure_wishlist_track_format(track_info),
+        'failure_reason': failure_reason,
+        'candidates': list(candidates or []),
+    }
+
+
+def track_object_to_dict(track_object) -> Dict[str, Any]:
+    """Convert a track object or TrackResult object to a dictionary."""
+    try:
+        logger.debug(
+            "Converting track object to dict: type=%s has_title=%s has_artist=%s has_id=%s",
+            type(track_object),
+            hasattr(track_object, "title"),
+            hasattr(track_object, "artist"),
+            hasattr(track_object, "id"),
+        )
+
+        if hasattr(track_object, "title") and hasattr(track_object, "artist") and not hasattr(track_object, "id"):
+            logger.debug("Detected TrackResult object, converting")
+            album_name = getattr(track_object, "album", "") or getattr(track_object, "title", "Unknown Album")
+            result = {
+                "id": f"trackresult_{hash(f'{track_object.artist}_{track_object.title}')}",
+                "name": getattr(track_object, "title", "Unknown Track"),
+                "artists": [{"name": getattr(track_object, "artist", "Unknown Artist")}],
+                "album": {"name": album_name, "images": [], "album_type": "single", "total_tracks": 1},
+                "duration_ms": 0,
+                "preview_url": None,
+                "external_urls": {},
+                "popularity": 0,
+                "source": "trackresult",
+            }
+            logger.debug(
+                "TrackResult converted successfully: name=%s artist=%s",
+                result["name"],
+                result["artists"][0]["name"],
+            )
+            return result
+
+        logger.debug("Processing as track object")
+
+        artists_list = []
+        raw_artists = getattr(track_object, "artists", [])
+        logger.debug("Raw artists: %r (type=%s)", raw_artists, type(raw_artists))
+
+        for artist in raw_artists:
+            logger.debug("Processing artist: %r (type=%s)", artist, type(artist))
+            if hasattr(artist, "name"):
+                artists_list.append({"name": artist.name})
+            elif isinstance(artist, str):
+                artists_list.append({"name": artist})
+            else:
+                artists_list.append({"name": str(artist)})
+
+        # Build the album dict by preserving every field the track
+        # object carries about its album. Pre-fix only ``name`` was
+        # surfaced — release_date / images / album_type / total_tracks
+        # / id / artists were all silently dropped during the
+        # Track→dict conversion that runs whenever the wishlist payload
+        # arrives as a Track dataclass (vs. a raw spotify_data dict).
+        # That regression poisoned every wishlist row added from a
+        # Track object: stored album={'name': X} only, so downstream
+        # path-template rendering had no year and post-process had no
+        # track count for relative-position math.
+        album_attr = getattr(track_object, "album", None) if hasattr(track_object, "album") else None
+        if isinstance(album_attr, dict):
+            # Album was already a dict on the track object — preserve
+            # every key the source put there.
+            album_dict = dict(album_attr)
+            album_dict.setdefault("name", "Unknown Album")
+        elif album_attr is not None and hasattr(album_attr, "name"):
+            # Album was a sub-object — pull every common field across
+            # the Spotify / Deezer / iTunes Album dataclass shapes.
+            album_dict = {
+                "name": getattr(album_attr, "name", "") or "Unknown Album",
+            }
+            for src_attr, dest_key in (
+                ("id", "id"),
+                ("release_date", "release_date"),
+                ("album_type", "album_type"),
+                ("total_tracks", "total_tracks"),
+                ("total_discs", "total_discs"),
+                ("artists", "artists"),
+                ("images", "images"),
+                ("image_url", "image_url"),
+            ):
+                val = getattr(album_attr, src_attr, None)
+                if val not in (None, "", [], 0):
+                    album_dict[dest_key] = val
+        else:
+            # Album was a bare string OR truthy-but-untyped — pull
+            # adjacent track-object attrs to flesh it out.
+            album_name = str(album_attr) if album_attr else "Unknown Album"
+            album_dict = {"name": album_name}
+            for src_attr, dest_key in (
+                ("release_date", "release_date"),
+                ("album_id", "id"),
+                ("album_type", "album_type"),
+                ("total_tracks", "total_tracks"),
+            ):
+                val = getattr(track_object, src_attr, None)
+                if val not in (None, "", [], 0):
+                    album_dict[dest_key] = val
+            # ``image_url`` lives on the track object on the Deezer /
+            # iTunes Track dataclasses — surface as album.images so the
+            # path template's artwork hook can find it.
+            img = getattr(track_object, "image_url", None)
+            if img and "images" not in album_dict:
+                album_dict["images"] = [{"url": img}]
+
+        result = {
+            "id": getattr(track_object, "id", None),
+            "name": getattr(track_object, "name", "Unknown Track"),
+            "artists": artists_list,
+            "album": album_dict,
+            "duration_ms": getattr(track_object, "duration_ms", 0),
+            "preview_url": getattr(track_object, "preview_url", None),
+            "external_urls": getattr(track_object, "external_urls", {}),
+            "popularity": getattr(track_object, "popularity", 0),
+            # See ``ensure_wishlist_track_format`` — preserve missing
+            # values as None so the import pipeline's filename fallback
+            # can fire instead of locking to track/disc 01.
+            "track_number": getattr(track_object, "track_number", None),
+            "disc_number": getattr(track_object, "disc_number", None),
+        }
+
+        logger.debug(
+            "Track converted: name=%s artists=%s",
+            result["name"],
+            [a["name"] for a in result["artists"]],
+        )
+
+        try:
+            json.dumps(result)
+            logger.debug("Conversion result is JSON serializable")
+        except Exception as json_error:
+            logger.error("Conversion result is NOT JSON serializable: %s", json_error)
+            logger.error("Conversion result content: %r", result)
+            return {
+                "id": f"fallback_{hash(str(track_object))}",
+                "name": str(getattr(track_object, "name", "Unknown Track")),
+                "artists": [{"name": "Unknown Artist"}],
+                "album": {"name": "Unknown Album"},
+                "duration_ms": 0,
+                "preview_url": None,
+                "external_urls": {},
+                "popularity": 0,
+                "source": "fallback",
+            }
+
+        return result
+    except Exception as e:
+        logger.error(f"Error converting track object to dict: {e}")
+        logger.error(f"Object type: {type(track_object)}")
+        logger.error(f"Object attributes: {dir(track_object)}")
+        return {}
+
+
+def spotify_track_object_to_dict(spotify_track) -> Dict[str, Any]:
+    """Backward-compatible wrapper for `track_object_to_dict`."""
+    return track_object_to_dict(spotify_track)
+
+
+def extract_wishlist_track_from_modal_info(track_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Extract a track payload from modal track_info structure.
+    """
+    try:
+        if not isinstance(track_info, dict):
+            return None
+
+        for key in ("track_data", "track", "metadata_track", "spotify_track"):
+            if key not in track_info or not track_info[key]:
+                continue
+            extracted = track_info[key]
+            if hasattr(extracted, "__dict__"):
+                return track_object_to_dict(extracted)
+            if isinstance(extracted, dict):
+                return extracted
+
+        if track_info.get("name") or track_info.get("title"):
+            if track_info.get("artists") or track_info.get("artist"):
+                return ensure_wishlist_track_format(track_info)
+
+        if "slskd_result" in track_info and track_info["slskd_result"]:
+            slskd_result = track_info["slskd_result"]
+            if hasattr(slskd_result, "artist") and hasattr(slskd_result, "title"):
+                album_name = getattr(slskd_result, "album", "") or getattr(slskd_result, "title", "Unknown Album")
+                return {
+                    "id": f"reconstructed_{hash(f'{slskd_result.artist}_{slskd_result.title}')}",
+                    "name": getattr(slskd_result, "title", "Unknown Track"),
+                    "artists": [{"name": getattr(slskd_result, "artist", "Unknown Artist")}],
+                    "album": {"name": album_name, "images": [], "album_type": "album", "total_tracks": 0},
+                    "duration_ms": 0,
+                    "reconstructed": True,
+                }
+
+        logger.warning("Could not find track data in modal info, attempting reconstruction")
+        return None
+
+    except Exception as e:
+        logger.error(f"Error extracting track from modal info: {e}")
+        return None
+
+
+def extract_spotify_track_from_modal_info(track_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Backward-compatible wrapper for `extract_wishlist_track_from_modal_info`."""
+    return extract_wishlist_track_from_modal_info(track_info)
+
+
+__all__ = [
+    "sanitize_track_data_for_processing",
+    "get_track_artist_name",
+    "ensure_wishlist_track_format",
+    "ensure_spotify_track_format",
+    "build_cancelled_task_wishlist_payload",
+    "build_failed_track_wishlist_context",
+    "track_object_to_dict",
+    "spotify_track_object_to_dict",
+    "extract_wishlist_track_from_modal_info",
+    "extract_spotify_track_from_modal_info",
+]

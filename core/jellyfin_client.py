@@ -1,0 +1,2039 @@
+import requests
+import time
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+import json
+from utils.logging_config import get_logger
+from config.settings import config_manager
+from core.library.bulk_paginate import paginate_all_items
+
+# Shared dataclasses live in the neutral media_server package — every
+# server client used to define a near-identical XTrackInfo /
+# XPlaylistInfo. Lifted to one canonical type so consumers (matching
+# engine, sync service) get a single import.
+from core.media_server.types import TrackInfo, PlaylistInfo
+
+logger = get_logger("jellyfin_client")
+
+
+class JellyfinArtist:
+    """Wrapper class to mimic Plex artist object interface"""
+    def __init__(self, jellyfin_data: Dict[str, Any], client: 'JellyfinClient'):
+        self._data = jellyfin_data
+        self._client = client
+        self.ratingKey = jellyfin_data.get('Id', '')
+        self.title = jellyfin_data.get('Name', 'Unknown Artist')
+        self.addedAt = self._parse_date(jellyfin_data.get('DateCreated'))
+        
+        # Create genres property from Jellyfin data (empty list for now since data structure needs investigation)
+        self.genres = []
+        # TODO: Map Jellyfin genre data to match Plex format
+        
+        # Create summary property from Jellyfin data (used for timestamp storage)
+        self.summary = jellyfin_data.get('Overview', '') or ''
+
+        # Create thumb property for artist images
+        self.thumb = self._get_artist_image_url()
+        
+    def _parse_date(self, date_str: Optional[str]) -> Optional[datetime]:
+        """Parse Jellyfin date string to datetime"""
+        if not date_str:
+            return None
+        try:
+            # Jellyfin uses ISO format: 2023-12-01T10:30:00.000Z
+            return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        except:
+            return None
+
+    def _get_artist_image_url(self) -> Optional[str]:
+        """Generate Jellyfin artist image URL"""
+        if not self.ratingKey:
+            return None
+
+        # Jellyfin primary image URL format
+        return f"/Items/{self.ratingKey}/Images/Primary"
+    
+    def albums(self) -> List['JellyfinAlbum']:
+        """Get all albums for this artist"""
+        return self._client.get_albums_for_artist(self.ratingKey)
+
+class JellyfinAlbum:
+    """Wrapper class to mimic Plex album object interface"""
+    def __init__(self, jellyfin_data: Dict[str, Any], client: 'JellyfinClient'):
+        self._data = jellyfin_data
+        self._client = client
+        self.ratingKey = jellyfin_data.get('Id', '')
+        self.title = jellyfin_data.get('Name', 'Unknown Album')
+        self.addedAt = self._parse_date(jellyfin_data.get('DateCreated'))
+        self._artist_id = jellyfin_data.get('AlbumArtists', [{}])[0].get('Id', '') if jellyfin_data.get('AlbumArtists') else ''
+        # Album cover image, mirroring JellyfinArtist.thumb — so the library
+        # scan stores albums.thumb_url instead of leaving it empty. Without
+        # this, EVERY album reads back with no thumb, the web UI shows blank
+        # art, and the Cover Art Filler flags the entire library as "missing
+        # cover art" (it became the only thing populating the column).
+        self.thumb = self._get_album_image_url()
+
+    def _get_album_image_url(self) -> Optional[str]:
+        """Jellyfin/Emby album primary image URL (same shape as the artist one)."""
+        if not self.ratingKey:
+            return None
+        return f"/Items/{self.ratingKey}/Images/Primary"
+
+    def _parse_date(self, date_str: Optional[str]) -> Optional[datetime]:
+        if not date_str:
+            return None
+        try:
+            return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        except:
+            return None
+
+    def artist(self) -> Optional[JellyfinArtist]:
+        """Get the album artist"""
+        if self._artist_id:
+            return self._client.get_artist_by_id(self._artist_id)
+        return None
+    
+    def tracks(self) -> List['JellyfinTrack']:
+        """Get all tracks for this album"""
+        return self._client.get_tracks_for_album(self.ratingKey)
+
+class JellyfinTrack:
+    """Wrapper class to mimic Plex track object interface"""
+    def __init__(self, jellyfin_data: Dict[str, Any], client: 'JellyfinClient'):
+        self._data = jellyfin_data
+        self._client = client
+        self.ratingKey = jellyfin_data.get('Id', '')
+        self.title = jellyfin_data.get('Name', 'Unknown Track')
+        self.duration = jellyfin_data.get('RunTimeTicks', 0) // 10000  # Convert from ticks to milliseconds
+        self.trackNumber = jellyfin_data.get('IndexNumber')
+        self.discNumber = jellyfin_data.get('ParentIndexNumber')  # multi-disc: disc number
+        self.year = jellyfin_data.get('ProductionYear')
+        self.userRating = jellyfin_data.get('UserData', {}).get('Rating')
+        self.addedAt = self._parse_date(jellyfin_data.get('DateCreated'))
+        
+        self._album_id = jellyfin_data.get('AlbumId', '')
+        self._artist_ids = [artist.get('Id', '') for artist in jellyfin_data.get('ArtistItems', [])]
+
+        # File path and media info (used by quality scanner and DB update)
+        self.path = jellyfin_data.get('Path')
+        # Extract bitrate + file size from MediaSources if available.
+        # `file_size` powers the Library Disk Usage card on the Stats
+        # page — populated free during the deep scan from data Jellyfin
+        # already returns in MediaSources[].
+        media_sources = jellyfin_data.get('MediaSources', [])
+        self.bitRate = (media_sources[0].get('Bitrate') or 0) // 1000 if media_sources else None  # Convert bps to kbps
+        self.file_size = (media_sources[0].get('Size') or 0) if media_sources else None
+        if self.file_size == 0:
+            self.file_size = None
+        
+    def _parse_date(self, date_str: Optional[str]) -> Optional[datetime]:
+        if not date_str:
+            return None
+        try:
+            return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+        except:
+            return None
+    
+    def artist(self) -> Optional[JellyfinArtist]:
+        """Get the primary track artist"""
+        if self._artist_ids:
+            return self._client.get_artist_by_id(self._artist_ids[0])
+        return None
+    
+    def album(self) -> Optional[JellyfinAlbum]:
+        """Get the track's album"""
+        if self._album_id:
+            return self._client.get_album_by_id(self._album_id)
+        return None
+
+from core.media_server.contract import MediaServerClient
+
+
+class JellyfinClient(MediaServerClient):
+    def __init__(self):
+        self.base_url: Optional[str] = None
+        self.api_key: Optional[str] = None
+        self.user_id: Optional[str] = None
+        self.music_library_id: Optional[str] = None
+        self._connection_attempted = False
+        self._is_connecting = False
+        
+        # Performance optimization: comprehensive caches
+        self._album_cache = {}
+        self._track_cache = {}
+        self._artist_cache = {}
+        
+        # Metadata-only mode flag for performance optimization
+        self._metadata_only_mode = False
+        self._all_albums_cache = None
+        self._all_tracks_cache = None
+        self._cache_populated = False
+        
+        # Progress callback for UI updates during caching
+        self._progress_callback = None
+    
+    def set_progress_callback(self, callback):
+        """Set callback function for cache progress updates: callback(message)"""
+        self._progress_callback = callback
+
+    def reload_config(self):
+        """Reset connection state so next ensure_connection() re-reads config.
+        Called when settings are saved to pick up URL/API key changes."""
+        self.base_url = None
+        self.api_key = None
+        self.user_id = None
+        self.music_library_id = None
+        self._connection_attempted = False
+        self.clear_cache()
+        logger.info("Jellyfin client config reset — will reconnect with new settings")
+
+    def ensure_connection(self) -> bool:
+        """Ensure connection to Jellyfin server with lazy initialization."""
+        if self._connection_attempted:
+            return self.base_url is not None and self.api_key is not None
+        
+        if self._is_connecting:
+            return False
+        
+        self._is_connecting = True
+        try:
+            self._setup_client()
+            return self.base_url is not None and self.api_key is not None
+        finally:
+            self._is_connecting = False
+            self._connection_attempted = True
+    
+    def _setup_client(self):
+        """Setup Jellyfin client configuration"""
+        config = config_manager.get_jellyfin_config()
+        
+        if not config.get('base_url'):
+            logger.warning("Jellyfin server URL not configured")
+            return
+        
+        if not config.get('api_key'):
+            logger.warning("Jellyfin API key not configured") 
+            return
+            
+        self.base_url = config['base_url'].rstrip('/')
+        self.api_key = config['api_key']
+        
+        try:
+            # Test connection and get system info
+            response = self._make_request('/System/Info')
+            if response:
+                server_name = response.get('ServerName', 'Unknown')
+                logger.info(f"Successfully connected to Jellyfin server: {server_name}")
+                
+                # Get all users
+                users_response = self._make_request('/Users')
+                
+                if not users_response:
+                    logger.error("No users found on Jellyfin server")
+                    return
+
+                # Check for a saved user preference
+                from database.music_database import MusicDatabase
+                db = MusicDatabase()
+                preferred_user = db.get_preference('jellyfin_user')
+
+                valid_user_found = False
+
+                # If a preferred user is saved, try that user first
+                if preferred_user:
+                    for user in users_response:
+                        if user.get('Name') == preferred_user:
+                            candidate_id = user['Id']
+                            try:
+                                views_response = self._make_request(f'/Users/{candidate_id}/Views')
+                                if views_response:
+                                    for view in views_response.get('Items', []):
+                                        collection_type = (view.get('CollectionType') or '').lower()
+                                        if collection_type == 'music':
+                                            self.user_id = candidate_id
+                                            self.music_library_id = view['Id']
+                                            logger.info(f"Using preferred user: {preferred_user} (Music Library: {view.get('Name')})")
+                                            valid_user_found = True
+                                            break
+                            except Exception as e:
+                                logger.debug(f"Preferred user {preferred_user} failed: {e}")
+                            break
+
+                # Check for a saved library preference for the selected user
+                preferred_library = db.get_preference('jellyfin_music_library')
+
+                # Fall back to auto-detect if preference is missing or invalid
+                if not valid_user_found:
+                    for user in users_response:
+                        candidate_id = user['Id']
+                        candidate_name = user.get('Name', 'Unknown')
+
+                        try:
+                            views_response = self._make_request(f'/Users/{candidate_id}/Views')
+
+                            if views_response:
+                                for view in views_response.get('Items', []):
+                                    collection_type = (view.get('CollectionType') or '').lower()
+
+                                    if collection_type == 'music':
+                                        self.user_id = candidate_id
+                                        self.music_library_id = view['Id']
+                                        logger.info(f"Using user: {candidate_name} (Music Library: {view.get('Name')})")
+                                        valid_user_found = True
+                                        break
+                        except Exception as e:
+                            logger.debug(f"Skipping user {candidate_name} due to error: {e}")
+                            continue
+
+                        if valid_user_found:
+                            break
+
+                # If we found a user, check if there's a saved library preference to apply
+                if valid_user_found and preferred_library:
+                    try:
+                        views_response = self._make_request(f'/Users/{self.user_id}/Views')
+                        if views_response:
+                            for view in views_response.get('Items', []):
+                                collection_type = (view.get('CollectionType') or '').lower()
+                                if collection_type == 'music' and view.get('Name') == preferred_library:
+                                    self.music_library_id = view['Id']
+                                    logger.info(f"Applied saved library preference: {preferred_library}")
+                                    break
+                    except Exception as e:
+                        logger.debug(f"Could not apply library preference: {e}")
+
+                if not valid_user_found:
+                    logger.error("Connected to Jellyfin, but could not find any user with access to a Music library")
+                    
+        except Exception as e:
+            logger.error(f"Failed to connect to Jellyfin server: {e}")
+            self.base_url = None
+            self.api_key = None
+    
+    def _find_music_library(self):
+        """Find the music library in Jellyfin"""
+        if not self.user_id:
+            return
+            
+        try:
+            views_response = self._make_request(f'/Users/{self.user_id}/Views')
+            if not views_response:
+                return
+                
+            for view in views_response.get('Items', []):
+                if view.get('CollectionType') == 'music':
+                    self.music_library_id = view['Id']
+                    logger.info(f"Found music library: {view.get('Name', 'Music')}")
+                    break
+            
+            if not self.music_library_id:
+                logger.warning("No music library found on Jellyfin server")
+                
+        except Exception as e:
+            logger.error(f"Error finding music library: {e}")
+
+    def get_available_music_libraries(self) -> List[Dict[str, str]]:
+        """Get list of all available music libraries from Jellyfin"""
+        if not self.ensure_connection() or not self.user_id:
+            return []
+
+        try:
+            views_response = self._make_request(f'/Users/{self.user_id}/Views')
+            if not views_response:
+                return []
+
+            music_libraries = []
+            for view in views_response.get('Items', []):
+                collection_type = (view.get('CollectionType') or '').lower()
+                if collection_type == 'music':
+                    music_libraries.append({
+                        'title': view.get('Name', 'Music'),
+                        'key': str(view['Id'])
+                    })
+
+            logger.debug(f"Found {len(music_libraries)} music libraries")
+            return music_libraries
+        except Exception as e:
+            logger.error(f"Error getting music libraries: {e}")
+            return []
+
+    def set_music_library_by_name(self, library_name: str) -> bool:
+        """Set the active music library by name"""
+        if not self.user_id:
+            return False
+
+        try:
+            views_response = self._make_request(f'/Users/{self.user_id}/Views')
+            if not views_response:
+                return False
+
+            for view in views_response.get('Items', []):
+                collection_type = (view.get('CollectionType') or '').lower()
+                if collection_type == 'music' and view.get('Name') == library_name:
+                    self.music_library_id = view['Id']
+                    logger.info(f"Set music library to: {library_name}")
+
+                    # Store preference in database
+                    from database.music_database import MusicDatabase
+                    db = MusicDatabase()
+                    db.set_preference('jellyfin_music_library', library_name)
+
+                    return True
+
+            logger.warning(f"Music library '{library_name}' not found")
+            return False
+        except Exception as e:
+            logger.error(f"Error setting music library: {e}")
+            return False
+
+    def get_available_users(self) -> List[Dict[str, str]]:
+        """Get list of users that have music libraries"""
+        if not self.ensure_connection():
+            return []
+
+        try:
+            users_response = self._make_request('/Users')
+            if not users_response:
+                return []
+
+            users_with_music = []
+            for user in users_response:
+                candidate_id = user['Id']
+                candidate_name = user.get('Name', 'Unknown')
+
+                try:
+                    views_response = self._make_request(f'/Users/{candidate_id}/Views')
+                    if views_response:
+                        for view in views_response.get('Items', []):
+                            collection_type = (view.get('CollectionType') or '').lower()
+                            if collection_type == 'music':
+                                users_with_music.append({
+                                    'id': candidate_id,
+                                    'name': candidate_name
+                                })
+                                break
+                except Exception as e:
+                    logger.debug(f"Skipping user {candidate_name} during enumeration: {e}")
+                    continue
+
+            logger.debug(f"Found {len(users_with_music)} users with music libraries")
+            return users_with_music
+        except Exception as e:
+            logger.error(f"Error getting available users: {e}")
+            return []
+
+    def set_user_by_name(self, username: str) -> bool:
+        """Set the active user by name, re-discover their music library, and save preference"""
+        if not self.ensure_connection():
+            return False
+
+        try:
+            users_response = self._make_request('/Users')
+            if not users_response:
+                return False
+
+            for user in users_response:
+                if user.get('Name') == username:
+                    candidate_id = user['Id']
+
+                    # Verify this user has a music library
+                    views_response = self._make_request(f'/Users/{candidate_id}/Views')
+                    if not views_response:
+                        return False
+
+                    for view in views_response.get('Items', []):
+                        collection_type = (view.get('CollectionType') or '').lower()
+                        if collection_type == 'music':
+                            self.user_id = candidate_id
+                            self.music_library_id = view['Id']
+                            logger.info(f"Switched to user: {username} (Music Library: {view.get('Name')})")
+
+                            # Save preference to database
+                            from database.music_database import MusicDatabase
+                            db = MusicDatabase()
+                            db.set_preference('jellyfin_user', username)
+
+                            # Clear caches since we switched users
+                            self.clear_cache()
+
+                            return True
+
+                    logger.warning(f"User '{username}' has no music library")
+                    return False
+
+            logger.warning(f"User '{username}' not found")
+            return False
+        except Exception as e:
+            logger.error(f"Error setting user: {e}")
+            return False
+
+    def _make_request(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        """Make authenticated request to Jellyfin API"""
+        if not self.base_url or not self.api_key:
+            return None
+
+        url = f"{self.base_url}{endpoint}"
+        headers = {
+            'X-Emby-Token': self.api_key,
+            'Content-Type': 'application/json'
+        }
+
+        # Use configurable timeout for bulk operations (lots of data)
+        is_bulk_operation = params and params.get('Limit', 0) > 1000
+        config = config_manager.get_jellyfin_config()
+        bulk_timeout = int(config.get('api_timeout', 120))
+        timeout = bulk_timeout if is_bulk_operation else max(5, bulk_timeout // 6)
+        
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Jellyfin API request failed: {e}")
+            return None
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse Jellyfin response: {e}")
+            return None
+    
+    def _populate_aggressive_cache(self):
+        """Aggressively pre-populate ALL caches to eliminate individual API calls"""
+        if self._cache_populated:
+            return
+        
+        # Check if we're in metadata-only mode and skip expensive operations
+        if self._metadata_only_mode:
+            logger.info("Skipping cache population for metadata-only operation")
+            self._cache_populated = True
+            return
+            
+        logger.info("Starting aggressive Jellyfin cache population to eliminate slow individual API calls...")
+        if self._progress_callback:
+            self._progress_callback("Fetching all tracks in bulk...")
+        
+        try:
+            # SIMPLIFIED APPROACH: Fetch all tracks, then all albums separately (robust and fast)
+            logger.info("Fetching all tracks in bulk...")
+
+            def _fetch_tracks_page(start_index, limit):
+                params = {
+                    'ParentId': self.music_library_id,
+                    'IncludeItemTypes': 'Audio',
+                    'Recursive': True,
+                    'Fields': 'AlbumId,ArtistItems,Path,MediaSources',
+                    'SortBy': 'AlbumId,IndexNumber',
+                    'SortOrder': 'Ascending',
+                    'StartIndex': start_index,
+                    'Limit': limit
+                }
+                response = self._make_request(f'/Users/{self.user_id}/Items', params)
+                return response.get('Items', []) if response else None  # None = failed page
+
+            # Page in modest chunks so progress is reported every page — a single
+            # huge silent request used to trip the 300s no-progress watchdog on
+            # slow servers even though it was alive (see bulk_paginate docstring).
+            all_tracks = paginate_all_items(
+                _fetch_tracks_page,
+                report_progress=self._progress_callback,
+                label="tracks",
+                on_retry_wait=lambda: time.sleep(5),
+            )
+
+            # Group tracks by album ID for instant lookup
+            self._track_cache = {}
+            for track_data in all_tracks:
+                album_id = track_data.get('AlbumId')
+                if album_id:
+                    if album_id not in self._track_cache:
+                        self._track_cache[album_id] = []
+                    self._track_cache[album_id].append(JellyfinTrack(track_data, self))
+            
+            logger.info(f"Cached {len(all_tracks)} tracks for {len(self._track_cache)} albums")
+            if self._progress_callback:
+                self._progress_callback(f"Cached {len(all_tracks)} tracks. Now fetching albums...")
+            
+            # STEP 2: Fetch all albums in bulk (same proven pattern)
+            logger.info("Fetching all albums in bulk...")
+
+            def _fetch_albums_page(start_index, limit):
+                params = {
+                    'ParentId': self.music_library_id,
+                    'IncludeItemTypes': 'MusicAlbum',
+                    'Recursive': True,
+                    'Fields': 'AlbumArtists,Artists',
+                    'SortBy': 'SortName',
+                    'SortOrder': 'Ascending',
+                    'StartIndex': start_index,
+                    'Limit': limit
+                }
+                response = self._make_request(f'/Users/{self.user_id}/Items', params)
+                return response.get('Items', []) if response else None  # None = failed page
+
+            all_albums = paginate_all_items(
+                _fetch_albums_page,
+                report_progress=self._progress_callback,
+                label="albums",
+                on_retry_wait=lambda: time.sleep(5),
+            )
+
+            # Group albums by artist ID for instant lookup
+            self._album_cache = {}
+            for album_data in all_albums:
+                album_artists = album_data.get('AlbumArtists', [])
+                for artist in album_artists:
+                    artist_id = artist.get('Id')
+                    if artist_id:
+                        if artist_id not in self._album_cache:
+                            self._album_cache[artist_id] = []
+                        self._album_cache[artist_id].append(JellyfinAlbum(album_data, self))
+            
+            logger.info(f"Cached {len(all_albums)} albums for {len(self._album_cache)} artists")
+            
+            self._cache_populated = True
+            logger.info("AGGRESSIVE CACHE COMPLETE! All subsequent album/track lookups will be INSTANT!")
+            if self._progress_callback:
+                self._progress_callback("Cache complete! Now processing artists...")
+            
+        except Exception as e:
+            logger.error(f"Error in aggressive cache population: {e}")
+            # Don't set cache_populated to True on error so we can retry
+    
+    def _populate_targeted_cache_for_albums(self, albums: List['JellyfinAlbum']):
+        """Populate cache only for tracks in specific albums - much faster for incremental updates"""
+        if not albums:
+            return
+            
+        logger.info(f"Starting targeted Jellyfin cache for {len(albums)} recent albums...")
+        if self._progress_callback:
+            self._progress_callback(f"Caching tracks for {len(albums)} recent albums...")
+        
+        try:
+            album_ids = [album.ratingKey for album in albums]
+            cached_tracks = 0
+            
+            # Process albums individually - Jellyfin API requires ParentId per album
+            for i, album_id in enumerate(album_ids):
+                try:
+                    # Fetch tracks for this specific album
+                    params = {
+                        'ParentId': album_id,
+                        'IncludeItemTypes': 'Audio',
+                        'Recursive': True,
+                        'Fields': 'AlbumId,ArtistItems,Path,MediaSources',
+                        'SortBy': 'IndexNumber',
+                        'SortOrder': 'Ascending',
+                        'Limit': 200  # Most albums won't have more than 200 tracks
+                    }
+                    
+                    response = self._make_request(f'/Users/{self.user_id}/Items', params)
+                    if response:
+                        album_tracks = response.get('Items', [])
+                        
+                        # Cache tracks for this album
+                        if album_tracks:
+                            self._track_cache[album_id] = []
+                            for track_data in album_tracks:
+                                self._track_cache[album_id].append(JellyfinTrack(track_data, self))
+                                cached_tracks += 1
+                
+                except Exception as e:
+                    logger.debug(f"Error caching tracks for album {album_id}: {e}")
+                    continue
+                
+                # Progress update every 50 albums
+                if (i + 1) % 50 == 0 or i == len(album_ids) - 1:
+                    progress_msg = f"Cached {cached_tracks} tracks from {i + 1} albums..."
+                    logger.info(f"   {progress_msg}")
+                    if self._progress_callback:
+                        self._progress_callback(progress_msg)
+            
+            logger.info(f"Targeted cache complete: {cached_tracks} tracks cached for {len(self._track_cache)} albums")
+            if self._progress_callback:
+                self._progress_callback("Targeted cache complete! Now checking for new tracks...")
+                
+        except Exception as e:
+            logger.error(f"Error in targeted cache population: {e}")
+    
+    def is_connected(self) -> bool:
+        """Check if connected to Jellyfin server"""
+        if not self._connection_attempted:
+            if not self._is_connecting:
+                self.ensure_connection()
+        return (self.base_url is not None and 
+                self.api_key is not None and 
+                self.user_id is not None and 
+                self.music_library_id is not None)
+    
+    def get_all_artists(self) -> List[JellyfinArtist]:
+        """Get all artists from the music library - matches Plex interface"""
+        # last_fetch_failed lets callers tell "library is genuinely empty"
+        # from "the fetch failed" — both come back as [] (#stale-artists).
+        self.last_fetch_failed = True
+        if not self.ensure_connection() or not self.music_library_id:
+            logger.error("Not connected to Jellyfin server or no music library")
+            return []
+
+        # PERFORMANCE OPTIMIZATION: Pre-populate ALL caches upfront for massive speedup
+        self._populate_aggressive_cache()
+
+        try:
+            # Use proper AlbumArtists endpoint to match Jellyfin's "Album Artists" tab
+            # This should return 3,966 artists including Weird Al
+            params = {
+                'ParentId': self.music_library_id,
+                'Recursive': True,
+                'SortBy': 'SortName',
+                'SortOrder': 'Ascending'
+            }
+
+            response = self._make_request('/Artists/AlbumArtists', params)
+            if not response:
+                # a failed/empty HTTP response is a FAILURE, not an empty
+                # library — an empty library still answers with Items: []
+                return []
+
+            artists = []
+            for item in response.get('Items', []):
+                artist = JellyfinArtist(item, self)
+                # Cache the artist for quick lookup
+                self._artist_cache[artist.ratingKey] = artist
+                artists.append(artist)
+
+            logger.info(f"Retrieved {len(artists)} album artists from Jellyfin AlbumArtists endpoint (with aggressive caching)")
+            self.last_fetch_failed = False
+            return artists
+
+        except Exception as e:
+            logger.error(f"Error getting artists from Jellyfin: {e}")
+            return []
+    
+    def get_all_artist_ids(self) -> set:
+        """Get all artist IDs from Jellyfin (lightweight, for removal detection).
+        Does NOT trigger _populate_aggressive_cache()."""
+        if not self.ensure_connection() or not self.music_library_id:
+            return set()
+        try:
+            params = {
+                'ParentId': self.music_library_id,
+                'Recursive': True,
+                'Fields': '',
+                'EnableTotalRecordCount': False
+            }
+            response = self._make_request('/Artists/AlbumArtists', params)
+            if not response:
+                return set()
+            ids = {item['Id'] for item in response.get('Items', []) if 'Id' in item}
+            logger.info(f"Retrieved {len(ids)} artist IDs from Jellyfin (lightweight)")
+            return ids
+        except Exception as e:
+            logger.error(f"Error getting artist IDs from Jellyfin: {e}")
+            return set()
+
+    def get_all_album_ids(self) -> set:
+        """Get all album IDs from Jellyfin (lightweight, paginated, for removal detection).
+        Does NOT trigger _populate_aggressive_cache()."""
+        if not self.ensure_connection() or not self.music_library_id:
+            return set()
+        try:
+            all_ids = set()
+            start_index = 0
+            limit = 10000
+            while True:
+                params = {
+                    'ParentId': self.music_library_id,
+                    'IncludeItemTypes': 'MusicAlbum',
+                    'Recursive': True,
+                    'Fields': '',
+                    'SortBy': 'SortName',
+                    'SortOrder': 'Ascending',
+                    'StartIndex': start_index,
+                    'Limit': limit,
+                    'EnableTotalRecordCount': False
+                }
+                response = self._make_request(f'/Users/{self.user_id}/Items', params)
+                if not response:
+                    break
+                items = response.get('Items', [])
+                if not items:
+                    break
+                all_ids.update(item['Id'] for item in items if 'Id' in item)
+                if len(items) < limit:
+                    break
+                start_index += limit
+            logger.info(f"Retrieved {len(all_ids)} album IDs from Jellyfin (lightweight)")
+            return all_ids
+        except Exception as e:
+            logger.error(f"Error getting album IDs from Jellyfin: {e}")
+            return set()
+
+    def get_albums_for_artist(self, artist_id: str) -> List[JellyfinAlbum]:
+        """Get all albums for a specific artist"""
+        # Use cache if available
+        if artist_id in self._album_cache:
+            return self._album_cache[artist_id]
+            
+        if not self.ensure_connection():
+            return []
+            
+        try:
+            # Use smaller, faster API call
+            params = {
+                'ArtistIds': artist_id,
+                'IncludeItemTypes': 'MusicAlbum',
+                'Recursive': True,
+                'SortBy': 'ProductionYear,SortName',
+                'SortOrder': 'Ascending',
+                'Limit': 200  # Reasonable limit for most artists
+            }
+            
+            response = self._make_request(f'/Users/{self.user_id}/Items', params)
+            if not response:
+                return []
+            
+            albums = []
+            for item in response.get('Items', []):
+                albums.append(JellyfinAlbum(item, self))
+            
+            # Cache the result
+            self._album_cache[artist_id] = albums
+            
+            return albums
+            
+        except Exception as e:
+            logger.error(f"Error getting albums for artist {artist_id}: {e}")
+            return []
+    
+    def get_tracks_for_album(self, album_id: str) -> List[JellyfinTrack]:
+        """Get all tracks for a specific album"""
+        # Use cache if available
+        if album_id in self._track_cache:
+            return self._track_cache[album_id]
+            
+        if not self.ensure_connection():
+            return []
+            
+        try:
+            # Most albums have < 30 tracks, so this is reasonable
+            params = {
+                'ParentId': album_id,
+                'IncludeItemTypes': 'Audio',
+                'Fields': 'Path,MediaSources',
+                'SortBy': 'IndexNumber',
+                'SortOrder': 'Ascending',
+                'Limit': 100  # Most albums won't hit this limit
+            }
+            
+            response = self._make_request(f'/Users/{self.user_id}/Items', params)
+            if not response:
+                return []
+            
+            tracks = []
+            for item in response.get('Items', []):
+                tracks.append(JellyfinTrack(item, self))
+            
+            # Cache the result
+            self._track_cache[album_id] = tracks
+            
+            return tracks
+            
+        except Exception as e:
+            logger.error(f"Error getting tracks for album {album_id}: {e}")
+            return []
+    
+    def get_artist_by_id(self, artist_id: str) -> Optional[JellyfinArtist]:
+        """Get a specific artist by ID"""
+        # Check cache first
+        if artist_id in self._artist_cache:
+            return self._artist_cache[artist_id]
+            
+        if not self.ensure_connection():
+            return None
+            
+        try:
+            response = self._make_request(f'/Users/{self.user_id}/Items/{artist_id}')
+            if response:
+                artist = JellyfinArtist(response, self)
+                # Cache for future use
+                self._artist_cache[artist_id] = artist
+                return artist
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting artist {artist_id}: {e}")
+            return None
+    
+    def get_album_by_id(self, album_id: str) -> Optional[JellyfinAlbum]:
+        """Get a specific album by ID"""
+        # Check if we can find this album in any artist's cache
+        for artist_albums in self._album_cache.values():
+            for album in artist_albums:
+                if album.ratingKey == album_id:
+                    return album
+                    
+        if not self.ensure_connection():
+            return None
+            
+        try:
+            response = self._make_request(f'/Users/{self.user_id}/Items/{album_id}')
+            if response:
+                return JellyfinAlbum(response, self)
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting album {album_id}: {e}")
+            return None
+    
+    def get_recently_added_albums(self, max_results: int = 400) -> List[JellyfinAlbum]:
+        """Get recently added albums - used for incremental updates"""
+        if not self.ensure_connection() or not self.music_library_id:
+            return []
+        
+        try:
+            params = {
+                'ParentId': self.music_library_id,
+                'IncludeItemTypes': 'MusicAlbum',
+                'Recursive': True,
+                'SortBy': 'DateCreated',
+                'SortOrder': 'Descending',
+                'Limit': max_results
+            }
+            
+            response = self._make_request(f'/Users/{self.user_id}/Items', params)
+            if not response:
+                return []
+            
+            albums = []
+            for item in response.get('Items', []):
+                albums.append(JellyfinAlbum(item, self))
+            
+            logger.info(f"Retrieved {len(albums)} recently added albums from Jellyfin")
+            return albums
+            
+        except Exception as e:
+            logger.error(f"Error getting recently added albums: {e}")
+            return []
+    
+    def get_recently_updated_albums(self, max_results: int = 400) -> List[JellyfinAlbum]:
+        """Get recently updated albums - used for incremental updates"""
+        if not self.ensure_connection() or not self.music_library_id:
+            return []
+        
+        try:
+            params = {
+                'ParentId': self.music_library_id,
+                'IncludeItemTypes': 'MusicAlbum', 
+                'Recursive': True,
+                'SortBy': 'DateLastMediaAdded',
+                'SortOrder': 'Descending',
+                'Limit': max_results
+            }
+            
+            response = self._make_request(f'/Users/{self.user_id}/Items', params)
+            if not response:
+                return []
+            
+            albums = []
+            for item in response.get('Items', []):
+                albums.append(JellyfinAlbum(item, self))
+            
+            logger.info(f"Retrieved {len(albums)} recently updated albums from Jellyfin")
+            return albums
+            
+        except Exception as e:
+            logger.error(f"Error getting recently updated albums: {e}")
+            return []
+    
+    def get_recently_added_tracks(self, max_results: int = 5000) -> List[JellyfinTrack]:
+        """Get recently added tracks directly - much faster for incremental updates"""
+        if not self.ensure_connection() or not self.music_library_id:
+            return []
+        
+        try:
+            params = {
+                'ParentId': self.music_library_id,
+                'IncludeItemTypes': 'Audio',
+                'Recursive': True,
+                'SortBy': 'DateCreated',
+                'SortOrder': 'Descending',
+                'Fields': 'AlbumId,ArtistItems,Path,MediaSources',
+                'Limit': max_results
+            }
+            
+            response = self._make_request(f'/Users/{self.user_id}/Items', params)
+            if not response:
+                return []
+            
+            tracks = []
+            for item in response.get('Items', []):
+                tracks.append(JellyfinTrack(item, self))
+            
+            logger.info(f"Retrieved {len(tracks)} recently added tracks from Jellyfin")
+            return tracks
+            
+        except Exception as e:
+            logger.error(f"Error getting recently added tracks: {e}")
+            return []
+    
+    def get_recently_updated_tracks(self, max_results: int = 5000) -> List[JellyfinTrack]:
+        """Get recently updated tracks directly - much faster for incremental updates"""
+        if not self.ensure_connection() or not self.music_library_id:
+            return []
+        
+        try:
+            params = {
+                'ParentId': self.music_library_id,
+                'IncludeItemTypes': 'Audio',
+                'Recursive': True,
+                'SortBy': 'DateLastSaved',  # When track metadata was last saved
+                'SortOrder': 'Descending',
+                'Fields': 'AlbumId,ArtistItems,Path,MediaSources',
+                'Limit': max_results
+            }
+            
+            response = self._make_request(f'/Users/{self.user_id}/Items', params)
+            if not response:
+                return []
+            
+            tracks = []
+            for item in response.get('Items', []):
+                tracks.append(JellyfinTrack(item, self))
+            
+            logger.info(f"Retrieved {len(tracks)} recently updated tracks from Jellyfin")
+            return tracks
+            
+        except Exception as e:
+            logger.error(f"Error getting recently updated tracks: {e}")
+            return []
+    
+    def get_library_stats(self) -> Dict[str, int]:
+        """Get library statistics - matches Plex interface"""
+        if not self.ensure_connection() or not self.music_library_id:
+            return {}
+        
+        try:
+            stats = {}
+            
+            # Get artist count
+            artists_params = {
+                'ParentId': self.music_library_id,
+                'IncludeItemTypes': 'MusicArtist',
+                'Recursive': True
+            }
+            artists_response = self._make_request(f'/Users/{self.user_id}/Items', artists_params)
+            stats['artists'] = artists_response.get('TotalRecordCount', 0) if artists_response else 0
+            
+            # Get album count  
+            albums_params = {
+                'ParentId': self.music_library_id,
+                'IncludeItemTypes': 'MusicAlbum',
+                'Recursive': True
+            }
+            albums_response = self._make_request(f'/Users/{self.user_id}/Items', albums_params)
+            stats['albums'] = albums_response.get('TotalRecordCount', 0) if albums_response else 0
+            
+            # Get track count
+            tracks_params = {
+                'ParentId': self.music_library_id,
+                'IncludeItemTypes': 'Audio',
+                'Recursive': True
+            }
+            tracks_response = self._make_request(f'/Users/{self.user_id}/Items', tracks_params)
+            stats['tracks'] = tracks_response.get('TotalRecordCount', 0) if tracks_response else 0
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting library stats: {e}")
+            return {}
+    
+    def get_play_history(self, limit=500):
+        """Fetch recently played tracks for the active user.
+
+        Returns list of dicts with: track_title, artist, album, played_at,
+        duration_ms, track_id.
+        """
+        if not self.ensure_connection() or not self.user_id:
+            return []
+
+        try:
+            params = {
+                'UserId': self.user_id,
+                'IncludeItemTypes': 'Audio',
+                'SortBy': 'DatePlayed',
+                'SortOrder': 'Descending',
+                'Fields': 'UserData,MediaSources',
+                'Recursive': True,
+                'IsPlayed': True,
+                'Limit': limit,
+            }
+            if self.music_library_id:
+                params['ParentId'] = self.music_library_id
+
+            response = self._make_request(f'/Users/{self.user_id}/Items', params)
+            if not response or 'Items' not in response:
+                return []
+
+            results = []
+            for item in response['Items']:
+                user_data = item.get('UserData', {})
+                played_at = user_data.get('LastPlayedDate')
+                if not played_at:
+                    continue
+                duration_ticks = item.get('RunTimeTicks', 0)
+                results.append({
+                    'track_title': item.get('Name', ''),
+                    'artist': item.get('AlbumArtist', '') or (item.get('Artists', [''])[0] if item.get('Artists') else ''),
+                    'album': item.get('Album', ''),
+                    'played_at': played_at,
+                    'duration_ms': duration_ticks // 10000 if duration_ticks else 0,
+                    'track_id': item.get('Id', ''),
+                })
+            logger.info(f"Retrieved {len(results)} play history entries from Jellyfin")
+            return results
+        except Exception as e:
+            logger.error(f"Error getting Jellyfin play history: {e}")
+            return []
+
+    def get_track_play_counts(self):
+        """Get PlayCount for all played audio items.
+
+        Returns dict of {item_id: play_count}.
+        """
+        if not self.ensure_connection() or not self.user_id:
+            return {}
+
+        try:
+            params = {
+                'UserId': self.user_id,
+                'IncludeItemTypes': 'Audio',
+                'Fields': 'UserData',
+                'Recursive': True,
+                'IsPlayed': True,
+                'Limit': 10000,
+            }
+            if self.music_library_id:
+                params['ParentId'] = self.music_library_id
+
+            response = self._make_request(f'/Users/{self.user_id}/Items', params)
+            if not response or 'Items' not in response:
+                return {}
+
+            counts = {}
+            for item in response['Items']:
+                user_data = item.get('UserData', {})
+                play_count = user_data.get('PlayCount', 0)
+                if play_count > 0:
+                    counts[item.get('Id', '')] = play_count
+            logger.info(f"Retrieved play counts for {len(counts)} tracks from Jellyfin")
+            return counts
+        except Exception as e:
+            logger.error(f"Error getting Jellyfin track play counts: {e}")
+            return {}
+
+    def clear_cache(self):
+        """Clear all caches to force fresh data on next request"""
+        self._album_cache.clear()
+        self._track_cache.clear()
+        self._artist_cache.clear()
+        self._all_albums_cache = None
+        self._all_tracks_cache = None
+        self._cache_populated = False
+        logger.info("Jellyfin client cache cleared")
+    
+    def get_cache_stats(self) -> Dict[str, int]:
+        """Get statistics about cached data for performance monitoring"""
+        stats = {
+            'cached_artists': len(self._artist_cache),
+            'cached_artist_albums': len(self._album_cache),
+            'cached_album_tracks': len(self._track_cache),
+            'cache_populated': self._cache_populated
+        }
+        
+        if self._all_albums_cache:
+            stats['bulk_albums_cached'] = len(self._all_albums_cache)
+        if self._all_tracks_cache:
+            stats['bulk_tracks_cached'] = len(self._all_tracks_cache)
+            
+        return stats
+    
+    def get_all_playlists(self) -> List[PlaylistInfo]:
+        """Get all playlists from Jellyfin server"""
+        if not self.ensure_connection():
+            return []
+        
+        try:
+            params = {
+                'IncludeItemTypes': 'Playlist',
+                'Recursive': True
+            }
+            
+            response = self._make_request(f'/Users/{self.user_id}/Items', params)
+            if not response:
+                return []
+            
+            playlists = []
+            for item in response.get('Items', []):
+                playlist_info = PlaylistInfo(
+                    id=item.get('Id', ''),
+                    title=item.get('Name', 'Unknown Playlist'),
+                    description=item.get('Overview'),
+                    duration=item.get('RunTimeTicks', 0) // 10000,
+                    leaf_count=item.get('ChildCount', 0),
+                    tracks=[]  # Will be populated when needed
+                )
+                playlists.append(playlist_info)
+            
+            logger.info(f"Retrieved {len(playlists)} playlists from Jellyfin")
+            return playlists
+            
+        except Exception as e:
+            logger.error(f"Error getting playlists from Jellyfin: {e}")
+            return []
+    
+    def get_playlist_by_name(self, name: str) -> Optional[PlaylistInfo]:
+        """Get a specific playlist by name"""
+        playlists = self.get_all_playlists()
+        for playlist in playlists:
+            if playlist.title.lower() == name.lower():
+                return playlist
+        return None
+    
+    def create_playlist(self, name: str, tracks) -> bool:
+        """Create a new playlist with given tracks"""
+        if not self.ensure_connection():
+            return False
+        
+        try:
+            # Convert tracks to Jellyfin/Emby track IDs
+            track_ids = []
+            invalid_tracks = []
+
+            for track in tracks:
+                track_id = None
+                if hasattr(track, 'ratingKey'):
+                    track_id = str(track.ratingKey)
+                elif hasattr(track, 'id'):
+                    track_id = str(track.id)
+
+                # Validate that track_id is a properly formatted GUID
+                if track_id and self._is_valid_guid(track_id):
+                    track_ids.append(track_id.strip())
+                else:
+                    invalid_tracks.append(track)
+                    if track_id:
+                        logger.debug(f"Rejected invalid GUID format: '{track_id}'")
+
+            if invalid_tracks:
+                logger.warning(f"Found {len(invalid_tracks)} tracks with invalid/empty IDs - these will be skipped")
+
+            if not track_ids:
+                logger.warning(f"No valid tracks provided for playlist '{name}'")
+                return False
+
+            logger.info(f"Creating Jellyfin/Emby playlist '{name}' with {len(track_ids)} valid track IDs (filtered {len(invalid_tracks)} invalid)")
+            
+            # For large playlists, create empty playlist first then add tracks in batches
+            if True:
+                return self._create_large_playlist(name, track_ids)
+            
+            # Create playlist using POST request for smaller playlists
+            import requests
+            url = f"{self.base_url}/Playlists"
+            headers = {
+                'X-Emby-Token': self.api_key,
+                'Content-Type': 'application/json'
+            }
+            data = {
+                'Name': name,
+                'UserId': self.user_id,
+                'MediaType': 'Audio',
+                'Ids': track_ids
+            }
+            
+            response = requests.post(url, json=data, headers=headers, timeout=30)
+            
+            # Log response details for debugging
+            logger.debug(f"Jellyfin playlist creation response: Status {response.status_code}")
+            if response.status_code >= 400:
+                logger.error(f"Jellyfin API error: {response.status_code} - {response.text}")
+                
+            response.raise_for_status()
+            
+            result = response.json()
+            if result and 'Id' in result:
+                logger.info(f"Created Jellyfin playlist '{name}' with {len(track_ids)} tracks")
+                return True
+            else:
+                logger.error(f"Failed to create Jellyfin playlist '{name}': No playlist ID returned")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error creating Jellyfin playlist '{name}': {e}")
+            return False
+    
+    def _is_valid_guid(self, guid: str) -> bool:
+        """Validate that a string is a properly formatted item ID for Emby/Jellyfin.
+        Jellyfin uses 32-char hex GUIDs, Emby uses integer IDs — both are valid."""
+        if not guid or not isinstance(guid, str):
+            return False
+
+        guid = guid.strip()
+        if not guid:
+            return False
+
+        # Emby uses integer IDs (e.g. "12345") — accept any numeric string
+        if guid.isdigit():
+            return True
+
+        # Jellyfin uses GUIDs (32 hex chars, optionally with hyphens for 36 total)
+        guid_no_hyphens = guid.replace('-', '')
+        if len(guid_no_hyphens) != 32:
+            return False
+
+        try:
+            int(guid_no_hyphens, 16)
+            return True
+        except ValueError:
+            return False
+
+    def _create_large_playlist(self, name: str, track_ids: List[str]) -> bool:
+        """Create a large playlist by first creating empty playlist, then adding tracks in batches"""
+        try:
+            import requests
+            
+            # Step 1: Create empty playlist
+            url = f"{self.base_url}/Playlists"
+            headers = {
+                'X-Emby-Token': self.api_key,
+                'Content-Type': 'application/json'
+            }
+            # Don't include 'Ids' field for empty playlist - Emby doesn't handle empty arrays
+            data = {
+                'Name': name,
+                'UserId': self.user_id,
+                'MediaType': 'Audio'
+            }
+
+            logger.debug(f"Creating empty playlist with data: {data}")
+            response = requests.post(url, json=data, headers=headers, timeout=10)
+
+            if response.status_code >= 400:
+                logger.error(f"Failed to create empty playlist: HTTP {response.status_code}")
+                logger.error(f"Response body: {response.text}")
+
+            response.raise_for_status()
+            
+            result = response.json()
+            if not result or 'Id' not in result:
+                logger.error(f"Failed to create empty Jellyfin playlist '{name}'")
+                return False
+                
+            playlist_id = result['Id']
+            logger.info(f"Created empty Jellyfin playlist '{name}' (ID: {playlist_id})")
+            
+            # Step 2: Add tracks in batches of 100
+            batch_size = 100
+            total_batches = (len(track_ids) + batch_size - 1) // batch_size
+            
+            for i in range(0, len(track_ids), batch_size):
+                batch = track_ids[i:i + batch_size]
+                batch_num = (i // batch_size) + 1
+
+                logger.info(f"Adding batch {batch_num}/{total_batches} ({len(batch)} tracks) to playlist '{name}'")
+
+                # Add tracks to playlist using POST to /Playlists/{id}/Items
+                # IMPORTANT: Filter out any invalid/empty IDs to prevent GUID parse errors in Emby
+                valid_batch = [track_id for track_id in batch if track_id and self._is_valid_guid(track_id)]
+
+                if not valid_batch:
+                    logger.warning(f"Batch {batch_num} has no valid track IDs, skipping")
+                    continue
+
+                add_url = f"{self.base_url}/Playlists/{playlist_id}/Items"
+
+                # Use URL query parameters (required by Jellyfin/Emby API)
+                # The Ids parameter must be comma-separated GUIDs
+                add_params = {
+                    'Ids': ','.join(valid_batch),
+                    'UserId': self.user_id
+                }
+
+                add_response = requests.post(add_url, params=add_params, headers={'X-Emby-Token': self.api_key}, timeout=30)
+
+                if add_response.status_code not in [200, 204]:
+                    logger.error(f"Failed to add batch {batch_num} to playlist '{name}': HTTP {add_response.status_code}")
+                    logger.error(f"  Response body: {add_response.text}")
+                    logger.error(f"  Track IDs in batch (first 5): {valid_batch[:5]}")
+                    logger.error(f"  Request URL: {add_url}")
+                    logger.error(f"  Request params: Ids={add_params['Ids'][:200]}... (truncated)")
+                    # Continue with other batches even if one fails
+                    
+            logger.info(f"Created large Jellyfin playlist '{name}' with {len(track_ids)} tracks in {total_batches} batches")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error creating large Jellyfin playlist '{name}': {e}")
+            return False
+    
+    def copy_playlist(self, source_name: str, target_name: str) -> bool:
+        """Copy a playlist to create a backup"""
+        if not self.ensure_connection():
+            return False
+        
+        try:
+            # Get the source playlist
+            source_playlist = self.get_playlist_by_name(source_name)
+            if not source_playlist:
+                logger.error(f"Source playlist '{source_name}' not found")
+                return False
+            
+            # Get tracks from source playlist
+            source_tracks = self.get_playlist_tracks(source_playlist.id)
+            logger.debug(f"Retrieved {len(source_tracks) if source_tracks else 0} tracks from source playlist")
+            
+            # Validate tracks
+            if not source_tracks:
+                logger.warning(f"Source playlist '{source_name}' has no tracks to copy")
+                return False
+                
+            # Delete target playlist if it exists (for overwriting backup)
+            try:
+                target_playlist = self.get_playlist_by_name(target_name)
+                if target_playlist:
+                    import requests
+                    url = f"{self.base_url}/Items/{target_playlist.id}"
+                    headers = {'X-Emby-Token': self.api_key}
+                    
+                    response = requests.delete(url, headers=headers, timeout=10)
+                    if response.status_code in [200, 204]:
+                        logger.info(f"Deleted existing backup playlist '{target_name}'")
+            except Exception as e:
+                logger.debug("backup playlist precheck: %s", e)
+            
+            # Create new playlist with copied tracks
+            try:
+                success = self.create_playlist(target_name, source_tracks)
+                if success:
+                    logger.info(f"Created backup playlist '{target_name}' with {len(source_tracks)} tracks")
+                    return True
+                else:
+                    logger.error(f"Failed to create backup playlist '{target_name}'")
+                    return False
+            except Exception as create_error:
+                logger.error(f"Failed to create backup playlist: {create_error}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error copying playlist '{source_name}' to '{target_name}': {e}")
+            return False
+
+    def get_playlist_tracks(self, playlist_id: str) -> List:
+        """Get all tracks from a specific playlist"""
+        if not self.ensure_connection():
+            return []
+
+        try:
+            tracks = []
+            start_index = 0
+            limit = 1000
+
+            while True:
+                params = {
+                    'ParentId': playlist_id,
+                    'IncludeItemTypes': 'Audio',
+                    'Recursive': True,
+                    'Fields': 'AlbumId,ArtistItems,Path,MediaSources',
+                    'SortBy': 'SortName',
+                    'SortOrder': 'Ascending',
+                    'StartIndex': start_index,
+                    'Limit': limit,
+                }
+
+                response = self._make_request(f'/Users/{self.user_id}/Items', params)
+                if not response:
+                    break
+
+                batch = response.get('Items', [])
+                for item in batch:
+                    tracks.append(JellyfinTrack(item, self))
+
+                if len(batch) < limit:
+                    break  # Last page
+                start_index += limit
+
+            logger.debug(f"Retrieved {len(tracks)} tracks from playlist {playlist_id}")
+            return tracks
+
+        except Exception as e:
+            logger.error(f"Error getting tracks for playlist {playlist_id}: {e}")
+            return []
+
+    def set_playlist_image(self, playlist_name: str, image_url: str) -> bool:
+        """Set the poster image for a playlist by downloading from a URL."""
+        if not self.ensure_connection() or not image_url:
+            return False
+        try:
+            playlist = self.get_playlist_by_name(playlist_name)
+            if not playlist:
+                return False
+            playlist_id = playlist.get('Id') or playlist.get('id')
+            if not playlist_id:
+                return False
+            import requests as _req
+            img_resp = _req.get(image_url, timeout=15)
+            if img_resp.ok and img_resp.content:
+                content_type = img_resp.headers.get('Content-Type', 'image/jpeg')
+                upload_url = f"{self.base_url}/Items/{playlist_id}/Images/Primary"
+                upload_resp = _req.post(
+                    upload_url,
+                    headers={'X-Emby-Token': self.api_key, 'Content-Type': content_type},
+                    data=img_resp.content,
+                    timeout=15
+                )
+                if upload_resp.ok:
+                    logger.info(f"Set playlist poster for '{playlist_name}'")
+                    return True
+                else:
+                    logger.debug(f"Playlist image upload returned {upload_resp.status_code}")
+        except Exception as e:
+            logger.debug(f"Could not set playlist poster for '{playlist_name}': {e}")
+        return False
+
+    def append_to_playlist(self, playlist_name: str, tracks) -> bool:
+        """Append tracks to an existing playlist (creates it if missing).
+
+        Differs from `update_playlist`: never deletes existing tracks,
+        never recreates the playlist, no backup. Used by sync mode
+        'append' so user-added tracks on the server playlist survive
+        re-syncing the source. Dedupe-by-Id ensures we don't re-add
+        tracks the playlist already contains."""
+        if not self.ensure_connection():
+            return False
+
+        try:
+            existing_playlist = self.get_playlist_by_name(playlist_name)
+            if not existing_playlist:
+                logger.info(
+                    f"Jellyfin append: playlist '{playlist_name}' doesn't exist yet — "
+                    f"creating with {len(tracks)} tracks"
+                )
+                return self.create_playlist(playlist_name, tracks)
+
+            playlist_id = existing_playlist.id
+            # #823 round 2: the old dedupe read `t.id` off get_playlist_tracks()
+            # results — but JellyfinTrack only defines `ratingKey`, so the
+            # existing-ids set was ALWAYS empty and every sync re-appended the
+            # whole matched list ("added 22 ... skipped 0" on a playlist that
+            # already had them, every track N times). Fetch the playlist's items
+            # from the canonical /Playlists/{id}/Items endpoint (the same one
+            # reconcile uses — works on Jellyfin GUIDs and Emby numeric ids) and
+            # dedupe on the raw item Id; fall back to ratingKey if that fails.
+            existing_ids = set()
+            items_resp = self._make_request(
+                f'/Playlists/{playlist_id}/Items', {'UserId': self.user_id})
+            if items_resp:
+                for item in items_resp.get('Items', []):
+                    iid = str(item.get('Id') or '')
+                    if iid:
+                        existing_ids.add(iid)
+            else:
+                existing_ids = {
+                    str(getattr(t, 'ratingKey', '') or '')
+                    for t in self.get_playlist_tracks(playlist_id)
+                } - {''}
+
+            desired_ids = []
+            for t in tracks:
+                tid = None
+                if hasattr(t, 'id'):
+                    tid = str(t.id) if t.id else None
+                elif isinstance(t, dict):
+                    tid = str(t.get('Id') or t.get('id') or '')
+                if tid and self._is_valid_guid(tid):
+                    desired_ids.append(tid)
+
+            from core.sync.playlist_edit import plan_playlist_append
+            new_track_ids = plan_playlist_append(existing_ids, desired_ids)
+
+            if not new_track_ids:
+                logger.info(
+                    f"Jellyfin append: no new tracks to add to '{playlist_name}' "
+                    f"(all matched tracks already present)"
+                )
+                return True
+
+            import requests
+            batch_size = 100
+            total_added = 0
+            for i in range(0, len(new_track_ids), batch_size):
+                batch = new_track_ids[i:i + batch_size]
+                add_url = f"{self.base_url}/Playlists/{playlist_id}/Items"
+                add_params = {'Ids': ','.join(batch), 'UserId': self.user_id}
+                resp = requests.post(
+                    add_url, params=add_params,
+                    headers={'X-Emby-Token': self.api_key}, timeout=30,
+                )
+                if resp.status_code in (200, 204):
+                    total_added += len(batch)
+                else:
+                    logger.error(
+                        f"Jellyfin append batch failed: HTTP {resp.status_code} - "
+                        f"{resp.text[:200]}"
+                    )
+                    return False
+
+            logger.info(
+                f"Jellyfin append: added {total_added} new tracks to '{playlist_name}' "
+                f"(skipped {len(tracks) - total_added} already present or invalid)"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error appending to Jellyfin playlist '{playlist_name}': {e}")
+            return False
+
+    def reconcile_playlist(self, playlist_name: str, tracks) -> bool:
+        """In-place reconcile (#792): add missing + remove gone on the existing
+        playlist (POST/DELETE /Playlists/{id}/Items) so its poster, name, and Id
+        survive — no delete/recreate. Removal needs each entry's PlaylistItemId,
+        which we fetch from /Playlists/{id}/Items. Creates the playlist if
+        missing. Returns False so the caller can fall back to replace."""
+        if not self.ensure_connection():
+            return False
+        try:
+            import requests
+            from core.sync.playlist_edit import plan_playlist_reconcile
+            existing = self.get_playlist_by_name(playlist_name)
+            if not existing:
+                logger.info(f"Jellyfin reconcile: '{playlist_name}' doesn't exist — creating")
+                return self.create_playlist(playlist_name, tracks)
+
+            playlist_id = existing.id
+            # Entries carry both the track Id and the PlaylistItemId (entry id);
+            # removal is by EntryIds, not track Ids.
+            entries = []  # list of (track_id, entry_id) in playlist order
+            resp = self._make_request(f'/Playlists/{playlist_id}/Items', {'UserId': self.user_id})
+            if resp:
+                for item in resp.get('Items', []):
+                    tid = str(item.get('Id') or '')
+                    eid = str(item.get('PlaylistItemId') or '')
+                    if tid:
+                        entries.append((tid, eid))
+
+            current_ids = [tid for tid, _ in entries]
+            desired_ids = []
+            for t in tracks:
+                tid = (str(t.id) if hasattr(t, 'id') and t.id
+                       else str(t.get('Id') or t.get('id') or '') if isinstance(t, dict) else '')
+                if tid and self._is_valid_guid(tid):
+                    desired_ids.append(tid)
+
+            plan = plan_playlist_reconcile(current_ids, desired_ids)
+            hdr = {'X-Emby-Token': self.api_key}
+
+            if plan['add']:
+                for i in range(0, len(plan['add']), 100):
+                    batch = plan['add'][i:i + 100]
+                    r = requests.post(
+                        f"{self.base_url}/Playlists/{playlist_id}/Items",
+                        params={'Ids': ','.join(batch), 'UserId': self.user_id},
+                        headers=hdr, timeout=30,
+                    )
+                    if r.status_code not in (200, 204):
+                        logger.error(f"Jellyfin reconcile add failed: HTTP {r.status_code}")
+                        return False
+
+            if plan['remove']:
+                remove_set = set(plan['remove'])
+                entry_ids = [eid for tid, eid in entries if tid in remove_set and eid]
+                for i in range(0, len(entry_ids), 100):
+                    batch = entry_ids[i:i + 100]
+                    r = requests.delete(
+                        f"{self.base_url}/Playlists/{playlist_id}/Items",
+                        params={'EntryIds': ','.join(batch)},
+                        headers=hdr, timeout=30,
+                    )
+                    if r.status_code not in (200, 204):
+                        logger.error(f"Jellyfin reconcile remove failed: HTTP {r.status_code}")
+                        return False
+
+            logger.info(
+                f"Jellyfin reconcile '{playlist_name}': +{len(plan['add'])} / "
+                f"-{len(plan['remove'])} (playlist preserved)"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error reconciling Jellyfin playlist '{playlist_name}': {e}")
+            return False
+
+    def get_playlist_track_ids(self, playlist_id: str) -> List[str]:
+        """The playlist's current track ids (Item Ids), in current order. [] on miss."""
+        if not self.ensure_connection():
+            return []
+        try:
+            resp = self._make_request(f'/Playlists/{playlist_id}/Items', {'UserId': self.user_id})
+            if not resp:
+                return []
+            return [str(i.get('Id')) for i in resp.get('Items', []) if i.get('Id')]
+        except Exception as e:
+            logger.error(f"Error getting Jellyfin playlist track ids '{playlist_id}': {e}")
+            return []
+
+    def reorder_playlist(self, playlist_id, playlist_name: str, ordered_ids) -> bool:
+        """In-place reorder a playlist to an exact ordered track-id list ('Align
+        playlists'). Operates on the existing playlist object so its poster, name
+        and Id survive — no delete/recreate of the playlist itself.
+
+        Does NOT use Jellyfin's per-item Move endpoint (Items/{entryId}/Move/{i}):
+        that endpoint is user-scoped and — unlike the add/remove item endpoints,
+        which take an explicit ``UserId`` — has no way to resolve a user from a
+        server API key, so it returns HTTP 400 for every playlist (Ashh, Docker).
+        Instead we re-add the desired ids IN ORDER via the same UserId-scoped
+        ``POST /Items`` the sync uses (append order is preserved), THEN remove the
+        original entries. Add-before-remove means a mid-operation failure never
+        leaves the playlist emptied — worst case is transient duplicates that the
+        next reconcile collapses."""
+        if not self.ensure_connection():
+            return False
+        try:
+            import requests
+            # plan_align_rewrite already guarantees ordered ⊆ current, but filter to
+            # valid GUIDs anyway — an invalid id makes Jellyfin 400 the whole add.
+            ordered = [str(i) for i in (ordered_ids or [])
+                       if str(i) and self._is_valid_guid(str(i))]
+            if not ordered:
+                logger.error(f"Jellyfin reorder: no valid ids for playlist {playlist_id}")
+                return False
+
+            # Current entries (track_id, entry_id) in current order. The entry id
+            # (PlaylistItemId) is what removal operates on.
+            entries = []
+            resp = self._make_request(f'/Playlists/{playlist_id}/Items', {'UserId': self.user_id})
+            if resp:
+                for item in resp.get('Items', []):
+                    tid = str(item.get('Id') or '')
+                    eid = str(item.get('PlaylistItemId') or '')
+                    if tid:
+                        entries.append((tid, eid))
+            if not entries:
+                logger.error(f"Jellyfin reorder: no entries for playlist {playlist_id}")
+                return False
+
+            old_eids = [eid for _tid, eid in entries if eid]
+            hdr = {'X-Emby-Token': self.api_key}
+
+            # 1) Append the desired ids in order (new entries; existing copies stay
+            #    for now — Jellyfin playlists allow duplicates).
+            for i in range(0, len(ordered), 100):
+                batch = ordered[i:i + 100]
+                r = requests.post(
+                    f"{self.base_url}/Playlists/{playlist_id}/Items",
+                    params={'Ids': ','.join(batch), 'UserId': self.user_id},
+                    headers=hdr, timeout=30,
+                )
+                if r.status_code not in (200, 204):
+                    logger.warning(f"Jellyfin reorder re-add failed: HTTP {r.status_code}")
+                    return False
+
+            # 2) Remove the ORIGINAL entries, leaving exactly the freshly-added
+            #    ones in `ordered` order.
+            for i in range(0, len(old_eids), 100):
+                batch = old_eids[i:i + 100]
+                r = requests.delete(
+                    f"{self.base_url}/Playlists/{playlist_id}/Items",
+                    params={'EntryIds': ','.join(batch)}, headers=hdr, timeout=30,
+                )
+                if r.status_code not in (200, 204):
+                    logger.warning(f"Jellyfin reorder cleanup-remove failed: HTTP {r.status_code}")
+                    return False
+
+            logger.info(f"Aligned Jellyfin playlist '{playlist_name}' order ({len(ordered)} tracks)")
+            return True
+        except Exception as e:
+            logger.error(f"Error reordering Jellyfin playlist '{playlist_name}': {e}")
+            return False
+
+    def update_playlist(self, playlist_name: str, tracks) -> bool:
+        """Update an existing playlist or create it if it doesn't exist"""
+        if not self.ensure_connection():
+            return False
+        
+        try:
+            existing_playlist = self.get_playlist_by_name(playlist_name)
+            
+            # Check if backup is enabled in config
+            from config.settings import config_manager
+            create_backup = config_manager.get('playlist_sync.create_backup', True)
+            
+            if existing_playlist and create_backup:
+                backup_name = f"{playlist_name} Backup"
+                logger.info(f"Creating backup playlist '{backup_name}' before sync")
+                
+                if self.copy_playlist(playlist_name, backup_name):
+                    logger.info("Backup created successfully")
+                else:
+                    logger.warning("Failed to create backup, continuing with sync")
+            
+            if existing_playlist:
+                # Delete existing playlist using DELETE request
+                import requests
+                url = f"{self.base_url}/Items/{existing_playlist.id}"
+                headers = {
+                    'X-Emby-Token': self.api_key
+                }
+                
+                response = requests.delete(url, headers=headers, timeout=10)
+                if response.status_code in [200, 204]:
+                    logger.info(f"Deleted existing Jellyfin playlist '{playlist_name}'")
+                else:
+                    logger.warning(f"Could not delete existing playlist '{playlist_name}' (status: {response.status_code}), creating anyway")
+            
+            # Create new playlist with tracks
+            return self.create_playlist(playlist_name, tracks)
+            
+        except Exception as e:
+            logger.error(f"Error updating Jellyfin playlist '{playlist_name}': {e}")
+            return False
+    
+    def trigger_library_scan(self, library_name: str = "Music") -> bool:
+        """Trigger Jellyfin library scan for the specified library"""
+        if not self.ensure_connection():
+            return False
+            
+        try:
+            # Get library info to find the correct library ID
+            libraries_response = self._make_request(f'/Users/{self.user_id}/Views')
+            if not libraries_response:
+                logger.error("Failed to get library list for scan")
+                return False
+                
+            target_library_id = None
+            for library in libraries_response.get('Items', []):
+                if (library.get('CollectionType') == 'music' and 
+                    library_name.lower() in library.get('Name', '').lower()):
+                    target_library_id = library['Id']
+                    break
+            
+            # Default to music_library_id if no specific library found
+            if not target_library_id:
+                target_library_id = self.music_library_id
+                
+            if not target_library_id:
+                logger.error(f"No library found matching '{library_name}'")
+                return False
+                
+            # Trigger the scan using POST request
+            import requests
+            url = f"{self.base_url}/Items/{target_library_id}/Refresh"
+            headers = {
+                'X-Emby-Token': self.api_key,
+                'Content-Type': 'application/json'
+            }
+            params = {
+                'Recursive': True,
+                'ImageRefreshMode': 'ValidationOnly',  # Don't refresh images, just metadata
+                'MetadataRefreshMode': 'ValidationOnly'
+            }
+            
+            response = requests.post(url, headers=headers, params=params, timeout=10)
+            response.raise_for_status()
+            
+            logger.info(f"Triggered Jellyfin library scan for '{library_name}'")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to trigger Jellyfin library scan for '{library_name}': {e}")
+            return False
+    
+    def is_library_scanning(self, library_name: str = "Music") -> bool:
+        """Check if Jellyfin library is currently scanning"""
+        if not self.ensure_connection():
+            logger.debug("Not connected to Jellyfin, cannot check scan status")
+            return False
+            
+        try:
+            # Check scheduled tasks for library scan activities
+            response = self._make_request('/ScheduledTasks')
+            if not response:
+                logger.debug("Could not get scheduled tasks")
+                return False
+                
+            for task in response:
+                task_name = task.get('Name', '').lower()
+                task_state = task.get('State', 'Idle')
+                
+                # Look for library scan related tasks that are running
+                if ('scan' in task_name or 'refresh' in task_name or 'library' in task_name):
+                    if task_state in ['Running', 'Cancelling']:
+                        logger.debug(
+                            "Found running scan task: name=%s state=%s",
+                            task.get('Name'),
+                            task_state,
+                        )
+                        return True
+                        
+            logger.debug("No active scan tasks detected")
+            return False
+            
+        except Exception as e:
+            logger.debug(f"Error checking if Jellyfin library is scanning: {e}")
+            return False
+    
+    # Metadata update methods for compatibility with metadata updater
+    def update_artist_genres(self, artist, genres: List[str]):
+        """Update artist genres - not implemented for Jellyfin"""
+        # Genre updates not supported via Jellyfin API - silently skip
+        return True
+    
+    def update_artist_poster(self, artist, image_data: bytes):
+        """Update artist poster image using Jellyfin API"""
+        try:
+            artist_id = artist.ratingKey
+            if not artist_id:
+                return False
+            
+            import requests
+            
+            url = f"{self.base_url}/Items/{artist_id}/Images/Primary"
+
+            # Use the working approach from successful Jellyfin implementation
+            from base64 import b64encode
+
+            # Base64 encode the image data (key difference!)
+            encoded_data = b64encode(image_data)
+
+            # Add /0 to URL for image index
+            url = f"{self.base_url}/Items/{artist_id}/Images/Primary/0"
+
+            headers = {
+                'X-Emby-Token': self.api_key,
+                'Content-Type': 'image/jpeg'
+            }
+
+            try:
+                logger.debug(f"Uploading {len(image_data)} bytes (base64 encoded) for {artist.title}")
+
+                response = requests.post(url, data=encoded_data, headers=headers, timeout=30)
+                response.raise_for_status()
+                logger.info(f"Updated poster for {artist.title} - HTTP {response.status_code}")
+                return True
+
+            except Exception as e:
+                logger.error(f"Failed to upload poster for {artist.title}: {e}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error updating poster for {artist.title}: {e}")
+            return False
+    
+    def update_album_poster(self, album, image_data: bytes):
+        """Update album poster image using Jellyfin API"""
+        try:
+            album_id = album.ratingKey
+            if not album_id:
+                return False
+            
+            import requests
+            
+            url = f"{self.base_url}/Items/{album_id}/Images/Primary"
+            headers = {
+                'X-Emby-Token': self.api_key
+            }
+            
+            # Try multiple approaches to find what works with Jellyfin
+            
+            # Method 1: Try with different field names that Jellyfin might expect
+            method1_files = {'data': ('poster.jpg', image_data, 'image/jpeg')}
+            try:
+                response = requests.post(url, files=method1_files, headers=headers, timeout=30)
+                response.raise_for_status()
+                logger.info(f"Updated poster for album '{album.title}' (method 1)")
+                return True
+            except Exception as e1:
+                logger.debug(f"Method 1 failed for album '{album.title}': {e1}")
+            
+            # Method 2: Try with raw data and proper content-type
+            try:
+                headers_raw = {
+                    'X-Emby-Token': self.api_key,
+                    'Content-Type': 'image/jpeg'
+                }
+                response = requests.post(url, data=image_data, headers=headers_raw, timeout=30)
+                response.raise_for_status()
+                logger.info(f"Updated poster for album '{album.title}' (method 2)")
+                return True
+            except Exception as e2:
+                logger.debug(f"Method 2 failed for album '{album.title}': {e2}")
+            
+            # Method 3: Try with different endpoint structure
+            try:
+                alt_url = f"{self.base_url}/Items/{album_id}/Images/Primary/0"
+                response = requests.post(alt_url, data=image_data, headers=headers_raw, timeout=30)
+                response.raise_for_status()
+                logger.info(f"Updated poster for album '{album.title}' (method 3)")
+                return True
+            except Exception as e3:
+                logger.debug(f"Method 3 failed for album '{album.title}': {e3}")
+            
+            # All methods failed
+            logger.error(f"All image upload methods failed for album '{album.title}'")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error updating poster for album '{album.title}': {e}")
+            return False
+    
+    def update_artist_biography(self, artist) -> bool:
+        """Update artist overview/biography - not implemented for Jellyfin"""
+        # Biography updates not supported via Jellyfin API - silently skip
+        return True
+    
+    def needs_update_by_age(self, artist, refresh_interval_days: int) -> bool:
+        """Check if artist needs updating based on age threshold"""
+        try:
+            last_update = self.parse_update_timestamp(artist)
+            if not last_update:
+                # No timestamp found, needs update
+                return True
+
+            # Calculate days since last update
+            from datetime import datetime
+            days_since_update = (datetime.now() - last_update).days
+
+            # Use same logic as Plex client
+            needs_update = days_since_update >= refresh_interval_days
+
+            if not needs_update:
+                logger.debug(f"Skipping {artist.title}: updated {days_since_update} days ago (threshold: {refresh_interval_days})")
+
+            return needs_update
+
+        except Exception as e:
+            logger.debug(f"Error checking update age for {artist.title}: {e}")
+            return True  # Default to needing update if error
+    
+    def is_artist_ignored(self, artist) -> bool:
+        """Check if artist is manually marked to be ignored"""
+        try:
+            # Check overview field where we store timestamps and ignore flags
+            overview = getattr(artist, 'overview', '') or ''
+            return '-IgnoreUpdate' in overview
+        except Exception as e:
+            logger.debug(f"Error checking ignore status for {artist.title}: {e}")
+            return False
+    
+    def parse_update_timestamp(self, artist) -> Optional[datetime]:
+        """Parse the last update timestamp - not implemented for Jellyfin"""
+        # No timestamp tracking for Jellyfin - always return None (needs update)
+        return None
+    
+    def set_metadata_only_mode(self, enabled: bool = True):
+        """Enable metadata-only mode to skip expensive track caching"""
+        try:
+            self._metadata_only_mode = enabled
+            if enabled:
+                logger.info("Metadata-only mode enabled - will skip expensive track caching")
+            else:
+                logger.info("Metadata-only mode disabled")
+            return True
+        except Exception as e:
+            logger.error(f"Error setting metadata-only mode: {e}")
+            return False

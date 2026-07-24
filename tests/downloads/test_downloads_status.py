@@ -1,0 +1,917 @@
+"""Tests for core/downloads/status.py — batch + unified status helpers."""
+
+from __future__ import annotations
+
+import pytest
+
+from core.downloads import status as st
+from core.runtime_state import (
+    download_batches,
+    download_tasks,
+)
+
+
+@pytest.fixture(autouse=True)
+def reset_state():
+    download_tasks.clear()
+    download_batches.clear()
+    yield
+    download_tasks.clear()
+    download_batches.clear()
+
+
+# ---------------------------------------------------------------------------
+# Fakes
+# ---------------------------------------------------------------------------
+
+class _FakeConfig:
+    def __init__(self, values=None):
+        self._v = values or {}
+
+    def get(self, key, default=None):
+        return self._v.get(key, default)
+
+
+def _build_deps(
+    *,
+    config=None,
+    docker_resolve=None,
+    find_completed=None,
+    make_key=None,
+    submit_pp=None,
+    cached_transfers=None,
+    download_orchestrator=None,
+    run_async=None,
+    persistent_history=None,
+):
+    submitted = []
+
+    def _default_submit(task_id, batch_id):
+        submitted.append((task_id, batch_id))
+
+    deps = st.StatusDeps(
+        config_manager=config or _FakeConfig({'soulseek.download_timeout': 600}),
+        docker_resolve_path=docker_resolve or (lambda p: p),
+        find_completed_file=find_completed or (lambda *a, **kw: (None, None)),
+        make_context_key=make_key or (lambda u, f: f"{u}::{f}"),
+        submit_post_processing=submit_pp or _default_submit,
+        get_cached_transfer_data=cached_transfers or (lambda: {}),
+        download_orchestrator=download_orchestrator,
+        run_async=run_async,
+        get_persistent_download_history=persistent_history,
+    )
+    return deps, submitted
+
+
+# ---------------------------------------------------------------------------
+# build_batch_status_data — phase routing
+# ---------------------------------------------------------------------------
+
+def test_unknown_phase_includes_basic_fields_only():
+    deps, _ = _build_deps()
+    batch = {'phase': 'unknown', 'playlist_id': 'pl1', 'playlist_name': 'My PL'}
+    out = st.build_batch_status_data('b1', batch, {}, deps)
+    assert out['phase'] == 'unknown'
+    assert out['playlist_id'] == 'pl1'
+    assert out['playlist_name'] == 'My PL'
+    assert 'tasks' not in out
+    assert 'analysis_progress' not in out
+
+
+def test_analysis_phase_includes_analysis_progress_and_results():
+    deps, _ = _build_deps()
+    batch = {
+        'phase': 'analysis',
+        'analysis_total': 10,
+        'analysis_processed': 4,
+        'analysis_results': [{'track_index': 0, 'found': True}],
+    }
+    out = st.build_batch_status_data('b1', batch, {}, deps)
+    assert out['analysis_progress'] == {'total': 10, 'processed': 4}
+    assert out['analysis_results'] == [{'track_index': 0, 'found': True}]
+
+
+def test_queued_phase_surfaces_analysis_progress_for_ui_count():
+    """A batch in ``queued`` state hasn't been picked up by the
+    executor yet, so analysis_processed is 0. The UI still needs
+    ``analysis_total`` so it can render "Queued — N tracks" instead
+    of showing an empty card. Pre-fix the queued phase fell through
+    to the default branch and the UI lost the track count entirely."""
+    deps, _ = _build_deps()
+    batch = {
+        'phase': 'queued',
+        'analysis_total': 17,
+        'analysis_processed': 0,
+        'analysis_results': [],
+    }
+    out = st.build_batch_status_data('b1', batch, {}, deps)
+    assert out['phase'] == 'queued'
+    assert out['analysis_progress'] == {'total': 17, 'processed': 0}
+    assert out['analysis_results'] == []
+
+
+def test_album_downloading_phase_exposes_bundle_progress_without_task_safety_valve():
+    deps, _ = _build_deps(config=_FakeConfig({'soulseek.download_timeout': 1}))
+    download_tasks['t1'] = {
+        'track_index': 0,
+        'status': 'queued',
+        'track_info': {},
+        'status_change_time': 0,
+    }
+    batch = {
+        'phase': 'album_downloading',
+        'queue': ['t1'],
+        'album_bundle_state': 'downloading',
+        'album_bundle_source': 'torrent',
+        'album_bundle_release': 'GNX [FLAC]',
+        'album_bundle_progress': 0.42,
+        'album_bundle_speed': 2048,
+        'album_bundle_size': 4096,
+    }
+    out = st.build_batch_status_data('b1', batch, {}, deps)
+    assert out['album_bundle'] == {
+        'state': 'downloading',
+        'source': 'torrent',
+        'release': 'GNX [FLAC]',
+        'progress': 0.42,
+        'progress_percent': 42,
+        'speed': 2048,
+        'size': 4096,
+    }
+    assert 'tasks' not in out
+    assert download_tasks['t1']['status'] == 'queued'
+
+
+def test_complete_phase_includes_wishlist_summary_when_present():
+    deps, _ = _build_deps()
+    batch = {
+        'phase': 'complete',
+        'queue': [],
+        'wishlist_summary': {'added': 3, 'failed': 0},
+    }
+    out = st.build_batch_status_data('b1', batch, {}, deps)
+    assert out['wishlist_summary'] == {'added': 3, 'failed': 0}
+
+
+def test_complete_phase_omits_wishlist_summary_when_missing():
+    deps, _ = _build_deps()
+    batch = {'phase': 'complete', 'queue': []}
+    out = st.build_batch_status_data('b1', batch, {}, deps)
+    assert 'wishlist_summary' not in out
+
+
+# ---------------------------------------------------------------------------
+# Task formatting
+# ---------------------------------------------------------------------------
+
+def test_downloading_phase_includes_active_count_and_max_concurrent():
+    deps, _ = _build_deps()
+    batch = {'phase': 'downloading', 'queue': [], 'active_count': 2, 'max_concurrent': 5}
+    out = st.build_batch_status_data('b1', batch, {}, deps)
+    assert out['active_count'] == 2
+    assert out['max_concurrent'] == 5
+
+
+def test_tasks_sorted_by_track_index():
+    deps, _ = _build_deps()
+    download_tasks['t1'] = {'track_index': 2, 'status': 'queued', 'track_info': {}}
+    download_tasks['t2'] = {'track_index': 0, 'status': 'queued', 'track_info': {}}
+    download_tasks['t3'] = {'track_index': 1, 'status': 'queued', 'track_info': {}}
+    batch = {'phase': 'downloading', 'queue': ['t1', 't2', 't3']}
+    out = st.build_batch_status_data('b1', batch, {}, deps)
+    assert [t['track_index'] for t in out['tasks']] == [0, 1, 2]
+
+
+def test_missing_task_in_queue_is_skipped():
+    deps, _ = _build_deps()
+    download_tasks['t1'] = {'track_index': 0, 'status': 'queued', 'track_info': {}}
+    batch = {'phase': 'downloading', 'queue': ['t1', 'absent']}
+    out = st.build_batch_status_data('b1', batch, {}, deps)
+    assert len(out['tasks']) == 1
+
+
+def test_task_status_includes_v2_state_fields():
+    deps, _ = _build_deps()
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'cancelling', 'track_info': {},
+        'cancel_requested': True, 'cancel_timestamp': 12345,
+        'ui_state': 'cancelling', 'playlist_id': 'pl1',
+        'error_message': 'oh no', 'cached_candidates': [{'x': 1}],
+        'quarantine_entry_id': '20260514_120000_song',
+    }
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    out = st.build_batch_status_data('b1', batch, {}, deps)
+    t = out['tasks'][0]
+    assert t['cancel_requested'] is True
+    assert t['cancel_timestamp'] == 12345
+    assert t['ui_state'] == 'cancelling'
+    assert t['playlist_id'] == 'pl1'
+    assert t['error_message'] == 'oh no'
+    assert t['quarantine_entry_id'] == '20260514_120000_song'
+    assert t['has_candidates'] is True
+
+
+# ---------------------------------------------------------------------------
+# Live transfer state mapping
+# ---------------------------------------------------------------------------
+
+def test_live_state_cancelled_maps_to_cancelled():
+    deps, _ = _build_deps()
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'downloading', 'track_info': {},
+        'filename': 'song.flac', 'username': 'u1',
+    }
+    live = {'u1::song.flac': {'state': 'Cancelled', 'percentComplete': 50}}
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    out = st.build_batch_status_data('b1', batch, live, deps)
+    assert out['tasks'][0]['status'] == 'cancelled'
+    assert download_tasks['t1']['status'] == 'cancelled'  # mutates source state
+
+
+def test_live_state_succeeded_with_full_bytes_marks_post_processing_and_submits():
+    deps, submitted = _build_deps()
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'downloading', 'track_info': {},
+        'filename': 'song.flac', 'username': 'u1',
+    }
+    live = {'u1::song.flac': {
+        'state': 'Succeeded', 'size': 100, 'bytesTransferred': 100, 'percentComplete': 100,
+    }}
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    out = st.build_batch_status_data('b1', batch, live, deps)
+    assert out['tasks'][0]['status'] == 'post_processing'
+    assert download_tasks['t1']['status'] == 'post_processing'
+    assert submitted == [('t1', 'b1')]
+
+
+def test_live_state_succeeded_with_byte_mismatch_keeps_status():
+    deps, submitted = _build_deps()
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'downloading', 'track_info': {},
+        'filename': 'song.flac', 'username': 'u1',
+    }
+    live = {'u1::song.flac': {
+        'state': 'Succeeded', 'size': 100, 'bytesTransferred': 50,
+    }}
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    out = st.build_batch_status_data('b1', batch, live, deps)
+    assert out['tasks'][0]['status'] == 'downloading'  # not promoted to post_processing
+    assert submitted == []  # not submitted
+
+
+def test_live_state_inprogress_maps_to_downloading():
+    deps, _ = _build_deps()
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'queued', 'track_info': {},
+        'filename': 'song.flac', 'username': 'u1',
+    }
+    live = {'u1::song.flac': {'state': 'InProgress', 'percentComplete': 42}}
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    out = st.build_batch_status_data('b1', batch, live, deps)
+    assert out['tasks'][0]['status'] == 'downloading'
+    assert out['tasks'][0]['progress'] == 42
+
+
+def test_live_state_errored_keeps_active_status_for_monitor():
+    deps, _ = _build_deps()
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'downloading', 'track_info': {},
+        'filename': 'song.flac', 'username': 'u1',
+    }
+    live = {'u1::song.flac': {'state': 'Errored'}}
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    out = st.build_batch_status_data('b1', batch, live, deps)
+    # Keeps current status so monitor handles retry
+    assert out['tasks'][0]['status'] == 'downloading'
+    assert download_tasks['t1']['status'] == 'downloading'  # not marked failed
+
+
+def test_terminal_status_not_overridden_by_live_state():
+    deps, _ = _build_deps()
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'completed', 'track_info': {},
+        'filename': 'song.flac', 'username': 'u1',
+    }
+    live = {'u1::song.flac': {'state': 'InProgress', 'percentComplete': 50}}
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    out = st.build_batch_status_data('b1', batch, live, deps)
+    assert out['tasks'][0]['status'] == 'completed'
+    assert out['tasks'][0]['progress'] == 100
+
+
+def test_post_processing_status_progress_is_95():
+    deps, _ = _build_deps()
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'post_processing', 'track_info': {},
+        'filename': 'song.flac', 'username': 'u1',
+    }
+    live = {}  # no live entry
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    out = st.build_batch_status_data('b1', batch, live, deps)
+    assert out['tasks'][0]['progress'] == 95
+
+
+def test_auto_torrent_without_live_entry_uses_engine_success_fallback():
+    class _Record:
+        state = 'Completed, Succeeded'
+        progress = 100
+
+    class _Orchestrator:
+        def get_download_status(self, download_id):
+            assert download_id == 'dl1'
+            return _Record()
+
+    deps, submitted = _build_deps(
+        download_orchestrator=_Orchestrator(),
+        run_async=lambda value: value,
+    )
+    download_tasks['t1'] = {
+        'track_index': 0,
+        'status': 'downloading',
+        'track_info': {},
+        'filename': 'song.flac',
+        'username': 'torrent',
+        'download_id': 'dl1',
+    }
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    out = st.build_batch_status_data('b1', batch, {}, deps)
+    assert out['tasks'][0]['status'] == 'post_processing'
+    assert download_tasks['t1']['status'] == 'post_processing'
+    assert submitted == [('t1', 'b1')]
+
+
+def test_auto_torrent_prefers_engine_success_over_live_entry():
+    class _Record:
+        state = 'Completed, Succeeded'
+        progress = 100
+
+    class _Orchestrator:
+        def get_download_status(self, download_id):
+            assert download_id == 'dl1'
+            return _Record()
+
+    deps, submitted = _build_deps(
+        download_orchestrator=_Orchestrator(),
+        run_async=lambda value: value,
+    )
+    download_tasks['t1'] = {
+        'track_index': 0,
+        'status': 'downloading',
+        'track_info': {},
+        'filename': 'song.flac',
+        'username': 'torrent',
+        'download_id': 'dl1',
+    }
+    live = {'torrent::song.flac': {
+        'state': 'InProgress, Downloading',
+        'percentComplete': 100,
+    }}
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    out = st.build_batch_status_data('b1', batch, live, deps)
+    assert out['tasks'][0]['status'] == 'post_processing'
+    assert download_tasks['t1']['status'] == 'post_processing'
+    assert submitted == [('t1', 'b1')]
+
+
+def test_auto_torrent_engine_failure_does_not_bypass_monitor_retry():
+    class _Record:
+        state = 'Completed, Errored'
+        progress = 100
+        error = 'client failed'
+
+    class _Orchestrator:
+        def get_download_status(self, download_id):
+            assert download_id == 'dl1'
+            return _Record()
+
+    deps, submitted = _build_deps(
+        download_orchestrator=_Orchestrator(),
+        run_async=lambda value: value,
+    )
+    download_tasks['t1'] = {
+        'track_index': 0,
+        'status': 'downloading',
+        'track_info': {},
+        'filename': 'song.flac',
+        'username': 'torrent',
+        'download_id': 'dl1',
+    }
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    out = st.build_batch_status_data('b1', batch, {}, deps)
+    assert out['tasks'][0]['status'] == 'downloading'
+    assert download_tasks['t1']['status'] == 'downloading'
+    assert submitted == []
+
+
+def test_auto_torrent_engine_success_recovers_premature_failed_task():
+    class _Record:
+        state = 'Completed, Succeeded'
+        progress = 100
+
+    class _Orchestrator:
+        def get_download_status(self, download_id):
+            assert download_id == 'dl1'
+            return _Record()
+
+    deps, submitted = _build_deps(
+        download_orchestrator=_Orchestrator(),
+        run_async=lambda value: value,
+    )
+    download_tasks['t1'] = {
+        'track_index': 0,
+        'status': 'failed',
+        'track_info': {},
+        'filename': 'release-url||Release',
+        'username': 'torrent',
+        'download_id': 'dl1',
+        'error_message': 'premature failure',
+    }
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    out = st.build_batch_status_data('b1', batch, {}, deps)
+    assert out['tasks'][0]['status'] == 'post_processing'
+    assert download_tasks['t1']['status'] == 'post_processing'
+    assert submitted == [('t1', 'b1')]
+
+
+# ---------------------------------------------------------------------------
+# Safety valve (stuck task handling)
+# ---------------------------------------------------------------------------
+
+def test_safety_valve_stuck_searching_marks_not_found():
+    deps, _ = _build_deps(config=_FakeConfig({'soulseek.download_timeout': 1}))
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'searching', 'track_info': {},
+        'status_change_time': 0,  # ancient
+    }
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    st.build_batch_status_data('b1', batch, {}, deps)
+    assert download_tasks['t1']['status'] == 'not_found'
+    assert 'Search stuck' in download_tasks['t1']['error_message']
+
+
+def test_safety_valve_stuck_downloading_with_recovered_file_routes_to_post_processing():
+    deps, submitted = _build_deps(
+        config=_FakeConfig({'soulseek.download_timeout': 1, 'soulseek.download_path': '/d', 'soulseek.transfer_path': '/t'}),
+        find_completed=lambda *a, **kw: ('/found.flac', 'transfer'),
+    )
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'downloading', 'track_info': {},
+        'filename': 'song.flac',
+        'status_change_time': 0,
+    }
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    st.build_batch_status_data('b1', batch, {}, deps)
+    assert download_tasks['t1']['status'] == 'post_processing'
+    assert submitted == [('t1', 'b1')]
+
+
+def test_safety_valve_stuck_downloading_no_file_marks_failed():
+    deps, _ = _build_deps(config=_FakeConfig({'soulseek.download_timeout': 1}))
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'downloading', 'track_info': {},
+        'filename': 'song.flac',
+        'status_change_time': 0,
+    }
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    st.build_batch_status_data('b1', batch, {}, deps)
+    assert download_tasks['t1']['status'] == 'failed'
+    assert 'Task stuck' in download_tasks['t1']['error_message']
+
+
+# ---------------------------------------------------------------------------
+# build_single_batch_status (route helper)
+# ---------------------------------------------------------------------------
+
+def test_single_batch_status_404_for_unknown_batch():
+    deps, _ = _build_deps()
+    body, status = st.build_single_batch_status('absent', deps)
+    assert status == 404
+    assert body['error'] == 'Batch not found'
+
+
+def test_single_batch_status_returns_payload_for_known_batch():
+    deps, _ = _build_deps()
+    download_batches['b1'] = {'phase': 'unknown', 'playlist_id': 'pl1'}
+    body, status = st.build_single_batch_status('b1', deps)
+    assert status == 200
+    assert body['phase'] == 'unknown'
+    assert body['playlist_id'] == 'pl1'
+
+
+# ---------------------------------------------------------------------------
+# build_batched_status (route helper)
+# ---------------------------------------------------------------------------
+
+def test_batched_status_filters_to_requested_ids():
+    deps, _ = _build_deps()
+    download_batches['b1'] = {'phase': 'unknown'}
+    download_batches['b2'] = {'phase': 'unknown'}
+    download_batches['b3'] = {'phase': 'unknown'}
+    out = st.build_batched_status(['b1', 'b3'], deps)
+    assert set(out['batches'].keys()) == {'b1', 'b3'}
+
+
+def test_batched_status_no_filter_returns_all_batches():
+    deps, _ = _build_deps()
+    download_batches['b1'] = {'phase': 'unknown'}
+    download_batches['b2'] = {'phase': 'unknown'}
+    out = st.build_batched_status([], deps)
+    assert set(out['batches'].keys()) == {'b1', 'b2'}
+
+
+def test_unified_downloads_response_includes_album_bundle_summary():
+    deps, _ = _build_deps()
+    download_batches['b1'] = {
+        'phase': 'album_downloading',
+        'playlist_id': 'pl1',
+        'playlist_name': 'GNX',
+        'queue': [],
+        'album_bundle_state': 'downloading',
+        'album_bundle_source': 'torrent',
+        'album_bundle_progress': 75,
+    }
+    out = st.build_unified_downloads_response(300, deps)
+    assert out['batches'][0]['album_bundle'] == {
+        'state': 'downloading',
+        'source': 'torrent',
+        'progress': 75,
+        'progress_percent': 75,
+    }
+
+
+def test_batched_status_metadata_present():
+    deps, _ = _build_deps()
+    download_batches['b1'] = {'phase': 'unknown'}
+    out = st.build_batched_status([], deps)
+    assert out['metadata']['total_batches'] == 1
+    assert out['metadata']['requested_batch_ids'] == []
+    assert isinstance(out['metadata']['timestamp'], (int, float))
+
+
+def test_batched_status_per_batch_failure_isolated():
+    deps, _ = _build_deps()
+    # b1 valid, b2 raises
+    download_batches['b1'] = {'phase': 'downloading', 'queue': []}
+
+    class _BadBatch(dict):
+        def get(self, k, default=None):
+            if k == 'phase':
+                raise RuntimeError("batch boom")
+            return super().get(k, default)
+
+    download_batches['b2'] = _BadBatch()
+
+    out = st.build_batched_status([], deps)
+    assert 'error' in out['batches']['b2']
+    assert out['batches']['b1'].get('phase') == 'downloading'
+
+
+def test_batched_status_debug_info_pre_existing_bug_never_populates():
+    """Documents a pre-existing bug: every batch payload includes
+    `"error": batch.get('error')` (key always present, value usually None).
+    The debug_info loop checks `if "error" not in batch_status:` which is
+    therefore always False → debug_info stays empty in production.
+
+    Lift preserves this exactly. A future PR can flip the check to
+    `if batch_status.get('error') is None` to fix it.
+    """
+    deps, _ = _build_deps()
+    download_tasks['t1'] = {'track_index': 0, 'status': 'downloading', 'track_info': {}}
+    download_tasks['t2'] = {'track_index': 1, 'status': 'downloading', 'track_info': {}}
+    download_batches['b1'] = {
+        'phase': 'downloading', 'queue': ['t1', 't2'],
+        'active_count': 5,
+        'max_concurrent': 5,
+    }
+    out = st.build_batched_status([], deps)
+    # Bug: stays empty because "error" key is always present in payload
+    assert out['debug_info'] == {}
+
+
+# ---------------------------------------------------------------------------
+# build_unified_downloads_response
+# ---------------------------------------------------------------------------
+
+def test_unified_response_sorts_by_priority_then_recency():
+    deps, _ = _build_deps()
+    download_tasks['old_complete'] = {
+        'track_index': 0, 'status': 'completed', 'track_info': {'name': 'A'},
+        'status_change_time': 100,
+    }
+    download_tasks['new_active'] = {
+        'track_index': 1, 'status': 'downloading', 'track_info': {'name': 'B'},
+        'status_change_time': 50,
+    }
+    out = st.build_unified_downloads_response(100, deps)
+    # Active downloads come first regardless of timestamp
+    assert out['downloads'][0]['title'] == 'B'
+
+
+def test_unified_response_artist_list_of_dicts_normalized():
+    deps, _ = _build_deps()
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'queued',
+        'track_info': {'name': 'X', 'artists': [{'name': 'Pink Floyd'}, {'name': 'Roger'}]},
+    }
+    out = st.build_unified_downloads_response(100, deps)
+    assert out['downloads'][0]['artist'] == 'Pink Floyd, Roger'
+
+
+def test_unified_response_album_dict_extracted_to_name():
+    deps, _ = _build_deps()
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'queued',
+        'track_info': {'name': 'X', 'album': {'name': 'DSOTM', 'images': [{'url': 'http://thumb.jpg'}]}},
+    }
+    out = st.build_unified_downloads_response(100, deps)
+    assert out['downloads'][0]['album'] == 'DSOTM'
+    assert out['downloads'][0]['artwork'] == 'http://thumb.jpg'
+
+
+def test_unified_response_completed_task_progress_is_100():
+    deps, _ = _build_deps()
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'completed',
+        'track_info': {'name': 'X'},
+    }
+    out = st.build_unified_downloads_response(100, deps)
+    assert out['downloads'][0]['progress'] == 100
+
+
+def test_unified_response_post_processing_progress_is_95():
+    deps, _ = _build_deps()
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'post_processing',
+        'track_info': {'name': 'X'},
+    }
+    out = st.build_unified_downloads_response(100, deps)
+    assert out['downloads'][0]['progress'] == 95
+
+
+def test_unified_response_includes_batch_summaries():
+    deps, _ = _build_deps()
+    download_tasks['t1'] = {'track_index': 0, 'status': 'completed', 'track_info': {}}
+    download_tasks['t2'] = {'track_index': 1, 'status': 'failed', 'track_info': {}}
+    download_tasks['t3'] = {'track_index': 2, 'status': 'downloading', 'track_info': {}}
+    download_tasks['t4'] = {'track_index': 3, 'status': 'queued', 'track_info': {}}
+    download_batches['b1'] = {
+        'phase': 'downloading', 'playlist_name': 'PL',
+        'queue': ['t1', 't2', 't3', 't4'],
+    }
+    out = st.build_unified_downloads_response(100, deps)
+    bs = out['batches'][0]
+    assert bs['total'] == 4
+    assert bs['completed'] == 1
+    assert bs['failed'] == 1
+    assert bs['active'] == 1
+    assert bs['queued'] == 1
+
+
+def test_unified_response_returns_all_live_tasks_even_past_limit():
+    """`limit` bounds the persistent-history tail, NOT live in-memory tasks.
+
+    Live tasks are already bounded by the 5-min cleanup, and the Downloads page
+    filters them client-side per tab — truncating them (active-first) starved
+    completed/failed/unverified rows out of the response during a busy batch so
+    they never showed until the batch drained.
+    """
+    deps, _ = _build_deps()
+    for i in range(20):
+        download_tasks[f't{i}'] = {
+            'track_index': i, 'status': 'completed', 'track_info': {},
+        }
+    out = st.build_unified_downloads_response(5, deps)
+    assert len(out['downloads']) == 20  # all live tasks returned
+    assert out['total'] == 20
+
+
+def test_unified_response_does_not_truncate_terminal_tasks_behind_active():
+    """A busy batch (many queued/active tasks) must not push completed/failed
+    rows off the end of the response — they're what the Completed/Failed tabs
+    show during the run."""
+    deps, _ = _build_deps()
+    for i in range(120):
+        download_tasks[f'q{i}'] = {
+            'track_index': i, 'status': 'queued',
+            'track_info': {'name': f'Q{i}'}, 'status_change_time': i,
+        }
+    download_tasks['done'] = {
+        'status': 'completed', 'track_info': {'name': 'DONE'}, 'status_change_time': 999,
+    }
+    download_tasks['fail'] = {
+        'status': 'failed', 'track_info': {'name': 'FAIL'}, 'status_change_time': 999,
+    }
+    out = st.build_unified_downloads_response(100, deps)
+    titles = {d['title'] for d in out['downloads']}
+    assert 'DONE' in titles
+    assert 'FAIL' in titles
+
+
+def test_unified_response_includes_persistent_download_history():
+    deps, _ = _build_deps(
+        persistent_history=lambda limit: [
+            {
+                'id': 42,
+                'title': 'Persisted Track',
+                'artist_name': 'Deezer Artist',
+                'album_name': 'Persistent Album',
+                'thumb_url': 'http://cover.jpg',
+                'download_source': 'Deezer',
+                'quality': 'FLAC',
+                'created_at': '2026-05-24 12:34:56',
+            }
+        ]
+    )
+
+    out = st.build_unified_downloads_response(100, deps)
+
+    assert out['total'] == 1
+    item = out['downloads'][0]
+    assert item['task_id'] == 'history-42'
+    assert item['title'] == 'Persisted Track'
+    assert item['artist'] == 'Deezer Artist'
+    assert item['album'] == 'Persistent Album'
+    assert item['artwork'] == 'http://cover.jpg'
+    assert item['status'] == 'completed'
+    assert item['progress'] == 100
+    assert item['batch_name'] == 'Deezer'
+    assert item['is_persistent_history'] is True
+
+
+def test_unified_response_dedupes_history_against_live_task():
+    download_tasks['live'] = {
+        'track_index': 0,
+        'status': 'completed',
+        'track_info': {
+            'name': 'Same Track',
+            'artist': 'Same Artist',
+            'album': 'Same Album',
+        },
+    }
+    deps, _ = _build_deps(
+        persistent_history=lambda limit: [
+            {
+                'id': 7,
+                'title': 'Same Track',
+                'artist_name': 'Same Artist',
+                'album_name': 'Same Album',
+                'created_at': '2026-05-24 12:34:56',
+            }
+        ]
+    )
+
+    out = st.build_unified_downloads_response(100, deps)
+
+    assert len(out['downloads']) == 1
+    assert out['downloads'][0]['task_id'] == 'live'
+    assert out['downloads'][0]['is_persistent_history'] is False
+
+
+def test_unified_response_caps_persistent_history_tail():
+    requested_limits = []
+
+    def _history(limit):
+        requested_limits.append(limit)
+        return [
+            {
+                'id': i,
+                'title': f'Track {i}',
+                'artist_name': 'Artist',
+                'album_name': 'Album',
+                'created_at': '2026-05-24 12:34:56',
+            }
+            for i in range(limit + 10)
+        ]
+
+    deps, _ = _build_deps(persistent_history=_history)
+
+    out = st.build_unified_downloads_response(300, deps)
+
+    assert requested_limits == [50]
+    assert len(out['downloads']) == 50
+    assert out['total'] == 50
+
+
+def test_unverified_history_always_loaded_even_when_at_limit():
+    """Unverified entries must appear even during a large batch that fills the limit."""
+    for i in range(200):
+        download_tasks[f'live-{i}'] = {
+            'track_index': i,
+            'status': 'completed',
+            'track_info': {'name': f'Track {i}', 'artist': f'Artist {i}', 'album': 'Album'},
+            'verification_status': 'verified',
+        }
+
+    deps, _ = _build_deps(
+        persistent_history=lambda limit: [],
+    )
+    deps.get_unverified_download_history = lambda: [
+        {
+            'id': 999,
+            'title': 'Old Unverified',
+            'artist_name': 'Forgotten Artist',
+            'album_name': 'Old Album',
+            'created_at': '2026-01-01 00:00:00',
+            'verification_status': 'unverified',
+        }
+    ]
+
+    out = st.build_unified_downloads_response(200, deps)
+
+    titles = {d['title'] for d in out['downloads']}
+    assert 'Old Unverified' in titles, "historical unverified entry must appear regardless of limit"
+
+    unverified = [d for d in out['downloads'] if d.get('verification_status') == 'unverified']
+    assert len(unverified) == 1
+    assert unverified[0]['task_id'] == 'history-999'
+    assert unverified[0]['is_persistent_history'] is True
+
+
+def test_unverified_history_deduped_against_live_task():
+    """A live task that's still unverified must not appear twice."""
+    download_tasks['live-unv'] = {
+        'track_index': 0,
+        'status': 'completed',
+        'track_info': {'name': 'Live Unverified', 'artist': 'Artsy', 'album': 'Alb'},
+        'verification_status': 'unverified',
+    }
+
+    deps, _ = _build_deps()
+    deps.get_unverified_download_history = lambda: [
+        {
+            'id': 77,
+            'title': 'Live Unverified',
+            'artist_name': 'Artsy',
+            'album_name': 'Alb',
+            'created_at': '2026-06-15 10:00:00',
+            'verification_status': 'unverified',
+        }
+    ]
+
+    out = st.build_unified_downloads_response(200, deps)
+    matches = [d for d in out['downloads'] if d['title'] == 'Live Unverified']
+    assert len(matches) == 1, "same track must not be duplicated"
+    assert matches[0]['is_persistent_history'] is False
+
+
+# ---------------------------------------------------------------------------
+# #836 — a rejected slskd transfer must not hang the task at 'downloading'
+# forever. The monitor normally retries; when it can't make progress, a backstop
+# in the status formatter marks the task failed after a grace window so the
+# worker frees and the batch can complete.
+# ---------------------------------------------------------------------------
+
+def test_rejected_within_grace_keeps_downloading_for_monitor():
+    import time
+    deps, _ = _build_deps()
+    now = time.time()
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'downloading', 'track_info': {},
+        'filename': 'song.flac', 'username': 'u1',
+        'status_change_time': now - 5,
+    }
+    live = {'u1::song.flac': {'state': 'Completed, Rejected', 'percentComplete': 0}}
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    out = st.build_batch_status_data('b1', batch, live, deps)
+    # inside the grace window — give the monitor its chance, don't fail yet
+    assert out['tasks'][0]['status'] == 'downloading'
+    assert download_tasks['t1']['status'] == 'downloading'
+
+
+def test_rejected_beyond_grace_marks_failed_and_frees_worker():
+    import time
+    completed = []
+    deps, _ = _build_deps()
+    deps.on_download_completed = lambda b, t, s: completed.append((b, t, s))
+    now = time.time()
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'downloading', 'track_info': {},
+        'filename': 'song.flac', 'username': 'u1',
+        # error persisted past the grace, no monitor transition since
+        'status_change_time': now - 130,
+        '_error_state_since': now - (st.ERROR_STATE_TERMINAL_GRACE_SECONDS + 30),
+    }
+    live = {'u1::song.flac': {'state': 'Completed, Rejected', 'errorMessage': 'peer rejected'}}
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    out = st.build_batch_status_data('b1', batch, live, deps)
+    assert out['tasks'][0]['status'] == 'failed'
+    assert download_tasks['t1']['status'] == 'failed'
+    assert download_tasks['t1']['error_message'] == 'peer rejected'
+    time.sleep(0.05)  # completion callback runs on a daemon thread
+    assert completed == [('b1', 't1', False)]  # batch can now finish
+
+
+def test_manual_pick_rejected_fails_immediately_without_grace():
+    import time
+    deps, _ = _build_deps()
+    now = time.time()
+    download_tasks['t1'] = {
+        'track_index': 0, 'status': 'downloading', 'track_info': {},
+        'filename': 'song.flac', 'username': 'u1',
+        '_user_manual_pick': True, 'status_change_time': now,
+    }
+    live = {'u1::song.flac': {'state': 'Completed, Rejected'}}
+    batch = {'phase': 'downloading', 'queue': ['t1']}
+    out = st.build_batch_status_data('b1', batch, live, deps)
+    assert out['tasks'][0]['status'] == 'failed'  # immediate, no 60s wait
+    assert download_tasks['t1']['status'] == 'failed'

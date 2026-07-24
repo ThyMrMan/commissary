@@ -1,0 +1,3554 @@
+// INITIALIZATION
+// ===============================
+let navigationEpoch = 0;
+let _optimisticNavPageId = null;
+
+// Schedule heavy per-page init during browser idle time so navigation paints and
+// the page becomes scrollable first. timeout caps the delay so content still loads
+// promptly. Falls back to a macrotask in browsers without requestIdleCallback.
+function _scheduleHeavyInit(fn) {
+    if (typeof requestIdleCallback === 'function') {
+        requestIdleCallback(fn, { timeout: 200 });
+    } else {
+        setTimeout(fn, 0);
+    }
+}
+
+function notifyPageWillChange(nextPageId) {
+    const fromPageId = typeof currentPage === 'string' ? currentPage : null;
+    if (fromPageId === nextPageId) return;
+
+    window.dispatchEvent(
+        new CustomEvent(PAGE_WILL_CHANGE_EVENT, {
+            detail: {
+                fromPageId,
+                toPageId: nextPageId,
+            },
+        }),
+    );
+}
+
+// ---- Accent Color System ----
+
+function getAccentFallbackColors() {
+    let accent = localStorage.getItem('soulsync-accent') || '#1db954';
+    if (!/^#[0-9a-fA-F]{6}$/.test(accent)) accent = '#1db954';
+    // Compute a lighter variant for the second color
+    const r = parseInt(accent.slice(1, 3), 16), g = parseInt(accent.slice(3, 5), 16), b = parseInt(accent.slice(5, 7), 16);
+    const lighter = '#' + [Math.min(r + 20, 255), Math.min(g + 30, 255), Math.min(b + 12, 255)]
+        .map(v => v.toString(16).padStart(2, '0')).join('');
+    return [accent, lighter];
+}
+
+function applyAccentColor(hex) {
+    // Validate hex format — reject corrupt values
+    if (typeof hex !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(hex)) {
+        hex = '#1db954'; // fallback to default
+    }
+    // Convert hex to RGB
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+
+    // Convert RGB to HSL
+    const rn = r / 255, gn = g / 255, bn = b / 255;
+    const max = Math.max(rn, gn, bn), min = Math.min(rn, gn, bn);
+    const l = (max + min) / 2;
+    let h = 0, s = 0;
+    if (max !== min) {
+        const d = max - min;
+        s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+        if (max === rn) h = ((gn - bn) / d + (gn < bn ? 6 : 0)) / 6;
+        else if (max === gn) h = ((bn - rn) / d + 2) / 6;
+        else h = ((rn - gn) / d + 4) / 6;
+    }
+
+    // Compute light variant: +16% lightness
+    const lightL = Math.min(l + 0.16, 0.95);
+    // Compute neon variant: high lightness + boosted saturation
+    const neonL = Math.min(l + 0.30, 0.95);
+    const neonS = Math.min(s + 0.1, 1.0);
+
+    function hslToRgb(h, s, l) {
+        if (s === 0) { const v = Math.round(l * 255); return [v, v, v]; }
+        const hue2rgb = (p, q, t) => {
+            if (t < 0) t += 1; if (t > 1) t -= 1;
+            if (t < 1 / 6) return p + (q - p) * 6 * t;
+            if (t < 1 / 2) return q;
+            if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+            return p;
+        };
+        const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+        const p = 2 * l - q;
+        return [Math.round(hue2rgb(p, q, h + 1 / 3) * 255),
+        Math.round(hue2rgb(p, q, h) * 255),
+        Math.round(hue2rgb(p, q, h - 1 / 3) * 255)];
+    }
+
+    const light = hslToRgb(h, s, lightL);
+    const neon = hslToRgb(h, neonS, neonL);
+
+    const root = document.documentElement.style;
+    root.setProperty('--accent-rgb', `${r}, ${g}, ${b}`);
+    root.setProperty('--accent-light-rgb', `${light[0]}, ${light[1]}, ${light[2]}`);
+    root.setProperty('--accent-neon-rgb', `${neon[0]}, ${neon[1]}, ${neon[2]}`);
+
+    // Store for instant restore on next page load
+    localStorage.setItem('soulsync-accent', hex);
+
+    // Update preview swatch if it exists
+    const swatch = document.getElementById('accent-preview-swatch');
+    if (swatch) swatch.style.background = hex;
+}
+
+function applyParticlesSetting(enabled) {
+    const canvas = document.getElementById('page-particles-canvas');
+    if (canvas) canvas.style.display = enabled ? '' : 'none';
+    if (window.pageParticles) {
+        if (enabled) {
+            const activePage = document.querySelector('.page.active');
+            if (activePage) {
+                window.pageParticles.setPage(activePage.id.replace('-page', ''));
+            }
+        } else {
+            window.pageParticles.stop();
+        }
+    }
+    window._particlesEnabled = enabled;
+    localStorage.setItem('soulsync-particles', String(enabled));
+}
+
+function applyWorkerOrbsSetting(enabled) {
+    window._workerOrbsEnabled = enabled;
+    localStorage.setItem('soulsync-worker-orbs', String(enabled));
+    if (window.workerOrbs) {
+        if (enabled) {
+            const activePage = document.querySelector('.page.active');
+            if (activePage && activePage.id === 'dashboard-page') {
+                window.workerOrbs.setPage('dashboard');
+            }
+        } else {
+            window.workerOrbs.setPage('_disabled');
+        }
+    }
+}
+
+function initAccentColorListeners() {
+    const presetSelect = document.getElementById('accent-preset');
+    const customGroup = document.getElementById('custom-color-group');
+    const customPicker = document.getElementById('accent-custom-color');
+    if (!presetSelect) return;
+
+    presetSelect.addEventListener('change', () => {
+        const val = presetSelect.value;
+        if (val === 'custom') {
+            if (customGroup) customGroup.style.display = '';
+            if (customPicker) applyAccentColor(customPicker.value);
+        } else {
+            if (customGroup) customGroup.style.display = 'none';
+            applyAccentColor(val);
+        }
+    });
+
+    if (customPicker) {
+        customPicker.addEventListener('input', () => {
+            applyAccentColor(customPicker.value);
+        });
+    }
+
+    // Particles toggle — apply immediately on change
+    const particlesCheckbox = document.getElementById('particles-enabled');
+    if (particlesCheckbox) {
+        particlesCheckbox.addEventListener('change', () => {
+            applyParticlesSetting(particlesCheckbox.checked);
+        });
+    }
+
+    // Worker orbs toggle — apply immediately on change
+    const workerOrbsCheckbox = document.getElementById('worker-orbs-enabled');
+    if (workerOrbsCheckbox) {
+        workerOrbsCheckbox.addEventListener('change', () => {
+            applyWorkerOrbsSetting(workerOrbsCheckbox.checked);
+        });
+    }
+
+    // Reduce effects toggle — apply immediately on change
+    const reduceEffectsCheckbox = document.getElementById('reduce-effects-enabled');
+    if (reduceEffectsCheckbox) {
+        reduceEffectsCheckbox.addEventListener('change', () => {
+            applyReduceEffects(reduceEffectsCheckbox.checked);
+        });
+    }
+
+    // Max Performance toggle — apply immediately on change
+    const maxPerfCheckbox = document.getElementById('max-performance-enabled');
+    if (maxPerfCheckbox) {
+        maxPerfCheckbox.addEventListener('change', () => {
+            applyMaxPerformance(maxPerfCheckbox.checked);
+        });
+    }
+}
+
+function applyReduceEffects(enabled) {
+    if (enabled) {
+        document.body.classList.add('reduce-effects');
+    } else {
+        document.body.classList.remove('reduce-effects');
+    }
+    window._reduceEffectsActive = enabled;
+    localStorage.setItem('soulsync-reduce-effects', enabled ? '1' : '0');
+
+    // Reduce Visual Effects is a full performance switch: also halt the canvas
+    // animation loops (particles + worker orbs), not just CSS effects.
+    const pcanvas = document.getElementById('page-particles-canvas');
+    if (enabled) {
+        if (window.pageParticles) window.pageParticles.stop();
+        if (pcanvas) pcanvas.style.display = 'none';
+        if (window.workerOrbs) window.workerOrbs.setPage('_disabled');
+    } else {
+        // Restore only what the user's own toggles still allow.
+        const activePage = document.querySelector('.page.active');
+        const activeId = activePage ? activePage.id.replace('-page', '') : null;
+        if (window._particlesEnabled !== false) {
+            if (pcanvas) pcanvas.style.display = '';
+            if (window.pageParticles && activeId) window.pageParticles.setPage(activeId);
+        }
+        if (window._workerOrbsEnabled !== false && window.workerOrbs && activeId) {
+            window.workerOrbs.setPage(activeId);
+        }
+    }
+}
+
+// Max Performance overrides Worker Orbs / Particles / Reduce Effects, so while it's
+// on we lock those checkboxes (greyed + visually off) and restore them when it's
+// off. We never fire their change handlers, so the user's real saved prefs
+// (window._workerOrbsEnabled / _particlesEnabled / the reduce-effects localStorage)
+// stay intact — saving reads those, not these forced-off boxes.
+function _syncMaxPerfDependentToggles(maxPerfOn) {
+    const ids = ['worker-orbs-enabled', 'particles-enabled', 'reduce-effects-enabled'];
+    ids.forEach(id => {
+        const cb = document.getElementById(id);
+        if (!cb) return;
+        const group = cb.closest('.form-group');
+        if (maxPerfOn) {
+            cb.disabled = true;
+            cb.checked = false;
+            if (group) group.classList.add('setting-overridden');
+        } else {
+            cb.disabled = false;
+            if (group) group.classList.remove('setting-overridden');
+            // Restore each box to the user's real per-device preference.
+            if (id === 'worker-orbs-enabled') cb.checked = window._workerOrbsEnabled !== false;
+            else if (id === 'particles-enabled') cb.checked = window._particlesEnabled === true;
+            else if (id === 'reduce-effects-enabled') cb.checked = localStorage.getItem('soulsync-reduce-effects') === '1';
+        }
+    });
+}
+
+// Max Performance — the nuclear low-power switch for software-rendered / no-GPU
+// setups (e.g. Docker). Superset of Reduce Visual Effects: body.max-performance CSS
+// kills the expensive GPU properties AND all animation/transitions, while here we
+// halt every JS canvas loop (particles + worker orbs; cursor-glow + API sparks gate
+// on window._maxPerfActive themselves).
+function applyMaxPerformance(enabled) {
+    if (enabled) {
+        document.body.classList.add('max-performance');
+    } else {
+        document.body.classList.remove('max-performance');
+    }
+    window._maxPerfActive = enabled;
+    localStorage.setItem('soulsync-max-performance', enabled ? '1' : '0');
+
+    const pcanvas = document.getElementById('page-particles-canvas');
+    if (enabled) {
+        if (window.pageParticles) window.pageParticles.stop();
+        if (pcanvas) pcanvas.style.display = 'none';
+        if (window.workerOrbs) window.workerOrbs.setPage('_disabled');
+    } else {
+        // Restore whatever the user's own toggles (and reduce-effects) still allow.
+        const reduce = window._reduceEffectsActive === true;
+        const activePage = document.querySelector('.page.active');
+        const activeId = activePage ? activePage.id.replace('-page', '') : null;
+        if (!reduce && window._particlesEnabled !== false) {
+            if (pcanvas) pcanvas.style.display = '';
+            if (window.pageParticles && activeId) window.pageParticles.setPage(activeId);
+        }
+        if (window._workerOrbsEnabled !== false && window.workerOrbs && activeId) {
+            window.workerOrbs.setPage(activeId);
+        }
+    }
+    _syncMaxPerfDependentToggles(enabled);
+}
+
+// Bootstrap accent and reduce-effects from localStorage instantly (prevents flash)
+(function () {
+    // Auto performance mode on likely-weak hardware. Only acts when this device has
+    // NO stored preference yet (null) — so it runs at most once and never overrides
+    // a choice the user (or a prior auto-run) made. Device-scoped via localStorage on
+    // purpose: a weak laptop shouldn't flip the server setting for the user's other
+    // machines. Mobile already disables these effects elsewhere, so skip it here.
+    if (localStorage.getItem('soulsync-reduce-effects') === null) {
+        const ua = navigator.userAgent || '';
+        const isMobile = window.innerWidth <= 768 || /Mobi|Android|iPhone|iPad|iPod/i.test(ua);
+        const cores = navigator.hardwareConcurrency || 0;   // widely supported
+        const mem = navigator.deviceMemory || 0;            // Chromium only; 0 elsewhere
+        // Conservative — avoid flagging capable machines: <=2 cores, or <=2GB, or a
+        // low-mid box that's low on BOTH (<=4 cores AND <=4GB). A 4-core/8GB laptop
+        // (mem>4) is NOT flagged; Firefox/Safari (mem unknown) only trip on <=2 cores.
+        const weak = !isMobile && (
+            (cores > 0 && cores <= 2) ||
+            (mem > 0 && mem <= 2) ||
+            (cores > 0 && cores <= 4 && mem > 0 && mem <= 4)
+        );
+        if (weak) {
+            localStorage.setItem('soulsync-reduce-effects', '1');
+            window._autoPerfModeApplied = true;   // show the explainer toast once the UI is up
+        }
+    }
+
+    if (window._autoPerfModeApplied) {
+        // Toast lives in downloads.js (loaded separately) — retry until it's defined.
+        const fireToast = (tries) => {
+            if (typeof showToast === 'function') {
+                showToast('Performance mode is on — this looks like a lower-power device. ' +
+                          'Turn effects back on in Settings → Appearance.', 'info');
+            } else if (tries < 40) {
+                setTimeout(() => fireToast(tries + 1), 250);
+            }
+        };
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => fireToast(0));
+        } else {
+            fireToast(0);
+        }
+    }
+
+    const reduceEffectsSaved = localStorage.getItem('soulsync-reduce-effects');
+    if (reduceEffectsSaved === '1') {
+        document.body.classList.add('reduce-effects');
+        window._reduceEffectsActive = true;
+    } else if (reduceEffectsSaved === '0') {
+        document.body.classList.remove('reduce-effects');
+        window._reduceEffectsActive = false;
+    } else if (window._reduceEffectsActive) {
+        document.body.classList.add('reduce-effects');
+    }
+    // Max Performance — device-scoped (localStorage wins over the server default,
+    // same as reduce-effects). The window flag is seeded server-side in index.html
+    // for a flash-free first paint; localStorage reconciles it here.
+    const maxPerfSaved = localStorage.getItem('soulsync-max-performance');
+    if (maxPerfSaved === '1') {
+        document.body.classList.add('max-performance');
+        window._maxPerfActive = true;
+    } else if (maxPerfSaved === '0') {
+        document.body.classList.remove('max-performance');
+        window._maxPerfActive = false;
+    } else if (window._maxPerfActive) {
+        document.body.classList.add('max-performance');
+    }
+    const saved = localStorage.getItem('soulsync-accent');
+    if (saved) applyAccentColor(saved);
+    // Bootstrap particles setting from localStorage — OFF by default (continuous
+    // full-page canvas = real GPU cost); only on when the user explicitly enabled it.
+    const particlesSaved = localStorage.getItem('soulsync-particles');
+    if (particlesSaved === 'true') {
+        window._particlesEnabled = true;
+    } else if (particlesSaved === 'false') {
+        window._particlesEnabled = false;
+    } else if (typeof window._particlesEnabled !== 'boolean') {
+        window._particlesEnabled = false;
+    }
+    if (!window._particlesEnabled) {
+        const canvas = document.getElementById('page-particles-canvas');
+        if (canvas) canvas.style.display = 'none';
+    }
+    // Bootstrap worker orbs setting from localStorage
+    const workerOrbsSaved = localStorage.getItem('soulsync-worker-orbs');
+    if (workerOrbsSaved === 'false') {
+        window._workerOrbsEnabled = false;
+    } else if (workerOrbsSaved === 'true') {
+        window._workerOrbsEnabled = true;
+    } else if (typeof window._workerOrbsEnabled !== 'boolean') {
+        window._workerOrbsEnabled = true;
+    }
+})();
+
+async function bootstrapServerAppearanceSettings() {
+    try {
+        const response = await fetch('/api/settings', { credentials: 'same-origin' });
+        const settings = await response.json();
+        if (!response.ok || !settings || typeof settings !== 'object' || settings.error) return;
+
+        const appearance = settings.ui_appearance || {};
+        const preset = appearance.accent_preset || '#1db954';
+        const custom = appearance.accent_color || '#1db954';
+        const accent = preset === 'custom' ? custom : preset;
+        applyAccentColor(accent);
+
+        if (Object.prototype.hasOwnProperty.call(appearance, 'particles_enabled')) {
+            applyParticlesSetting(appearance.particles_enabled !== false);
+        }
+        if (Object.prototype.hasOwnProperty.call(appearance, 'worker_orbs_enabled')) {
+            applyWorkerOrbsSetting(appearance.worker_orbs_enabled !== false);
+        }
+        if (localStorage.getItem('soulsync-reduce-effects') === null) {
+            applyReduceEffects(appearance.reduce_effects === true);
+        }
+    } catch (error) {
+        console.warn('Could not bootstrap appearance settings:', error);
+    }
+}
+
+bootstrapServerAppearanceSettings();
+
+// ── Password-manager autofill suppression ──────────────────────────────
+// Bitwarden / 1Password / LastPass etc. attach an inline autofill overlay to
+// every <input>/<select>/<textarea> and REBUILD it on every DOM mutation. This
+// app mutates the DOM continuously (live service status, download/automation
+// progress bars, the per-second "next run" countdown, innerHTML hub rebuilds),
+// so the managers' whole-document MutationObserver storms the main thread. A
+// captured DevTools trace (2026-06-29) showed Bitwarden's
+// bootstrap-autofill-overlay.js (setupOverlayOnField / setupOverlayListeners)
+// using ~6× the CPU of the entire SoulSync app — almost the whole freeze.
+//
+// None of these fields are credentials (they're search boxes, filters, config),
+// so we mark them ignored and the managers skip them: once a field carries the
+// ignore hint, the overlay is never (re)attached, so the mutation→re-setup storm
+// stops. Real sign-in fields (password type + the auth overlays) are left alone
+// so the user can still autofill the login / PIN screen. Purely additive data-*
+// attributes — no functional effect on the app, and a no-op for any manager that
+// doesn't honour them.
+(function suppressPasswordManagerAutofill() {
+    const SKIP_CONTAINERS = ['#login-overlay', '#launch-pin-overlay', '#profile-pin-dialog'];
+    const isCredentialField = (el) => {
+        if (el.type === 'password') return true;
+        return SKIP_CONTAINERS.some(sel => typeof el.closest === 'function' && el.closest(sel));
+    };
+    const IGNORE_ATTRS = ['data-bwignore', 'data-1p-ignore', 'data-lpignore', 'data-form-type'];
+    const tag = (el) => {
+        if (el.dataset.pmTagged) return;            // tagged once — never touch again
+        if (isCredentialField(el)) return;          // leave real login fields for the manager
+        el.dataset.pmTagged = '1';
+        el.setAttribute('data-bwignore', 'true');   // Bitwarden
+        el.setAttribute('data-1p-ignore', '');      // 1Password
+        el.setAttribute('data-lpignore', 'true');   // LastPass
+        el.setAttribute('data-form-type', 'other'); // Dashlane
+        if (!el.hasAttribute('autocomplete')) el.setAttribute('autocomplete', 'off');
+    };
+    const sweep = () => {
+        document.querySelectorAll(
+            'input:not([data-pm-tagged]),textarea:not([data-pm-tagged]),select:not([data-pm-tagged])'
+        ).forEach(tag);
+    };
+
+    // Debounce: a burst of DOM mutations triggers at most one sweep per idle slot.
+    // The `:not([data-pm-tagged])` selector makes the steady-state sweep a no-op
+    // (it only ever processes freshly-added inputs), and our own attribute writes
+    // don't re-arm the observer (it watches childList, not attributes).
+    let pending = false, observer = null, disabled = false;
+    const scheduleSweep = () => {
+        if (disabled || pending) return;
+        pending = true;
+        const run = () => { pending = false; if (!disabled) sweep(); };
+        if (typeof requestIdleCallback === 'function') requestIdleCallback(run, { timeout: 400 });
+        else setTimeout(run, 300);
+    };
+
+    const startObserving = () => {
+        if (observer) return;
+        observer = new MutationObserver(scheduleSweep);
+        observer.observe(document.body, { childList: true, subtree: true });
+    };
+    const start = () => { sweep(); startObserving(); };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+    else start();
+
+    // Benchmark hook (not used by the app): toggle the suppression at runtime so a
+    // before/after can be measured without rebuilding. disable() strips the ignore
+    // hints + stops the observer, so password managers re-attach their autofill
+    // overlay — i.e. the pre-fix "before" behaviour. enable() re-tags + resumes.
+    window.__pmSuppress = {
+        disable() {
+            disabled = true;
+            if (observer) { observer.disconnect(); observer = null; }
+            document.querySelectorAll('[data-pm-tagged]').forEach((el) => {
+                IGNORE_ATTRS.forEach((a) => el.removeAttribute(a));
+                delete el.dataset.pmTagged;
+            });
+        },
+        enable() {
+            disabled = false;
+            sweep();
+            startObserving();
+        },
+        get isActive() { return !disabled; },
+    };
+})();
+
+// ── Profile System ─────────────────────────────────────────────
+let currentProfile = null;
+const PROFILE_CONTEXT_CHANGED_EVENT = 'ss:webui-profile-context-changed';
+
+function notifyProfileContextChanged() {
+    window.dispatchEvent(new CustomEvent(PROFILE_CONTEXT_CHANGED_EVENT));
+}
+
+function setCurrentProfile(profile) {
+    currentProfile = profile;
+    updateProfileIndicator();
+    notifyProfileContextChanged();
+}
+
+// Temporary compatibility shim until existing profile rows are migrated to
+// the current page ids.
+const LEGACY_PROFILE_PAGE_ALIASES = {
+    downloads: 'search',
+    artists: 'search',
+};
+
+function normalizeProfilePageId(pageId) {
+    return LEGACY_PROFILE_PAGE_ALIASES[pageId] || pageId;
+}
+
+function normalizeProfilePageList(pageIds) {
+    if (!Array.isArray(pageIds)) return pageIds;
+    return pageIds.map(normalizeProfilePageId);
+}
+
+function getProfileHomePage() {
+    if (!currentProfile) return 'dashboard';
+    if (currentProfile.home_page) return normalizeProfilePageId(currentProfile.home_page);
+    return currentProfile.is_admin ? 'dashboard' : 'discover';
+}
+
+function isPageAllowed(pageId) {
+    if (!currentProfile) return true;
+    if (currentProfile.id === 1) return true;
+    const normalizedPageId = normalizeProfilePageId(pageId);
+    if (normalizedPageId === 'help' || normalizedPageId === 'issues') return true;
+    if (normalizedPageId === 'settings') return currentProfile.is_admin;
+    if (normalizedPageId === 'artist-detail') {
+        const ap = normalizeProfilePageList(currentProfile.allowed_pages);
+        if (!ap) return true;
+        return ap.includes('library') || ap.includes('search');
+    }
+    if (normalizedPageId === 'label-detail') {
+        const ap = normalizeProfilePageList(currentProfile.allowed_pages);
+        if (!ap) return true;
+        return ap.includes('search') || ap.includes('watchlist') || ap.includes('library');
+    }
+    const ap = normalizeProfilePageList(currentProfile.allowed_pages);
+    if (!ap) return true; // null = all pages
+    if (ap.includes(normalizedPageId)) return true;
+    return false;
+}
+
+function canDownload() {
+    if (!currentProfile) return true;
+    if (currentProfile.id === 1) return true;
+    return currentProfile.can_download !== false && currentProfile.can_download !== 0;
+}
+
+function getCurrentProfileContext() {
+    if (!currentProfile) return null;
+    return {
+        profileId: currentProfile.id,
+        isAdmin: !!currentProfile.is_admin,
+    };
+}
+
+function activatePage(pageId, options = {}) {
+    const forceReload = options.forceReload === true;
+    const pageElement = document.getElementById(`${pageId}-page`);
+    const isPageVisible = pageElement ? pageElement.classList.contains('active') : false;
+
+    if (!forceReload && pageId === currentPage && isPageVisible) return;
+
+    showLegacyPage(pageId);
+    setActivePageChrome(pageId);
+    loadPageData(pageId);
+}
+
+function renderProfileAvatar(el, profile) {
+    // Renders avatar as image (if avatar_url set) or colored initial fallback
+    // Preserves existing classes, ensures 'profile-avatar' is present
+    if (!el.classList.contains('profile-avatar') && !el.classList.contains('profile-indicator-avatar') && !el.classList.contains('profile-pin-avatar')) {
+        el.className = 'profile-avatar';
+    }
+    el.style.background = profile.avatar_color || '#6366f1';
+    el.textContent = '';
+    if (profile.avatar_url) {
+        const img = document.createElement('img');
+        img.src = profile.avatar_url;
+        img.alt = profile.name;
+        img.className = 'profile-avatar-img';
+        img.onerror = () => {
+            img.remove();
+            el.textContent = profile.name.charAt(0).toUpperCase();
+        };
+        el.appendChild(img);
+    } else {
+        el.textContent = profile.name.charAt(0).toUpperCase();
+    }
+}
+
+async function initProfileSystem() {
+    try {
+        // Check if a session already has a profile selected
+        const currentRes = await fetch('/api/profiles/current');
+        const currentData = await currentRes.json();
+        // Login mode: show the sign-in screen and defer everything else until
+        // the user authenticates.
+        if (currentData.login_required) {
+            showLoginScreen();
+            return false;
+        }
+        if (currentData.success && currentData.profile) {
+            setCurrentProfile(currentData.profile);
+
+            // Login mode → reveal the Sign out button in the profile bar.
+            if (currentData.login_mode) {
+                const lb = document.getElementById('logout-btn');
+                if (lb) lb.style.display = '';
+            }
+
+            // Check if launch PIN is required
+            if (currentData.launch_pin_required) {
+                showLaunchPinScreen();
+                return false; // Defer app init until PIN verified
+            }
+
+            return true; // Profile already selected, skip picker
+        }
+
+        // Fetch all profiles
+        const res = await fetch('/api/profiles');
+        const data = await res.json();
+        const profiles = data.profiles || [];
+
+        if (profiles.length === 0) {
+            // No profiles yet — auto-select admin profile 1
+            await selectProfile(1);
+            return true;
+        }
+
+        if (profiles.length === 1) {
+            // Only one profile — always auto-select (PIN only matters with multiple profiles)
+            await selectProfile(profiles[0].id);
+
+            // Re-check for launch PIN after auto-select
+            const recheck = await fetch('/api/profiles/current');
+            const recheckData = await recheck.json();
+            if (recheckData.launch_pin_required) {
+                showLaunchPinScreen();
+                return false;
+            }
+
+            return true;
+        }
+
+        // Multiple profiles or PIN required — show picker
+        showProfilePicker(profiles);
+        return false; // App init deferred until profile selected
+    } catch (e) {
+        console.error('Profile init error:', e);
+        return true; // Fall through to normal init
+    }
+}
+
+// ── Login Screen (username/password mode) ──────────────────────────────
+
+function showLoginScreen() {
+    const overlay = document.getElementById('login-overlay');
+    if (!overlay) return;
+    // Hide the entire app while locked, so removing the overlay (Safari "Hide
+    // Distracting Items", devtools) reveals nothing — not even the empty chrome.
+    // initApp() reveals it again on a successful sign-in (#852).
+    document.body.classList.add('app-locked');
+    overlay.style.display = 'flex';
+    const u = document.getElementById('login-username');
+    if (u) setTimeout(() => u.focus(), 50);
+}
+
+async function submitLogin() {
+    const username = (document.getElementById('login-username')?.value || '').trim();
+    const password = document.getElementById('login-password')?.value || '';
+    const errEl = document.getElementById('login-error');
+    const btn = document.getElementById('login-submit');
+    const showErr = (msg) => { if (errEl) { errEl.textContent = msg; errEl.style.display = 'block'; } };
+    if (errEl) errEl.style.display = 'none';
+    if (!username || !password) { showErr('Enter your username and password'); return; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Signing in...'; }
+    try {
+        const res = await fetch('/api/auth/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password }),
+        });
+        const data = await res.json();
+        if (data.success) {
+            window.location.reload();   // authenticated → reload into the app
+        } else {
+            showErr(res.status === 429 ? 'Too many attempts — wait a moment.' : (data.error || 'Sign in failed'));
+            if (btn) { btn.disabled = false; btn.textContent = 'Sign in'; }
+        }
+    } catch (e) {
+        showErr('Connection error');
+        if (btn) { btn.disabled = false; btn.textContent = 'Sign in'; }
+    }
+}
+
+async function soulsyncLogout() {
+    try { await fetch('/api/auth/logout', { method: 'POST' }); } catch (e) { /* reload anyway */ }
+    window.location.reload();
+}
+
+function showLoginRecovery() {
+    const entry = document.getElementById('login-entry');
+    const rec = document.getElementById('login-recovery');
+    if (entry) entry.style.display = 'none';
+    if (rec) rec.style.display = 'block';
+    const u = document.getElementById('recovery-username');
+    const lu = document.getElementById('login-username');
+    if (u && lu && lu.value) u.value = lu.value;
+    const errEl = document.getElementById('recovery-error');
+    if (errEl) errEl.style.display = 'none';
+}
+
+function showLoginEntry() {
+    const entry = document.getElementById('login-entry');
+    const rec = document.getElementById('login-recovery');
+    if (rec) rec.style.display = 'none';
+    if (entry) entry.style.display = 'block';
+}
+
+async function fetchRecoveryQuestion() {
+    const username = (document.getElementById('recovery-username')?.value || '').trim();
+    const errEl = document.getElementById('recovery-error');
+    const section = document.getElementById('recovery-answer-section');
+    const qText = document.getElementById('recovery-question-text');
+    const showErr = (m) => { if (errEl) { errEl.textContent = m; errEl.style.display = 'block'; } };
+    if (errEl) errEl.style.display = 'none';
+    if (!username) { showErr('Enter your username'); return; }
+    try {
+        const res = await fetch('/api/auth/recovery-question?username=' + encodeURIComponent(username));
+        const data = await res.json();
+        if (data.success && data.question) {
+            if (qText) qText.textContent = data.question;
+            if (section) section.style.display = 'block';
+        } else {
+            showErr('No recovery question is set for that account.');
+        }
+    } catch (e) { showErr('Connection error'); }
+}
+
+async function submitRecoveryReset() {
+    const username = (document.getElementById('recovery-username')?.value || '').trim();
+    const answer = document.getElementById('recovery-answer')?.value || '';
+    const newPassword = document.getElementById('recovery-new-password')?.value || '';
+    const confirmPassword = document.getElementById('recovery-new-password-confirm')?.value || '';
+    const errEl = document.getElementById('recovery-error');
+    const showErr = (m) => { if (errEl) { errEl.textContent = m; errEl.style.display = 'block'; } };
+    if (errEl) errEl.style.display = 'none';
+    if (!answer || !newPassword) { showErr('Enter your answer and a new password'); return; }
+    if (newPassword.length < 6) { showErr('New password must be at least 6 characters'); return; }
+    if (newPassword !== confirmPassword) { showErr('Passwords do not match'); return; }
+    try {
+        const res = await fetch('/api/auth/recovery-reset', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, answer, new_password: newPassword }),
+        });
+        const data = await res.json();
+        if (data.success) { window.location.reload(); }
+        else { showErr(res.status === 429 ? 'Too many attempts — wait a moment.' : (data.error || 'Reset failed')); }
+    } catch (e) { showErr('Connection error'); }
+}
+
+// ── Launch PIN Lock Screen ─────────────────────────────────────────────
+
+function showLaunchPinScreen() {
+    const overlay = document.getElementById('launch-pin-overlay');
+    if (!overlay) return;
+    // Hide the whole app while locked — bypassing the overlay reveals nothing (#852).
+    document.body.classList.add('app-locked');
+    overlay.style.display = 'flex';
+
+    const input = document.getElementById('launch-pin-input');
+    const submit = document.getElementById('launch-pin-submit');
+    const error = document.getElementById('launch-pin-error');
+
+    input.value = '';
+    error.style.display = 'none';
+    setTimeout(() => input.focus(), 100);
+
+    const doSubmit = async () => {
+        const pin = input.value.trim();
+        if (!pin) return;
+
+        submit.disabled = true;
+        submit.textContent = 'Verifying...';
+
+        try {
+            const res = await fetch('/api/profiles/verify-launch-pin', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ pin })
+            });
+            const data = await res.json();
+
+            if (data.success) {
+                // Server session flag set by verify endpoint — consumed on next /api/profiles/current call
+                overlay.style.display = 'none';
+                initApp(); // Now safe to load the full app
+            } else {
+                error.textContent = data.error || 'Invalid PIN';
+                error.style.display = 'block';
+                input.value = '';
+                input.focus();
+                // Shake animation
+                overlay.querySelector('.launch-pin-container').classList.add('shake');
+                setTimeout(() => overlay.querySelector('.launch-pin-container').classList.remove('shake'), 500);
+            }
+        } catch (e) {
+            error.textContent = 'Connection error';
+            error.style.display = 'block';
+        }
+
+        submit.disabled = false;
+        submit.textContent = 'Unlock';
+    };
+
+    // Remove old listeners to prevent stacking
+    const newSubmit = submit.cloneNode(true);
+    submit.parentNode.replaceChild(newSubmit, submit);
+    newSubmit.addEventListener('click', doSubmit);
+
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') doSubmit();
+    });
+}
+
+// ── Security Settings Helpers ──────────────────────────────────────────
+
+async function saveLoginPassword() {
+    const input = document.getElementById('security-login-password');
+    const confirmInput = document.getElementById('security-login-password-confirm');
+    const msg = document.getElementById('security-login-password-msg');
+    const password = input?.value || '';
+    const confirm = confirmInput?.value || '';
+    const show = (text, ok) => {
+        if (!msg) return;
+        msg.textContent = text;
+        msg.style.color = ok ? '#4caf50' : '#ff5252';
+        msg.style.display = 'block';
+    };
+    if (!password || password.length < 6) { show('Password must be at least 6 characters', false); return; }
+    if (password !== confirm) { show('Passwords do not match', false); return; }
+    try {
+        const res = await fetch('/api/profiles/1/set-password', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password }),
+        });
+        const data = await res.json();
+        if (data.success) {
+            show('Admin login password saved', true);
+            if (input) { input.value = ''; input.placeholder = 'Enter a new password to change it'; }
+            if (confirmInput) confirmInput.value = '';
+            updateRequireLoginGate(true);   // Step 1 done → unlock Step 3
+            const st = document.getElementById('security-login-password-status');
+            if (st) st.style.display = 'block';
+        }
+        else show(data.error || 'Failed to save password', false);
+    } catch (e) { show('Connection error', false); }
+}
+
+// Lock/unlock the "Require login" toggle based on whether the admin has a
+// password — makes the prerequisite (anti-lockout) visible instead of a
+// surprise 400 on save.
+function updateRequireLoginGate(hasPassword) {
+    const toggle = document.getElementById('security-require-login');
+    const wrap = document.getElementById('security-login-toggle-wrap');
+    const help = document.getElementById('security-require-login-help');
+    if (!toggle) return;
+    toggle.disabled = !hasPassword;
+    if (!hasPassword) toggle.checked = false;
+    if (wrap) wrap.classList.toggle('security-locked', !hasPassword);
+    if (help) {
+        help.innerHTML = hasPassword
+            ? 'Replaces the profile picker + PIN with a sign-in screen. Best for instances exposed to the internet.'
+            : '🔒 Set the admin password in <strong>Step 1</strong> first — then you can turn this on.';
+    }
+}
+
+// Reflect already-saved login credentials. Passwords are never sent to the
+// browser, so instead of an empty field (which looks unset after a refresh) we
+// show that one is set and pre-fill the saved recovery question.
+function applyLoginSavedState(profile) {
+    const hasPassword = profile?.has_password || false;
+    const hasRecovery = profile?.has_recovery || false;
+    const question = profile?.recovery_question || '';
+
+    const pwStatus = document.getElementById('security-login-password-status');
+    const pwField = document.getElementById('security-login-password');
+    const pwConfirm = document.getElementById('security-login-password-confirm');
+    if (pwStatus) pwStatus.style.display = hasPassword ? 'block' : 'none';
+    if (hasPassword) {
+        if (pwField) pwField.placeholder = 'Enter a new password to change it';
+        if (pwConfirm) pwConfirm.placeholder = 'Confirm new password';
+    }
+
+    const recStatus = document.getElementById('security-recovery-status');
+    const recSel = document.getElementById('security-recovery-question');
+    const recCustom = document.getElementById('security-recovery-custom');
+    const recAnswer = document.getElementById('security-recovery-answer');
+    if (recStatus) {
+        recStatus.style.display = hasRecovery ? 'block' : 'none';
+        recStatus.textContent = hasRecovery
+            ? ('✓ Recovery question saved' + (question ? ': “' + question + '”' : ''))
+            : '';
+    }
+    if (hasRecovery) {
+        if (recSel && question) {
+            recSel.value = question;            // preset options default value = their text
+            if (recSel.value !== question) {    // not a preset → custom question
+                recSel.value = '__custom__';
+                if (recCustom) { recCustom.style.display = 'block'; recCustom.value = question; }
+            }
+        }
+        if (recAnswer) recAnswer.placeholder = 'Enter a new answer to change it';
+    }
+}
+
+function handleRecoveryQuestionChange() {
+    const sel = document.getElementById('security-recovery-question');
+    const custom = document.getElementById('security-recovery-custom');
+    if (sel && custom) custom.style.display = (sel.value === '__custom__') ? 'block' : 'none';
+}
+
+async function saveRecoveryQuestion() {
+    const sel = document.getElementById('security-recovery-question');
+    const custom = document.getElementById('security-recovery-custom');
+    const answer = document.getElementById('security-recovery-answer')?.value || '';
+    const msg = document.getElementById('security-recovery-msg');
+    const show = (text, ok) => {
+        if (!msg) return;
+        msg.textContent = text;
+        msg.style.color = ok ? '#4caf50' : '#ff5252';
+        msg.style.display = 'block';
+    };
+    let question = sel?.value || '';
+    if (question === '__custom__') question = (custom?.value || '').trim();
+    if (!question) { show('Pick or type a question', false); return; }
+    if (!answer.trim()) { show('Enter an answer', false); return; }
+    try {
+        const res = await fetch('/api/profiles/1/set-recovery', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ question, answer }),
+        });
+        const data = await res.json();
+        if (data.success) {
+            show('Recovery question saved', true);
+            const a = document.getElementById('security-recovery-answer');
+            if (a) { a.value = ''; a.placeholder = 'Enter a new answer to change it'; }
+            const rst = document.getElementById('security-recovery-status');
+            if (rst) { rst.style.display = 'block'; rst.textContent = '✓ Recovery question saved: “' + question + '”'; }
+        }
+        else show(data.error || 'Failed to save', false);
+    } catch (e) { show('Connection error', false); }
+}
+
+async function saveSecurityPin() {
+    const pin = document.getElementById('security-new-pin').value;
+    const confirm = document.getElementById('security-confirm-pin').value;
+    const msg = document.getElementById('security-pin-msg');
+
+    if (!pin || pin.length < 4) {
+        msg.textContent = 'PIN must be at least 4 characters';
+        msg.style.display = 'block';
+        msg.style.color = '#ff5252';
+        return;
+    }
+    if (pin !== confirm) {
+        msg.textContent = 'PINs do not match';
+        msg.style.display = 'block';
+        msg.style.color = '#ff5252';
+        return;
+    }
+
+    try {
+        const res = await fetch('/api/profiles/1/set-pin', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin })
+        });
+        const data = await res.json();
+
+        if (data.success) {
+            msg.textContent = 'PIN saved! You can now enable the lock screen.';
+            msg.style.color = '#4caf50';
+            msg.style.display = 'block';
+
+            // Update UI — hide setup, show change, enable toggle
+            document.getElementById('security-pin-setup').style.display = 'none';
+            document.getElementById('security-change-pin-section').style.display = 'block';
+            document.getElementById('security-require-pin').disabled = false;
+
+            // Clear inputs
+            document.getElementById('security-new-pin').value = '';
+            document.getElementById('security-confirm-pin').value = '';
+        } else {
+            msg.textContent = data.error || 'Failed to save PIN';
+            msg.style.color = '#ff5252';
+            msg.style.display = 'block';
+        }
+    } catch (e) {
+        msg.textContent = 'Connection error';
+        msg.style.color = '#ff5252';
+        msg.style.display = 'block';
+    }
+}
+
+function handleSecurityPinToggle(checkbox) {
+    // If trying to enable but no PIN, show the setup section
+    if (checkbox.checked) {
+        const setupSection = document.getElementById('security-pin-setup');
+        if (setupSection.style.display !== 'none' || checkbox.disabled) {
+            checkbox.checked = false;
+            setupSection.style.display = 'block';
+            document.getElementById('security-new-pin').focus();
+            return;
+        }
+    }
+    // Auto-save this setting
+    saveSettings(true);
+}
+
+function showChangeSecurityPin() {
+    document.getElementById('security-pin-setup').style.display = 'block';
+    document.getElementById('security-new-pin').focus();
+}
+
+// ── Forgot PIN Recovery ────────────────────────────────────────────────
+
+function showForgotPinView() {
+    document.getElementById('launch-pin-entry').style.display = 'none';
+    document.getElementById('launch-pin-recovery').style.display = 'block';
+    document.getElementById('launch-recovery-input').value = '';
+    document.getElementById('launch-recovery-error').style.display = 'none';
+    setTimeout(() => document.getElementById('launch-recovery-input').focus(), 100);
+}
+
+function showPinEntryView() {
+    document.getElementById('launch-pin-recovery').style.display = 'none';
+    document.getElementById('launch-pin-entry').style.display = 'block';
+    setTimeout(() => document.getElementById('launch-pin-input').focus(), 100);
+}
+
+async function submitRecoveryCredential() {
+    const input = document.getElementById('launch-recovery-input');
+    const error = document.getElementById('launch-recovery-error');
+    const btn = document.getElementById('launch-recovery-submit');
+    const credential = input.value.trim();
+
+    if (!credential) return;
+
+    btn.disabled = true;
+    btn.textContent = 'Verifying...';
+    error.style.display = 'none';
+
+    try {
+        const res = await fetch('/api/profiles/reset-pin-via-credential', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ credential })
+        });
+        const data = await res.json();
+
+        if (data.success) {
+            sessionStorage.setItem('soulsync_pin_ok', '1');
+            document.getElementById('launch-pin-overlay').style.display = 'none';
+            initApp();
+            setTimeout(() => showToast('PIN cleared. You can set a new one in Settings → Advanced.', 'success'), 1000);
+        } else {
+            error.textContent = data.error || 'Credential not recognized';
+            error.style.display = 'block';
+            input.value = '';
+            input.focus();
+            document.getElementById('launch-pin-container').classList.add('shake');
+            setTimeout(() => document.getElementById('launch-pin-container').classList.remove('shake'), 500);
+        }
+    } catch (e) {
+        error.textContent = 'Connection error';
+        error.style.display = 'block';
+    }
+
+    btn.disabled = false;
+    btn.textContent = 'Verify & Reset PIN';
+}
+
+// ── Profile PIN Forgot Recovery ────────────────────────────────────────
+function showProfileForgotPin() {
+    const dialog = document.getElementById('profile-pin-dialog');
+    const content = dialog.querySelector('.profile-pin-content');
+
+    // Store the profile ID we're recovering for
+    const profileName = document.getElementById('profile-pin-name').textContent;
+
+    // Replace dialog content with recovery form
+    content.dataset.prevHtml = content.innerHTML;
+    content.innerHTML = `
+        <p style="color:#fff;font-size:14px;font-weight:600;margin-bottom:4px">Reset PIN for ${profileName}</p>
+        <p style="color:rgba(255,255,255,0.5);font-size:12px;margin-bottom:12px">Enter any configured API credential<br>(Spotify secret, Plex token, etc.)</p>
+        <input type="password" id="profile-recovery-input" class="profile-pin-input" maxlength="200" placeholder="Paste API credential" autocomplete="off">
+        <div class="profile-pin-buttons">
+            <button id="profile-recovery-cancel" class="profile-pin-cancel">Back</button>
+            <button id="profile-recovery-submit" class="profile-pin-submit">Verify & Reset</button>
+        </div>
+        <p id="profile-recovery-error" class="profile-pin-error" style="display:none"></p>
+    `;
+    setTimeout(() => document.getElementById('profile-recovery-input').focus(), 100);
+
+    document.getElementById('profile-recovery-cancel').onclick = () => {
+        content.innerHTML = content.dataset.prevHtml;
+    };
+
+    document.getElementById('profile-recovery-submit').onclick = async () => {
+        const input = document.getElementById('profile-recovery-input');
+        const error = document.getElementById('profile-recovery-error');
+        const credential = input.value.trim();
+        if (!credential) return;
+
+        const btn = document.getElementById('profile-recovery-submit');
+        btn.disabled = true;
+        btn.textContent = 'Verifying...';
+        error.style.display = 'none';
+
+        try {
+            const res = await fetch('/api/profiles/reset-pin-via-credential', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ credential, profile_id: dialog._profileId || 1 })
+            });
+            const data = await res.json();
+            if (data.success) {
+                dialog.style.display = 'none';
+                content.innerHTML = content.dataset.prevHtml;
+                showToast('PIN cleared. You can set a new one in Settings.', 'success');
+                // Re-try selecting the profile (now PIN-free)
+                if (dialog._profileId) selectProfile(dialog._profileId);
+            } else {
+                error.textContent = data.error || 'Credential not recognized';
+                error.style.display = 'block';
+                input.value = '';
+                input.focus();
+            }
+        } catch (e) {
+            error.textContent = 'Connection error';
+            error.style.display = 'block';
+        }
+        btn.disabled = false;
+        btn.textContent = 'Verify & Reset';
+    };
+
+    document.getElementById('profile-recovery-input').onkeydown = (e) => {
+        if (e.key === 'Enter') document.getElementById('profile-recovery-submit').click();
+    };
+}
+
+function showProfilePicker(profiles, canCancel = false) {
+    const overlay = document.getElementById('profile-picker-overlay');
+    const grid = document.getElementById('profile-picker-grid');
+    const actions = document.getElementById('profile-picker-actions');
+
+    grid.innerHTML = '';
+    profiles.forEach(p => {
+        const card = document.createElement('div');
+        card.className = 'profile-picker-card';
+        const avatarEl = document.createElement('div');
+        renderProfileAvatar(avatarEl, p);
+        card.appendChild(avatarEl);
+        const nameEl = document.createElement('span');
+        nameEl.className = 'profile-name';
+        nameEl.textContent = p.name;
+        card.appendChild(nameEl);
+        if (p.is_admin) {
+            const badge = document.createElement('span');
+            badge.className = 'profile-badge';
+            badge.textContent = 'Admin';
+            card.appendChild(badge);
+        }
+        card.onclick = () => handleProfileClick(p);
+        grid.appendChild(card);
+    });
+
+    // Show actions: admin sees "Manage Profiles", non-admin sees "My Profile" (when they have a profile selected)
+    const isAdmin = currentProfile ? currentProfile.is_admin : false;
+    const manageBtn = document.getElementById('manage-profiles-btn');
+    if (isAdmin) {
+        actions.style.display = '';
+        if (manageBtn) {
+            manageBtn.textContent = 'Manage Profiles';
+            // Reset onclick to admin handler (initProfileManagement sets this, but re-affirm here)
+            manageBtn.onclick = () => {
+                document.getElementById('profile-manage-panel').style.display = 'flex';
+                loadProfileManageList();
+            };
+        }
+    } else if (currentProfile && canCancel) {
+        // Non-admin with an active profile: show "My Profile" to edit own settings
+        actions.style.display = '';
+        if (manageBtn) {
+            manageBtn.textContent = 'My Profile';
+            manageBtn.onclick = () => showSelfEditForm();
+        }
+    } else {
+        actions.style.display = 'none';
+    }
+
+    // Show/remove cancel button when opened from sidebar indicator
+    let cancelBtn = overlay.querySelector('.profile-picker-cancel');
+    if (cancelBtn) cancelBtn.remove();
+    if (canCancel) {
+        cancelBtn = document.createElement('button');
+        cancelBtn.className = 'profile-picker-cancel';
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.onclick = () => hideProfilePicker();
+        actions.parentElement.appendChild(cancelBtn);
+    }
+
+    overlay.style.display = 'flex';
+    document.querySelector('.main-container').style.display = 'none';
+}
+
+async function handleProfileClick(profile) {
+    // Fetch profile count — PIN only matters with multiple profiles
+    let profileCount = 1;
+    try {
+        const r = await fetch('/api/profiles');
+        const d = await r.json();
+        profileCount = (d.profiles || []).length;
+    } catch (e) { }
+
+    if (profile.has_pin && profileCount > 1) {
+        showPinDialog(profile);
+    } else {
+        const wasSwitching = !!currentProfile;
+        await selectProfile(profile.id);
+        if (wasSwitching) {
+            window.location.reload();
+            return;
+        }
+        hideProfilePicker();
+        initApp();
+    }
+}
+
+function showPinDialog(profile) {
+    const dialog = document.getElementById('profile-pin-dialog');
+    const avatar = document.getElementById('profile-pin-avatar');
+    const nameEl = document.getElementById('profile-pin-name');
+    const errorEl = document.getElementById('profile-pin-error');
+    const oldInput = document.getElementById('profile-pin-input');
+    const oldSubmit = document.getElementById('profile-pin-submit');
+    const oldCancel = document.getElementById('profile-pin-cancel');
+
+    // Replace controls on every open so stale listeners from a previous
+    // profile cannot submit the new PIN against the old profile id.
+    const input = oldInput.cloneNode(true);
+    const submit = oldSubmit.cloneNode(true);
+    const cancel = oldCancel.cloneNode(true);
+    oldInput.parentNode.replaceChild(input, oldInput);
+    oldSubmit.parentNode.replaceChild(submit, oldSubmit);
+    oldCancel.parentNode.replaceChild(cancel, oldCancel);
+
+    renderProfileAvatar(avatar, profile);
+    nameEl.textContent = profile.name;
+    input.value = '';
+    errorEl.style.display = 'none';
+    dialog._profileId = profile.id;
+    dialog.style.display = 'flex';
+    setTimeout(() => input.focus(), 100);
+
+    const wasSwitching = !!currentProfile;
+    const handleSubmit = async () => {
+        const pin = input.value;
+        if (!pin) return;
+        submit.disabled = true;
+        submit.textContent = 'Verifying...';
+        try {
+            const res = await fetch('/api/profiles/select', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ profile_id: profile.id, pin })
+            });
+            const data = await res.json();
+            if (data.success) {
+                cleanup();
+                if (wasSwitching) {
+                    window.location.reload();
+                    return;
+                }
+                dialog.style.display = 'none';
+                hideProfilePicker();
+                setCurrentProfile(data.profile);
+                initApp();
+                return;
+            } else {
+                errorEl.textContent = data.error || 'Invalid PIN';
+                errorEl.style.display = '';
+                input.value = '';
+                input.focus();
+            }
+        } catch (e) {
+            errorEl.textContent = 'Connection error';
+            errorEl.style.display = '';
+        }
+        submit.disabled = false;
+        submit.textContent = 'Submit';
+    };
+
+    const handleCancel = () => {
+        dialog.style.display = 'none';
+        cleanup();
+    };
+
+    const handleKeydown = (e) => {
+        if (e.key === 'Enter') handleSubmit();
+        if (e.key === 'Escape') handleCancel();
+    };
+
+    const cleanup = () => {
+        submit.removeEventListener('click', handleSubmit);
+        cancel.removeEventListener('click', handleCancel);
+        input.removeEventListener('keydown', handleKeydown);
+    };
+
+    submit.addEventListener('click', handleSubmit);
+    cancel.addEventListener('click', handleCancel);
+    input.addEventListener('keydown', handleKeydown);
+}
+
+async function selectProfile(profileId) {
+    try {
+        const oldProfileId = currentProfile ? currentProfile.id : null;
+        const res = await fetch('/api/profiles/select', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ profile_id: profileId })
+        });
+        const data = await res.json();
+        if (data.success) {
+            setCurrentProfile(data.profile);
+            // Join profile-scoped WebSocket room for watchlist/wishlist count updates
+            if (socket && socket.connected) {
+                socket.emit('profile:join', { profile_id: profileId, old_profile_id: oldProfileId });
+            }
+            // Invalidate ListenBrainz cache on profile switch (each profile has their own playlists)
+            _invalidateListenBrainzCache();
+        }
+        return data.success;
+    } catch (e) {
+        console.error('Error selecting profile:', e);
+        return false;
+    }
+}
+
+function hideProfilePicker() {
+    document.getElementById('profile-picker-overlay').style.display = 'none';
+    document.querySelector('.main-container').style.display = 'flex';
+}
+
+function updateProfileIndicator() {
+    const indicator = document.getElementById('profile-indicator');
+    if (!currentProfile || !indicator) return;
+
+    const avatar = document.getElementById('profile-indicator-avatar');
+    const name = document.getElementById('profile-indicator-name');
+
+    renderProfileAvatar(avatar, currentProfile);
+    name.textContent = currentProfile.name;
+    indicator.style.display = 'flex';
+
+    // Service Status quick-switch is admin-only — drop the clickable affordance
+    // for non-admins so it doesn't look interactive.
+    const statusSection = document.querySelector('.status-section--clickable');
+    if (statusSection) statusSection.classList.toggle('status-section--locked', !currentProfile.is_admin);
+
+    // My Accounts (per-profile streaming OAuth) and My Settings (per-profile
+    // server library) are inert for admin — admin uses the global app account
+    // for every service and the full Settings page. Hide both for admin; keep
+    // them for non-admins, who actually get a connect/library UI.
+    const myAccountsBtn = document.getElementById('my-accounts-btn');
+    const personalSettingsBtn = document.getElementById('personal-settings-btn');
+    if (myAccountsBtn) myAccountsBtn.style.display = currentProfile.is_admin ? 'none' : '';
+    if (personalSettingsBtn) personalSettingsBtn.style.display = currentProfile.is_admin ? 'none' : '';
+
+    indicator.onclick = async () => {
+        const res = await fetch('/api/profiles');
+        const data = await res.json();
+        if (data.profiles && data.profiles.length > 0) {
+            showProfilePicker(data.profiles, true);
+        }
+    };
+
+    // Filter sidebar pages based on profile permissions
+    document.querySelectorAll('.nav-button[data-page]').forEach(btn => {
+        const page = btn.getAttribute('data-page');
+        if (page === 'hydrabase') return; // Managed by dev mode toggle
+        if (page === 'settings') {
+            // Settings always gated by is_admin
+            btn.style.display = currentProfile.is_admin ? '' : 'none';
+        } else if (page === 'help' || page === 'issues') {
+            btn.style.display = ''; // Always visible
+        } else if (currentProfile.id === 1) {
+            btn.style.display = ''; // Root admin sees all
+        } else {
+            const ap = currentProfile.allowed_pages;
+            btn.style.display = (!ap || ap.includes(page)) ? '' : 'none';
+        }
+    });
+
+    // Video side — same model. Control surfaces (Import, Settings, Automations) are
+    // admin-only; the Overlay Studio launcher is admin-only via a body class (robust
+    // to the dashboard re-rendering it); everything else is a per-profile page toggle
+    // sharing the same allowed_pages list. Help/Issues always visible.
+    const VIDEO_ADMIN_ONLY = ['video-import', 'video-settings', 'video-automations'];
+    document.querySelectorAll('.video-nav .nav-button[data-video-page]').forEach(btn => {
+        const page = btn.getAttribute('data-video-page');
+        if (page === 'video-help' || page === 'video-issues') { btn.style.display = ''; return; }
+        if (VIDEO_ADMIN_ONLY.includes(page)) { btn.style.display = currentProfile.is_admin ? '' : 'none'; return; }
+        if (currentProfile.id === 1) { btn.style.display = ''; return; }
+        const ap = currentProfile.allowed_pages;
+        btn.style.display = (!ap || ap.includes(page)) ? '' : 'none';
+    });
+    document.body.classList.toggle('video-admin', !!currentProfile.is_admin);
+
+    // Toggle download capability
+    if (canDownload()) {
+        document.body.classList.remove('downloads-disabled');
+    } else {
+        document.body.classList.add('downloads-disabled');
+    }
+
+    // Per-profile SIDE access (music | video | both): a single-side profile
+    // never sees the Music↔Video switcher — they just live on their side.
+    // Forcing the side here (boot + every profile switch) also covers a stale
+    // localStorage side from a previous profile on the same browser. The video
+    // API is enforced server-side too; this is the visible half.
+    const sides = profileAllowedSides();
+    const sideToggle = document.querySelector('.side-toggle');
+    if (sideToggle) sideToggle.style.display = sides === 'both' ? '' : 'none';
+    // Keep the pre-paint flash guard in sync: the html-level class (seeded from
+    // this cache by the inline <head> script) hides the switcher on the NEXT
+    // reload before the profile has even been fetched.
+    document.documentElement.classList.toggle('side-locked', sides !== 'both');
+    try { localStorage.setItem('ss_allowed_sides', sides); } catch (e) { /* ignore */ }
+    if (sides !== 'both' &&
+            document.body.getAttribute('data-side') !== sides &&
+            typeof window._switchAppSide === 'function') {
+        window._switchAppSide(sides, { force: true });
+    }
+}
+
+// Per-profile side access — 'music' | 'video' | 'both'. Admins always both;
+// non-admins default to music unless explicitly granted (mirrors the server's
+// get_profile resolution, so a stale payload can't widen access).
+function profileAllowedSides() {
+    if (!currentProfile || currentProfile.is_admin || currentProfile.id === 1) return 'both';
+    const s = currentProfile.allowed_sides;
+    return (s === 'video' || s === 'both') ? s : 'music';
+}
+
+// =====================
+// PERSONAL SETTINGS MODAL
+// =====================
+
+async function openPersonalSettings() {
+    const overlay = document.getElementById('personal-settings-overlay');
+    if (!overlay) return;
+    overlay.style.display = 'flex';
+
+    const body = document.getElementById('personal-settings-body');
+    body.innerHTML = '<div style="text-align:center;padding:20px;color:rgba(255,255,255,0.4);">Loading...</div>';
+
+    try {
+        body.innerHTML = '';
+        const isNonAdmin = currentProfile && !currentProfile.is_admin;
+
+        // Streaming-account connections now live in the My Accounts modal (the ♫
+        // button). Personal Settings keeps only the per-profile server library.
+        if (isNonAdmin) {
+            const serverTab = document.createElement('div');
+            serverTab.style.padding = '18px 22px 22px';
+            serverTab.innerHTML = '<div style="text-align:center;padding:20px;color:rgba(255,255,255,0.3);">Loading libraries...</div>';
+            body.appendChild(serverTab);
+            fetch('/api/profiles/me/server-library').then(r => r.json()).then(libData => {
+                serverTab.innerHTML = '';
+                renderPersonalSettingsServerLibrary(serverTab, libData);
+            }).catch(() => {
+                serverTab.innerHTML = '';
+                renderPersonalSettingsServerLibrary(serverTab, {});
+            });
+        } else {
+            const content = document.createElement('div');
+            content.style.padding = '24px';
+            content.innerHTML = '<div style="color:rgba(255,255,255,0.55);font-size:0.9rem;line-height:1.7;">'
+                + 'Your streaming accounts are in <b>My Accounts</b> (the ♫ button next to your profile).<br>'
+                + 'Global service setup lives in <b>Settings</b>.</div>';
+            body.appendChild(content);
+        }
+    } catch (e) {
+        body.innerHTML = '<div style="color:#ef4444;padding:16px;">Failed to load settings</div>';
+    }
+}
+
+function closePersonalSettings() {
+    const overlay = document.getElementById('personal-settings-overlay');
+    if (overlay) overlay.style.display = 'none';
+}
+
+function renderPersonalSettingsSpotify(body, data) {
+    const hasCreds = data.has_credentials;
+    const clientId = data.client_id || '';
+
+    let contentHtml;
+    if (hasCreds) {
+        contentHtml = `
+            <div class="ps-connected-info">
+                <div class="ps-connected-icon">🟢</div>
+                <div class="ps-connected-details">
+                    <div class="ps-connected-username">Credentials configured</div>
+                    <div class="ps-connected-server">Client ID: ${escapeHtml(clientId.substring(0, 8))}...</div>
+                    <div class="ps-connected-source">Personal Spotify app</div>
+                </div>
+            </div>
+            <div class="ps-actions">
+                <button class="ps-btn ps-btn-primary" onclick="authenticatePersonalSpotify()">🔐 Authenticate</button>
+                <button class="ps-btn ps-btn-danger" onclick="disconnectPersonalSpotify()">Remove</button>
+            </div>
+        `;
+    } else {
+        contentHtml = `
+            <div class="ps-form-group">
+                <label>Client ID</label>
+                <input type="text" id="ps-spotify-client-id" placeholder="Your Spotify Client ID">
+            </div>
+            <div class="ps-form-group">
+                <label>Client Secret</label>
+                <input type="password" id="ps-spotify-client-secret" placeholder="Your Spotify Client Secret">
+            </div>
+            <div class="ps-form-group">
+                <label>Redirect URI <span style="font-weight:400;color:rgba(255,255,255,0.3)">(optional)</span></label>
+                <input type="text" id="ps-spotify-redirect-uri" placeholder="http://127.0.0.1:8888/callback">
+                <div class="ps-help-text">
+                    Create an app at <a href="https://developer.spotify.com/dashboard" target="_blank">developer.spotify.com</a> and add the redirect URI
+                </div>
+            </div>
+            <div id="ps-spotify-result"></div>
+            <div class="ps-actions">
+                <button class="ps-btn ps-btn-primary" onclick="savePersonalSpotify()">Save Credentials</button>
+            </div>
+        `;
+    }
+
+    const section = document.createElement('div');
+    section.id = 'ps-spotify-section';
+    section.innerHTML = `
+        <div class="ps-section">
+            <div class="ps-section-header">
+                <h4 class="ps-section-title">Spotify</h4>
+                <span class="ps-connection-badge ${hasCreds ? 'connected' : 'disconnected'}">
+                    <span class="ps-connection-dot"></span>
+                    ${hasCreds ? 'Configured' : 'Not configured'}
+                </span>
+            </div>
+            <div class="ps-help-text" style="margin-bottom:12px;">
+                Connect your own Spotify account to see your playlists instead of the admin's.
+            </div>
+            ${contentHtml}
+        </div>
+    `;
+
+    const existing = document.getElementById('ps-spotify-section');
+    if (existing) existing.replaceWith(section);
+    else body.appendChild(section);
+}
+
+async function savePersonalSpotify() {
+    const clientId = document.getElementById('ps-spotify-client-id')?.value?.trim();
+    const clientSecret = document.getElementById('ps-spotify-client-secret')?.value?.trim();
+    const redirectUri = document.getElementById('ps-spotify-redirect-uri')?.value?.trim();
+    const resultEl = document.getElementById('ps-spotify-result');
+
+    if (!clientId || !clientSecret) {
+        if (resultEl) resultEl.innerHTML = '<div style="color:#ef4444;font-size:12px;margin-top:8px;">Client ID and Secret are required</div>';
+        return;
+    }
+
+    try {
+        const res = await fetch('/api/profiles/me/spotify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri })
+        });
+        const data = await res.json();
+        if (data.success) {
+            showToast('Spotify credentials saved', 'success');
+            openPersonalSettings(); // Reload to show connected state
+        } else {
+            if (resultEl) resultEl.innerHTML = `<div style="color:#ef4444;font-size:12px;margin-top:8px;">${data.error || 'Failed to save'}</div>`;
+        }
+    } catch (e) {
+        if (resultEl) resultEl.innerHTML = '<div style="color:#ef4444;font-size:12px;margin-top:8px;">Network error</div>';
+    }
+}
+
+async function authenticatePersonalSpotify() {
+    // Trigger OAuth flow with profile_id in state so callback knows which profile
+    window.open('/auth/spotify?profile_id=' + (currentProfile?.id || ''), '_blank');
+}
+
+function renderPersonalSettingsTidal(body) {
+    const section = document.createElement('div');
+    section.id = 'ps-tidal-section';
+    section.innerHTML = `
+        <div class="ps-section">
+            <div class="ps-section-header">
+                <h4 class="ps-section-title">Tidal</h4>
+            </div>
+            <div class="ps-help-text" style="margin-bottom:12px;">
+                Connect your own Tidal account to see your playlists. Uses the admin's Tidal app credentials.
+            </div>
+            <div class="ps-actions">
+                <button class="ps-btn ps-btn-primary" onclick="authenticatePersonalTidal()">🔐 Authenticate Tidal</button>
+            </div>
+        </div>
+    `;
+    const existing = document.getElementById('ps-tidal-section');
+    if (existing) existing.replaceWith(section);
+    else body.appendChild(section);
+}
+
+function authenticatePersonalTidal() {
+    window.open('/auth/tidal?profile_id=' + (currentProfile?.id || ''), '_blank');
+}
+
+async function renderPersonalSettingsServerLibrary(container, profileData) {
+    const section = document.createElement('div');
+    section.id = 'ps-server-library-section';
+
+    // Detect which server is active
+    let serverType = 'none';
+    let libraries = [];
+    let users = [];
+    const currentLib = profileData || {};
+
+    try {
+        // Try each server type to find the active one
+        const plexRes = await fetch('/api/plex/music-libraries');
+        if (plexRes.ok) {
+            const plexData = await plexRes.json();
+            if (plexData.libraries && plexData.libraries.length > 0) {
+                serverType = 'plex';
+                libraries = plexData.libraries;
+            }
+        }
+    } catch (e) { }
+
+    if (serverType === 'none') {
+        try {
+            const jellyRes = await fetch('/api/jellyfin/music-libraries');
+            if (jellyRes.ok) {
+                const jellyData = await jellyRes.json();
+                if (jellyData.libraries && jellyData.libraries.length > 0) {
+                    serverType = 'jellyfin';
+                    libraries = jellyData.libraries;
+                    users = jellyData.users || [];
+                }
+            }
+        } catch (e) { }
+    }
+
+    if (serverType === 'none') {
+        section.innerHTML = `
+            <div class="ps-section">
+                <div class="ps-section-header">
+                    <h4 class="ps-section-title">Media Server</h4>
+                </div>
+                <div class="ps-help-text">No media server connected. Ask your admin to configure Plex, Jellyfin, or Navidrome in Settings.</div>
+            </div>
+        `;
+    } else if (serverType === 'plex') {
+        const selectedLib = currentLib.plex_library_id || '';
+        const optionsHtml = libraries.map(lib => {
+            const name = lib.name || lib.title || lib;
+            const val = typeof lib === 'string' ? lib : (lib.name || lib.title);
+            return `<option value="${escapeHtml(val)}" ${val === selectedLib ? 'selected' : ''}>${escapeHtml(val)}</option>`;
+        }).join('');
+
+        section.innerHTML = `
+            <div class="ps-section">
+                <div class="ps-section-header">
+                    <h4 class="ps-section-title">Plex Library</h4>
+                    <span class="ps-connection-badge ${selectedLib ? 'connected' : 'disconnected'}">
+                        <span class="ps-connection-dot"></span>
+                        ${selectedLib ? 'Custom' : 'Default'}
+                    </span>
+                </div>
+                <div class="ps-help-text" style="margin-bottom:12px;">Choose which Plex music library your playlists sync to.</div>
+                <div class="ps-form-group">
+                    <label>Music Library</label>
+                    <select id="ps-plex-library-select">
+                        <option value="">Use admin default</option>
+                        ${optionsHtml}
+                    </select>
+                </div>
+                <div class="ps-actions">
+                    <button class="ps-btn ps-btn-primary" onclick="savePersonalServerLibrary()">Save</button>
+                </div>
+            </div>
+        `;
+    } else if (serverType === 'jellyfin') {
+        const selectedUser = currentLib.jellyfin_user_id || '';
+        const selectedLib = currentLib.jellyfin_library_id || '';
+
+        const userOpts = users.map(u => {
+            const uid = u.id || u.Id;
+            const uname = u.name || u.Name;
+            return `<option value="${escapeHtml(uid)}" ${uid === selectedUser ? 'selected' : ''}>${escapeHtml(uname)}</option>`;
+        }).join('');
+
+        const libOpts = libraries.map(lib => {
+            const lid = lib.key || lib.id || lib.Id;
+            const lname = lib.name || lib.Name || lib.title;
+            return `<option value="${escapeHtml(lid)}" ${lid === selectedLib ? 'selected' : ''}>${escapeHtml(lname)}</option>`;
+        }).join('');
+
+        section.innerHTML = `
+            <div class="ps-section">
+                <div class="ps-section-header">
+                    <h4 class="ps-section-title">Jellyfin</h4>
+                    <span class="ps-connection-badge ${selectedUser || selectedLib ? 'connected' : 'disconnected'}">
+                        <span class="ps-connection-dot"></span>
+                        ${selectedUser || selectedLib ? 'Custom' : 'Default'}
+                    </span>
+                </div>
+                <div class="ps-help-text" style="margin-bottom:12px;">Choose which Jellyfin user and library your playlists sync to.</div>
+                ${users.length ? `<div class="ps-form-group"><label>User</label><select id="ps-jellyfin-user-select"><option value="">Use admin default</option>${userOpts}</select></div>` : ''}
+                <div class="ps-form-group">
+                    <label>Music Library</label>
+                    <select id="ps-jellyfin-library-select">
+                        <option value="">Use admin default</option>
+                        ${libOpts}
+                    </select>
+                </div>
+                <div class="ps-actions">
+                    <button class="ps-btn ps-btn-primary" onclick="savePersonalServerLibrary()">Save</button>
+                </div>
+            </div>
+        `;
+    }
+
+    const existing = document.getElementById('ps-server-library-section');
+    if (existing) existing.replaceWith(section);
+    else container.appendChild(section);
+}
+
+async function savePersonalServerLibrary() {
+    try {
+        const plexSelect = document.getElementById('ps-plex-library-select');
+        const jellyUserSelect = document.getElementById('ps-jellyfin-user-select');
+        const jellyLibSelect = document.getElementById('ps-jellyfin-library-select');
+
+        if (plexSelect) {
+            await fetch('/api/profiles/me/server-library', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ server_type: 'plex', library_id: plexSelect.value || null })
+            });
+        }
+        if (jellyUserSelect || jellyLibSelect) {
+            await fetch('/api/profiles/me/server-library', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    server_type: 'jellyfin',
+                    user_id: jellyUserSelect?.value || null,
+                    library_id: jellyLibSelect?.value || null
+                })
+            });
+        }
+
+        showToast('Server library settings saved', 'success');
+    } catch (e) {
+        showToast('Error saving settings', 'error');
+    }
+}
+
+async function disconnectPersonalSpotify() {
+    try {
+        const res = await fetch('/api/profiles/me/spotify', { method: 'DELETE' });
+        const data = await res.json();
+        if (data.success) {
+            showToast('Spotify credentials removed — using shared config', 'info');
+            openPersonalSettings(); // Reload
+        }
+    } catch (e) {
+        showToast('Error removing credentials', 'error');
+    }
+}
+
+function renderPersonalSettingsLB(data, container) {
+    const body = container || document.getElementById('personal-settings-body');
+    const connected = data.connected;
+    const username = data.username || '';
+    const baseUrl = data.base_url || '';
+    const source = data.source || 'global';
+
+    const tokenFormHtml = `
+        <div class="ps-form-group">
+            <label>User Token</label>
+            <input type="password" id="ps-lb-token" placeholder="Paste your ListenBrainz token">
+        </div>
+        <div class="ps-form-group">
+            <label>Server URL <span style="font-weight:400;color:rgba(255,255,255,0.3)">(optional)</span></label>
+            <input type="text" id="ps-lb-base-url" placeholder="Leave empty for official (api.listenbrainz.org)">
+            <div class="ps-help-text">
+                Get your token from <a href="https://listenbrainz.org/profile/" target="_blank">listenbrainz.org/profile</a>
+            </div>
+        </div>
+        <div id="ps-lb-result"></div>
+        <div class="ps-actions">
+            <button class="ps-btn ps-btn-secondary" onclick="testPersonalListenBrainz()">Test</button>
+            <button class="ps-btn ps-btn-primary" onclick="connectPersonalListenBrainz()">Connect</button>
+        </div>
+    `;
+
+    let contentHtml;
+    if (connected && source === 'profile') {
+        // Personal token — show connected state with Disconnect
+        const serverDisplay = baseUrl ? baseUrl.replace(/\/1$/, '').replace(/^https?:\/\//, '') : 'api.listenbrainz.org';
+        contentHtml = `
+            <div class="ps-connected-info">
+                <div class="ps-connected-icon">&#129504;</div>
+                <div class="ps-connected-details">
+                    <div class="ps-connected-username">Connected as ${escapeHtml(username)}</div>
+                    <div class="ps-connected-server">${escapeHtml(serverDisplay)}</div>
+                    <div class="ps-connected-source">Personal token</div>
+                </div>
+            </div>
+            <div class="ps-actions">
+                <button class="ps-btn ps-btn-danger" onclick="disconnectPersonalListenBrainz()">Disconnect</button>
+            </div>
+        `;
+    } else if (connected && source === 'global') {
+        // Using admin's shared token — show status + option to set own token
+        const serverDisplay = baseUrl ? baseUrl.replace(/\/1$/, '').replace(/^https?:\/\//, '') : 'api.listenbrainz.org';
+        contentHtml = `
+            <div class="ps-connected-info">
+                <div class="ps-connected-icon">&#129504;</div>
+                <div class="ps-connected-details">
+                    <div class="ps-connected-username">Connected as ${escapeHtml(username)}</div>
+                    <div class="ps-connected-server">${escapeHtml(serverDisplay)}</div>
+                    <div class="ps-connected-source">Using shared token from Settings</div>
+                </div>
+            </div>
+            <div style="margin-top:14px;padding-top:14px;border-top:1px solid rgba(255,255,255,0.06);">
+                <div style="font-size:11px;color:rgba(255,255,255,0.45);margin-bottom:10px;">Set your own token to use a different ListenBrainz account:</div>
+                ${tokenFormHtml}
+            </div>
+        `;
+    } else {
+        // Not connected at all
+        contentHtml = tokenFormHtml;
+    }
+
+    const section = document.createElement('div');
+    section.id = 'ps-listenbrainz-section';
+    section.innerHTML = `
+        <div class="ps-section">
+            <div class="ps-section-header">
+                <h4 class="ps-section-title">ListenBrainz</h4>
+                <span class="ps-connection-badge ${connected ? 'connected' : 'disconnected'}">
+                    <span class="ps-connection-dot"></span>
+                    ${connected ? 'Connected' : 'Not connected'}
+                </span>
+            </div>
+            ${contentHtml}
+        </div>
+    `;
+    // Replace existing or append
+    const existing = document.getElementById('ps-listenbrainz-section');
+    if (existing) existing.replaceWith(section);
+    else body.appendChild(section);
+}
+
+async function testPersonalListenBrainz() {
+    const token = document.getElementById('ps-lb-token')?.value?.trim();
+    const baseUrl = document.getElementById('ps-lb-base-url')?.value?.trim() || '';
+    const resultEl = document.getElementById('ps-lb-result');
+    if (!token) {
+        if (resultEl) resultEl.innerHTML = '<div class="ps-inline-result error">Please enter a token</div>';
+        return;
+    }
+    if (resultEl) resultEl.innerHTML = '<div class="ps-inline-result" style="color:rgba(255,255,255,0.5);">Testing...</div>';
+    try {
+        const res = await fetch('/api/profiles/me/listenbrainz/test', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token, base_url: baseUrl })
+        });
+        const data = await res.json();
+        if (data.success) {
+            resultEl.innerHTML = `<div class="ps-inline-result success">Valid token — ${escapeHtml(data.username)}</div>`;
+        } else {
+            resultEl.innerHTML = `<div class="ps-inline-result error">${escapeHtml(data.error || 'Invalid token')}</div>`;
+        }
+    } catch (e) {
+        resultEl.innerHTML = '<div class="ps-inline-result error">Connection failed</div>';
+    }
+}
+
+async function connectPersonalListenBrainz() {
+    const token = document.getElementById('ps-lb-token')?.value?.trim();
+    const baseUrl = document.getElementById('ps-lb-base-url')?.value?.trim() || '';
+    const resultEl = document.getElementById('ps-lb-result');
+    if (!token) {
+        if (resultEl) resultEl.innerHTML = '<div class="ps-inline-result error">Please enter a token</div>';
+        return;
+    }
+    // Disable buttons during connect
+    document.querySelectorAll('.ps-actions .ps-btn').forEach(b => b.disabled = true);
+    if (resultEl) resultEl.innerHTML = '<div class="ps-inline-result" style="color:rgba(255,255,255,0.5);">Connecting...</div>';
+    try {
+        const res = await fetch('/api/profiles/me/listenbrainz', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token, base_url: baseUrl })
+        });
+        const data = await res.json();
+        if (data.success) {
+            showToast(`Connected to ListenBrainz as ${data.username}`, 'success');
+            // Re-render as connected
+            renderPersonalSettingsLB({ connected: true, username: data.username, base_url: baseUrl, source: 'profile' });
+            // Refresh LB playlists on discover page
+            _invalidateListenBrainzCache();
+            if (typeof initializeListenBrainzTabs === 'function') {
+                initializeListenBrainzTabs();
+            }
+        } else {
+            resultEl.innerHTML = `<div class="ps-inline-result error">${escapeHtml(data.error || 'Connection failed')}</div>`;
+            document.querySelectorAll('.ps-actions .ps-btn').forEach(b => b.disabled = false);
+        }
+    } catch (e) {
+        resultEl.innerHTML = '<div class="ps-inline-result error">Connection failed</div>';
+        document.querySelectorAll('.ps-actions .ps-btn').forEach(b => b.disabled = false);
+    }
+}
+
+async function disconnectPersonalListenBrainz() {
+    try {
+        await fetch('/api/profiles/me/listenbrainz', { method: 'DELETE' });
+        showToast('ListenBrainz disconnected', 'info');
+        // Re-render as disconnected — re-fetch to check if global fallback exists
+        const res = await fetch('/api/profiles/me/listenbrainz');
+        const data = await res.json();
+        renderPersonalSettingsLB(data);
+        // Refresh LB playlists on discover page
+        _invalidateListenBrainzCache();
+        if (typeof initializeListenBrainzTabs === 'function') {
+            initializeListenBrainzTabs();
+        }
+    } catch (e) {
+        showToast('Failed to disconnect', 'error');
+    }
+}
+
+function _invalidateListenBrainzCache() {
+    if (typeof listenbrainzPlaylistsLoaded !== 'undefined') listenbrainzPlaylistsLoaded = false;
+    if (typeof listenbrainzPlaylistsCache !== 'undefined') {
+        try { Object.keys(listenbrainzPlaylistsCache).forEach(k => delete listenbrainzPlaylistsCache[k]); } catch (e) { }
+    }
+    if (typeof listenbrainzTracksCache !== 'undefined') {
+        try { Object.keys(listenbrainzTracksCache).forEach(k => delete listenbrainzTracksCache[k]); } catch (e) { }
+    }
+}
+
+const PROFILE_PAGE_LABELS = {
+    dashboard: 'Dashboard',
+    sync: 'Sync',
+    search: 'Search',
+    discover: 'Discover',
+    watchlist: 'Watchlist',
+    wishlist: 'Wishlist',
+    automations: 'Automations',
+    'active-downloads': 'Downloads',
+    library: 'Library',
+    stats: 'Listening Stats',
+    'playlist-explorer': 'Playlist Explorer',
+    import: 'Import',
+    tools: 'Tools',
+    hydrabase: 'Hydrabase',
+    issues: 'Issues',
+    help: 'Help & Docs',
+    settings: 'Settings',
+    'artist-detail': 'Artist Detail',
+    'video-dashboard': 'Video · Dashboard',
+    'video-search': 'Video · Search',
+    'video-discover': 'Video · Discover',
+    'video-library': 'Video · Library',
+    'video-watchlist': 'Video · Watchlist',
+    'video-wishlist': 'Video · Wishlist',
+    'video-downloads': 'Video · Downloads',
+    'video-calendar': 'Video · Calendar',
+    'video-tools': 'Video · Tools',
+};
+
+function getProfilePageLabel(pageId) {
+    return PROFILE_PAGE_LABELS[pageId] || pageId.split('-').map(part => part ? part[0].toUpperCase() + part.slice(1) : part).join(' ');
+}
+
+function getProfilePageSelectOptions(profileSettings = {}) {
+    const options = [];
+    const seen = new Set();
+    const homeSelect = document.getElementById('new-profile-home-page');
+    const normalizedHomePage = normalizeProfilePageId(profileSettings.home_page);
+
+    if (homeSelect) {
+        homeSelect.querySelectorAll('option').forEach(option => {
+            if (!option.value || seen.has(option.value)) return;
+            options.push({
+                value: option.value,
+                label: option.textContent?.trim() || getProfilePageLabel(option.value),
+            });
+            seen.add(option.value);
+        });
+    }
+
+    if (normalizedHomePage && !seen.has(normalizedHomePage)) {
+        options.push({
+            value: normalizedHomePage,
+            label: getProfilePageLabel(normalizedHomePage),
+        });
+        seen.add(normalizedHomePage);
+    }
+
+    return options;
+}
+
+function getProfilePageAccessOptions(profileSettings = {}) {
+    const options = [];
+    const seen = new Set();
+    const allowedSet = Array.isArray(profileSettings.allowed_pages)
+        ? new Set(normalizeProfilePageList(profileSettings.allowed_pages))
+        : null;
+    const accessContainer = document.getElementById('new-profile-allowed-pages');
+
+    if (accessContainer) {
+        accessContainer.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+            if (seen.has(cb.value)) return;
+            // Permanent always-on pages (Help/Issues) are marked data-always-on
+            // in the template — checked+locked here too. Plain .disabled can't
+            // be the signal anymore: the create modal also disables a whole
+            // SIDE's boxes when its side-access radio excludes them, and that
+            // transient state must not leak into the edit form as "locked on".
+            const alwaysOn = cb.dataset.alwaysOn === '1';
+            options.push({
+                value: cb.value,
+                // Use the canonical label (keeps the 'Video · …' prefix) so the edit
+                // form's FLAT list stays unambiguous; the create modal groups them
+                // under Music/Video dividers with plain labels instead.
+                label: getProfilePageLabel(cb.value),
+                checked: alwaysOn ? true : (allowedSet ? allowedSet.has(cb.value) : true),
+                disabled: alwaysOn,
+            });
+            seen.add(cb.value);
+        });
+    }
+
+    if (allowedSet) {
+        allowedSet.forEach(pageId => {
+            if (seen.has(pageId)) return;
+            options.push({
+                value: pageId,
+                label: getProfilePageLabel(pageId),
+                checked: true,
+                disabled: false,
+            });
+            seen.add(pageId);
+        });
+    }
+
+    return options;
+}
+
+// Which side a profile page id belongs to — 'shared' pages (Help/Issues) are
+// exempt from side gating.
+function profilePageSide(pageId) {
+    if (pageId === 'help' || pageId === 'issues') return 'shared';
+    return String(pageId).startsWith('video-') ? 'video' : 'music';
+}
+
+// Grey out (and lock) the page checkboxes of a side the profile can't access.
+// Always-on boxes (Help/Issues) keep their permanent state.
+function applySidesToPageCheckboxes(checkboxes, sides) {
+    checkboxes.forEach(cb => {
+        if (cb.dataset.alwaysOn === '1') return;
+        const side = profilePageSide(cb.value);
+        const blocked = side !== 'shared' && sides !== 'both' && side !== sides;
+        cb.disabled = blocked;
+        const lbl = cb.closest('label');
+        if (lbl) lbl.style.opacity = blocked ? '0.35' : '';
+    });
+}
+
+function initProfileManagement() {
+    const manageBtn = document.getElementById('manage-profiles-btn');
+    const closeBtn = document.getElementById('profile-manage-close');
+    const createBtn = document.getElementById('create-profile-btn');
+    const adminPinBtn = document.getElementById('set-admin-pin-btn');
+
+    if (manageBtn) {
+        manageBtn.onclick = () => {
+            document.getElementById('profile-manage-panel').style.display = 'flex';
+            loadProfileManageList();
+        };
+    }
+
+    if (closeBtn) {
+        closeBtn.onclick = () => {
+            document.getElementById('profile-manage-panel').style.display = 'none';
+            // Refresh picker — keep cancel button if user already has a profile selected
+            const hasCancel = !!currentProfile;
+            fetch('/api/profiles').then(r => r.json()).then(d => {
+                showProfilePicker(d.profiles || [], hasCancel);
+            });
+        };
+    }
+
+    // Color picker
+    let selectedColor = '#6366f1';
+    document.querySelectorAll('.profile-color-swatch').forEach(swatch => {
+        swatch.onclick = () => {
+            document.querySelectorAll('.profile-color-swatch').forEach(s => s.classList.remove('selected'));
+            swatch.classList.add('selected');
+            selectedColor = swatch.dataset.color;
+        };
+    });
+    // Select first by default
+    const firstSwatch = document.querySelector('.profile-color-swatch');
+    if (firstSwatch) firstSwatch.classList.add('selected');
+
+    // Side access radios: greying out the excluded side's page checkboxes live.
+    // Default (from the template) is Music only — the shipped default.
+    const sideRadios = document.querySelectorAll('input[name="new-profile-sides"]');
+    const _createPageBoxes = () => Array.from(document.querySelectorAll('#new-profile-allowed-pages input[type="checkbox"]'));
+    const _selectedSides = () => {
+        const r = document.querySelector('input[name="new-profile-sides"]:checked');
+        return r ? r.value : 'music';
+    };
+    sideRadios.forEach(r => r.addEventListener('change', () => {
+        applySidesToPageCheckboxes(_createPageBoxes(), _selectedSides());
+    }));
+    applySidesToPageCheckboxes(_createPageBoxes(), _selectedSides());
+
+    if (createBtn) {
+        createBtn.onclick = async () => {
+            const name = document.getElementById('new-profile-name').value.trim();
+            const avatarUrl = document.getElementById('new-profile-avatar-url').value.trim();
+            const pin = document.getElementById('new-profile-pin').value;
+            const loginPassword = (document.getElementById('new-profile-password') || {}).value || '';
+            if (!name) return;
+
+            // Collect profile settings
+            const homePage = document.getElementById('new-profile-home-page').value || null;
+            const pageCheckboxes = document.querySelectorAll('#new-profile-allowed-pages input[type="checkbox"]:not(:disabled)');
+            const allChecked = Array.from(pageCheckboxes).every(cb => cb.checked);
+            const allowedPages = allChecked ? null : Array.from(pageCheckboxes).filter(cb => cb.checked).map(cb => cb.value);
+            const canDl = document.getElementById('new-profile-can-download').checked;
+
+            const res = await fetch('/api/profiles', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    name, avatar_color: selectedColor,
+                    avatar_url: avatarUrl || undefined,
+                    pin: pin || undefined,
+                    password: loginPassword || undefined,
+                    home_page: homePage,
+                    allowed_pages: allowedPages,
+                    can_download: canDl,
+                    allowed_sides: _selectedSides()
+                })
+            });
+            const data = await res.json();
+            if (data.success) {
+                document.getElementById('new-profile-name').value = '';
+                document.getElementById('new-profile-avatar-url').value = '';
+                document.getElementById('new-profile-pin').value = '';
+                if (document.getElementById('new-profile-password')) document.getElementById('new-profile-password').value = '';
+                document.getElementById('new-profile-home-page').value = '';
+                pageCheckboxes.forEach(cb => cb.checked = true);
+                document.getElementById('new-profile-can-download').checked = true;
+                // Reset side access to the Music-only default.
+                const musicRadio = document.querySelector('input[name="new-profile-sides"][value="music"]');
+                if (musicRadio) { musicRadio.checked = true; }
+                applySidesToPageCheckboxes(_createPageBoxes(), 'music');
+                loadProfileManageList();
+                // Show admin PIN section if >1 profiles and admin has no PIN
+                checkAdminPinRequired();
+            } else {
+                alert(data.error || 'Failed to create profile');
+            }
+        };
+    }
+
+    if (adminPinBtn) {
+        adminPinBtn.onclick = async () => {
+            const pin = document.getElementById('admin-pin-input').value;
+            if (!pin || pin.length < 1) return;
+            // Find admin profile
+            const res = await fetch('/api/profiles');
+            const data = await res.json();
+            const admin = (data.profiles || []).find(p => p.is_admin);
+            if (!admin) return;
+
+            try {
+                const pinRes = await fetch(`/api/profiles/${admin.id}/set-pin`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ pin })
+                });
+                const pinData = await pinRes.json();
+                if (!pinData.success) {
+                    alert(pinData.error || 'Failed to set PIN');
+                    return;
+                }
+            } catch (e) {
+                alert('Connection error');
+                return;
+            }
+            document.getElementById('admin-pin-input').value = '';
+            document.getElementById('admin-pin-section').style.display = 'none';
+            loadProfileManageList();
+        };
+    }
+}
+
+async function loadProfileManageList() {
+    const list = document.getElementById('profile-manage-list');
+    const res = await fetch('/api/profiles');
+    const data = await res.json();
+    const profiles = data.profiles || [];
+
+    // Login-mode aware: when it's on, surface which members can't sign in yet
+    // (no login password) so the lock button's purpose is obvious.
+    let loginMode = false;
+    try { loginMode = !!(await (await fetch('/api/profiles/current')).json()).login_mode; } catch (e) { /* ignore */ }
+
+    // Banner when login mode is on (explains the password requirement up front).
+    const banner = document.getElementById('profile-manage-login-banner');
+    if (banner) banner.remove();
+    if (loginMode) {
+        const b = document.createElement('div');
+        b.id = 'profile-manage-login-banner';
+        b.className = 'profile-manage-login-banner';
+        b.textContent = '🔐 Login mode is on — every member needs a login password to sign in. Use the lock button to set one.';
+        list.parentNode.insertBefore(b, list);
+    }
+
+    list.innerHTML = '';
+    profiles.forEach(p => {
+        const item = document.createElement('div');
+        item.className = 'profile-manage-item';
+        const isCurrent = currentProfile && currentProfile.id === p.id;
+        if (isCurrent) item.classList.add('is-current');
+
+        const av = document.createElement('div');
+        renderProfileAvatar(av, p);
+        item.appendChild(av);
+
+        const info = document.createElement('div');
+        info.className = 'profile-info';
+        const nameDiv = document.createElement('div');
+        nameDiv.className = 'name';
+        nameDiv.textContent = p.name + (p.has_pin ? ' 🔒' : '');
+        info.appendChild(nameDiv);
+        // Role/status as pills
+        const pills = [];
+        if (isCurrent) pills.push({ text: 'You', cls: 'profile-role-pill--current' });
+        if (p.is_admin) pills.push({ text: 'Admin', cls: 'profile-role-pill--admin' });
+        if (p.can_download === false) pills.push({ text: 'No Downloads', cls: '' });
+        if (p.allowed_pages) pills.push({ text: `${p.allowed_pages.length} pages`, cls: '' });
+        // Login-password status (only meaningful while login mode is on).
+        if (loginMode && !p.is_admin) {
+            pills.push(p.has_password
+                ? { text: '🔒 Login ready', cls: 'profile-role-pill--ok' }
+                : { text: '⚠ No login password', cls: 'profile-role-pill--warn' });
+        }
+        if (pills.length) {
+            const roleDiv = document.createElement('div');
+            roleDiv.className = 'role';
+            pills.forEach(pill => {
+                const span = document.createElement('span');
+                span.className = ('profile-role-pill ' + pill.cls).trim();
+                span.textContent = pill.text;
+                roleDiv.appendChild(span);
+            });
+            info.appendChild(roleDiv);
+        }
+        item.appendChild(info);
+
+        const actions = document.createElement('div');
+        actions.className = 'profile-manage-actions';
+
+        const editBtn = document.createElement('button');
+        editBtn.className = 'profile-edit-btn';
+        editBtn.dataset.id = p.id;
+        editBtn.dataset.name = p.name;
+        editBtn.dataset.color = p.avatar_color || '#6366f1';
+        editBtn.dataset.avatarUrl = p.avatar_url || '';
+        editBtn.dataset.homePage = p.home_page || '';
+        editBtn.dataset.allowedPages = p.allowed_pages ? JSON.stringify(p.allowed_pages) : '';
+        editBtn.dataset.canDownload = p.can_download !== false ? '1' : '0';
+        editBtn.dataset.isAdmin = p.is_admin ? '1' : '0';
+        editBtn.title = 'Edit profile';
+        editBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
+        actions.appendChild(editBtn);
+
+        if (!p.is_admin) {
+            // Set/change the LOGIN password (separate from the quick-switch PIN;
+            // used when "Require login" is on). A member with no password can't
+            // sign in and can't self-bootstrap one, so the admin sets it here.
+            const pwBtn = document.createElement('button');
+            // Pulse the button when login's on and this member can't sign in yet.
+            const needsPw = loginMode && !p.has_password;
+            pwBtn.className = 'profile-password-btn' + (p.has_password ? ' has-password' : '') + (needsPw ? ' needs-password' : '');
+            pwBtn.dataset.id = p.id;
+            pwBtn.dataset.name = p.name;
+            pwBtn.dataset.hasPassword = p.has_password ? '1' : '0';
+            pwBtn.title = p.has_password ? 'Change login password' : 'Set login password (for Require Login mode)';
+            pwBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="16" r="1"/><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>';
+            actions.appendChild(pwBtn);
+
+            const delBtn = document.createElement('button');
+            delBtn.className = 'profile-delete-btn';
+            delBtn.dataset.id = p.id;
+            delBtn.title = 'Delete profile';
+            delBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>';
+            actions.appendChild(delBtn);
+        }
+
+        item.appendChild(actions);
+        list.appendChild(item);
+    });
+
+    // Bind edit buttons
+    list.querySelectorAll('.profile-edit-btn').forEach(btn => {
+        btn.onclick = () => {
+            showProfileEditForm(btn.dataset.id, btn.dataset.name, btn.dataset.color, btn.dataset.avatarUrl, {
+                home_page: btn.dataset.homePage || '',
+                allowed_pages: btn.dataset.allowedPages ? JSON.parse(btn.dataset.allowedPages) : null,
+                can_download: btn.dataset.canDownload !== '0',
+                is_admin: btn.dataset.isAdmin === '1'
+            });
+        };
+    });
+
+    // Bind set-login-password buttons
+    list.querySelectorAll('.profile-password-btn').forEach(btn => {
+        btn.onclick = () => showProfilePasswordForm(btn.dataset.id, btn.dataset.name, btn.dataset.hasPassword === '1');
+    });
+
+    // Bind delete buttons
+    list.querySelectorAll('.profile-delete-btn').forEach(btn => {
+        btn.onclick = async () => {
+            if (!await showConfirmDialog({ title: 'Delete Profile', message: 'Delete this profile and all its data?', confirmText: 'Delete', destructive: true })) return;
+            try {
+                const res = await fetch(`/api/profiles/${btn.dataset.id}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (!data.success) {
+                    alert(data.error || 'Failed to delete profile');
+                }
+            } catch (e) {
+                alert('Connection error');
+            }
+            loadProfileManageList();
+        };
+    });
+
+    checkAdminPinRequired();
+}
+
+function showProfilePasswordForm(profileId, name, hasPassword) {
+    const list = document.getElementById('profile-manage-list');
+    // One inline form at a time — drop any edit/password form already open.
+    ['profile-password-form', 'profile-edit-form'].forEach(id => {
+        const el = document.getElementById(id); if (el) el.remove();
+    });
+
+    const form = document.createElement('div');
+    form.id = 'profile-password-form';
+    form.className = 'profile-edit-form';
+
+    const title = document.createElement('div');
+    title.style.cssText = 'font-weight:600;margin-bottom:4px;';
+    title.textContent = 'Login password — ' + name;     // textContent = XSS-safe
+    form.appendChild(title);
+
+    const hint = document.createElement('div');
+    hint.style.cssText = 'font-size:0.8em;color:rgba(255,255,255,0.5);margin-bottom:8px;line-height:1.4;';
+    hint.textContent = 'Used when "Require login" is on (separate from the quick-switch PIN). ' +
+        (hasPassword ? 'This profile has a password set.'
+                     : "This profile has no password yet — it can't sign in until you set one.");
+    form.appendChild(hint);
+
+    const pw = document.createElement('input');
+    pw.type = 'password'; pw.className = 'profile-input';
+    pw.placeholder = 'New password'; pw.autocomplete = 'new-password';
+    const confirm = document.createElement('input');
+    confirm.type = 'password'; confirm.className = 'profile-input';
+    confirm.placeholder = 'Confirm password'; confirm.autocomplete = 'new-password';
+    form.appendChild(pw); form.appendChild(confirm);
+
+    const msg = document.createElement('div');
+    msg.style.cssText = 'font-size:0.8em;margin:6px 0;display:none;';
+    form.appendChild(msg);
+    const showMsg = (t, ok) => {
+        msg.textContent = t; msg.style.color = ok ? '#10b981' : '#ef4444'; msg.style.display = 'block';
+    };
+
+    const post = async (password, okMsg, okType) => {
+        const res = await fetch('/api/profiles/' + encodeURIComponent(profileId) + '/set-password', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password }),
+        });
+        const data = await res.json();
+        if (data.success) {
+            form.remove();
+            loadProfileManageList();
+            if (typeof showToast === 'function') showToast(okMsg, okType);
+            return true;
+        }
+        showMsg(data.error || 'Failed to update password', false);
+        return false;
+    };
+
+    const btnRow = document.createElement('div');
+    btnRow.style.cssText = 'display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;';
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'btn btn--primary';
+    saveBtn.textContent = 'Save password';
+    saveBtn.onclick = async () => {
+        const p1 = pw.value, p2 = confirm.value;
+        if (!p1 || !p1.trim()) { showMsg('Enter a password', false); return; }
+        if (p1.length < 4) { showMsg('Use at least 4 characters', false); return; }
+        if (p1 !== p2) { showMsg("Passwords don't match", false); return; }
+        saveBtn.disabled = true;
+        try { if (!await post(p1, 'Login password set for ' + name, 'success')) saveBtn.disabled = false; }
+        catch (e) { showMsg('Connection error', false); saveBtn.disabled = false; }
+    };
+    btnRow.appendChild(saveBtn);
+
+    if (hasPassword) {
+        const clearBtn = document.createElement('button');
+        clearBtn.className = 'btn';
+        clearBtn.textContent = 'Remove password';
+        clearBtn.onclick = async () => {
+            clearBtn.disabled = true;
+            try { if (!await post('', 'Login password removed', 'info')) clearBtn.disabled = false; }
+            catch (e) { showMsg('Connection error', false); clearBtn.disabled = false; }
+        };
+        btnRow.appendChild(clearBtn);
+    }
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => form.remove();
+    btnRow.appendChild(cancelBtn);
+
+    form.appendChild(btnRow);
+    list.appendChild(form);
+    pw.focus();
+}
+
+function showProfileEditForm(profileId, currentName, currentColor, currentAvatarUrl, profileSettings = {}) {
+    const list = document.getElementById('profile-manage-list');
+    // Remove any existing edit form
+    const existing = document.getElementById('profile-edit-form');
+    if (existing) existing.remove();
+
+    const isAdmin = currentProfile && currentProfile.is_admin;
+    const isEditingAdmin = profileSettings.is_admin;
+    const editColors = ['#6366f1', '#ec4899', '#10b981', '#f59e0b', '#3b82f6', '#ef4444', '#8b5cf6', '#14b8a6'];
+    const pageSelectOptions = getProfilePageSelectOptions(profileSettings);
+    const pageAccessOptions = getProfilePageAccessOptions(profileSettings);
+
+    const form = document.createElement('div');
+    form.id = 'profile-edit-form';
+    form.className = 'profile-edit-form';
+
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.className = 'profile-input';
+    nameInput.value = currentName;
+    nameInput.maxLength = 20;
+    nameInput.placeholder = 'Profile name';
+    form.appendChild(nameInput);
+
+    const urlInput = document.createElement('input');
+    urlInput.type = 'url';
+    urlInput.className = 'profile-input';
+    urlInput.value = currentAvatarUrl || '';
+    urlInput.placeholder = 'Avatar image URL (optional)';
+    form.appendChild(urlInput);
+
+    const colorRow = document.createElement('div');
+    colorRow.className = 'profile-color-picker';
+    let editColor = currentColor;
+    editColors.forEach(c => {
+        const swatch = document.createElement('span');
+        swatch.className = 'profile-color-swatch' + (c === currentColor ? ' selected' : '');
+        swatch.style.background = c;
+        swatch.dataset.color = c;
+        swatch.onclick = () => {
+            colorRow.querySelectorAll('.profile-color-swatch').forEach(s => s.classList.remove('selected'));
+            swatch.classList.add('selected');
+            editColor = c;
+        };
+        colorRow.appendChild(swatch);
+    });
+    form.appendChild(colorRow);
+
+    // Home page selector — visible to everyone (self-edit or admin editing others)
+    const homeLabel = document.createElement('label');
+    homeLabel.className = 'profile-settings-label';
+    homeLabel.textContent = 'Home Page';
+    form.appendChild(homeLabel);
+
+    const homeSelect = document.createElement('select');
+    homeSelect.className = 'profile-input';
+    const defaultOpt = document.createElement('option');
+    defaultOpt.value = '';
+    defaultOpt.textContent = isEditingAdmin ? 'Default (Dashboard)' : 'Default (Discover)';
+    homeSelect.appendChild(defaultOpt);
+    const normalizedHome = profileSettings.home_page;
+    pageSelectOptions.forEach(({ value, label }) => {
+        const opt = document.createElement('option');
+        opt.value = value;
+        opt.textContent = label;
+        if (value === normalizedHome) opt.selected = true;
+        homeSelect.appendChild(opt);
+    });
+    form.appendChild(homeSelect);
+
+    // Admin-only settings: side access, allowed pages & can_download
+    let pageCheckboxes = [];
+    let canDlCheckbox = null;
+    let selectedSides = null;
+    if (isAdmin && !isEditingAdmin) {
+        // Side access — music | video | both, never nothing.
+        selectedSides = (profileSettings.allowed_sides === 'video' || profileSettings.allowed_sides === 'both')
+            ? profileSettings.allowed_sides : 'music';
+        const sidesLabel = document.createElement('label');
+        sidesLabel.className = 'profile-settings-label';
+        sidesLabel.textContent = 'Side Access';
+        form.appendChild(sidesLabel);
+
+        const sidesRow = document.createElement('div');
+        sidesRow.className = 'profile-sides-picker';
+        [['music', 'Music only'], ['video', 'Video only'], ['both', 'Music + Video']].forEach(([value, label]) => {
+            const lbl = document.createElement('label');
+            const r = document.createElement('input');
+            r.type = 'radio';
+            r.name = 'edit-profile-sides';
+            r.value = value;
+            r.checked = value === selectedSides;
+            r.addEventListener('change', () => {
+                selectedSides = value;
+                applySidesToPageCheckboxes(pageCheckboxes, selectedSides);
+            });
+            lbl.appendChild(r);
+            lbl.appendChild(document.createTextNode(' ' + label));
+            sidesRow.appendChild(lbl);
+        });
+        form.appendChild(sidesRow);
+
+        const apLabel = document.createElement('label');
+        apLabel.className = 'profile-settings-label';
+        apLabel.textContent = 'Page Access';
+        form.appendChild(apLabel);
+
+        const apContainer = document.createElement('div');
+        apContainer.className = 'profile-page-checkboxes';
+        pageAccessOptions.forEach(({ value, label, checked, disabled }) => {
+            const lbl = document.createElement('label');
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.value = value;
+            cb.checked = checked;
+            cb.disabled = disabled;
+            if (disabled) cb.dataset.alwaysOn = '1';   // Help/Issues stay locked-on
+            lbl.appendChild(cb);
+            lbl.appendChild(document.createTextNode(' ' + label));
+            apContainer.appendChild(lbl);
+            pageCheckboxes.push(cb);
+        });
+        form.appendChild(apContainer);
+        applySidesToPageCheckboxes(pageCheckboxes, selectedSides);
+
+        const dlLabel = document.createElement('label');
+        dlLabel.className = 'profile-checkbox-label';
+        canDlCheckbox = document.createElement('input');
+        canDlCheckbox.type = 'checkbox';
+        canDlCheckbox.checked = profileSettings.can_download !== false;
+        dlLabel.appendChild(canDlCheckbox);
+        dlLabel.appendChild(document.createTextNode(' Can download music'));
+        form.appendChild(dlLabel);
+    }
+
+    const btnRow = document.createElement('div');
+    btnRow.className = 'profile-edit-buttons';
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'btn btn--block btn--primary profile-create-btn';
+    saveBtn.textContent = 'Save';
+    saveBtn.onclick = async () => {
+        const newName = nameInput.value.trim();
+        if (!newName) { alert('Name cannot be empty'); return; }
+        const newAvatarUrl = urlInput.value.trim() || null;
+        const payload = { name: newName, avatar_color: editColor, avatar_url: newAvatarUrl };
+
+        // Home page
+        payload.home_page = homeSelect.value || null;
+
+        // Admin-only fields
+        if (isAdmin && !isEditingAdmin && pageCheckboxes.length) {
+            const editablePageCheckboxes = pageCheckboxes.filter(cb => !cb.disabled);
+            const allChecked = editablePageCheckboxes.every(cb => cb.checked);
+            payload.allowed_pages = allChecked ? null : editablePageCheckboxes.filter(cb => cb.checked).map(cb => cb.value);
+            payload.can_download = canDlCheckbox ? canDlCheckbox.checked : true;
+            if (selectedSides) payload.allowed_sides = selectedSides;
+        }
+
+        try {
+            const res = await fetch(`/api/profiles/${profileId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await res.json();
+            if (data.success) {
+                // Update sidebar indicator if editing current profile
+                if (currentProfile && currentProfile.id == profileId) {
+                    currentProfile.name = newName;
+                    currentProfile.avatar_color = editColor;
+                    currentProfile.avatar_url = newAvatarUrl;
+                    if (payload.home_page !== undefined) currentProfile.home_page = payload.home_page;
+                    if (payload.allowed_pages !== undefined) currentProfile.allowed_pages = payload.allowed_pages;
+                    if (payload.can_download !== undefined) currentProfile.can_download = payload.can_download;
+                    if (payload.allowed_sides !== undefined) currentProfile.allowed_sides = payload.allowed_sides;
+                    updateProfileIndicator();
+                    notifyProfileContextChanged();
+                }
+                loadProfileManageList();
+            } else {
+                alert(data.error || 'Failed to update profile');
+            }
+        } catch (e) {
+            alert('Connection error');
+        }
+    };
+    btnRow.appendChild(saveBtn);
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'profile-picker-cancel';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => form.remove();
+    btnRow.appendChild(cancelBtn);
+
+    form.appendChild(btnRow);
+    list.appendChild(form);
+    nameInput.focus();
+    nameInput.select();
+}
+
+function showSelfEditForm() {
+    if (!currentProfile) return;
+    const overlay = document.getElementById('profile-picker-overlay');
+    const container = overlay.querySelector('.profile-picker-container');
+
+    // Hide the picker grid and show self-edit form
+    const grid = document.getElementById('profile-picker-grid');
+    const actions = document.getElementById('profile-picker-actions');
+    grid.style.display = 'none';
+    actions.style.display = 'none';
+
+    // Remove any existing self-edit form
+    const existing = document.getElementById('self-edit-form');
+    if (existing) existing.remove();
+
+    const pageLabels = {
+        dashboard: 'Dashboard', sync: 'Sync', search: 'Search', discover: 'Discover',
+        automations: 'Automations', library: 'Library', stats: 'Listening Stats',
+        'playlist-explorer': 'Playlist Explorer', import: 'Import', help: 'Help & Docs'
+    };
+
+    const form = document.createElement('div');
+    form.id = 'self-edit-form';
+    form.className = 'profile-edit-form';
+    form.style.marginTop = '16px';
+
+    const title = document.createElement('h3');
+    title.textContent = 'My Profile';
+    title.style.cssText = 'color: #fff; margin: 0 0 12px; font-size: 18px;';
+    form.appendChild(title);
+
+    // Name
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.className = 'profile-input';
+    nameInput.value = currentProfile.name;
+    nameInput.maxLength = 20;
+    nameInput.placeholder = 'Profile name';
+    form.appendChild(nameInput);
+
+    // Home page
+    const homeLabel = document.createElement('label');
+    homeLabel.className = 'profile-settings-label';
+    homeLabel.textContent = 'Home Page';
+    form.appendChild(homeLabel);
+
+    const homeSelect = document.createElement('select');
+    homeSelect.className = 'profile-input';
+    const defaultOpt = document.createElement('option');
+    defaultOpt.value = '';
+    defaultOpt.textContent = 'Default (Discover)';
+    homeSelect.appendChild(defaultOpt);
+    const normalizedHome = currentProfile.home_page;
+    getProfilePageSelectOptions({ home_page: normalizedHome }).forEach(({ value, label }) => {
+        const opt = document.createElement('option');
+        opt.value = value;
+        opt.textContent = label;
+        if (value === normalizedHome) opt.selected = true;
+        homeSelect.appendChild(opt);
+    });
+    form.appendChild(homeSelect);
+
+    // Buttons
+    const btnRow = document.createElement('div');
+    btnRow.className = 'profile-edit-buttons';
+    btnRow.style.marginTop = '12px';
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'btn btn--block btn--primary profile-create-btn';
+    saveBtn.textContent = 'Save';
+    saveBtn.onclick = async () => {
+        const newName = nameInput.value.trim();
+        if (!newName) { alert('Name cannot be empty'); return; }
+        try {
+            const res = await fetch(`/api/profiles/${currentProfile.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: newName, home_page: homeSelect.value || null })
+            });
+            const data = await res.json();
+            if (data.success) {
+                currentProfile.name = newName;
+                currentProfile.home_page = homeSelect.value || null;
+                updateProfileIndicator();
+                closeSelfEdit();
+                hideProfilePicker();
+            } else {
+                alert(data.error || 'Failed to update');
+            }
+        } catch (e) {
+            alert('Connection error');
+        }
+    };
+    btnRow.appendChild(saveBtn);
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'profile-picker-cancel';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => closeSelfEdit();
+    btnRow.appendChild(cancelBtn);
+
+    form.appendChild(btnRow);
+    container.appendChild(form);
+
+    function closeSelfEdit() {
+        form.remove();
+        grid.style.display = '';
+        actions.style.display = '';
+    }
+}
+
+async function checkAdminPinRequired() {
+    const res = await fetch('/api/profiles');
+    const data = await res.json();
+    const profiles = data.profiles || [];
+    const admin = profiles.find(p => p.is_admin);
+    const section = document.getElementById('admin-pin-section');
+
+    if (profiles.length > 1 && admin && !admin.has_pin && section) {
+        section.style.display = '';
+    } else if (section) {
+        section.style.display = 'none';
+    }
+}
+
+// Service worker registration. Runs as soon as the JS parses (doesn't
+// need to wait for DOMContentLoaded). Cache-first image strategy +
+// stale-while-revalidate static shell — see /sw.js for details. Skipped
+// when the API isn't available (older browsers, file:// origin) or when
+// the page is loaded from a non-secure origin (SW requires HTTPS or
+// localhost).
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js', { scope: '/' })
+            .catch((err) => console.warn('[SW] registration failed:', err));
+    });
+}
+
+document.addEventListener('DOMContentLoaded', async function () {
+    console.log('SoulSync WebUI initializing...');
+
+    // Check if first-run setup wizard should be shown
+    const params = new URLSearchParams(window.location.search);
+    const forceSetup = params.get('setup') === '1';
+    let showWizard = forceSetup;
+
+    if (!forceSetup) {
+        try {
+            const setupResp = await fetch('/api/setup/status');
+            // Fail-safe (#842): only launch the wizard when the server DEFINITIVELY
+            // says setup isn't done. A non-OK response (e.g. 401 while the launch
+            // PIN is locked) must NOT trigger the wizard — otherwise a PIN-gated
+            // returning user gets the full setup flow every visit.
+            if (setupResp.ok) {
+                const setupData = await setupResp.json();
+                if (setupData.setup_complete === false) {
+                    showWizard = true;
+                    localStorage.removeItem('soulsync_setup_complete');
+                }
+            }
+        } catch (e) {
+            console.warn('Setup status check failed, continuing normal init:', e);
+        }
+    }
+
+    if (showWizard && typeof openSetupWizard === 'function') {
+        window._onSetupWizardComplete = function () {
+            _continueAppInit();
+        };
+        openSetupWizard();
+        return; // Defer init until wizard closes
+    }
+
+    _continueAppInit();
+});
+
+async function _continueAppInit() {
+    // Initialize profile management UI handlers
+    initProfileManagement();
+
+    // Check profiles first — may show picker instead of app
+    const profileReady = await initProfileSystem();
+    if (!profileReady) {
+        console.log('Waiting for profile selection...');
+        return; // App init deferred until profile is selected via picker
+    }
+
+    initApp();
+}
+
+function initApp() {
+    // Unlocked / authenticated — reveal the app (the lock screens hide it via
+    // body.app-locked so a bypassed overlay shows nothing). Do this FIRST so
+    // component init below measures real layout, not a display:none container.
+    document.body.classList.remove('app-locked');
+    // Initialize components
+    initializeNavigation();
+    initializeMobileNavigation();
+    initializeMediaPlayer();
+    initExpandedPlayer();
+    initializeSyncPage();
+    initializeWatchlist();
+    if (typeof initializeSpotifyAuthCompletionListener === 'function') {
+        initializeSpotifyAuthCompletionListener();
+    }
+
+
+    // Initialize WebSocket connection (falls back to HTTP polling if unavailable)
+    initializeWebSocket();
+
+    // Start global service status polling for sidebar (works on all pages)
+    // Initial fetch for immediate data, then setInterval as fallback when WebSocket is disconnected
+    fetchAndUpdateServiceStatus();
+    setInterval(fetchAndUpdateServiceStatus, 5000); // Every 5 seconds (no-op when WebSocket active)
+
+    // Check for updates on load and every hour
+    checkForUpdates();
+    setInterval(checkForUpdates, 3600000);
+
+    // Refresh key data immediately when user returns to this tab
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) {
+            fetchAndUpdateServiceStatus();
+            // Refresh dashboard-specific data if on dashboard
+            const dashboardPage = document.getElementById('dashboard-page');
+            if (dashboardPage && dashboardPage.classList.contains('active')) {
+                fetchAndUpdateSystemStats();
+                fetchAndUpdateActivityFeed();
+            }
+        }
+    });
+
+    // Start always-on download polling (batched, minimal overhead)
+    startGlobalDownloadPolling();
+
+    // Load initial data
+    loadInitialData();
+
+    // Handle window resize to re-check track title scrolling
+    window.addEventListener('resize', function () {
+        if (currentTrack) {
+            const trackTitleElement = document.getElementById('track-title');
+            const trackTitle = currentTrack.title || 'Unknown Track';
+            setTimeout(() => {
+                checkAndEnableScrolling(trackTitleElement, trackTitle);
+            }, 100); // Small delay to allow layout to settle
+        }
+    });
+
+    console.log('SoulSync WebUI initialized successfully!');
+}
+
+// ===============================
+// NAVIGATION SYSTEM
+// ===============================
+
+function initializeNavigation() {
+    // Sidebar navigation is now driven by native link navigation.
+    // Page activation and active-state styling are synchronized from the
+    // current URL by the shell bridge and route controllers.
+}
+
+const _DEEPLINK_VALID_PAGES = new Set([
+    'dashboard', 'sync', 'search', 'discover', 'automations',
+    'library', 'import', 'settings', 'help', 'issues', 'stats', 'watchlist',
+    'wishlist', 'active-downloads', 'artist-detail', 'playlist-explorer',
+    'hydrabase', 'tools', 'chat'
+]);
+
+function _getPageFromPath() {
+    const router = getWebRouter();
+    const resolved = router?.resolvePageId?.(window.location.pathname);
+    if (resolved) return resolved;
+
+    const path = window.location.pathname.replace(/^\/+|\/+$/g, '');
+    if (!path) return 'dashboard';
+    const segs = path.split('/');
+    const basePage = segs[0];
+    if (!_DEEPLINK_VALID_PAGES.has(basePage)) return 'dashboard';
+    // Context-dependent pages fall back to a sensible parent
+    if (basePage === 'playlist-explorer') return 'library';
+    return basePage;
+}
+
+function _normalizeArtistDetailSource(source) {
+    const value = (source || '').toString().trim().toLowerCase();
+    return value || 'library';
+}
+
+function buildArtistDetailPath(artistId, source = null, name = null) {
+    if (!artistId) {
+        throw new Error('artistId is required for artist-detail navigation');
+    }
+    const normalizedSource = _normalizeArtistDetailSource(source);
+    let path = '/artist-detail/' + encodeURIComponent(normalizedSource) + '/' + encodeURIComponent(String(artistId));
+    // Some sources (Bandcamp) have no numeric-ID lookup API at all — the
+    // artist's display name has to travel with the URL, or a page load /
+    // browser-back landing on this route has nothing to resolve against.
+    if (name) {
+        path += '?name=' + encodeURIComponent(name);
+    }
+    return path;
+}
+
+function parseArtistDetailPath(pathname = window.location.pathname) {
+    const segs = String(pathname || '').split('/').filter(Boolean);
+    if (segs[0] !== 'artist-detail' || segs.length < 3) return null;
+
+    const source = decodeURIComponent(segs[1] || '');
+    const artistId = decodeURIComponent(segs.slice(2).join('/'));
+    if (!source || !artistId) return null;
+
+    const name = new URLSearchParams(window.location.search).get('name') || '';
+
+    return {
+        artistId,
+        source: source.toLowerCase() === 'library' ? null : source,
+        name,
+    };
+}
+
+// ---- Label detail (a record label's catalog, monitored like a watchlist) ----
+// A static legacy page; the label MBID rides the query string so a reload /
+// browser-back can re-resolve it. Purely additive, parallel to artist-detail
+// but far simpler (no dynamic route, no label stack).
+let _labelDetailState = { id: null, name: null };
+let _labelDetailReturnTo = 'search';   // where the Back button returns to
+
+function buildLabelDetailPath(labelId, name = null) {
+    if (!labelId) throw new Error('labelId is required for label-detail navigation');
+    // Real path-based route (like artist-detail) so a refresh reloads the page.
+    let path = '/label-detail/' + encodeURIComponent(String(labelId));
+    if (name) path += '?name=' + encodeURIComponent(name);
+    return path;
+}
+
+function parseLabelDetailPath(pathname = window.location.pathname) {
+    const segs = String(pathname || '').split('/').filter(Boolean);
+    if (segs[0] !== 'label-detail' || segs.length < 2) return null;
+    const id = decodeURIComponent(segs.slice(1).join('/'));
+    if (!id) return null;
+    const name = new URLSearchParams(window.location.search || '').get('name') || '';
+    return { id, name };
+}
+
+function navigateToLabelDetail(labelId, name = null, options = {}) {
+    if (!labelId) return;
+    // Remember where we came from so the label-detail Back button returns there
+    // (raw history.back() is unreliable through the SPA router).
+    if (typeof currentPage === 'string' && currentPage && currentPage !== 'label-detail') {
+        _labelDetailReturnTo = currentPage;
+    }
+    window._labelDetailReturnTo = _labelDetailReturnTo;   // read by label-detail.js
+    // The TanStack route component re-fires this on mount; skip the reload if
+    // we're already showing this exact label (mirrors navigateToArtistDetail).
+    if (String(labelId) === String(_labelDetailState.id) && currentPage === 'label-detail') {
+        return;
+    }
+    _labelDetailState = { id: String(labelId), name: name || '' };
+    navigateToPage('label-detail', {
+        labelId: String(labelId),
+        labelName: name || '',
+        skipRouteChange: options.skipRouteChange === true,
+    });
+}
+
+// ===============================
+// MOBILE NAVIGATION
+// ===============================
+
+function initializeMobileNavigation() {
+    const hamburgerBtn = document.getElementById('hamburger-btn');
+    const sidebar = document.querySelector('.sidebar');
+    const overlay = document.getElementById('mobile-overlay');
+
+    if (!hamburgerBtn || !sidebar || !overlay) return;
+
+    function openMobileNav() {
+        sidebar.classList.add('mobile-open');
+        hamburgerBtn.classList.add('active');
+        overlay.classList.add('active');
+        document.body.classList.add('mobile-nav-open');
+    }
+
+    function closeMobileNav() {
+        sidebar.classList.remove('mobile-open');
+        hamburgerBtn.classList.remove('active');
+        overlay.classList.remove('active');
+        document.body.classList.remove('mobile-nav-open');
+    }
+
+    hamburgerBtn.addEventListener('click', () => {
+        if (sidebar.classList.contains('mobile-open')) {
+            closeMobileNav();
+        } else {
+            openMobileNav();
+        }
+    });
+
+    overlay.addEventListener('click', closeMobileNav);
+
+    // Close sidebar on nav button click (mobile only)
+    document.querySelectorAll('.nav-button').forEach(btn => {
+        btn.addEventListener('click', () => {
+            if (window.innerWidth <= 768) {
+                closeMobileNav();
+            }
+        });
+    });
+
+    restoreNavSections();
+}
+
+// --- Collapsible sidebar sections (persisted per section in localStorage) ---
+function _navSectionItems(label) {
+    const items = [];
+    let el = label.nextElementSibling;
+    while (el && !el.classList.contains('nav-section-label')) {
+        if (el.classList.contains('nav-button')) items.push(el);
+        el = el.nextElementSibling;
+    }
+    return items;
+}
+function _setNavSectionCollapsed(label, collapsed) {
+    label.classList.toggle('collapsed', collapsed);
+    _navSectionItems(label).forEach(it => it.classList.toggle('nav-item-hidden', collapsed));
+}
+function toggleNavSection(label) {
+    const collapsed = !label.classList.contains('collapsed');
+    _setNavSectionCollapsed(label, collapsed);
+    try {
+        const saved = JSON.parse(localStorage.getItem('navSections') || '{}');
+        saved[label.dataset.section] = collapsed;
+        localStorage.setItem('navSections', JSON.stringify(saved));
+    } catch (e) { /* localStorage unavailable — collapse still works for the session */ }
+}
+function restoreNavSections() {
+    let saved = {};
+    try { saved = JSON.parse(localStorage.getItem('navSections') || '{}'); } catch (e) { saved = {}; }
+    const path = window.location.pathname;
+    document.querySelectorAll('.nav-section-label').forEach(label => {
+        // Expanded by default; collapsed only when the user explicitly collapsed it.
+        let collapsed = saved[label.dataset.section] === true;
+        // Never collapse the section holding the current page — the active item must stay visible.
+        if (_navSectionItems(label).some(it => it.getAttribute('href') === path)) collapsed = false;
+        _setNavSectionCollapsed(label, collapsed);
+    });
+}
+
+function initializeWatchlist() {
+    // Watchlist button navigates to watchlist page
+    const watchlistButton = document.getElementById('watchlist-button');
+    if (watchlistButton) {
+        watchlistButton.addEventListener('click', () => navigateToPage('watchlist'));
+    }
+
+    // Wishlist button: quick check for active download, otherwise navigate to page
+    const wishlistButton = document.getElementById('wishlist-button');
+    if (wishlistButton) {
+        wishlistButton.addEventListener('click', async () => {
+            // Fast path: check if we already know about an active wishlist process
+            const clientProcess = activeDownloadProcesses['wishlist'];
+            if (clientProcess && clientProcess.modalElement && document.body.contains(clientProcess.modalElement)) {
+                clientProcess.modalElement.style.display = 'flex';
+                WishlistModalState.setVisible();
+                return;
+            }
+            // Slow path: ask the server (with timeout to prevent button feeling dead)
+            try {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 2000);
+                const resp = await fetch('/api/active-processes', { signal: controller.signal });
+                clearTimeout(timeout);
+                if (resp.ok) {
+                    const data = await resp.json();
+                    const serverProcess = (data.active_processes || []).find(p => p.playlist_id === 'wishlist');
+                    if (serverProcess) {
+                        try {
+                            WishlistModalState.clearUserClosed();
+                            await rehydrateModal(serverProcess, true);
+                        } catch (e) {
+                            console.debug('Rehydration failed, navigating to page:', e);
+                            navigateToPage('wishlist');
+                        }
+                        return;
+                    }
+                }
+            } catch (e) {
+                // Timeout or network error — just navigate
+            }
+            navigateToPage('wishlist');
+        });
+    }
+
+    // Update watchlist count initially
+    updateWatchlistButtonCount();
+
+    // Update count every 10 seconds
+    setInterval(updateWatchlistButtonCount, 10000);
+
+    console.log('Watchlist system initialized');
+}
+
+function navigateToPage(pageId, options = {}) {
+    navigationEpoch += 1;
+
+    if (!options.forceReload && pageId === currentPage) return;
+
+    // Permission guard — redirect to home page if not allowed
+    if (!isPageAllowed(pageId)) {
+        const home = getProfileHomePage();
+        if (home !== currentPage && isPageAllowed(home)) {
+            navigateToPage(home, options);
+        }
+        return;
+    }
+
+    if (pageId === 'artist-detail' && !options.artistId) {
+        return false;
+    }
+    if (pageId === 'label-detail' && !options.labelId) {
+        return false;
+    }
+
+    const router = getWebRouter();
+    if (router && !options.skipRouteChange) {
+        notifyPageWillChange(pageId);
+        const route = router.routeManifest?.find((entry) => entry.pageId === pageId);
+        if (route?.kind === 'react') {
+            showReactHost(pageId);
+            setActivePageChrome(pageId);
+        } else if (route?.kind === 'legacy' && pageId !== 'artist-detail' && pageId !== 'label-detail') {
+            // Show legacy page immediately — don't wait for TanStack Router's async cycle
+            showLegacyPage(pageId);
+            setActivePageChrome(pageId);
+            _optimisticNavPageId = pageId;
+            // Defer data loading until the browser is idle, so the page paints AND
+            // becomes scrollable before heavy sync init (settings form wiring, etc.)
+            // runs. Falls back to a macrotask where requestIdleCallback is missing.
+            _scheduleHeavyInit(() => loadPageData(pageId));
+        }
+        return router.navigateToPage(pageId, {
+            replace: options.replace === true,
+            artistId: options.artistId,
+            artistSource: options.artistSource,
+            artistName: options.artistName,
+            labelId: options.labelId,
+            labelName: options.labelName,
+        });
+    }
+
+    // Fallback path for initial bootstrap or environments without TanStack routing.
+    const route = router?.routeManifest?.find((entry) => entry.pageId === pageId);
+    notifyPageWillChange(pageId);
+    const legacyPageElement = document.getElementById(`${pageId}-page`);
+    if (route?.kind === 'react' || !legacyPageElement) {
+        showReactHost(pageId);
+        setActivePageChrome(pageId);
+    } else {
+        activatePage(pageId, { forceReload: options.forceReload === true });
+    }
+
+    if (!options.skipPushState) {
+        const urlPath = pageId === 'dashboard' ? '/'
+            : (pageId === 'artist-detail' && options.artistId) ? buildArtistDetailPath(options.artistId, options.artistSource, options.artistName)
+            : (pageId === 'label-detail' && options.labelId) ? buildLabelDetailPath(options.labelId, options.labelName)
+            : '/' + pageId;
+        if (window.location.pathname !== urlPath) {
+            if (options.replace === true) {
+                history.replaceState({ page: pageId }, '', urlPath);
+            } else {
+                history.pushState({ page: pageId }, '', urlPath);
+            }
+        }
+    }
+
+    return true;
+}
+
+async function loadPageData(pageId) {
+    try {
+        // Stop any active polling when navigating away
+        stopDbStatsPolling();
+        stopDbUpdatePolling();
+        stopWishlistCountPolling();
+        stopLogPolling();
+        // Stop watchlist/wishlist page timers when navigating away
+        if (watchlistCountdownInterval) { clearInterval(watchlistCountdownInterval); watchlistCountdownInterval = null; }
+        if (wishlistCountdownInterval) { clearInterval(wishlistCountdownInterval); wishlistCountdownInterval = null; }
+        if (typeof _stopNebulaLivePolling === 'function') _stopNebulaLivePolling();
+        if (pageId !== 'sync') {
+            cleanupBeatportContent();
+        }
+        switch (pageId) {
+            case 'dashboard':
+                await loadDashboardData();
+                loadDashboardSyncHistory();
+                break;
+            case 'sync':
+                initializeSyncPage();
+                await loadSyncData();
+                break;
+            case 'search':
+                initializeSearch();
+                initializeSearchModeToggle();
+                initializeFilters();
+                break;
+            case 'label-detail': {
+                // Resolve the label from nav state, falling back to the URL
+                // (reload / browser-back). label-detail.js owns the render.
+                const lab = (_labelDetailState && _labelDetailState.id)
+                    ? _labelDetailState
+                    : (typeof parseLabelDetailPath === 'function' ? parseLabelDetailPath() : null);
+                if (lab && lab.id && typeof loadLabelDetailData === 'function') {
+                    if (typeof initializeLabelDetailPage === 'function') initializeLabelDetailPage();
+                    loadLabelDetailData(lab.id, lab.name || '');
+                }
+                break;
+            }
+            case 'active-downloads':
+                loadActiveDownloadsPage();
+                break;
+            case 'library':
+                // Check if we should return to artist detail view instead of list
+                if (artistDetailPageState.currentArtistId && artistDetailPageState.currentArtistName) {
+                    navigateToPage('artist-detail', {
+                        artistId: artistDetailPageState.currentArtistId,
+                        artistSource: artistDetailPageState.currentArtistSource,
+                    });
+                    if (!artistDetailPageState.isInitialized) {
+                        initializeArtistDetailPage();
+                        loadArtistDetailData(artistDetailPageState.currentArtistId, artistDetailPageState.currentArtistName);
+                    }
+                    // Already initialized — DOM content persists, no reload needed
+                } else {
+                    if (!libraryPageState.isInitialized) {
+                        initializeLibraryPage();
+                    }
+                    // Already initialized — DOM content persists, no reload needed
+                }
+                break;
+            case 'artist-detail':
+                // Artist detail page is entered through the route handoff and legacy navigator.
+                break;
+            case 'discover':
+                if (!discoverPageInitialized) {
+                    await loadDiscoverPage();
+                    discoverPageInitialized = true;
+                }
+                // Already initialized — DOM content persists, no reload needed
+                break;
+            case 'playlist-explorer':
+                initExplorer();
+                break;
+            case 'settings':
+                // Suppress auto-save while the form is being populated, so opening
+                // Settings no longer fires a spurious full save (4 POSTs + backend
+                // service re-init) on every visit.
+                window._suppressSettingsAutoSave = true;
+                try {
+                    initializeSettings();
+                    switchSettingsTab('connections');
+                    await loadSettingsData();
+                    await loadQualityProfile();
+                    loadApiKeys();
+                    loadBlacklistCount();
+                } finally {
+                    window._suppressSettingsAutoSave = false;
+                }
+                break;
+            case 'hydrabase':
+                // Check connection status and pre-fill saved credentials
+                try {
+                    const hsResp = await fetch('/api/hydrabase/status');
+                    const hsData = await hsResp.json();
+                    _hydrabaseConnected = hsData.connected;
+                    document.getElementById('hydra-connection-status').textContent = hsData.connected ? 'Connected' : 'Disconnected';
+                    document.getElementById('hydra-connection-status').style.color = hsData.connected ? 'rgb(var(--accent-light-rgb))' : '#888';
+                    document.getElementById('hydra-connect-btn').textContent = hsData.connected ? 'Disconnect' : 'Connect';
+                    // Pre-fill saved credentials
+                    if (hsData.saved_url) {
+                        document.getElementById('hydra-ws-url').value = hsData.saved_url;
+                    }
+                    if (hsData.saved_api_key) {
+                        document.getElementById('hydra-api-key').value = hsData.saved_api_key;
+                    }
+                    // Update peer count
+                    if (hsData.peer_count !== null && hsData.peer_count !== undefined) {
+                        document.getElementById('hydra-peer-count').textContent = `Peers: ${hsData.peer_count}`;
+                    }
+                } catch (e) { }
+                // Load comparisons
+                loadHydrabaseComparisons();
+                break;
+            case 'tools':
+                await initializeToolsPage();
+                break;
+            case 'watchlist':
+                await initializeWatchlistPage();
+                break;
+            case 'wishlist':
+                await initializeWishlistPage();
+                break;
+            case 'automations':
+                await loadAutomations();
+                break;
+            case 'chat':
+                if (window.ChatPage) window.ChatPage.open();
+                break;
+            case 'help':
+                initializeDocsPage();
+                break;
+        }
+    } catch (error) {
+        console.error(`Error loading ${pageId} data:`, error);
+        showToast(`Failed to load ${pageId} data`, 'error');
+    }
+}
+
+// ---- Dashboard cursor-following accent blob (two-layer liquid) ----
+// Both layers lerp toward a target point: the cursor when it's hovering
+// any .dash-card, otherwise the grid center (idle resting position).
+// Core layer (--blob-x/y) follows faster, halo (--blob-x-soft/y-soft)
+// trails. Each card renders both layers and clips them to its own bounds
+// via overflow:hidden, so the blob spans the bento while gaps stay dark.
+// Disabled entirely when body.reduce-effects is set.
+(function initDashboardCursorBlob() {
+    let grid = null;
+    let cards = [];
+    let cardRects = [];               // cached rects, refreshed each frame
+    let targetX = 0, targetY = 0;
+    let coreX = 0, coreY = 0;
+    let softX = 0, softY = 0;
+    let rafId = 0;
+    let attached = false;
+    let centeredOnce = false;
+
+    const RECENTER_DELAY_MS = 1500;
+    let recenterTimer = 0;
+
+    const isReduced = () => document.body.classList.contains('reduce-effects')
+        || document.body.classList.contains('max-performance');
+
+    const gridCenter = () => {
+        const r = grid.getBoundingClientRect();
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    };
+
+    // Two-pass per frame: read all rects first (one layout flush), then
+    // write all CSS vars (no further reads). Avoids per-card layout thrash.
+    const tick = () => {
+        if (isReduced()) { rafId = 0; return; }
+
+        coreX += (targetX - coreX) * 0.040;
+        coreY += (targetY - coreY) * 0.040;
+        softX += (targetX - softX) * 0.022;
+        softY += (targetY - softY) * 0.022;
+
+        const n = cards.length;
+        if (cardRects.length !== n) cardRects.length = n;
+        for (let i = 0; i < n; i++) cardRects[i] = cards[i].getBoundingClientRect();
+        for (let i = 0; i < n; i++) {
+            const r = cardRects[i];
+            const s = cards[i].style;
+            s.setProperty('--blob-x',      (coreX - r.left) + 'px');
+            s.setProperty('--blob-y',      (coreY - r.top)  + 'px');
+            s.setProperty('--blob-x-soft', (softX - r.left) + 'px');
+            s.setProperty('--blob-y-soft', (softY - r.top)  + 'px');
+        }
+
+        const dx = Math.abs(targetX - softX) + Math.abs(targetX - coreX);
+        const dy = Math.abs(targetY - softY) + Math.abs(targetY - coreY);
+        if (dx + dy > 0.4) rafId = requestAnimationFrame(tick);
+        else rafId = 0;
+    };
+
+    const ensureLoop = () => {
+        if (!rafId && !isReduced()) rafId = requestAnimationFrame(tick);
+    };
+
+    const cancelRecenter = () => {
+        if (recenterTimer) { clearTimeout(recenterTimer); recenterTimer = 0; }
+    };
+    const recenterNow = () => {
+        recenterTimer = 0;
+        if (!grid) return;
+        const c = gridCenter();
+        targetX = c.x; targetY = c.y;
+        ensureLoop();
+    };
+    const scheduleRecenter = () => {
+        if (recenterTimer) return;
+        recenterTimer = setTimeout(recenterNow, RECENTER_DELAY_MS);
+    };
+
+    // Snap the blob to grid center the first time the grid becomes
+    // measurable (page may not be visible at DOMContentLoaded).
+    const snapToCenterIfReady = () => {
+        if (!grid || centeredOnce) return;
+        const r = grid.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return;  // not visible yet
+        const c = { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        targetX = coreX = softX = c.x;
+        targetY = coreY = softY = c.y;
+        centeredOnce = true;
+        ensureLoop();
+    };
+
+    function attach() {
+        if (attached) return;
+        grid = document.querySelector('.dash-grid');
+        if (!grid) return;
+        attached = true;
+        cards = Array.from(grid.querySelectorAll('.dash-card'));
+
+        snapToCenterIfReady();
+
+        grid.addEventListener('pointermove', (e) => {
+            if (isReduced()) return;
+            const onCard = e.target && e.target.closest && e.target.closest('.dash-card');
+            if (onCard) {
+                cancelRecenter();
+                targetX = e.clientX;
+                targetY = e.clientY;
+                ensureLoop();
+            } else {
+                scheduleRecenter();
+            }
+        });
+        grid.addEventListener('pointerleave', () => {
+            if (!isReduced()) scheduleRecenter();
+        });
+        window.addEventListener('resize', () => {
+            if (isReduced()) return;
+            // Idle: snap immediately. Active: respect the existing delay.
+            if (!recenterTimer) recenterNow();
+        });
+
+        // Re-resolve cards when active-downloads card toggles visibility.
+        const cardObserver = new MutationObserver(() => {
+            cards = Array.from(grid.querySelectorAll('.dash-card'));
+            ensureLoop();
+        });
+        cardObserver.observe(grid, { childList: true, subtree: false, attributes: true, attributeFilter: ['style', 'class'] });
+
+        // If the grid was hidden at attach time, snap once it becomes
+        // measurable (page navigation, tab switch).
+        if (!centeredOnce && 'IntersectionObserver' in window) {
+            const visObserver = new IntersectionObserver((entries) => {
+                for (const ent of entries) {
+                    if (ent.isIntersecting) { snapToCenterIfReady(); break; }
+                }
+            });
+            visObserver.observe(grid);
+        }
+
+        // React to reduce-effects toggle on body class.
+        const bodyObserver = new MutationObserver(() => {
+            if (isReduced()) {
+                cancelRecenter();
+                if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+            } else {
+                centeredOnce = false;
+                snapToCenterIfReady();
+            }
+        });
+        bodyObserver.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', attach);
+    } else {
+        attach();
+    }
+    // Also retry on full load — covers late-mounted markup.
+    window.addEventListener('load', () => {
+        attach();
+        snapToCenterIfReady();
+    });
+})();
