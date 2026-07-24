@@ -64,4 +64,22 @@ def resolve_download_root(kind: str, *, root_folder: dict | None = None,
     return paths.get("tv_path") or ""
 
 
-__all__ = ["basename_of", "find_completed_file", "dest_path_for", "resolve_download_root"]
+def resolve_torrent_category(*, root_folder: dict | None = None,
+                             primary_root_folder: dict | None = None) -> str | None:
+    """Which torrent/usenet client category or label a grab destined for this
+    library should carry (multi-category, mirrors resolve_download_root's tiers):
+      1. ``root_folder`` — an explicitly-picked Library's own category.
+      2. ``primary_root_folder`` — the primary configured Library's category.
+      3. ``None`` — the caller falls back to the global torrent_client.category
+         / usenet_client.category setting.
+    A Library that exists but has no category set (blank) means "inherit",
+    not "no category" — same blank-doesn't-shadow rule as the path tiers."""
+    if root_folder and (root_folder.get("category") or "").strip():
+        return root_folder["category"].strip()
+    if primary_root_folder and (primary_root_folder.get("category") or "").strip():
+        return primary_root_folder["category"].strip()
+    return None
+
+
+__all__ = ["basename_of", "find_completed_file", "dest_path_for", "resolve_download_root",
+           "resolve_torrent_category"]

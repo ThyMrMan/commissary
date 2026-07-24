@@ -163,3 +163,141 @@ def test_set_recovery_endpoint(client):
     r = client.post(f'/api/profiles/{pid}/set-recovery', json={'question': 'Q?', 'answer': 'A'})
     assert r.get_json()['has_recovery'] is True
     assert db.verify_profile_recovery_answer(pid, 'a') is True
+
+
+# ── Sign in with Plex ────────────────────────────────────────────────────────
+
+def _enable_plex_login(monkeypatch, on=True):
+    real_get = web_server.config_manager.get
+    monkeypatch.setattr(web_server.config_manager, 'get',
+                        lambda k, d=None: on if k == 'security.allow_plex_login' else real_get(k, d))
+
+
+class _FakePinLogin:
+    def __init__(self, pin='4242', token='FAKETOKEN', logged_in=True, expired=False):
+        self.pin = pin
+        self.token = token
+        self.expires_at = None
+        self._logged_in = logged_in
+        self.expired = expired
+
+    def checkLogin(self):
+        return self._logged_in
+
+
+class _FakeAccount:
+    def __init__(self, id, title=None, username=None, thumb=None):
+        self.id = id
+        self.title = title
+        self.username = username
+        self.thumb = thumb
+
+
+def _start_plex_signin(client, monkeypatch, pinlogin):
+    monkeypatch.setattr(web_server, 'MyPlexPinLogin', lambda oauth=False: pinlogin)
+    r = client.post('/api/auth/plex/start')
+    assert r.status_code == 200 and r.get_json()['success'] is True
+    return r.get_json()['request_id']
+
+
+def test_plex_signin_disabled_by_default(client):
+    r = client.post('/api/auth/plex/start')
+    assert r.status_code == 403
+
+
+def test_plex_signin_matches_existing_linked_profile(client, monkeypatch):
+    db = web_server.get_database()
+    pid = db.create_profile(name='PlexAlice', plex_account_id=101)
+    _enable_plex_login(monkeypatch)
+    rid = _start_plex_signin(client, monkeypatch, _FakePinLogin())
+    monkeypatch.setattr(web_server, 'MyPlexAccount',
+                        lambda token: _FakeAccount(101, title='PlexAlice', username='alice'))
+
+    r = client.get(f'/api/auth/plex/status?request_id={rid}')
+    body = r.get_json()
+    assert r.status_code == 200 and body['success'] is True
+    assert body['is_new'] is False and body['profile']['id'] == pid
+    with client.session_transaction() as sess:
+        assert sess['login_authenticated'] is True and sess['profile_id'] == pid
+    # Only the one pre-existing profile is linked to this Plex account — no duplicate created.
+    assert sum(1 for p in db.get_all_profiles() if p.get('plex_account_id') == 101) == 1
+
+
+def test_plex_signin_auto_provisions_authorized_new_account(client, monkeypatch):
+    db = web_server.get_database()
+    _enable_plex_login(monkeypatch)
+    monkeypatch.setattr('core.plex_user_auth.plex_account_has_server_access', lambda pid, admin_token=None: True)
+    rid = _start_plex_signin(client, monkeypatch, _FakePinLogin())
+    monkeypatch.setattr(web_server, 'MyPlexAccount',
+                        lambda token: _FakeAccount(202, title='NewPlexUser', username='newuser', thumb='http://t'))
+
+    r = client.get(f'/api/auth/plex/status?request_id={rid}')
+    body = r.get_json()
+    assert r.status_code == 200 and body['success'] is True and body['is_new'] is True
+    new_id = body['profile']['id']
+    created = db.get_profile(new_id)
+    assert created['plex_account_id'] == 202
+    assert created['allowed_sides'] == 'music' and created['can_download'] is False and created['is_admin'] is False
+    with client.session_transaction() as sess:
+        assert sess['profile_id'] == new_id
+
+
+def test_plex_signin_rejects_unauthorized_account_and_creates_no_profile(client, monkeypatch):
+    db = web_server.get_database()
+    before = len(db.get_all_profiles())
+    _enable_plex_login(monkeypatch)
+    monkeypatch.setattr('core.plex_user_auth.plex_account_has_server_access', lambda pid, admin_token=None: False)
+    rid = _start_plex_signin(client, monkeypatch, _FakePinLogin())
+    monkeypatch.setattr(web_server, 'MyPlexAccount',
+                        lambda token: _FakeAccount(303, title='Stranger'))
+
+    r = client.get(f'/api/auth/plex/status?request_id={rid}')
+    assert r.status_code == 403
+    assert db.get_profile_by_plex_id(303) is None
+    assert len(db.get_all_profiles()) == before
+    with client.session_transaction() as sess:
+        assert 'login_authenticated' not in sess
+
+
+def test_plex_signin_name_collision_gets_suffix(client, monkeypatch):
+    db = web_server.get_database()
+    db.create_profile(name='Sam')   # local profile, not Plex-linked, same name as the incoming Plex title
+    _enable_plex_login(monkeypatch)
+    monkeypatch.setattr('core.plex_user_auth.plex_account_has_server_access', lambda pid, admin_token=None: True)
+    rid = _start_plex_signin(client, monkeypatch, _FakePinLogin())
+    monkeypatch.setattr(web_server, 'MyPlexAccount', lambda token: _FakeAccount(404, title='Sam'))
+
+    r = client.get(f'/api/auth/plex/status?request_id={rid}')
+    body = r.get_json()
+    assert r.status_code == 200 and body['success'] is True
+    assert body['profile']['name'] == 'Sam (Plex)'
+
+
+def test_plex_signin_expired_pin(client, monkeypatch):
+    _enable_plex_login(monkeypatch)
+    rid = _start_plex_signin(client, monkeypatch, _FakePinLogin(expired=True))
+    r = client.get(f'/api/auth/plex/status?request_id={rid}')
+    body = r.get_json()
+    assert body['success'] is False and body['expired'] is True
+
+
+def test_plex_signin_waiting_for_authorization(client, monkeypatch):
+    _enable_plex_login(monkeypatch)
+    rid = _start_plex_signin(client, monkeypatch, _FakePinLogin(logged_in=False))
+    r = client.get(f'/api/auth/plex/status?request_id={rid}')
+    body = r.get_json()
+    assert body['success'] is False and 'status' in body and 'error' not in body
+
+
+def test_plex_signin_status_disabled(client, monkeypatch):
+    _enable_plex_login(monkeypatch, on=True)
+    rid = _start_plex_signin(client, monkeypatch, _FakePinLogin())
+    _enable_plex_login(monkeypatch, on=False)   # disabled between start and poll
+    r = client.get(f'/api/auth/plex/status?request_id={rid}')
+    assert r.status_code == 403
+
+
+def test_profiles_current_reports_plex_login_enabled(client, monkeypatch):
+    _enable_plex_login(monkeypatch, on=True)
+    body = client.get('/api/profiles/current').get_json()
+    assert body.get('plex_login_enabled') is True

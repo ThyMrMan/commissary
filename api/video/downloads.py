@@ -78,6 +78,27 @@ def _resolve_target(db, kind: str, root_folder_id) -> str:
                                  primary_root_folder=primary, paths=paths)
 
 
+def _resolve_category(db, kind: str, root_folder_id) -> str | None:
+    """The torrent/usenet category for a grab of this kind (multi-category,
+    P.4): the explicitly picked Library's own category when given, else the
+    PRIMARY configured Library's category, else None (the client adapter
+    falls back to the global torrent_client.category/usenet_client.category
+    setting). Mirrors ``_resolve_target``'s tiers so a grab's destination
+    folder and its category always come from the SAME Library."""
+    from core.video.download_pipeline import resolve_torrent_category
+    from core.video.sources import resolve_video_server
+    root_folder = None
+    if root_folder_id:
+        try:
+            root_folder = db.get_root_folder(int(root_folder_id))
+        except (TypeError, ValueError):
+            root_folder = None
+    k = "movie" if str(kind or "").lower() in ("movie", "movies", "film", "films") else "show"
+    server = resolve_video_server(db)
+    primary = db.primary_root_folder(server, k) if server else None
+    return resolve_torrent_category(root_folder=root_folder, primary_root_folder=primary)
+
+
 def _parse_text(hit) -> str:
     """What the release parser should read for a hit. Soulseek hits are grouped by
     FOLDER — the folder title carries the show/release name, but on library-style
@@ -806,7 +827,10 @@ def register_routes(bp):
             # torrent / usenet — hand the magnet/NZB to the SHARED download client; the monitor
             # tracks progress + completion by client_ref. No Soulseek-style alternate requery.
             from core.video.client_grab import grab
-            res = grab(source, body.get("download_url"))
+            category = None
+            if str(body.get("kind") or "").lower() != "youtube":
+                category = _resolve_category(db, body.get("kind"), body.get("root_folder_id"))
+            res = grab(source, body.get("download_url"), category=category)
             if not res.get("ok"):
                 return jsonify({"ok": False, "error": res.get("error") or "The download client refused it."}), 502
             dl_id = db.add_video_download({**common, "source": source,

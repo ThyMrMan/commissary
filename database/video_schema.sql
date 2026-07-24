@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS root_folders (
     server_title TEXT,             -- the Plex section title / Jellyfin view name it scans
     label        TEXT,             -- display override for tabs/UI; NULL falls back to server_title
     sort_order   INTEGER NOT NULL DEFAULT 0,   -- tab order; lowest = "primary" (default grab destination)
+    category     TEXT,             -- per-library torrent-client category/label; NULL inherits the global default
     created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

@@ -2434,6 +2434,13 @@ body[data-side="video"] #soulsync-toggle { display: none; }
     background: rgba(0, 0, 0, 0.3); color: rgba(255, 255, 255, 0.55); cursor: pointer; }
 .vq-fmt-del:hover { background: rgba(239, 68, 68, 0.8); color: #fff; border-color: transparent; }
 @media (max-width: 900px) { .vq-fmt-row { grid-template-columns: 1fr 1fr; } }
+
+/* YouTube Libraries editor rows — manual name + destination folder (no
+   server-side discovery, so no checkbox column like the Movies/TV rows). */
+.yt-library-row { display: grid; grid-template-columns: 1fr 1.6fr 30px; gap: 8px;
+    align-items: center; margin-bottom: 8px; }
+@media (max-width: 640px) { .yt-library-row { grid-template-columns: 1fr 30px; }
+    .yt-library-row [data-yt-lib-name] { grid-column: 1 / -1; } }
 /* backups card (P10) */
 .vbk-list { margin: 10px 0; max-height: 180px; overflow-y: auto; }
 .vbk-row { display: flex; align-items: center; gap: 8px; padding: 6px 0;

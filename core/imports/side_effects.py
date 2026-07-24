@@ -432,6 +432,12 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
         if not final_path:
             return
 
+        # Real downloads (manual search, watchlist/playlist auto-download, any
+        # slskd/YouTube/Tidal/etc. source) start flagged "to be purchased";
+        # the manual staging Import feature and the reorganize/retag scan both
+        # set is_local_import — those are the user's own files, not downloads.
+        to_be_purchased = 0 if context.get("is_local_import") else 1
+
         album_ctx = get_import_context_album(context)
         track_info = get_import_track_info(context)
         original_search = get_import_original_search(context)
@@ -689,8 +695,8 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
                     INSERT INTO tracks (id, album_id, artist_id, title, track_number,
                                         duration, file_path, bitrate, file_size, track_artist,
                                         musicbrainz_recording_id, isrc, quality_profile_id, server_source,
-                                        created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'soulsync', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                                        to_be_purchased, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'soulsync', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     """,
                     (
                         track_id,
@@ -706,6 +712,7 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
                         track_mbid,
                         track_isrc,
                         track_quality_profile_id,
+                        to_be_purchased,
                     ),
                 )
                 track_source_col = source_columns.get("track")

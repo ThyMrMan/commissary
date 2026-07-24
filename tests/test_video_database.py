@@ -209,14 +209,15 @@ def test_dashboard_stats_counts_content_and_downloads(db):
 
 
 def test_library_selection_roundtrip(db):
-    assert db.get_library_selection("plex") == {"movies": [], "tv": []}
+    assert db.get_library_selection("plex") == {"movies": [], "tv": [], "youtube": []}
     db.save_libraries("plex",
                        [{"server_title": "Movies", "path": "/media/movies"},
                         {"server_title": "Movies 4K", "label": "4K", "path": "/media/movies4k"}],
                        [{"server_title": "TV Shows", "path": "/media/tv"}])
-    assert db.get_library_selection("plex") == {"movies": ["Movies", "Movies 4K"], "tv": ["TV Shows"]}
+    assert db.get_library_selection("plex") == {
+        "movies": ["Movies", "Movies 4K"], "tv": ["TV Shows"], "youtube": []}
     # Per-server keys don't collide.
-    assert db.get_library_selection("jellyfin") == {"movies": [], "tv": []}
+    assert db.get_library_selection("jellyfin") == {"movies": [], "tv": [], "youtube": []}
 
 
 def test_save_libraries_upserts_by_id_and_deletes_on_removal(db):
@@ -242,10 +243,55 @@ def test_save_libraries_upserts_by_id_and_deletes_on_removal(db):
     assert row["root_folder_id"] is None
 
 
+def test_youtube_libraries_manual_save(db):
+    # No server-side discovery for youtube — entries are named by hand, but
+    # saved/upserted/deleted through the same path as movies/tv.
+    saved = db.save_libraries(
+        "plex", [], [], [{"server_title": "YouTube", "path": "/media/youtube"}])
+    assert len(saved["youtube"]) == 1
+    yid = saved["youtube"][0]["id"]
+    assert saved["youtube"][0]["path"] == "/media/youtube"
+    assert db.get_library_selection("plex")["youtube"] == ["YouTube"]
+
+    # Re-saving with the same id UPDATES that row.
+    saved2 = db.save_libraries(
+        "plex", [], [], [{"id": yid, "server_title": "Kids", "path": "/media/yt-kids"}])
+    assert len(saved2["youtube"]) == 1
+    assert saved2["youtube"][0]["id"] == yid
+    assert saved2["youtube"][0]["server_title"] == "Kids"
+    assert saved2["youtube"][0]["path"] == "/media/yt-kids"
+
+    # Omitting it from the next save deletes it, independent of movies/tv.
+    db.save_libraries("plex", [{"server_title": "Movies", "path": "/m"}], [], [])
+    assert db.list_libraries("plex")["youtube"] == []
+    assert len(db.list_libraries("plex")["movies"]) == 1
+
+
+def test_library_category_roundtrips_and_defaults_to_none(db):
+    # Per-library torrent category (e.g. Movies -> "movies", Anime -> "anime").
+    saved = db.save_libraries(
+        "plex",
+        [{"server_title": "Movies", "path": "/m1", "category": "movies"},
+         {"server_title": "Anime Movies", "path": "/m2", "category": "anime"}],
+        [{"server_title": "TV Shows", "path": "/tv"}])   # no category set -> inherits the global default
+    assert saved["movies"][0]["category"] == "movies"
+    assert saved["movies"][1]["category"] == "anime"
+    assert saved["tv"][0]["category"] is None
+
+    mid = saved["movies"][0]["id"]
+    assert db.get_root_folder(mid)["category"] == "movies"
+    assert db.primary_root_folder("plex", "movie")["category"] == "movies"
+
+    # Re-saving with a blank category clears it back to "inherit".
+    saved2 = db.save_libraries(
+        "plex", [{"id": mid, "server_title": "Movies", "path": "/m1", "category": ""}], [])
+    assert saved2["movies"][0]["category"] is None
+
+
 def test_library_selection_legacy_plain_string(db):
     # Pre-multi-library installs stored a bare name (not JSON) — must still read back.
     db.set_setting("plex.movies_library", "Movies")
-    assert db.get_library_selection("plex") == {"movies": ["Movies"], "tv": []}
+    assert db.get_library_selection("plex") == {"movies": ["Movies"], "tv": [], "youtube": []}
 
 
 def test_legacy_kv_migrates_titles_and_flat_path(db):

@@ -174,10 +174,18 @@
         if (n) n.textContent = text || '';
     }
 
+    // The global Torrent Client category field (Settings → Connections →
+    // Torrent Client) — read live so a per-library category input can show
+    // it as the "blank = inherits X" placeholder.
+    function _globalTorrentCategory() {
+        var el = document.getElementById('torrent-client-category');
+        return (el && el.value.trim()) || 'soulsync';
+    }
+
     // Each row = one discovered server section, optionally CONFIGURED as a
-    // Library (checked, with a rename + destination folder). Text inputs stay
-    // hidden until checked, and only fire save() on 'change' (blur), never per
-    // keystroke, so typing a path never fights a re-render.
+    // Library (checked, with a rename + destination folder + torrent category).
+    // Text inputs stay hidden until checked, and only fire save() on 'change'
+    // (blur), never per keystroke, so typing a path never fights a re-render.
     function libraryRow(title, configured) {
         var row = document.createElement('div');
         row.className = 'library-editor-row';
@@ -212,6 +220,14 @@
         pathInput.setAttribute('data-lib-path', '');
         fields.appendChild(pathInput);
 
+        var categoryInput = document.createElement('input');
+        categoryInput.type = 'text';
+        categoryInput.placeholder = 'Torrent category (blank = "' + _globalTorrentCategory() + '")';
+        categoryInput.title = 'Overrides the global Torrent Client category for grabs that land in this library.';
+        categoryInput.value = (configured && configured.category) || '';
+        categoryInput.setAttribute('data-lib-category', '');
+        fields.appendChild(categoryInput);
+
         row.appendChild(fields);
         box.addEventListener('change', function () { fields.style.display = box.checked ? '' : 'none'; });
         return row;
@@ -245,11 +261,13 @@
             if (!box || !box.checked) continue;
             var labelInput = row.querySelector('[data-lib-label]');
             var pathInput = row.querySelector('[data-lib-path]');
+            var categoryInput = row.querySelector('[data-lib-category]');
             out.push({
                 id: row.dataset.libId ? parseInt(row.dataset.libId, 10) : null,
                 server_title: row.dataset.serverTitle,
                 label: labelInput ? labelInput.value.trim() : '',
-                path: pathInput ? pathInput.value.trim() : ''
+                path: pathInput ? pathInput.value.trim() : '',
+                category: categoryInput ? categoryInput.value.trim() : ''
             });
         }
         return out;
@@ -269,6 +287,90 @@
         }
     }
 
+    // ── YouTube Libraries: manual name + destination folder, no server-side
+    // discovery (YouTube isn't scanned from a Plex/Jellyfin section). Rows are
+    // added/removed by hand and saved through the same /api/video/libraries
+    // POST as movies/tv, keyed by the "youtube" content kind.
+    function ytLibraryRow(configured) {
+        var row = document.createElement('div');
+        row.className = 'yt-library-row';
+        row.dataset.libId = (configured && configured.id) || '';
+
+        var nameInput = document.createElement('input');
+        nameInput.type = 'text';
+        nameInput.placeholder = 'Name, e.g. YouTube';
+        nameInput.value = (configured && configured.server_title) || '';
+        nameInput.setAttribute('data-yt-lib-name', '');
+        row.appendChild(nameInput);
+
+        var pathInput = document.createElement('input');
+        pathInput.type = 'text';
+        pathInput.placeholder = 'Destination folder, e.g. /media/youtube';
+        pathInput.value = (configured && configured.path) || '';
+        pathInput.setAttribute('data-yt-lib-path', '');
+        row.appendChild(pathInput);
+
+        var del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'vq-fmt-del';
+        del.title = 'Delete library';
+        del.textContent = '✕';
+        del.setAttribute('data-yt-lib-del', '');
+        row.appendChild(del);
+
+        return row;
+    }
+
+    function fillYt(group, configured) {
+        if (!group) return;
+        group.textContent = '';
+        configured = configured || [];
+        configured.forEach(function (c) { group.appendChild(ytLibraryRow(c)); });
+        if (!configured.length) {
+            var hint = document.createElement('div');
+            hint.className = 'settings-hint yt-lib-empty-hint';
+            hint.style.padding = '6px 0';
+            hint.textContent = 'No YouTube libraries yet — click "+ Add library" below.';
+            group.appendChild(hint);
+        }
+    }
+
+    function collectYtLibraries(group) {
+        if (!group) return [];
+        var rows = group.querySelectorAll('.yt-library-row');
+        var out = [];
+        for (var i = 0; i < rows.length; i++) {
+            var row = rows[i];
+            var nameInput = row.querySelector('[data-yt-lib-name]');
+            var pathInput = row.querySelector('[data-yt-lib-path]');
+            var name = nameInput ? nameInput.value.trim() : '';
+            if (!name) continue;   // blank (not-yet-named) rows aren't saved
+            out.push({
+                id: row.dataset.libId ? parseInt(row.dataset.libId, 10) : null,
+                server_title: name,
+                label: '',
+                path: pathInput ? pathInput.value.trim() : ''
+            });
+        }
+        return out;
+    }
+
+    // Like reconcileIds, but matched by the current name (manual rows have no
+    // fixed discovered title to key off of) so a later edit UPDATEs instead of
+    // inserting a duplicate.
+    function reconcileYtIds(group, configured) {
+        if (!group || !configured) return;
+        var byTitle = {};
+        configured.forEach(function (c) { byTitle[c.server_title] = c; });
+        var rows = group.querySelectorAll('.yt-library-row');
+        for (var i = 0; i < rows.length; i++) {
+            var nameInput = rows[i].querySelector('[data-yt-lib-name]');
+            var name = nameInput ? nameInput.value.trim() : '';
+            var match = name ? byTitle[name] : null;
+            rows[i].dataset.libId = match ? match.id : '';
+        }
+    }
+
     function load() {
         status('Loading…');
         fetch(URL, { headers: { 'Accept': 'application/json' } })
@@ -278,6 +380,7 @@
                 var cfg = d.configured || {};
                 fill(document.querySelector('[data-video-lib-group="movies"]'), d.movies || [], cfg.movies);
                 fill(document.querySelector('[data-video-lib-group="tv"]'), d.tv || [], cfg.tv);
+                fillYt(document.querySelector('[data-video-lib-group="youtube"]'), cfg.youtube);
                 status('');
             })
             .catch(function () { status('Could not load libraries'); });
@@ -286,15 +389,20 @@
     function save(silent) {
         var m = document.querySelector('[data-video-lib-group="movies"]');
         var t = document.querySelector('[data-video-lib-group="tv"]');
+        var y = document.querySelector('[data-video-lib-group="youtube"]');
         status('Saving…');
         return fetch(URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-            body: JSON.stringify({ movies: collectLibraries(m), tv: collectLibraries(t) })
+            body: JSON.stringify({ movies: collectLibraries(m), tv: collectLibraries(t), youtube: collectYtLibraries(y) })
         })
             .then(function (r) { return r.json(); })
             .then(function (d) {
-                if (d && d.configured) { reconcileIds(m, d.configured.movies); reconcileIds(t, d.configured.tv); }
+                if (d && d.configured) {
+                    reconcileIds(m, d.configured.movies);
+                    reconcileIds(t, d.configured.tv);
+                    reconcileYtIds(y, d.configured.youtube);
+                }
                 status('Saved'); if (!silent) toast('Libraries saved', 'success');
             })
             .catch(function () { status('Save failed'); if (!silent) toast('Could not save libraries', 'error'); });
@@ -1397,6 +1505,30 @@
         for (var i = 0; i < groups.length; i++) {
             groups[i].addEventListener('change', function (e) {
                 if (e.target && (e.target.type === 'checkbox' || e.target.type === 'text')) save();
+            });
+            // YouTube rows have no checkbox — deleted via an explicit ✕ button.
+            groups[i].addEventListener('click', function (e) {
+                var del = e.target.closest('[data-yt-lib-del]');
+                if (!del) return;
+                var group = del.closest('[data-video-lib-group="youtube"]');
+                del.closest('.yt-library-row').remove();
+                if (group && !group.querySelector('.yt-library-row')) fillYt(group, []);
+                save();
+            });
+        }
+        // "+ Add library" appends a blank, unsaved row — it's picked up by the
+        // 'change' listener above (and thus saved) once the user names it.
+        var addYtLib = document.querySelector('[data-video-ytlib-add]');
+        if (addYtLib) {
+            addYtLib.addEventListener('click', function () {
+                var group = document.querySelector('[data-video-lib-group="youtube"]');
+                if (!group) return;
+                var hint = group.querySelector('.yt-lib-empty-hint');
+                if (hint) hint.remove();
+                var row = ytLibraryRow(null);
+                group.appendChild(row);
+                var nameInput = row.querySelector('[data-yt-lib-name]');
+                if (nameInput) nameInput.focus();
             });
         }
         // Enrichment keys save on blur/change (turns the workers on).

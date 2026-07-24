@@ -583,6 +583,7 @@ class MusicDatabase:
             self._add_profile_recovery_support(cursor)
             self._add_profile_service_credentials(cursor)
             self._add_service_credential_sets(cursor)
+            self._add_profile_plex_link(cursor)
             self._add_soul_id_columns(cursor)
             self._add_listening_history_table(cursor)
 
@@ -712,6 +713,9 @@ class MusicDatabase:
             self._add_automation_then_actions_column(cursor)
             self._add_automation_group_name_column(cursor)
             self._add_automation_owned_by_column(cursor)
+
+            # Flags a downloaded track as not-yet-purchased (migration)
+            self._add_to_be_purchased_column(cursor)
 
             # Library issues — user-reported problems with tracks/albums/artists
             cursor.execute("""
@@ -1644,6 +1648,20 @@ class MusicDatabase:
                 logger.info(f"Backfilled {cursor.rowcount} existing Auto-Sync automations with owned_by='auto_sync'")
         except Exception as e:
             logger.error(f"Error adding automation owned_by column: {e}")
+
+    def _add_to_be_purchased_column(self, cursor):
+        """Flags a track as downloaded-but-not-yet-purchased — set automatically
+        when a real download lands in the library (core/imports/side_effects.py's
+        record_soulsync_library_entry), cleared manually once bought via the
+        generic PUT /api/library/track/<id> endpoint."""
+        try:
+            cursor.execute("PRAGMA table_info(tracks)")
+            cols = [c[1] for c in cursor.fetchall()]
+            if 'to_be_purchased' not in cols:
+                cursor.execute("ALTER TABLE tracks ADD COLUMN to_be_purchased INTEGER NOT NULL DEFAULT 0")
+                logger.info("Added to_be_purchased column to tracks table")
+        except Exception as e:
+            logger.error(f"Error adding to_be_purchased column: {e}")
 
     def _add_automation_then_actions_column(self, cursor):
         """Add then_actions column to automations table and migrate existing notify data."""
@@ -5790,7 +5808,7 @@ class MusicDatabase:
                 cursor = conn.cursor()
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='profiles'")
                 if not cursor.fetchone():
-                    return [{'id': 1, 'name': 'Admin', 'avatar_color': '#6366f1', 'avatar_url': None, 'is_admin': True, 'has_pin': False}]
+                    return [{'id': 1, 'name': 'Admin', 'avatar_color': '#6366f1', 'avatar_url': None, 'is_admin': True, 'has_pin': False, 'plex_account_id': None}]
                 cursor.execute("SELECT * FROM profiles ORDER BY id")
                 rows = cursor.fetchall()
                 columns = [desc[0] for desc in cursor.description]
@@ -5813,13 +5831,15 @@ class MusicDatabase:
                         'can_download': bool(row['can_download']) if 'can_download' in columns else True,
                         'has_listenbrainz': row['listenbrainz_token'] is not None if 'listenbrainz_token' in columns else False,
                         'listenbrainz_username': row['listenbrainz_username'] if 'listenbrainz_username' in columns else None,
+                        'plex_account_id': row['plex_account_id'] if 'plex_account_id' in columns else None,
+                        'plex_username': row['plex_username'] if 'plex_username' in columns else None,
                         'created_at': row['created_at'],
                         'updated_at': row['updated_at'],
                     })
                 return results
         except Exception as e:
             logger.error(f"Error getting profiles: {e}")
-            return [{'id': 1, 'name': 'Admin', 'avatar_color': '#6366f1', 'avatar_url': None, 'is_admin': True, 'has_pin': False}]
+            return [{'id': 1, 'name': 'Admin', 'avatar_color': '#6366f1', 'avatar_url': None, 'is_admin': True, 'has_pin': False, 'plex_account_id': None}]
 
     def get_profile(self, profile_id: int) -> Optional[Dict[str, Any]]:
         """Get a single profile by ID"""
@@ -5847,6 +5867,8 @@ class MusicDatabase:
                         'can_download': bool(row['can_download']) if 'can_download' in columns else True,
                         'has_listenbrainz': row['listenbrainz_token'] is not None if 'listenbrainz_token' in columns else False,
                         'listenbrainz_username': row['listenbrainz_username'] if 'listenbrainz_username' in columns else None,
+                        'plex_account_id': row['plex_account_id'] if 'plex_account_id' in columns else None,
+                        'plex_username': row['plex_username'] if 'plex_username' in columns else None,
                         'created_at': row['created_at'],
                         'updated_at': row['updated_at'],
                     }
@@ -5859,8 +5881,14 @@ class MusicDatabase:
                        pin_hash: Optional[str] = None, is_admin: bool = False,
                        avatar_url: Optional[str] = None, home_page: Optional[str] = None,
                        allowed_pages: Optional[list] = None, can_download: bool = True,
-                       allowed_sides: Optional[str] = None) -> Optional[int]:
-        """Create a new profile. Returns new profile ID or None on error."""
+                       allowed_sides: Optional[str] = None,
+                       plex_account_id: Optional[int] = None, plex_username: Optional[str] = None,
+                       plex_thumb: Optional[str] = None) -> Optional[int]:
+        """Create a new profile. Returns new profile ID or None on error.
+        plex_account_id/plex_username/plex_thumb link this profile to a Plex
+        account (bulk import or Sign in with Plex auto-provisioning) — the
+        caller is responsible for checking get_profile_by_plex_id() first to
+        avoid a duplicate link (no DB-level uniqueness on plex_account_id)."""
         if allowed_sides not in ('music', 'video', 'both'):
             allowed_sides = None   # NULL = the shipped default (music for non-admin)
         try:
@@ -5868,9 +5896,9 @@ class MusicDatabase:
                 cursor = conn.cursor()
                 ap_json = json.dumps(allowed_pages) if allowed_pages is not None else None
                 cursor.execute("""
-                    INSERT INTO profiles (name, avatar_color, pin_hash, is_admin, avatar_url, home_page, allowed_pages, can_download, allowed_sides)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (name, avatar_color, pin_hash, int(is_admin), avatar_url, home_page, ap_json, int(can_download), allowed_sides))
+                    INSERT INTO profiles (name, avatar_color, pin_hash, is_admin, avatar_url, home_page, allowed_pages, can_download, allowed_sides, plex_account_id, plex_username, plex_thumb)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (name, avatar_color, pin_hash, int(is_admin), avatar_url, home_page, ap_json, int(can_download), allowed_sides, plex_account_id, plex_username, plex_thumb))
                 conn.commit()
                 return cursor.lastrowid
         except sqlite3.IntegrityError:
@@ -5881,8 +5909,9 @@ class MusicDatabase:
             return None
 
     def update_profile(self, profile_id: int, **kwargs) -> bool:
-        """Update profile fields. Accepts: name, avatar_color, avatar_url, pin_hash, is_admin, home_page, allowed_pages, can_download."""
-        allowed = {'name', 'avatar_color', 'avatar_url', 'pin_hash', 'is_admin', 'home_page', 'allowed_pages', 'can_download', 'allowed_sides'}
+        """Update profile fields. Accepts: name, avatar_color, avatar_url, pin_hash, is_admin, home_page, allowed_pages, can_download, allowed_sides, plex_account_id, plex_username, plex_thumb."""
+        allowed = {'name', 'avatar_color', 'avatar_url', 'pin_hash', 'is_admin', 'home_page', 'allowed_pages', 'can_download', 'allowed_sides',
+                  'plex_account_id', 'plex_username', 'plex_thumb'}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         # Serialize allowed_pages list to JSON string for storage
         if 'allowed_pages' in updates:
@@ -6030,6 +6059,23 @@ class MusicDatabase:
             logger.error(f"Error looking up profile by name '{name}': {e}")
             return None
 
+    def get_profile_by_plex_id(self, plex_account_id: int) -> Optional[Dict[str, Any]]:
+        """Look up a profile by its linked Plex account id (bulk import /
+        Sign in with Plex). None if no profile is linked to that account yet."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT id, name, is_admin FROM profiles WHERE plex_account_id = ?",
+                    (plex_account_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return {'id': row['id'], 'name': row['name'], 'is_admin': bool(row['is_admin'])}
+        except Exception as e:
+            logger.error(f"Error looking up profile by plex_account_id '{plex_account_id}': {e}")
+            return None
+
     def _add_profile_password_support(self, cursor):
         """Add a per-profile login password column (separate from pin_hash)."""
         try:
@@ -6133,6 +6179,31 @@ class MusicDatabase:
             logger.info("Per-profile recovery-question migration completed")
         except Exception as e:
             logger.error(f"Error in recovery-question migration: {e}")
+
+    def _add_profile_plex_link(self, cursor):
+        """Add Plex-account-linkage columns (bulk import + Sign in with Plex).
+        No DB-level UNIQUE on plex_account_id — SQLite's ALTER TABLE ADD COLUMN
+        doesn't support inline constraints; uniqueness is enforced in code via
+        get_profile_by_plex_id() before insert."""
+        try:
+            cursor.execute("SELECT value FROM metadata WHERE key = 'profiles_plex_link_v1' LIMIT 1")
+            if cursor.fetchone():
+                return  # Already migrated
+            logger.info("Applying profile Plex-link migration...")
+            for col_sql in (
+                "ALTER TABLE profiles ADD COLUMN plex_account_id INTEGER DEFAULT NULL",
+                "ALTER TABLE profiles ADD COLUMN plex_username TEXT DEFAULT NULL",
+                "ALTER TABLE profiles ADD COLUMN plex_thumb TEXT DEFAULT NULL",
+            ):
+                try:
+                    cursor.execute(col_sql)
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+            cursor.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('profiles_plex_link_v1', '1')")
+            logger.info("Profile Plex-link migration completed")
+        except Exception as e:
+            logger.error(f"Error in profile Plex-link migration: {e}")
 
     def close(self):
         """Close database connection (no-op since we create connections per operation)"""
@@ -12950,6 +13021,74 @@ class MusicDatabase:
                 }
             }
 
+    def get_to_be_purchased_tracks(self, search: str = "", page: int = 1, limit: int = 50) -> Dict[str, Any]:
+        """Flat, cross-artist list of tracks still flagged to_be_purchased —
+        the "shopping list" view. Newest-flagged-first (most recently
+        downloaded is most likely to be top of mind). Pagination shape
+        mirrors get_library_artists()."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+
+                where_conditions = ["t.to_be_purchased = 1"]
+                params: List[Any] = []
+                if search:
+                    where_conditions.append("(LOWER(t.title) LIKE LOWER(?) OR LOWER(ar.name) LIKE LOWER(?) OR LOWER(al.title) LIKE LOWER(?))")
+                    like = f"%{search}%"
+                    params.extend([like, like, like])
+                where_clause = " AND ".join(where_conditions)
+
+                cursor.execute(
+                    f"""
+                    SELECT COUNT(*) as total_count
+                    FROM tracks t
+                    JOIN albums al ON t.album_id = al.id
+                    JOIN artists ar ON al.artist_id = ar.id
+                    WHERE {where_clause}
+                    """,
+                    params,
+                )
+                total_count = cursor.fetchone()['total_count']
+
+                offset = (page - 1) * limit
+                cursor.execute(
+                    f"""
+                    SELECT t.id, t.title, t.track_number, t.duration, t.file_path,
+                           al.id AS album_id, al.title AS album_title, al.thumb_url, al.year,
+                           ar.id AS artist_id, ar.name AS artist_name
+                    FROM tracks t
+                    JOIN albums al ON t.album_id = al.id
+                    JOIN artists ar ON al.artist_id = ar.id
+                    WHERE {where_clause}
+                    ORDER BY t.created_at DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    params + [limit, offset],
+                )
+                tracks = [dict(row) for row in cursor.fetchall()]
+
+                total_pages = (total_count + limit - 1) // limit if limit else 0
+                return {
+                    'tracks': tracks,
+                    'pagination': {
+                        'page': page,
+                        'limit': limit,
+                        'total_count': total_count,
+                        'total_pages': total_pages,
+                        'has_prev': page > 1,
+                        'has_next': page < total_pages,
+                    }
+                }
+        except Exception as e:
+            logger.error(f"Error getting to-be-purchased tracks: {e}")
+            return {
+                'tracks': [],
+                'pagination': {
+                    'page': 1, 'limit': limit, 'total_count': 0, 'total_pages': 0,
+                    'has_prev': False, 'has_next': False,
+                }
+            }
+
     def get_artist_discography(self, artist_id) -> Dict[str, Any]:
         """
         Get complete artist information and their releases from the database.
@@ -13158,7 +13297,7 @@ class MusicDatabase:
     # Field whitelists for safe updates
     ARTIST_EDITABLE_FIELDS = {'name', 'genres', 'summary', 'style', 'mood', 'label'}
     ALBUM_EDITABLE_FIELDS = {'title', 'year', 'release_date', 'genres', 'style', 'mood', 'label', 'explicit', 'record_type', 'track_count'}
-    TRACK_EDITABLE_FIELDS = {'title', 'track_number', 'disc_number', 'bpm', 'explicit', 'style', 'mood'}
+    TRACK_EDITABLE_FIELDS = {'title', 'track_number', 'disc_number', 'bpm', 'explicit', 'style', 'mood', 'to_be_purchased'}
 
     def get_artist_full_detail(self, artist_id) -> Dict[str, Any]:
         """

@@ -487,6 +487,7 @@ bootstrapServerAppearanceSettings();
 
 // ── Profile System ─────────────────────────────────────────────
 let currentProfile = null;
+let plexLoginEnabled = false;   // security.allow_plex_login, read from /api/profiles/current
 const PROFILE_CONTEXT_CHANGED_EVENT = 'ss:webui-profile-context-changed';
 
 function notifyProfileContextChanged() {
@@ -597,6 +598,7 @@ async function initProfileSystem() {
         // Check if a session already has a profile selected
         const currentRes = await fetch('/api/profiles/current');
         const currentData = await currentRes.json();
+        plexLoginEnabled = !!currentData.plex_login_enabled;
         // Login mode: show the sign-in screen and defer everything else until
         // the user authenticates.
         if (currentData.login_required) {
@@ -666,6 +668,8 @@ function showLoginScreen() {
     // initApp() reveals it again on a successful sign-in (#852).
     document.body.classList.add('app-locked');
     overlay.style.display = 'flex';
+    const plexBtn = document.getElementById('login-plex-signin-btn');
+    if (plexBtn) plexBtn.style.display = plexLoginEnabled ? '' : 'none';
     const u = document.getElementById('login-username');
     if (u) setTimeout(() => u.focus(), 50);
 }
@@ -700,6 +704,93 @@ async function submitLogin() {
 async function soulsyncLogout() {
     try { await fetch('/api/auth/logout', { method: 'POST' }); } catch (e) { /* reload anyway */ }
     window.location.reload();
+}
+
+// ── Sign in with Plex — shared PIN-code flow triggered from either the
+// login screen or the profile picker. Mirrors settings.js's admin-side
+// startPlexPinAuth()/pollPlexPinAuthStatus() (server-linking), but this flow
+// identifies the SIGNING-IN user via /api/auth/plex/* and reloads into the
+// app on success rather than filling in a config field. ──────────────────
+let _plexSignInRequestId = null;
+let _plexSignInPollInterval = null;
+
+async function startPlexSignIn() {
+    const overlay = document.getElementById('plex-signin-overlay');
+    const codeEl = document.getElementById('plex-signin-code');
+    const statusEl = document.getElementById('plex-signin-status');
+    const errEl = document.getElementById('plex-signin-error');
+    if (errEl) errEl.style.display = 'none';
+    if (overlay) overlay.style.display = 'flex';
+    if (statusEl) statusEl.textContent = 'Starting Plex authorization…';
+    if (codeEl) codeEl.textContent = '';
+
+    try {
+        const res = await fetch('/api/auth/plex/start', { method: 'POST' });
+        const data = await res.json();
+        if (!data.success) {
+            if (errEl) { errEl.textContent = data.error || 'Failed to start Plex sign-in'; errEl.style.display = 'block'; }
+            return;
+        }
+        _plexSignInRequestId = data.request_id;
+        if (codeEl) codeEl.textContent = data.code || '';
+        if (statusEl) {
+            statusEl.textContent = data.expires_in
+                ? `Waiting for authorization… code expires in ${data.expires_in}s`
+                : 'Waiting for authorization…';
+        }
+        _plexSignInPollInterval = setInterval(pollPlexSignInStatus, 5000);
+        pollPlexSignInStatus();
+    } catch (e) {
+        if (errEl) { errEl.textContent = 'Connection error'; errEl.style.display = 'block'; }
+    }
+}
+
+async function pollPlexSignInStatus() {
+    if (!_plexSignInRequestId) return;
+    const statusEl = document.getElementById('plex-signin-status');
+    const errEl = document.getElementById('plex-signin-error');
+    try {
+        const res = await fetch(`/api/auth/plex/status?request_id=${encodeURIComponent(_plexSignInRequestId)}`);
+        const data = await res.json();
+
+        if (!data.success && data.expired) {
+            stopPlexSignInPolling();
+            if (statusEl) statusEl.textContent = 'Code expired.';
+            if (errEl) { errEl.textContent = 'That code expired — click Sign in with Plex to get a new one.'; errEl.style.display = 'block'; }
+            return;
+        }
+        if (data.success) {
+            stopPlexSignInPolling();
+            if (statusEl) statusEl.textContent = 'Signed in — loading…';
+            window.location.reload();   // authenticated → reload into the app, same as submitLogin()
+            return;
+        }
+        if (data.status) {
+            if (statusEl) statusEl.textContent = data.status;
+            return;
+        }
+        // A definitive rejection (disabled, no server access) — stop polling and show it.
+        if (data.error) {
+            stopPlexSignInPolling();
+            if (errEl) { errEl.textContent = data.error; errEl.style.display = 'block'; }
+        }
+    } catch (e) {
+        if (statusEl) statusEl.textContent = 'Unable to contact Plex sign-in status. Retrying…';
+    }
+}
+
+function stopPlexSignInPolling() {
+    if (_plexSignInPollInterval) {
+        clearInterval(_plexSignInPollInterval);
+        _plexSignInPollInterval = null;
+    }
+}
+
+function cancelPlexSignIn() {
+    stopPlexSignInPolling();
+    _plexSignInRequestId = null;
+    const overlay = document.getElementById('plex-signin-overlay');
+    if (overlay) overlay.style.display = 'none';
 }
 
 function showLoginRecovery() {
@@ -1183,8 +1274,9 @@ function showProfilePicker(profiles, canCancel = false) {
     // Show actions: admin sees "Manage Profiles", non-admin sees "My Profile" (when they have a profile selected)
     const isAdmin = currentProfile ? currentProfile.is_admin : false;
     const manageBtn = document.getElementById('manage-profiles-btn');
+    const showManage = isAdmin || (currentProfile && canCancel);
+    if (manageBtn) manageBtn.style.display = showManage ? '' : 'none';
     if (isAdmin) {
-        actions.style.display = '';
         if (manageBtn) {
             manageBtn.textContent = 'Manage Profiles';
             // Reset onclick to admin handler (initProfileManagement sets this, but re-affirm here)
@@ -1195,14 +1287,16 @@ function showProfilePicker(profiles, canCancel = false) {
         }
     } else if (currentProfile && canCancel) {
         // Non-admin with an active profile: show "My Profile" to edit own settings
-        actions.style.display = '';
         if (manageBtn) {
             manageBtn.textContent = 'My Profile';
             manageBtn.onclick = () => showSelfEditForm();
         }
-    } else {
-        actions.style.display = 'none';
     }
+    // Sign in with Plex — independent of admin/manage visibility above; can
+    // show on its own on a fresh picker with no profile selected yet.
+    const pickerPlexBtn = document.getElementById('picker-plex-signin-btn');
+    if (pickerPlexBtn) pickerPlexBtn.style.display = plexLoginEnabled ? '' : 'none';
+    actions.style.display = (showManage || plexLoginEnabled) ? '' : 'none';
 
     // Show/remove cancel button when opened from sidebar indicator
     let cancelBtn = overlay.querySelector('.profile-picker-cancel');
@@ -2275,10 +2369,14 @@ async function loadProfileManageList() {
         const pills = [];
         if (isCurrent) pills.push({ text: 'You', cls: 'profile-role-pill--current' });
         if (p.is_admin) pills.push({ text: 'Admin', cls: 'profile-role-pill--admin' });
+        if (p.plex_account_id) pills.push({ text: 'Plex', cls: 'profile-role-pill--plex' });
         if (p.can_download === false) pills.push({ text: 'No Downloads', cls: '' });
         if (p.allowed_pages) pills.push({ text: `${p.allowed_pages.length} pages`, cls: '' });
-        // Login-password status (only meaningful while login mode is on).
-        if (loginMode && !p.is_admin) {
+        // Login-password status (only meaningful while login mode is on). A
+        // Plex-linked profile is exempt from needing a local password —
+        // completing Plex OAuth is its own way in — so skip the "no
+        // password" warning for it (see core/security/login_provisioning.py).
+        if (loginMode && !p.is_admin && !p.plex_account_id) {
             pills.push(p.has_password
                 ? { text: '🔒 Login ready', cls: 'profile-role-pill--ok' }
                 : { text: '⚠ No login password', cls: 'profile-role-pill--warn' });

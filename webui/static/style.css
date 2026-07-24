@@ -46169,6 +46169,24 @@ div.artist-hero-badge {
     border-color: rgba(16, 185, 129, 0.35);
 }
 
+/* Plex-linked profile (bulk import or Sign in with Plex) — Plex's brand amber. */
+.profile-role-pill--plex {
+    background: rgba(229, 160, 13, 0.16);
+    color: #f3c969;
+    border-color: rgba(229, 160, 13, 0.4);
+}
+
+/* Sign in with Plex button — same shape as the launch-pin/login submit
+   button, but a Plex-amber outline so it reads as a distinct action. */
+.plex-signin-btn {
+    background: transparent;
+    border: 1px solid rgba(229, 160, 13, 0.5);
+    color: #f3c969;
+}
+.plex-signin-btn:hover {
+    background: rgba(229, 160, 13, 0.12);
+}
+
 .profile-manage-actions {
     display: flex;
     gap: 6px;
@@ -62053,6 +62071,16 @@ tr:hover .enhanced-track-actions-group { opacity: 1; }
 }
 .enhanced-delete-btn:hover { color: #ef5350; background: rgba(239,83,80,0.1); }
 
+.enhanced-tbp-btn {
+    background: none; border: none; cursor: pointer;
+    width: 24px; height: 24px; border-radius: 5px;
+    display: flex; align-items: center; justify-content: center;
+    color: rgba(255,255,255,0.35); font-size: 13px;
+    transition: all 0.15s; padding: 0;
+}
+.enhanced-tbp-btn:hover { color: #f1c40f; background: rgba(241,196,15,0.1); }
+.enhanced-tbp-btn.active { color: #f1c40f; }
+
 /* Source Info Popover */
 .source-info-popover {
     position: fixed;
@@ -70828,6 +70856,42 @@ body.em-scroll-lock { overflow: hidden; }
 .arec-body::-webkit-scrollbar { width: 10px; }
 .arec-body::-webkit-scrollbar-thumb { background: rgba(122,162,247,0.25); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
 .arec-body::-webkit-scrollbar-thumb:hover { background: rgba(122,162,247,0.45); background-clip: padding-box; }
+
+/* ── "To Be Purchased" shopping list (reuses the .arec-* modal shell) ── */
+.library-tbp-count {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 16px; height: 16px; padding: 0 4px;
+    border-radius: 999px; background: rgba(var(--accent-rgb), 0.9);
+    color: #0d1017; font-size: 10px; font-weight: 700; line-height: 16px;
+}
+.tbp-rows { display: flex; flex-direction: column; gap: 4px; }
+.tbp-row {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px; border-radius: 9px;
+    transition: background .12s ease;
+}
+.tbp-row:hover { background: rgba(122,162,247,0.07); }
+.tbp-thumb {
+    width: 40px; height: 40px; border-radius: 6px; flex-shrink: 0;
+    object-fit: cover; background: rgba(255,255,255,0.05);
+}
+.tbp-thumb-placeholder {
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px; opacity: 0.6;
+}
+.tbp-row-info { flex: 1; min-width: 0; }
+.tbp-row-title {
+    color: #e6ebff; font-size: 13px; font-weight: 600;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tbp-row-sub {
+    color: #8b93b0; font-size: 12px; margin-top: 2px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tbp-mark-btn { flex-shrink: 0; }
+.tbp-pager { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; }
+.tbp-pager .arec-btn:disabled { opacity: 0.35; cursor: default; }
 
 @media (max-width: 640px) {
     .artist-db-record-btn span { display: none; }

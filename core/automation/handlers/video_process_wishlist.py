@@ -286,6 +286,23 @@ def _default_target_dir(media_type: str) -> str:
     return resolve_download_root(kind, primary_root_folder=primary, paths=paths)
 
 
+def _default_category(media_type: str) -> Optional[str]:
+    """The torrent/usenet category for an unattended grab (multi-category,
+    P.4) — the PRIMARY configured Library's category for this kind, else None
+    (the client adapter falls back to the global torrent_client.category /
+    usenet_client.category setting). Mirrors ``_default_target_dir`` so an
+    unattended grab's destination folder and its category come from the SAME
+    Library."""
+    from api.video import get_video_db
+    from core.video.download_pipeline import resolve_torrent_category
+    from core.video.sources import resolve_video_server
+    db = get_video_db()
+    kind = "movie" if media_type == "movie" else "show"
+    server = resolve_video_server(db)
+    primary = db.primary_root_folder(server, kind) if server else None
+    return resolve_torrent_category(primary_root_folder=primary)
+
+
 def _search_one_source(source: str, item: Dict[str, Any], media_type: str):
     """Search ONE source → (ranked candidates tagged with source, error). soulseek via slskd,
     torrent/usenet via Prowlarr. Returns (None, error) when the search couldn't run."""
@@ -382,8 +399,9 @@ def _default_enqueue(item: Dict[str, Any], best: Dict[str, Any], candidates: Lis
             return False
     else:
         # torrent / usenet — hand off to the shared client; carry the returned ref into the row.
+        # Category comes from the SAME primary Library target_dir was resolved from (P.4).
         from core.video.client_grab import grab
-        res = grab(source, best.get("download_url"))
+        res = grab(source, best.get("download_url"), category=_default_category(media_type))
         if not res.get("ok"):
             logger.warning("video hybrid: %s grab refused for %s: %s", source, item.get("title"), res.get("error"))
             return False

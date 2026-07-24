@@ -35,6 +35,9 @@ function initializeLibraryPage() {
         // Load initial data
         loadLibraryArtists();
 
+        // "To Be Purchased" header badge count
+        loadToBePurchasedCount();
+
         // Show download bubbles if any exist
         showLibraryDownloadsSection();
 
@@ -4853,8 +4856,10 @@ function _buildTrackRow(track, album, admin) {
                 </div>
             `;
         } else {
+            const tbpOn = !!track.to_be_purchased;
             actionsTd.innerHTML = `
                 <div class="enhanced-track-actions-group">
+                    <button class="enhanced-tbp-btn${tbpOn ? ' active' : ''}" title="${tbpOn ? 'Mark purchased' : 'Mark to be purchased'}">🛒</button>
                     <button class="enhanced-source-info-btn" title="View download source info">ℹ</button>
                     <button class="enhanced-reidentify-btn" title="Re-identify — file this track under a different release">&#8644;</button>
                     <button class="enhanced-redownload-btn" title="Redownload this track">&#8635;</button>
@@ -5057,6 +5062,13 @@ function _attachTableDelegation(table, album) {
             return;
         }
 
+        // To Be Purchased toggle (admin)
+        if (target.closest('.enhanced-tbp-btn')) {
+            e.stopPropagation();
+            _toggleTrackToBePurchased(track.id, target.closest('.enhanced-tbp-btn'));
+            return;
+        }
+
         // Source info button (admin)
         if (target.closest('.enhanced-source-info-btn')) {
             e.stopPropagation();
@@ -5140,6 +5152,10 @@ function _showMobileTrackActions(track, album) {
         actions.push({ icon: '✎', label: 'Write Tags', action: () => showTagPreview(track.id) });
     }
     if (admin) {
+        actions.push({
+            icon: '🛒', label: track.to_be_purchased ? 'Mark Purchased' : 'Mark To Be Purchased',
+            action: () => _toggleTrackToBePurchasedMobile(track)
+        });
         actions.push({ icon: 'ℹ', label: 'Source Info', action: () => showTrackSourceInfo(track, null) });
         actions.push({ icon: '↻', label: 'Redownload Track', action: () => showTrackRedownloadModal(track, album) });
         actions.push({ icon: '✕', label: 'Delete Track', cls: 'popover-delete', action: () => deleteLibraryTrack(track.id, album.id) });
@@ -9929,6 +9945,206 @@ async function openArtistExportModal(initialScope) {
     };
 
     refresh();
+}
+
+
+// ==================== "To Be Purchased" shopping list ====================
+// Flat, cross-artist list of tracks flagged to_be_purchased (auto-set on
+// download, cleared here or from the artist drill-down). Reuses the .arec-*
+// modal shell (see openArtistExportModal above) for consistent chrome.
+
+const tbpState = { page: 1, search: '', totalPages: 1 };
+
+async function loadToBePurchasedCount() {
+    const badge = document.getElementById('library-tbp-count');
+    if (!badge) return;
+    try {
+        const res = await fetch('/api/library/to-be-purchased?limit=1');
+        const data = await res.json();
+        const count = (data && data.pagination && data.pagination.total_count) || 0;
+        badge.textContent = count > 99 ? '99+' : String(count);
+        badge.style.display = count > 0 ? '' : 'none';
+    } catch (e) {
+        badge.style.display = 'none';
+    }
+}
+
+function openToBePurchasedModal() {
+    tbpState.page = 1;
+    tbpState.search = '';
+
+    const existing = document.getElementById('tbp-overlay');
+    if (existing) existing.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'tbp-overlay';
+    overlay.className = 'arec-overlay';
+    overlay.innerHTML =
+        '<div class="arec-card" role="dialog" aria-label="To Be Purchased">' +
+            '<div class="arec-header">' +
+                '<div class="arec-title-wrap">' +
+                    '<div class="arec-title"><span class="arec-dot"></span>To Be Purchased</div>' +
+                    '<div class="arec-sub">Tracks downloaded but not yet bought</div>' +
+                '</div>' +
+                '<button class="arec-close" id="tbp-close" title="Close (Esc)">&times;</button>' +
+            '</div>' +
+            '<div class="arec-toolbar">' +
+                '<input type="text" class="arec-filter" id="tbp-search" placeholder="Filter by title, artist, or album…">' +
+            '</div>' +
+            '<div class="arec-body" id="tbp-body"><div class="arec-loading">Loading…</div></div>' +
+            '<div class="arec-footer" id="tbp-footer"></div>' +
+        '</div>';
+    document.body.appendChild(overlay);
+    requestAnimationFrame(() => overlay.classList.add('visible'));
+
+    const close = () => {
+        overlay.classList.remove('visible');
+        document.removeEventListener('keydown', onKey);
+        setTimeout(() => overlay.remove(), 220);
+    };
+    const onKey = (e) => { if (e.key === 'Escape') close(); };
+    document.addEventListener('keydown', onKey);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    overlay.querySelector('#tbp-close').onclick = close;
+
+    let searchDebounce = null;
+    document.getElementById('tbp-search').addEventListener('input', (e) => {
+        clearTimeout(searchDebounce);
+        searchDebounce = setTimeout(() => {
+            tbpState.search = e.target.value.trim();
+            tbpState.page = 1;
+            _tbpRefresh();
+        }, 300);
+    });
+
+    _tbpRefresh();
+}
+
+async function _tbpRefresh() {
+    const body = document.getElementById('tbp-body');
+    const footer = document.getElementById('tbp-footer');
+    if (!body) return;
+    body.innerHTML = '<div class="arec-loading">Loading…</div>';
+    footer.innerHTML = '';
+
+    try {
+        const params = new URLSearchParams({ page: tbpState.page, limit: 50 });
+        if (tbpState.search) params.set('search', tbpState.search);
+        const res = await fetch('/api/library/to-be-purchased?' + params.toString());
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Failed to load');
+
+        const tracks = data.tracks || [];
+        tbpState.totalPages = data.pagination.total_pages || 1;
+
+        if (!tracks.length) {
+            body.innerHTML = '<div class="arec-loading">' +
+                (tbpState.search ? 'No matches.' : 'Nothing to buy — every downloaded track is accounted for.') +
+                '</div>';
+        } else {
+            body.innerHTML = '<div class="tbp-rows">' + tracks.map(_tbpRowHtml).join('') + '</div>';
+            body.querySelectorAll('.tbp-mark-btn').forEach(btn => {
+                btn.onclick = () => _tbpMarkPurchased(btn.dataset.trackId, btn.closest('.tbp-row'));
+            });
+        }
+
+        footer.innerHTML =
+            '<span><b>' + data.pagination.total_count + '</b> to buy</span>' +
+            (tbpState.totalPages > 1
+                ? '<span class="tbp-pager">' +
+                    '<button class="arec-btn" id="tbp-prev"' + (data.pagination.has_prev ? '' : ' disabled') + '>&larr;</button>' +
+                    '<span>' + tbpState.page + ' / ' + tbpState.totalPages + '</span>' +
+                    '<button class="arec-btn" id="tbp-next"' + (data.pagination.has_next ? '' : ' disabled') + '>&rarr;</button>' +
+                  '</span>'
+                : '');
+        const prevBtn = document.getElementById('tbp-prev');
+        const nextBtn = document.getElementById('tbp-next');
+        if (prevBtn) prevBtn.onclick = () => { tbpState.page--; _tbpRefresh(); };
+        if (nextBtn) nextBtn.onclick = () => { tbpState.page++; _tbpRefresh(); };
+    } catch (err) {
+        body.innerHTML = '<div class="arec-error">' + _arecEsc(err.message || String(err)) + '</div>';
+    }
+}
+
+function _tbpRowHtml(track) {
+    const sub = [track.artist_name, track.album_title].filter(Boolean).map(_arecEsc).join(' — ');
+    const thumb = track.thumb_url
+        ? '<img class="tbp-thumb" src="' + _arecEscAttr(track.thumb_url) + '" alt="">'
+        : '<div class="tbp-thumb tbp-thumb-placeholder">🎵</div>';
+    return '<div class="tbp-row">' +
+        thumb +
+        '<div class="tbp-row-info">' +
+            '<div class="tbp-row-title">' + _arecEsc(track.title || 'Untitled') + '</div>' +
+            '<div class="tbp-row-sub">' + sub + '</div>' +
+        '</div>' +
+        '<button class="arec-btn tbp-mark-btn" data-track-id="' + _arecEscAttr(track.id) + '">Mark Purchased</button>' +
+    '</div>';
+}
+
+async function _tbpMarkPurchased(trackId, rowEl) {
+    try {
+        const res = await fetch('/api/library/track/' + encodeURIComponent(trackId), {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ to_be_purchased: 0 })
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Failed to update');
+        if (rowEl) rowEl.remove();
+        loadToBePurchasedCount();
+        if (typeof showToast === 'function') showToast('Marked purchased', 'success');
+        // Re-fetch the modal's own list when a page empties out from under it
+        // (last row on a non-first page, or the very last item overall).
+        const body = document.getElementById('tbp-body');
+        if (body && !body.querySelector('.tbp-row')) _tbpRefresh();
+    } catch (err) {
+        if (typeof showToast === 'function') showToast('Could not mark purchased: ' + (err.message || err), 'error');
+    }
+}
+
+// Per-track toggle in the artist drill-down (_buildTrackRow's action group) —
+// same underlying flag/endpoint as the shopping-list modal above, so a user
+// can flag/unflag while just browsing an artist, not only from the list.
+async function _toggleTrackToBePurchased(trackId, btnEl) {
+    if (!btnEl) return;
+    const turningOn = !btnEl.classList.contains('active');
+    try {
+        const res = await fetch('/api/library/track/' + encodeURIComponent(trackId), {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ to_be_purchased: turningOn ? 1 : 0 })
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Failed to update');
+        btnEl.classList.toggle('active', turningOn);
+        btnEl.title = turningOn ? 'Mark purchased' : 'Mark to be purchased';
+        const tr = btnEl.closest('tr[data-track-id]');
+        if (tr && tr._enhancedTrack) tr._enhancedTrack.to_be_purchased = turningOn ? 1 : 0;
+        loadToBePurchasedCount();
+    } catch (err) {
+        if (typeof showToast === 'function') showToast('Could not update: ' + (err.message || err), 'error');
+    }
+}
+
+// Mobile popover variant — no persistent button element to flip in place
+// (the popover closes immediately on tap), so just persist + toast + update
+// the in-memory track object for if the row re-renders without a refetch.
+async function _toggleTrackToBePurchasedMobile(track) {
+    const turningOn = !track.to_be_purchased;
+    try {
+        const res = await fetch('/api/library/track/' + encodeURIComponent(track.id), {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ to_be_purchased: turningOn ? 1 : 0 })
+        });
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Failed to update');
+        track.to_be_purchased = turningOn ? 1 : 0;
+        loadToBePurchasedCount();
+        if (typeof showToast === 'function') showToast(turningOn ? 'Marked to be purchased' : 'Marked purchased', 'success');
+    } catch (err) {
+        if (typeof showToast === 'function') showToast('Could not update: ' + (err.message || err), 'error');
+    }
 }
 
 

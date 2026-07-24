@@ -89,6 +89,7 @@
                 <input type="text" id="login-username" class="launch-pin-input" placeholder="Username" autocomplete="username" maxlength="40" style="margin-bottom: 8px; letter-spacing: normal;">
                 <input type="password" id="login-password" class="launch-pin-input" placeholder="Password" autocomplete="current-password" maxlength="200" style="letter-spacing: normal;" onkeydown="if(event.key==='Enter') submitLogin()">
                 <button id="login-submit" class="launch-pin-submit" onclick="submitLogin()">Sign in</button>
+                <button id="login-plex-signin-btn" class="launch-pin-submit plex-signin-btn" style="display: none; margin-top: 8px;" onclick="startPlexSignIn()">Sign in with Plex</button>
                 <p id="login-error" class="launch-pin-error" style="display: none;"></p>
                 <button class="launch-pin-forgot" onclick="showLoginRecovery()">Forgot password?</button>
             </div>
@@ -119,6 +120,7 @@
             <div id="profile-picker-grid" class="profile-picker-grid"></div>
             <div id="profile-picker-actions" class="profile-picker-actions" style="display: none;">
                 <button id="manage-profiles-btn" class="profile-manage-btn">Manage Profiles</button>
+                <button id="picker-plex-signin-btn" class="profile-manage-btn" style="display: none;" onclick="startPlexSignIn()">Sign in with Plex</button>
             </div>
         </div>
         <!-- PIN Dialog -->
@@ -224,6 +226,20 @@
                     <button id="set-admin-pin-btn" class="btn btn--block btn--primary profile-create-btn">Set Admin PIN</button>
                 </div>
             </div>
+        </div>
+    </div>
+
+    <!-- Sign in with Plex — shared PIN-code panel, triggered from either the
+         login screen or the profile picker (see startPlexSignIn() in init.js). -->
+    <div id="plex-signin-overlay" class="launch-pin-overlay" style="display: none;">
+        <div class="launch-pin-container">
+            <div class="launch-pin-icon">🔗</div>
+            <h2 class="launch-pin-title">Sign in with Plex</h2>
+            <p class="launch-pin-subtitle">Go to <strong>plex.tv/link</strong> and enter this code:</p>
+            <div id="plex-signin-code" style="font-size: 1.8em; font-weight: 700; letter-spacing: 4px; text-align: center; margin: 14px 0;"></div>
+            <p id="plex-signin-status" class="launch-pin-subtitle" style="min-height: 1.2em;"></p>
+            <p id="plex-signin-error" class="launch-pin-error" style="display: none;"></p>
+            <button class="launch-pin-forgot" onclick="cancelPlexSignIn()">Cancel</button>
         </div>
     </div>
 
@@ -4410,6 +4426,11 @@
                                 <span class="stat-label">Artists</span>
                             </span>
                         </div>
+                        <button class="library-watchlist-all-btn library-tbp-btn" id="library-tbp-btn" onclick="openToBePurchasedModal()" title="Tracks downloaded but not yet purchased">
+                            <span class="watchlist-all-icon">🛒</span>
+                            <span class="watchlist-all-text">To Be Purchased</span>
+                            <span class="library-tbp-count" id="library-tbp-count" style="display:none;"></span>
+                        </button>
                         <button class="library-watchlist-all-btn library-export-btn" id="library-export-btn" onclick="openArtistExportModal()" title="Export artists — pick watchlist or whole library, as JSON / CSV / text">
                             <span class="watchlist-all-icon">⬇</span>
                             <span class="watchlist-all-text">Export</span>
@@ -5962,6 +5983,7 @@
                             <button class="stg-tab" data-tab="quality" onclick="switchSettingsTab('quality')">Quality</button>
                             <button class="stg-tab" data-tab="library" onclick="switchSettingsTab('library')">Library</button>
                             <button class="stg-tab" data-tab="appearance" onclick="switchSettingsTab('appearance')">Appearance</button>
+                            <button class="stg-tab" data-tab="users" onclick="switchSettingsTab('users')">Users</button>
                             <button class="stg-tab" data-tab="advanced" onclick="switchSettingsTab('advanced')">Advanced</button>
                             <button class="stg-tab" data-tab="logs" onclick="switchSettingsTab('logs')">Logs</button>
                         </div>
@@ -6678,17 +6700,28 @@
 
                                 <!-- Libraries: which server sections the video side scans. Any number
                                      per kind (e.g. "Movies" + "Anime Movies") — each gets its own
-                                     display name (for its Library-page tab) and destination folder
-                                     (where its new downloads land). -->
+                                     display name (for its Library-page tab), destination folder
+                                     (where its new downloads land), and torrent category/label
+                                     override (which client category a grab into it carries). -->
                                 <div class="form-group video-library-selectors" style="margin-top: 20px;">
                                     <label>Movies Libraries:</label>
                                     <div class="library-editor-list" data-video-lib-group="movies">Loading…</div>
                                     <label style="margin-top: 12px;">TV Shows Libraries:</label>
                                     <div class="library-editor-list" data-video-lib-group="tv">Loading…</div>
                                     <small style="color: #999; font-size: 0.9em; display: block; margin-top: 5px;">
-                                        Pick as many libraries as you like; rename their tab and set where their
-                                        downloads land. The FIRST checked one in each group is the default
-                                        destination for unattended grabs (wishlist, RSS). <span data-video-lib-status></span>
+                                        Pick as many libraries as you like; rename their tab, set where their
+                                        downloads land, and optionally give each one its own torrent Category/Label
+                                        (e.g. "movies" for one library, "anime" for another) — blank inherits the
+                                        Torrent Client section's default. The FIRST checked one in each group is the
+                                        default destination for unattended grabs (wishlist, RSS). <span data-video-lib-status></span>
+                                    </small>
+                                    <label style="margin-top: 12px;">▶️ YouTube Libraries:</label>
+                                    <div class="library-editor-list yt-library-list" data-video-lib-group="youtube">Loading…</div>
+                                    <button class="test-button" type="button" data-video-ytlib-add>+ Add library</button>
+                                    <small style="color: #999; font-size: 0.9em; display: block; margin-top: 5px;">
+                                        YouTube isn't scanned from a Plex/Jellyfin section, so these are named by hand —
+                                        give each one a name and the folder its channels' downloads land in. The FIRST
+                                        one is the default destination for new channel subscriptions.
                                     </small>
                                 </div>
                             </div>
@@ -8324,7 +8357,7 @@
                                             <label>Category / Label:</label>
                                             <input type="text" id="torrent-client-category" placeholder="soulsync" value="soulsync">
                                             <div class="setting-help-text">
-                                                SoulSync tags every torrent it adds with this label so it's easy to spot in your client. Deluge needs the Label plugin installed for this to stick.
+                                                SoulSync tags every torrent it adds with this label so it's easy to spot in your client. Deluge needs the Label plugin installed for this to stick. This is the DEFAULT — on the video side, each Movies/TV Library on Settings → Connections can set its own category (e.g. "movies" vs "anime") that overrides this for grabs landing there.
                                             </div>
                                         </div>
                                         <div class="form-group">
@@ -9293,6 +9326,64 @@
                                 </div>
                             </div>
                             </div><!-- end Security & Access body -->
+
+                            <!-- Sign in with Plex -->
+                            <div class="settings-section-header collapsed" data-stg="users" onclick="this.classList.toggle('collapsed'); const b=this.nextElementSibling; b.classList.toggle('collapsed'); b.style.display=b.classList.contains('collapsed')?'none':''">
+                                <span class="settings-section-arrow">&#9660;</span>
+                                <h3>Sign in with Plex</h3>
+                                <span class="settings-section-hint">Let Plex users sign in directly</span>
+                            </div>
+                            <div class="settings-section-body collapsed" data-stg="users">
+                            <div class="settings-group" data-stg="users">
+                                <div class="form-group">
+                                    <label class="toggle-label">
+                                        <input type="checkbox" id="security-allow-plex-login">
+                                        <span>Allow Sign in with Plex</span>
+                                    </label>
+                                    <div class="setting-help-text">
+                                        Anyone with access to your configured Plex server (Settings → Connections) can sign in with their Plex account. If they don't already have a profile here, one is created automatically the first time — music-only access, downloads off — which you can adjust anytime below or in Manage Profiles. Works alongside, not instead of, the PIN/login options above.
+                                    </div>
+                                </div>
+                            </div>
+                            </div><!-- end Sign in with Plex body -->
+
+                            <!-- Import from Plex -->
+                            <div class="settings-section-header collapsed" data-stg="users" onclick="this.classList.toggle('collapsed'); const b=this.nextElementSibling; b.classList.toggle('collapsed'); b.style.display=b.classList.contains('collapsed')?'none':''">
+                                <span class="settings-section-arrow">&#9660;</span>
+                                <h3>Import from Plex</h3>
+                                <span class="settings-section-hint">Bulk-create profiles for your Plex users</span>
+                            </div>
+                            <div class="settings-section-body collapsed" data-stg="users">
+                            <div class="settings-group" data-stg="users">
+                                <div class="setting-help-text" style="margin-bottom: 12px;">
+                                    Pulls everyone with access to your configured Plex server (friends + Plex Home members) so you can set up their profiles ahead of time, instead of waiting for them to sign in themselves. Already-imported accounts are shown but can't be re-imported.
+                                </div>
+                                <div class="form-actions">
+                                    <button class="detect-button" id="plex-import-fetch-btn" onclick="loadPlexImportCandidates()">Fetch Plex Users</button>
+                                </div>
+                                <div id="plex-import-status" class="setting-help-text" style="margin-top: 8px;"></div>
+
+                                <div id="plex-import-defaults" style="display: none; margin-top: 18px;">
+                                    <label>Default access for imported users:</label>
+                                    <div class="profile-sides-picker" role="radiogroup" id="plex-import-sides">
+                                        <label><input type="radio" name="plex-import-sides" value="music" checked><span>Music</span></label>
+                                        <label><input type="radio" name="plex-import-sides" value="video"><span>Video</span></label>
+                                        <label><input type="radio" name="plex-import-sides" value="both"><span>Both</span></label>
+                                    </div>
+                                    <label class="toggle-label" style="margin-top: 10px;">
+                                        <input type="checkbox" id="plex-import-can-download">
+                                        <span>Allow downloads</span>
+                                    </label>
+                                </div>
+
+                                <div id="plex-import-list" class="profile-manage-list" style="margin-top: 16px; padding: 0;"></div>
+
+                                <div class="form-actions" id="plex-import-actions" style="display: none; margin-top: 12px;">
+                                    <button class="test-button" id="plex-import-submit-btn" onclick="submitPlexImport()">Import Selected</button>
+                                </div>
+                                <div id="plex-import-result" class="setting-help-text" style="margin-top: 8px;"></div>
+                            </div>
+                            </div><!-- end Import from Plex body -->
 
                             <!-- Discovery Settings -->
                                                         <!-- Discovery Pool Settings (collapsible tile) -->

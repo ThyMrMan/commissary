@@ -34,3 +34,16 @@ def test_profile_list_NOT_exposed_pre_auth():
 def test_key_authed_public_api_allowed():
     assert blocked('/api/v1/search', 'GET', require_login=True, authenticated=False) is False
     assert blocked('/api/v1/api-keys-internal', 'GET', require_login=True, authenticated=False) is True
+
+
+def test_plex_signin_flow_allowed_unauthenticated():
+    """Sign in with Plex must be reachable BEFORE authentication — it's how
+    the user gets authenticated in the first place — mirroring /api/auth/login."""
+    assert blocked('/api/auth/plex/start', 'POST', require_login=True, authenticated=False) is False
+    assert blocked('/api/auth/plex/status', 'GET', require_login=True, authenticated=False) is False
+
+
+def test_plex_import_endpoints_NOT_exposed_pre_auth():
+    # Admin-only bulk import — only reachable by an already-authenticated admin.
+    assert blocked('/api/profiles/plex/candidates', 'GET', require_login=True, authenticated=False) is True
+    assert blocked('/api/profiles/plex/import', 'POST', require_login=True, authenticated=False) is True

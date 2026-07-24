@@ -1875,6 +1875,8 @@ async function loadSettingsData() {
             if (authHeader) authHeader.value = settings.security?.auth_proxy_header || '';
             const reqLogin = document.getElementById('security-require-login');
             if (reqLogin) reqLogin.checked = settings.security?.require_login || false;
+            const allowPlexLogin = document.getElementById('security-allow-plex-login');
+            if (allowPlexLogin) allowPlexLogin.checked = settings.security?.allow_plex_login || false;
 
             // Check if admin has a PIN set
             const profilesRes = await fetch('/api/profiles');
@@ -2159,6 +2161,123 @@ function cancelPlexPinAuth() {
 function restartPlexPinAuth() {
     cancelPlexPinAuth();
     startPlexPinAuth();
+}
+
+// ── Settings → Users: Import from Plex ──────────────────────────────────────
+let _plexImportCandidates = [];
+
+async function loadPlexImportCandidates() {
+    const statusEl = document.getElementById('plex-import-status');
+    const listEl = document.getElementById('plex-import-list');
+    const defaultsEl = document.getElementById('plex-import-defaults');
+    const actionsEl = document.getElementById('plex-import-actions');
+    if (statusEl) statusEl.textContent = 'Fetching Plex users…';
+    if (listEl) listEl.innerHTML = '';
+    if (actionsEl) actionsEl.style.display = 'none';
+
+    try {
+        const response = await fetch('/api/profiles/plex/candidates');
+        const result = await response.json();
+        if (!result.success) {
+            if (statusEl) statusEl.textContent = result.error || 'Could not fetch Plex users.';
+            if (defaultsEl) defaultsEl.style.display = 'none';
+            return;
+        }
+        _plexImportCandidates = result.candidates || [];
+        if (!_plexImportCandidates.length) {
+            if (statusEl) statusEl.textContent = 'No Plex users found with access to this server.';
+            if (defaultsEl) defaultsEl.style.display = 'none';
+            return;
+        }
+        if (statusEl) statusEl.textContent = `${_plexImportCandidates.length} Plex user(s) found.`;
+        if (defaultsEl) defaultsEl.style.display = '';
+        renderPlexImportList();
+    } catch (error) {
+        console.error('Error fetching Plex import candidates:', error);
+        if (statusEl) statusEl.textContent = 'Could not reach the server to fetch Plex users.';
+    }
+}
+
+function renderPlexImportList() {
+    const listEl = document.getElementById('plex-import-list');
+    const actionsEl = document.getElementById('plex-import-actions');
+    if (!listEl) return;
+
+    listEl.innerHTML = _plexImportCandidates.map(c => {
+        const name = escapeHtml(c.title || c.username || `Plex User ${c.plex_account_id}`);
+        const pills = [];
+        if (c.home) pills.push('<span class="profile-role-pill">Home</span>');
+        if (c.already_imported) pills.push('<span class="profile-role-pill profile-role-pill--current">Imported</span>');
+        const avatar = c.thumb
+            ? `<img class="profile-avatar" src="${escapeHtml(c.thumb)}" alt="" style="object-fit:cover;">`
+            : `<div class="profile-avatar" style="display:flex;align-items:center;justify-content:center;background:#6366f1;">${name.charAt(0).toUpperCase()}</div>`;
+        return `<label class="profile-manage-item" style="cursor:${c.already_imported ? 'default' : 'pointer'}; opacity:${c.already_imported ? '0.55' : '1'};">
+            <input type="checkbox" class="plex-import-check" value="${c.plex_account_id}" ${c.already_imported ? 'disabled' : ''} style="width:16px;height:16px;flex-shrink:0;">
+            ${avatar}
+            <div class="profile-info">
+                <div class="name">${name}</div>
+                <div class="role">${pills.join('')}</div>
+            </div>
+        </label>`;
+    }).join('');
+
+    listEl.querySelectorAll('.plex-import-check').forEach(cb => {
+        cb.addEventListener('change', () => {
+            const anyChecked = listEl.querySelectorAll('.plex-import-check:checked').length > 0;
+            if (actionsEl) actionsEl.style.display = anyChecked ? '' : 'none';
+        });
+    });
+}
+
+async function submitPlexImport() {
+    const listEl = document.getElementById('plex-import-list');
+    const resultEl = document.getElementById('plex-import-result');
+    const submitBtn = document.getElementById('plex-import-submit-btn');
+    if (!listEl) return;
+
+    const ids = Array.from(listEl.querySelectorAll('.plex-import-check:checked')).map(cb => parseInt(cb.value, 10));
+    if (!ids.length) return;
+
+    const sidesInput = document.querySelector('input[name="plex-import-sides"]:checked');
+    const defaults = {
+        allowed_sides: sidesInput ? sidesInput.value : 'music',
+        can_download: document.getElementById('plex-import-can-download')?.checked || false,
+    };
+
+    if (submitBtn) submitBtn.disabled = true;
+    if (resultEl) resultEl.textContent = 'Importing…';
+    try {
+        const response = await fetch('/api/profiles/plex/import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ plex_account_ids: ids, defaults })
+        });
+        const result = await response.json();
+        if (!result.success) {
+            if (resultEl) resultEl.textContent = result.error || 'Import failed.';
+            return;
+        }
+        const parts = [];
+        if (result.imported?.length) parts.push(`${result.imported.length} imported`);
+        if (result.skipped?.length) parts.push(`${result.skipped.length} already imported`);
+        if (result.failed?.length) parts.push(`${result.failed.length} failed (name collision)`);
+        if (resultEl) resultEl.textContent = parts.join(', ') || 'Nothing to import.';
+        showToast(`Imported ${result.imported?.length || 0} Plex user(s)`, 'success');
+        await loadPlexImportCandidates();
+        // Hand off to the existing Manage Profiles panel for fine-tuning access.
+        if (result.imported?.length && typeof loadProfileManageList === 'function') {
+            const overlay = document.getElementById('profile-picker-overlay');
+            const panel = document.getElementById('profile-manage-panel');
+            if (overlay) overlay.style.display = 'flex';
+            if (panel) panel.style.display = 'flex';
+            loadProfileManageList();
+        }
+    } catch (error) {
+        console.error('Error importing Plex users:', error);
+        if (resultEl) resultEl.textContent = 'Could not reach the server to import users.';
+    } finally {
+        if (submitBtn) submitBtn.disabled = false;
+    }
 }
 
 async function clearPlexConfiguration() {
@@ -4651,6 +4770,7 @@ async function saveSettings(quiet = false) {
             trust_reverse_proxy: document.getElementById('security-trust-proxy')?.checked || false,
             auth_proxy_header: document.getElementById('security-auth-proxy-header')?.value?.trim() || '',
             require_login: document.getElementById('security-require-login')?.checked || false,
+            allow_plex_login: document.getElementById('security-allow-plex-login')?.checked || false,
         }
     };
 

@@ -2,12 +2,16 @@
 
 GET  /api/video/libraries -> discover the active server's Movies/TV sections,
                              plus the user's CONFIGURED Libraries for it (each:
-                             {id, server_title, label, path, sort_order}).
-POST /api/video/libraries -> save {movies, tv} — arrays of Library entries
-                             ({id?, server_title, label, path}) for the active
-                             server. The scanner then reads only their titles;
-                             each entry's ``path`` is where new grabs assigned
-                             to it land.
+                             {id, server_title, label, path, sort_order}) —
+                             including any manually-named YouTube libraries.
+POST /api/video/libraries -> save {movies, tv, youtube} — arrays of Library
+                             entries ({id?, server_title, label, path}) for
+                             the active server. The scanner then reads only
+                             their titles; each entry's ``path`` is where new
+                             grabs assigned to it land. ``youtube`` entries
+                             have no server-side discovery (YouTube isn't
+                             scanned from a Plex/Jellyfin section) — they're
+                             named by hand in the Settings UI.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ def register_routes(bp):
             libs = list_video_libraries() or {"server": None, "movies": [], "tv": []}
             server = libs.get("server") or resolve_video_server()
             libs["configured"] = (get_video_db().list_libraries(server)
-                                  if server else {"movies": [], "tv": []})
+                                  if server else {"movies": [], "tv": [], "youtube": []})
             return jsonify(libs)
         except Exception:
             logger.exception("Failed to list video libraries")
@@ -217,7 +221,8 @@ def register_routes(bp):
             server = resolve_video_server()
             if not server:
                 return jsonify({"error": "no video server"}), 400
-            configured = get_video_db().save_libraries(server, body.get("movies"), body.get("tv"))
+            configured = get_video_db().save_libraries(
+                server, body.get("movies"), body.get("tv"), body.get("youtube"))
             return jsonify({"status": "saved", "server": server, "configured": configured})
         except Exception:
             logger.exception("Failed to save video libraries")

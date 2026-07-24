@@ -10,6 +10,7 @@ from core.video.download_pipeline import (
     dest_path_for,
     find_completed_file,
     resolve_download_root,
+    resolve_torrent_category,
 )
 from core.video.slskd_download import (
     classify_state,
@@ -83,6 +84,22 @@ def test_resolve_download_root_three_tier_fallback():
     assert resolve_download_root("movie", root_folder={"path": ""}, primary_root_folder=primary,
                                  paths=paths) == "/library/movies"
     assert resolve_download_root("weird-kind", paths=paths) == "/t"   # unknown kinds fall to 'show'
+
+
+def test_resolve_torrent_category_tiers():
+    root_folder = {"category": "anime"}
+    primary = {"category": "movies"}
+
+    # 1. An explicit pick's own category always wins.
+    assert resolve_torrent_category(root_folder=root_folder, primary_root_folder=primary) == "anime"
+    # 2. No explicit pick -> the primary Library's category.
+    assert resolve_torrent_category(primary_root_folder=primary) == "movies"
+    # 3. Nothing configured -> None (caller falls back to the global setting).
+    assert resolve_torrent_category() is None
+    # A Library that exists but has no category set (blank) doesn't shadow a good fallback.
+    assert resolve_torrent_category(root_folder={"category": ""}, primary_root_folder=primary) == "movies"
+    assert resolve_torrent_category(root_folder={"category": "  "}, primary_root_folder=primary) == "movies"
+    assert resolve_torrent_category(primary_root_folder={"category": None}) is None
 
 
 # ── DB CRUD ───────────────────────────────────────────────────────────────────

@@ -70,7 +70,8 @@ def _make_soulsync_db():
             created_at TEXT,
             updated_at TEXT,
             spotify_track_id TEXT,
-            deezer_id TEXT
+            deezer_id TEXT,
+            to_be_purchased INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -157,6 +158,74 @@ def test_record_soulsync_library_entry_writes_artist_album_and_track(tmp_path, m
     # No override on this item — NULL means "follow the app-wide default at
     # read time" (same semantics as wishlist_tracks.quality_profile_id).
     assert track_row["quality_profile_id"] is None
+
+
+def test_record_soulsync_library_entry_flags_downloads_to_be_purchased(tmp_path, monkeypatch):
+    """A real download (no is_local_import in context) lands flagged
+    to_be_purchased=1 — the signal the Library page's shopping-list view
+    and the /api/library/track/<id> toggle both rely on."""
+    conn = _make_soulsync_db()
+    fake_db = _FakeDB(conn)
+    final_path = tmp_path / "track.flac"
+    final_path.write_bytes(b"audio")
+
+    monkeypatch.setattr(side_effects, "get_database", lambda: fake_db)
+    monkeypatch.setattr(
+        side_effects,
+        "_get_config_manager",
+        lambda: SimpleNamespace(get_active_media_server=lambda: "soulsync"),
+    )
+    import core.genre_filter as genre_filter
+    monkeypatch.setattr(genre_filter, "filter_genres", lambda genres, _cfg: genres)
+
+    context = {
+        "source": "spotify",
+        "artist": {"id": "sp-artist", "name": "Artist One"},
+        "album": {"id": "sp-album", "name": "Album One"},
+        "track_info": {"id": "sp-track", "name": "Song One", "_source": "spotify"},
+        "original_search_result": {"title": "Song One"},
+        "_final_processed_path": str(final_path),
+    }
+    artist_context = {"name": "Artist One", "genres": []}
+    album_info = {"is_album": True, "album_name": "Album One"}
+
+    side_effects.record_soulsync_library_entry(context, artist_context, album_info)
+
+    assert conn.execute("SELECT to_be_purchased FROM tracks").fetchone()["to_be_purchased"] == 1
+
+
+def test_record_soulsync_library_entry_manual_import_not_flagged(tmp_path, monkeypatch):
+    """The staging Import feature sets is_local_import=True — the user's own
+    file, not a download, so it must NOT be flagged to_be_purchased."""
+    conn = _make_soulsync_db()
+    fake_db = _FakeDB(conn)
+    final_path = tmp_path / "track.flac"
+    final_path.write_bytes(b"audio")
+
+    monkeypatch.setattr(side_effects, "get_database", lambda: fake_db)
+    monkeypatch.setattr(
+        side_effects,
+        "_get_config_manager",
+        lambda: SimpleNamespace(get_active_media_server=lambda: "soulsync"),
+    )
+    import core.genre_filter as genre_filter
+    monkeypatch.setattr(genre_filter, "filter_genres", lambda genres, _cfg: genres)
+
+    context = {
+        "source": "spotify",
+        "is_local_import": True,
+        "artist": {"id": "sp-artist", "name": "Artist One"},
+        "album": {"id": "sp-album", "name": "Album One"},
+        "track_info": {"id": "sp-track", "name": "Song One", "_source": "spotify"},
+        "original_search_result": {"title": "Song One"},
+        "_final_processed_path": str(final_path),
+    }
+    artist_context = {"name": "Artist One", "genres": []}
+    album_info = {"is_album": True, "album_name": "Album One"}
+
+    side_effects.record_soulsync_library_entry(context, artist_context, album_info)
+
+    assert conn.execute("SELECT to_be_purchased FROM tracks").fetchone()["to_be_purchased"] == 0
 
 
 def test_record_soulsync_library_entry_persists_quality_profile_id(tmp_path, monkeypatch):

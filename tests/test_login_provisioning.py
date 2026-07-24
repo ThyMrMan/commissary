@@ -29,15 +29,37 @@ def test_members_without_password_empty_when_all_set():
     assert members_without_password(None) == []
 
 
+def test_members_without_password_exempts_plex_linked():
+    """A Plex-linked profile (bulk import or Sign in with Plex) is exempt —
+    completing Plex OAuth is its own way in."""
+    profiles = [
+        {'id': 3, 'name': 'NoPw', 'is_admin': False, 'has_password': False, 'plex_account_id': None},
+        {'id': 4, 'name': 'PlexLinked', 'is_admin': False, 'has_password': False, 'plex_account_id': 555},
+    ]
+    assert members_without_password(profiles) == [{'id': 3, 'name': 'NoPw'}]
+
+
 def test_create_needs_password_only_when_login_on_and_nonadmin():
     assert create_needs_password(True) is True
     assert create_needs_password(False) is False
     assert create_needs_password(True, is_admin=True) is False
 
 
+def test_create_needs_password_exempts_plex_linked():
+    assert create_needs_password(True, plex_linked=True) is False
+    assert create_needs_password(True, plex_linked=False) is True
+    assert create_needs_password(False, plex_linked=False) is False
+
+
 def test_removing_password_strands_only_when_login_on():
     assert removing_password_strands(True) is True
     assert removing_password_strands(False) is False
+
+
+def test_removing_password_strands_exempts_plex_linked():
+    assert removing_password_strands(True, plex_linked=True) is False
+    assert removing_password_strands(True, plex_linked=False) is True
+    assert removing_password_strands(False, plex_linked=True) is False
 
 
 # ── endpoint enforcement ────────────────────────────────────────────────────
@@ -95,3 +117,15 @@ def test_clear_password_blocked_when_login_on(monkeypatch, client):
     r2 = client.post(f'/api/profiles/{pid}/set-password', json={'password': ''})
     assert r2.status_code == 400 and 'login mode' in r2.get_json()['error'].lower()
     assert db.verify_profile_password(pid, 'x12345') is True          # still set
+
+
+def test_clear_password_allowed_for_plex_linked_when_login_on(monkeypatch, client):
+    """A Plex-linked profile's login password can be cleared even while login
+    mode is on — Plex sign-in still gets them in."""
+    db = web_server.get_database()
+    pid = db.create_profile('PlexMember', plex_account_id=777)
+    db.set_profile_password(pid, 'temp12345')
+    _login_on(monkeypatch, True); _auth(client)
+    r = client.post(f'/api/profiles/{pid}/set-password', json={'password': ''})
+    assert r.status_code == 200 and r.get_json()['success'] is True
+    assert db.profile_has_password(pid) is False

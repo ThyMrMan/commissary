@@ -543,6 +543,13 @@ def _require_login_enabled():
         return False
 
 
+def _plex_login_enabled():
+    try:
+        return bool(config_manager.get('security.allow_plex_login', False)) if config_manager else False
+    except Exception:
+        return False
+
+
 # --- Login gate (opt-in username/password mode; replaces the launch PIN) ---
 @app.before_request
 def _enforce_login():
@@ -4742,6 +4749,135 @@ def get_plex_pin_status():
         return jsonify({"success": False, "status": 'Waiting for Plex authorization. Enter the PIN on plex.tv/link.'})
     except Exception as e:
         logger.error(f'Error checking Plex PIN status: {e}')
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# --- Sign in with Plex (end-user identity, distinct from /api/plex/pin/*
+# above which links the ADMIN's server connection) ---
+
+@app.route('/api/auth/plex/start', methods=['POST'])
+def start_plex_signin():
+    """Sign in with Plex — step 1: start a plex.tv PIN auth flow to identify
+    the signing-in user. Reuses the same in-memory PIN-request store as the
+    server-linking flow above (it's flow-agnostic, keyed by a random
+    request_id) but is otherwise a fully separate flow — its status endpoint
+    below never echoes the Plex token to the browser."""
+    if not _plex_login_enabled():
+        return jsonify({"success": False, "error": "Sign in with Plex is not enabled."}), 403
+    try:
+        pinlogin = MyPlexPinLogin(oauth=False)
+    except Exception as e:
+        logger.error(f'Failed to start Plex sign-in: {e}')
+        return jsonify({"success": False, "error": str(e)}), 500
+
+    pin_code = getattr(pinlogin, 'pin', None)
+    if not pin_code:
+        return jsonify({"success": False, "error": 'Failed to generate Plex PIN code.'}), 500
+
+    request_id = str(uuid.uuid4())
+    with _plex_pin_requests_lock:
+        _plex_pin_requests[request_id] = {
+            'pinlogin': pinlogin,
+            'created_at': time.time(),
+            'expires_at': getattr(pinlogin, 'expires_at', None)
+        }
+
+    expires_in = None
+    expires_at = getattr(pinlogin, 'expires_at', None)
+    if expires_at:
+        try:
+            expires_in = int((expires_at - datetime.now(timezone.utc)).total_seconds())
+        except Exception:
+            expires_in = None
+
+    return jsonify({
+        "success": True,
+        "request_id": request_id,
+        "code": str(pin_code),
+        "auth_url": "https://plex.tv/link",
+        "expires_in": expires_in
+    })
+
+
+@app.route('/api/auth/plex/status', methods=['GET'])
+def get_plex_signin_status():
+    """Sign in with Plex — step 2: poll for completion. On success, matches
+    the authorizing Plex account to an existing profile (signs in) or, if
+    unmatched but confirmed to have access to the configured Plex server,
+    auto-provisions a new profile with restrictive defaults and signs in. An
+    account with no server access gets neither a profile nor a session. The
+    raw Plex token never leaves the server."""
+    if not _plex_login_enabled():
+        return jsonify({"success": False, "error": "Sign in with Plex is not enabled."}), 403
+    request_id = request.args.get('request_id')
+    if not request_id:
+        return jsonify({"success": False, "error": 'request_id is required'}), 400
+
+    with _plex_pin_requests_lock:
+        entry = _plex_pin_requests.get(request_id)
+
+    if not entry:
+        return jsonify({"success": False, "error": 'Invalid or expired PIN request id.'}), 400
+
+    pinlogin = entry.get('pinlogin')
+    if not pinlogin:
+        return jsonify({"success": False, "error": 'Invalid PIN login state.'}), 500
+
+    try:
+        if getattr(pinlogin, 'expired', False):
+            with _plex_pin_requests_lock:
+                _plex_pin_requests.pop(request_id, None)
+            return jsonify({"success": False, "expired": True, "error": 'PIN code expired.'})
+
+        if not pinlogin.checkLogin():
+            return jsonify({"success": False, "status": 'Waiting for Plex authorization. Enter the PIN on plex.tv/link.'})
+
+        token = getattr(pinlogin, 'token', None)
+        with _plex_pin_requests_lock:
+            _plex_pin_requests.pop(request_id, None)
+        if not token:
+            return jsonify({"success": False, "error": 'Plex token was not returned after authorization.'}), 500
+
+        try:
+            account = MyPlexAccount(token=token)   # server-side only — never sent to the browser
+        except Exception as e:
+            logger.error(f'Failed to resolve the Plex account after sign-in: {e}')
+            return jsonify({"success": False,
+                            "error": 'Plex authorization succeeded but the account could not be resolved.'}), 500
+
+        database = get_database()
+        matched = database.get_profile_by_plex_id(account.id)
+        is_new = False
+        if not matched:
+            from core.plex_user_auth import plex_account_has_server_access, PLEX_PROFILE_DEFAULTS
+            if not plex_account_has_server_access(account.id):
+                return jsonify({"success": False,
+                                "error": "This Plex account doesn't have access to the configured Plex server."}), 403
+            name = (getattr(account, 'title', None) or getattr(account, 'username', None)
+                   or ('Plex User %s' % account.id))
+            plex_username = getattr(account, 'username', None) or getattr(account, 'title', None)
+            plex_thumb = getattr(account, 'thumb', None)
+            new_id = database.create_profile(
+                name, avatar_url=plex_thumb, plex_account_id=account.id,
+                plex_username=plex_username, plex_thumb=plex_thumb, **PLEX_PROFILE_DEFAULTS)
+            if new_id is None:
+                # Name collision with an existing local profile — retry once with a suffix.
+                new_id = database.create_profile(
+                    name + ' (Plex)', avatar_url=plex_thumb, plex_account_id=account.id,
+                    plex_username=plex_username, plex_thumb=plex_thumb, **PLEX_PROFILE_DEFAULTS)
+            if new_id is None:
+                return jsonify({"success": False, "error": "Couldn't create a profile for this Plex account."}), 500
+            matched = database.get_profile(new_id)
+            is_new = True
+
+        session['login_authenticated'] = True
+        session['profile_id'] = matched['id']
+        session.pop('launch_pin_verified', None)
+        return jsonify({"success": True, "is_new": is_new, "profile": {
+            'id': matched['id'], 'name': matched['name'], 'is_admin': bool(matched.get('is_admin')),
+        }})
+    except Exception as e:
+        logger.error(f'Error checking Plex sign-in status: {e}')
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -9352,6 +9488,34 @@ def get_library_artists():
                 "has_prev": False,
                 "has_next": False
             }
+        }), 500
+
+@app.route('/api/library/to-be-purchased')
+def get_library_to_be_purchased():
+    """Flat, cross-artist shopping-list view: every track flagged
+    to_be_purchased (auto-set on download, cleared via the generic
+    PUT /api/library/track/<id> endpoint)."""
+    try:
+        search = request.args.get('search', '')
+        page = int(request.args.get('page', 1))
+        limit = int(request.args.get('limit', 50))
+
+        database = get_database()
+        result = database.get_to_be_purchased_tracks(search=search, page=page, limit=limit)
+
+        for track in result['tracks']:
+            if track.get('thumb_url'):
+                track['thumb_url'] = fix_artist_image_url(track['thumb_url'])
+
+        return jsonify({"success": True, **result})
+    except Exception as e:
+        logger.error(f"Error fetching to-be-purchased tracks: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "tracks": [],
+            "pagination": {"page": 1, "limit": 50, "total_count": 0, "total_pages": 0,
+                           "has_prev": False, "has_next": False}
         }), 500
 
 @app.route('/api/test-artist/<artist_id>')
@@ -28233,10 +28397,12 @@ def create_profile():
             pin_hash = generate_password_hash(pin, method='pbkdf2:sha256')
 
         # No-gaps: while login mode is on, a new member must be born with a login
-        # password or they could never sign in.
+        # password (or a Plex link — completing Plex OAuth is its own way in) or
+        # they could never sign in.
         password = (data.get('password') or '').strip()
         from core.security.login_provisioning import create_needs_password
-        if create_needs_password(_require_login_enabled()) and not password:
+        _plex_linked = bool(data.get('plex_account_id'))
+        if create_needs_password(_require_login_enabled(), plex_linked=_plex_linked) and not password:
             return jsonify({'success': False,
                             'error': 'Login mode is on — give this profile a login '
                                      'password so they can sign in.'}), 400
@@ -28277,6 +28443,103 @@ def create_profile():
         return jsonify({'success': True, 'profile_id': profile_id})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/profiles/plex/candidates', methods=['GET'])
+@admin_only
+def plex_profile_candidates():
+    """Every Plex account with access to the configured Plex server, flagged
+    with whether it's already imported — the preview list for the Users
+    settings tab's "Import from Plex" action."""
+    try:
+        from core.plex_user_auth import get_server_authorized_plex_ids
+        users = get_server_authorized_plex_ids()
+        if users is None:
+            return jsonify({'success': False,
+                            'error': 'Configure a Plex server connection first (Settings → Connections).'}), 400
+
+        database = get_database()
+        existing = {p.get('plex_account_id'): p.get('id') for p in database.get_all_profiles()
+                   if p.get('plex_account_id')}
+        candidates = []
+        for pid, u in users.items():
+            candidates.append({
+                'plex_account_id': pid,
+                'title': u.get('title'),
+                'username': u.get('username'),
+                'email': u.get('email'),
+                'thumb': u.get('thumb'),
+                'home': u.get('home'),
+                'already_imported': pid in existing,
+                'existing_profile_id': existing.get(pid),
+            })
+        candidates.sort(key=lambda c: (c['already_imported'], (c['title'] or c['username'] or '').lower()))
+        return jsonify({'success': True, 'candidates': candidates})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/profiles/plex/import', methods=['POST'])
+@admin_only
+def plex_profile_import():
+    """Bulk-create profiles from selected Plex accounts (re-verified server-
+    side against the live authorized list, never trusting client-supplied
+    metadata). Dedups against already-linked accounts; a title collision with
+    an existing profile name gets a "(Plex)" suffix retry before being
+    reported as failed. Never aborts the whole batch on one bad id."""
+    try:
+        from core.plex_user_auth import get_server_authorized_plex_ids, PLEX_PROFILE_DEFAULTS
+
+        data = request.json or {}
+        requested_ids = data.get('plex_account_ids') or []
+        defaults = data.get('defaults') or {}
+        allowed_sides = defaults.get('allowed_sides') or PLEX_PROFILE_DEFAULTS['allowed_sides']
+        if allowed_sides not in ('music', 'video', 'both'):
+            allowed_sides = PLEX_PROFILE_DEFAULTS['allowed_sides']
+        can_download = bool(defaults.get('can_download', PLEX_PROFILE_DEFAULTS['can_download']))
+
+        users = get_server_authorized_plex_ids()
+        if users is None:
+            return jsonify({'success': False,
+                            'error': 'Configure a Plex server connection first (Settings → Connections).'}), 400
+
+        database = get_database()
+        imported, skipped, failed = [], [], []
+        for raw_id in requested_ids:
+            try:
+                pid = int(raw_id)
+            except (TypeError, ValueError):
+                failed.append({'plex_account_id': raw_id, 'reason': 'invalid_id'})
+                continue
+            u = users.get(pid)
+            if u is None:
+                skipped.append({'plex_account_id': pid, 'reason': 'no_longer_authorized'})
+                continue
+            if database.get_profile_by_plex_id(pid):
+                skipped.append({'plex_account_id': pid, 'reason': 'already_imported'})
+                continue
+
+            name = (u.get('title') or u.get('username') or ('Plex User %d' % pid)).strip()
+            new_id = database.create_profile(
+                name, is_admin=PLEX_PROFILE_DEFAULTS['is_admin'], avatar_url=u.get('thumb'),
+                can_download=can_download, allowed_sides=allowed_sides,
+                plex_account_id=pid, plex_username=u.get('username') or u.get('title'),
+                plex_thumb=u.get('thumb'))
+            if new_id is None:
+                # Name collision with an existing local profile — retry once with a suffix.
+                new_id = database.create_profile(
+                    name + ' (Plex)', is_admin=PLEX_PROFILE_DEFAULTS['is_admin'], avatar_url=u.get('thumb'),
+                    can_download=can_download, allowed_sides=allowed_sides,
+                    plex_account_id=pid, plex_username=u.get('username') or u.get('title'),
+                    plex_thumb=u.get('thumb'))
+            if new_id is None:
+                failed.append({'plex_account_id': pid, 'reason': 'name_collision'})
+                continue
+            imported.append({'profile_id': new_id, 'plex_account_id': pid, 'name': name})
+
+        return jsonify({'success': True, 'imported': imported, 'skipped': skipped, 'failed': failed})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @app.route('/api/profiles/<int:profile_id>', methods=['PUT'])
 def update_profile(profile_id):
@@ -28424,13 +28687,18 @@ def get_current_profile():
     try:
         # Login mode: when on and the session isn't authenticated, tell the
         # frontend to show the sign-in screen (this is checked before profile
-        # selection, since there's no profile until you log in).
+        # selection, since there's no profile until you log in). Include
+        # plex_login_enabled here too — the sign-in screen needs it to decide
+        # whether to show the "Sign in with Plex" button, and this branch
+        # returns before the normal payload below would ever set it.
         if _require_login_enabled() and not session.get('login_authenticated', False):
-            return jsonify({'success': False, 'login_required': True}), 200
+            return jsonify({'success': False, 'login_required': True,
+                            'plex_login_enabled': _plex_login_enabled()}), 200
 
         pid = session.get('profile_id')
         if not pid:
-            return jsonify({'success': False, 'error': 'No profile selected'}), 200
+            return jsonify({'success': False, 'error': 'No profile selected',
+                            'plex_login_enabled': _plex_login_enabled()}), 200
 
         database = get_database()
         profile = database.get_profile(pid)
@@ -28452,6 +28720,7 @@ def get_current_profile():
             'profile': profile,
             'launch_pin_required': bool(require_pin) and not pin_verified,
             'login_mode': _require_login_enabled(),
+            'plex_login_enabled': _plex_login_enabled(),
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -28699,9 +28968,12 @@ def set_profile_password_endpoint(profile_id):
         data = request.json or {}
         password = data.get('password', '')
         # No-gaps: clearing a password while login mode is on would lock that
-        # profile out — refuse it (delete the profile instead if that's intended).
+        # profile out — refuse it, unless a linked Plex account can still get
+        # them in (delete the profile instead if that's intended).
         from core.security.login_provisioning import removing_password_strands
-        if not (password or '').strip() and removing_password_strands(_require_login_enabled()):
+        _target_profile = current if current_pid == profile_id else database.get_profile(profile_id)
+        _plex_linked = bool((_target_profile or {}).get('plex_account_id'))
+        if not (password or '').strip() and removing_password_strands(_require_login_enabled(), plex_linked=_plex_linked):
             return jsonify({'success': False,
                             'error': "Can't remove this password while login mode is on — "
                                      "that profile couldn't sign in."}), 400

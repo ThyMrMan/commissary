@@ -360,6 +360,9 @@ _COLUMN_MIGRATIONS = [
     ("root_folders", "server_title", "TEXT"),
     ("root_folders", "label", "TEXT"),
     ("root_folders", "sort_order", "INTEGER NOT NULL DEFAULT 0"),
+    # Per-library torrent-client category/label (e.g. Movies -> "movies", Anime ->
+    # "anime") — NULL inherits the global torrent_client.category setting.
+    ("root_folders", "category", "TEXT"),
 ]
 
 
@@ -2503,8 +2506,8 @@ class VideoDatabase:
     # root_folders doubles as the "Libraries" registry: each row is one server
     # library — its section title, an optional display label/rename, and the
     # download destination path new grabs for it land in (see schema.sql).
-    _LIB_KIND = {"movies": "movie", "tv": "show"}
-    _LEGACY_PATH_KEY = {"movies": "movies_path", "tv": "tv_path"}
+    _LIB_KIND = {"movies": "movie", "tv": "show", "youtube": "youtube"}
+    _LEGACY_PATH_KEY = {"movies": "movies_path", "tv": "tv_path", "youtube": "youtube_path"}
 
     def _migrate_legacy_libraries(self, conn, server: str) -> None:
         """One-time backfill: if ``root_folders`` has no rows yet for this
@@ -2540,14 +2543,14 @@ class VideoDatabase:
         """Every configured library for this server, full detail (for the
         Settings editor + the Library page's tab bar).
         {"movies": [...], "tv": [...]} — each entry:
-        {id, server_title, label, path, sort_order}."""
+        {id, server_title, label, path, sort_order, category}."""
         conn = self._get_connection()
         try:
             self._migrate_legacy_libraries(conn, server)
             out = {}
             for ui_kind, content_kind in self._LIB_KIND.items():
                 rows = conn.execute(
-                    "SELECT id, server_title, label, path, sort_order FROM root_folders "
+                    "SELECT id, server_title, label, path, sort_order, category FROM root_folders "
                     "WHERE server=? AND content_kind=? ORDER BY sort_order, id",
                     (server, content_kind)).fetchall()
                 out[ui_kind] = [dict(r) for r in rows]
@@ -2561,16 +2564,21 @@ class VideoDatabase:
         libs = self.list_libraries(server)
         return {k: [r["server_title"] for r in v if r.get("server_title")] for k, v in libs.items()}
 
-    def save_libraries(self, server: str, movies, tv) -> dict:
+    def save_libraries(self, server: str, movies, tv, youtube=None) -> dict:
         """Replace this server's Libraries with the given lists (each entry:
-        {id?, server_title, label, path}). Missing ids are deleted (their
-        movies/shows rows fall back to unassigned); others are upserted in
-        list order, which becomes sort_order (index 0 = primary). Returns the
-        new list_libraries(server) shape."""
+        {id?, server_title, label, path, category}). Missing ids are deleted
+        (their movies/shows rows fall back to unassigned); others are upserted
+        in list order, which becomes sort_order (index 0 = primary). Returns
+        the new list_libraries(server) shape. ``youtube`` entries are manually
+        named (no server-side discovery — YouTube isn't scanned from a Plex/
+        Jellyfin section), but stored the same way as movies/tv. ``category``
+        is the torrent-client category/label new grabs into this library
+        carry; blank/omitted inherits the global torrent_client.category."""
+        entries_by_kind = {"movies": movies, "tv": tv, "youtube": youtube}
         conn = self._get_connection()
         try:
             for ui_kind, content_kind in self._LIB_KIND.items():
-                entries = (movies if ui_kind == "movies" else tv) or []
+                entries = entries_by_kind.get(ui_kind) or []
                 keep_ids = set()
                 for i, e in enumerate(entries):
                     e = e or {}
@@ -2579,18 +2587,19 @@ class VideoDatabase:
                         continue
                     label = str(e.get("label") or "").strip() or None
                     path = str(e.get("path") or "").strip()
+                    category = str(e.get("category") or "").strip() or None
                     eid = e.get("id")
                     if eid:
                         conn.execute(
-                            "UPDATE root_folders SET server_title=?, label=?, path=?, sort_order=? "
+                            "UPDATE root_folders SET server_title=?, label=?, path=?, sort_order=?, category=? "
                             "WHERE id=? AND server=? AND content_kind=?",
-                            (title, label, path, i, int(eid), server, content_kind))
+                            (title, label, path, i, category, int(eid), server, content_kind))
                         keep_ids.add(int(eid))
                     else:
                         cur = conn.execute(
-                            "INSERT INTO root_folders (path, content_kind, server, server_title, label, sort_order) "
-                            "VALUES (?, ?, ?, ?, ?, ?)",
-                            (path, content_kind, server, title, label, i))
+                            "INSERT INTO root_folders (path, content_kind, server, server_title, label, sort_order, category) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (path, content_kind, server, title, label, i, category))
                         keep_ids.add(cur.lastrowid)
                 existing_ids = {r[0] for r in conn.execute(
                     "SELECT id FROM root_folders WHERE server=? AND content_kind=?",
@@ -2639,7 +2648,7 @@ class VideoDatabase:
         conn = self._get_connection()
         try:
             row = conn.execute(
-                "SELECT id, server_title, label, path FROM root_folders "
+                "SELECT id, server_title, label, path, category FROM root_folders "
                 "WHERE server=? AND content_kind=? ORDER BY sort_order, id LIMIT 1",
                 (server, content_kind)).fetchone()
             return dict(row) if row else None
@@ -2652,7 +2661,7 @@ class VideoDatabase:
         conn = self._get_connection()
         try:
             row = conn.execute(
-                "SELECT id, path, content_kind, server, server_title, label, sort_order "
+                "SELECT id, path, content_kind, server, server_title, label, sort_order, category "
                 "FROM root_folders WHERE id=?", (int(root_folder_id),)).fetchone()
             return dict(row) if row else None
         except (TypeError, ValueError):

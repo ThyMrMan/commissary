@@ -32,16 +32,20 @@ def _usenet_category() -> str:
     return str(config_manager.get("usenet_client.category", "") or "soulsync")
 
 
-def grab_torrent(url_or_magnet: str, *, save_path: Optional[str] = None) -> dict:
-    """Add a magnet/.torrent URL to the active torrent client. Returns
-    ``{ok, ref}`` (ref = the info-hash to poll) or ``{ok: False, error}``."""
+def grab_torrent(url_or_magnet: str, *, category: Optional[str] = None,
+                 save_path: Optional[str] = None) -> dict:
+    """Add a magnet/.torrent URL to the active torrent client. ``category``
+    overrides the global default (e.g. a per-Library category resolved from
+    root_folders) — omitted/blank falls back to torrent_client.category.
+    Returns ``{ok, ref}`` (ref = the info-hash to poll) or ``{ok: False, error}``."""
     from core.torrent_clients import get_active_adapter
     adapter = get_active_adapter()
     if adapter is None or not adapter.is_configured():
         return {"ok": False, "error": "No torrent client configured — set it on Settings → Downloads."}
     try:
         from core.torrent_clients.base import add_torrent_smart
-        ref = _run(add_torrent_smart(adapter, url_or_magnet, category=_torrent_category(), save_path=save_path))
+        cat = category or _torrent_category()
+        ref = _run(add_torrent_smart(adapter, url_or_magnet, category=cat, save_path=save_path))
     except Exception as e:   # noqa: BLE001 - surface the client error to the grab handler
         logger.warning("torrent add failed: %s", e, exc_info=True)
         return {"ok": False, "error": "Torrent client: " + str(e)}
@@ -50,15 +54,18 @@ def grab_torrent(url_or_magnet: str, *, save_path: Optional[str] = None) -> dict
     return {"ok": True, "ref": str(ref)}
 
 
-def grab_usenet(url_or_nzb: Any, *, save_path: Optional[str] = None) -> dict:
-    """Add an NZB (URL or bytes) to the active usenet client. Returns
+def grab_usenet(url_or_nzb: Any, *, category: Optional[str] = None,
+                save_path: Optional[str] = None) -> dict:
+    """Add an NZB (URL or bytes) to the active usenet client. ``category``
+    overrides the global default the same way ``grab_torrent`` does. Returns
     ``{ok, ref}`` (ref = the nzo_id/NZBID to poll) or ``{ok: False, error}``."""
     from core.usenet_clients import get_active_adapter
     adapter = get_active_adapter()
     if adapter is None or not adapter.is_configured():
         return {"ok": False, "error": "No usenet client configured — set it on Settings → Downloads."}
     try:
-        ref = _run(adapter.add_nzb(url_or_nzb, category=_usenet_category(), save_path=save_path))
+        cat = category or _usenet_category()
+        ref = _run(adapter.add_nzb(url_or_nzb, category=cat, save_path=save_path))
     except Exception as e:   # noqa: BLE001
         logger.warning("usenet add failed: %s", e, exc_info=True)
         return {"ok": False, "error": "Usenet client: " + str(e)}
@@ -67,10 +74,11 @@ def grab_usenet(url_or_nzb: Any, *, save_path: Optional[str] = None) -> dict:
     return {"ok": True, "ref": str(ref)}
 
 
-def grab(source: str, url: Any, *, save_path: Optional[str] = None) -> dict:
+def grab(source: str, url: Any, *, category: Optional[str] = None,
+        save_path: Optional[str] = None) -> dict:
     """Dispatch a grab by source (torrent | usenet)."""
     if str(source).lower() == "torrent":
-        return grab_torrent(url, save_path=save_path)
+        return grab_torrent(url, category=category, save_path=save_path)
     if str(source).lower() == "usenet":
-        return grab_usenet(url, save_path=save_path)
+        return grab_usenet(url, category=category, save_path=save_path)
     return {"ok": False, "error": "Unsupported source %r" % source}
