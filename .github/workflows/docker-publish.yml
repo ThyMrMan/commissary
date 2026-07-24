@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       version_tag:
-        description: 'Version tag (e.g. 3.1.5)'
+        description: 'Version tag (e.g. 1.0.0)'
         required: true
-        default: '3.1.5'
+        default: '1.0.0'
 
 jobs:
   build-and-push:
@@ -41,13 +41,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ env.OWNER }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
@@ -60,7 +53,5 @@ jobs:
           build-args: |
             COMMIT_SHA=${{ github.sha }}
           tags: |
-            boulderbadgedad/soulsync:latest
-            ghcr.io/${{ env.OWNER }}/soulsync:latest
-            ${{ inputs.version_tag && format('boulderbadgedad/soulsync:{0}', inputs.version_tag) || '' }}
-            ${{ inputs.version_tag && format('ghcr.io/{0}/soulsync:{1}', env.OWNER, inputs.version_tag) || '' }}
+            thymrman/soul-sync-custom:latest
+            ${{ inputs.version_tag != '' && format('thymrman/soul-sync-custom:{0}', inputs.version_tag) || '' }}
