@@ -9495,8 +9495,10 @@ def get_library_artists():
 @app.route('/api/library/to-be-purchased')
 def get_library_to_be_purchased():
     """Flat, cross-artist shopping-list view: every track flagged
-    to_be_purchased (auto-set on download, cleared via the generic
-    PUT /api/library/track/<id> endpoint)."""
+    to_be_purchased (auto-set on download). Marking a track/album purchased
+    (POST /api/library/tracks/mark-purchased) clears this flag and moves it
+    to the durable Purchased history below — it's no longer just a bare
+    PUT-and-clear."""
     try:
         search = request.args.get('search', '')
         page = int(request.args.get('page', 1))
@@ -9517,6 +9519,72 @@ def get_library_to_be_purchased():
             "error": str(e),
             "tracks": [],
             "pagination": {"page": 1, "limit": 50, "total_count": 0, "total_pages": 0,
+                           "has_prev": False, "has_next": False}
+        }), 500
+
+@app.route('/api/library/tracks/mark-purchased', methods=['POST'])
+def mark_library_tracks_purchased():
+    """Mark one or more tracks as purchased — clears to_be_purchased and
+    stamps a durable purchased_at (see Database.mark_tracks_purchased).
+    Same endpoint serves both a single track (track-level "Mark Purchased")
+    and every track in an album (album-level "Mark Album Purchased") —
+    the caller just sends however many ids it means."""
+    try:
+        data = request.get_json() or {}
+        track_ids = data.get('track_ids') or []
+        if not track_ids:
+            return jsonify({"success": False, "error": "track_ids is required"}), 400
+        result = get_database().mark_tracks_purchased(track_ids)
+        if not result.get('success'):
+            return jsonify(result), 400
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Error marking tracks purchased: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/library/tracks/unmark-purchased', methods=['POST'])
+def unmark_library_tracks_purchased():
+    """Undo a purchase mark — clears purchased_at only (does not re-add the
+    track to the to-be-purchased shopping list; see
+    Database.unmark_tracks_purchased)."""
+    try:
+        data = request.get_json() or {}
+        track_ids = data.get('track_ids') or []
+        if not track_ids:
+            return jsonify({"success": False, "error": "track_ids is required"}), 400
+        result = get_database().unmark_tracks_purchased(track_ids)
+        if not result.get('success'):
+            return jsonify(result), 400
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Error unmarking tracks purchased: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/library/purchased')
+def get_library_purchased():
+    """Purchase history for the Purchased nav page, grouped by album (most
+    recently purchased first) — backs the durable record that
+    mark-purchased/unmark-purchased maintain."""
+    try:
+        search = request.args.get('search', '')
+        page = int(request.args.get('page', 1))
+        limit = int(request.args.get('limit', 25))
+
+        database = get_database()
+        result = database.get_purchased_albums(search=search, page=page, limit=limit)
+
+        for album in result['albums']:
+            if album.get('thumb_url'):
+                album['thumb_url'] = fix_artist_image_url(album['thumb_url'])
+
+        return jsonify({"success": True, **result})
+    except Exception as e:
+        logger.error(f"Error fetching purchased albums: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "albums": [],
+            "pagination": {"page": 1, "limit": 25, "total_count": 0, "total_pages": 0,
                            "has_prev": False, "has_next": False}
         }), 500
 

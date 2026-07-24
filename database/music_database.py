@@ -717,6 +717,10 @@ class MusicDatabase:
             # Flags a downloaded track as not-yet-purchased (migration)
             self._add_to_be_purchased_column(cursor)
 
+            # Durable purchase record — when a to-be-purchased track/album is
+            # actually bought (migration)
+            self._add_purchased_at_column(cursor)
+
             # Library issues — user-reported problems with tracks/albums/artists
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS library_issues (
@@ -1652,8 +1656,8 @@ class MusicDatabase:
     def _add_to_be_purchased_column(self, cursor):
         """Flags a track as downloaded-but-not-yet-purchased — set automatically
         when a real download lands in the library (core/imports/side_effects.py's
-        record_soulsync_library_entry), cleared manually once bought via the
-        generic PUT /api/library/track/<id> endpoint."""
+        record_soulsync_library_entry), cleared once bought via
+        mark_tracks_purchased (see _add_purchased_at_column below)."""
         try:
             cursor.execute("PRAGMA table_info(tracks)")
             cols = [c[1] for c in cursor.fetchall()]
@@ -1662,6 +1666,22 @@ class MusicDatabase:
                 logger.info("Added to_be_purchased column to tracks table")
         except Exception as e:
             logger.error(f"Error adding to_be_purchased column: {e}")
+
+    def _add_purchased_at_column(self, cursor):
+        """Durable purchase record — set (to CURRENT_TIMESTAMP) by
+        mark_tracks_purchased when a track/album is actually bought, cleared
+        by unmark_tracks_purchased. Deliberately NOT in TRACK_EDITABLE_FIELDS
+        (never an arbitrary client-supplied value — always server-stamped) so
+        it can only be set through those two methods, keeping the Purchased
+        page's history trustworthy."""
+        try:
+            cursor.execute("PRAGMA table_info(tracks)")
+            cols = [c[1] for c in cursor.fetchall()]
+            if 'purchased_at' not in cols:
+                cursor.execute("ALTER TABLE tracks ADD COLUMN purchased_at TEXT DEFAULT NULL")
+                logger.info("Added purchased_at column to tracks table")
+        except Exception as e:
+            logger.error(f"Error adding purchased_at column: {e}")
 
     def _add_automation_then_actions_column(self, cursor):
         """Add then_actions column to automations table and migrate existing notify data."""
@@ -13083,6 +13103,167 @@ class MusicDatabase:
             logger.error(f"Error getting to-be-purchased tracks: {e}")
             return {
                 'tracks': [],
+                'pagination': {
+                    'page': 1, 'limit': limit, 'total_count': 0, 'total_pages': 0,
+                    'has_prev': False, 'has_next': False,
+                }
+            }
+
+    def mark_tracks_purchased(self, track_ids: List[str]) -> Dict[str, Any]:
+        """Mark one or more tracks purchased: clears the shopping-list flag
+        and stamps a durable purchased_at (server-side timestamp — never a
+        client-supplied value), read by get_purchased_albums for the
+        Purchased page. Works identically for a single track (track-level
+        "Mark Purchased") or every track in an album (album-level "Mark
+        Album Purchased") — the caller decides which ids to pass."""
+        if not track_ids:
+            return {'success': False, 'error': 'No tracks specified'}
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                placeholders = ','.join('?' * len(track_ids))
+                cursor.execute(
+                    f"UPDATE tracks SET to_be_purchased = 0, purchased_at = CURRENT_TIMESTAMP, "
+                    f"updated_at = CURRENT_TIMESTAMP WHERE id IN ({placeholders})",
+                    track_ids,
+                )
+                conn.commit()
+                return {'success': True, 'updated': cursor.rowcount}
+        except Exception as e:
+            logger.error(f"Error marking tracks purchased: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def unmark_tracks_purchased(self, track_ids: List[str]) -> Dict[str, Any]:
+        """Undo a purchase mark — clears purchased_at only. Deliberately does
+        NOT re-set to_be_purchased: this is a clean "undo the purchase
+        record", not "put it back on my shopping list"."""
+        if not track_ids:
+            return {'success': False, 'error': 'No tracks specified'}
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                placeholders = ','.join('?' * len(track_ids))
+                cursor.execute(
+                    f"UPDATE tracks SET purchased_at = NULL, updated_at = CURRENT_TIMESTAMP "
+                    f"WHERE id IN ({placeholders})",
+                    track_ids,
+                )
+                conn.commit()
+                return {'success': True, 'updated': cursor.rowcount}
+        except Exception as e:
+            logger.error(f"Error unmarking tracks purchased: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def get_purchased_albums(self, search: str = "", page: int = 1, limit: int = 25) -> Dict[str, Any]:
+        """Purchase history for the Purchased page, grouped by album (most
+        recently purchased first). Two-query page-then-hydrate shape,
+        mirroring get_library_artists(): count + a paginated distinct-album
+        query, then one query to fetch every purchased track for just that
+        page's albums, grouped in Python. An album with only SOME of its
+        tracks purchased still shows (purchased_count < total_track_count)."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+
+                where_conditions = ["t.purchased_at IS NOT NULL"]
+                params: List[Any] = []
+                if search:
+                    where_conditions.append("(LOWER(t.title) LIKE LOWER(?) OR LOWER(ar.name) LIKE LOWER(?) OR LOWER(al.title) LIKE LOWER(?))")
+                    like = f"%{search}%"
+                    params.extend([like, like, like])
+                where_clause = " AND ".join(where_conditions)
+
+                cursor.execute(
+                    f"""
+                    SELECT COUNT(DISTINCT al.id) as total_count
+                    FROM tracks t
+                    JOIN albums al ON t.album_id = al.id
+                    JOIN artists ar ON al.artist_id = ar.id
+                    WHERE {where_clause}
+                    """,
+                    params,
+                )
+                total_count = cursor.fetchone()['total_count']
+
+                offset = (page - 1) * limit
+                cursor.execute(
+                    f"""
+                    SELECT al.id AS album_id, MAX(t.purchased_at) AS last_purchased_at
+                    FROM tracks t
+                    JOIN albums al ON t.album_id = al.id
+                    JOIN artists ar ON al.artist_id = ar.id
+                    WHERE {where_clause}
+                    GROUP BY al.id
+                    ORDER BY last_purchased_at DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    params + [limit, offset],
+                )
+                page_rows = cursor.fetchall()
+                page_album_ids = [row['album_id'] for row in page_rows]
+                last_purchased_map = {row['album_id']: row['last_purchased_at'] for row in page_rows}
+
+                albums: List[Dict[str, Any]] = []
+                if page_album_ids:
+                    id_placeholders = ','.join('?' * len(page_album_ids))
+                    cursor.execute(
+                        f"""
+                        SELECT al.id AS album_id, al.title AS album_title, al.thumb_url, al.year,
+                               ar.id AS artist_id, ar.name AS artist_name,
+                               (SELECT COUNT(*) FROM tracks t2 WHERE t2.album_id = al.id) AS total_track_count
+                        FROM albums al
+                        JOIN artists ar ON al.artist_id = ar.id
+                        WHERE al.id IN ({id_placeholders})
+                        """,
+                        page_album_ids,
+                    )
+                    summaries = {row['album_id']: dict(row) for row in cursor.fetchall()}
+
+                    cursor.execute(
+                        f"""
+                        SELECT t.id, t.title, t.track_number, t.purchased_at, t.album_id
+                        FROM tracks t
+                        WHERE t.album_id IN ({id_placeholders}) AND t.purchased_at IS NOT NULL
+                        ORDER BY t.album_id, t.track_number
+                        """,
+                        page_album_ids,
+                    )
+                    tracks_by_album: Dict[Any, List[Dict[str, Any]]] = {}
+                    for row in cursor.fetchall():
+                        tracks_by_album.setdefault(row['album_id'], []).append({
+                            'id': row['id'], 'title': row['title'],
+                            'track_number': row['track_number'], 'purchased_at': row['purchased_at'],
+                        })
+
+                    # Preserve the newest-purchase-first order from the paginated query above.
+                    for album_id in page_album_ids:
+                        summary = summaries.get(album_id)
+                        if not summary:
+                            continue
+                        album_tracks = tracks_by_album.get(album_id, [])
+                        albums.append({
+                            **summary,
+                            'purchased_count': len(album_tracks),
+                            'last_purchased_at': last_purchased_map.get(album_id),
+                            'tracks': album_tracks,
+                        })
+
+                total_pages = (total_count + limit - 1) // limit if limit else 0
+                return {
+                    'albums': albums,
+                    'pagination': {
+                        'page': page,
+                        'limit': limit,
+                        'total_count': total_count,
+                        'total_pages': total_pages,
+                        'has_prev': page > 1,
+                        'has_next': page < total_pages,
+                    }
+                }
+        except Exception as e:
+            logger.error(f"Error getting purchased albums: {e}")
+            return {
+                'albums': [],
                 'pagination': {
                     'page': 1, 'limit': limit, 'total_count': 0, 'total_pages': 0,
                     'has_prev': False, 'has_next': False,

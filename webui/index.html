@@ -350,6 +350,10 @@
                     <span class="nav-text">Wishlist</span>
                     <span class="dl-nav-badge hidden" id="wishlist-nav-badge">0</span>
                 </a>
+                <a class="nav-button" data-page="purchased" href="/purchased">
+                    <span class="nav-icon"><svg class="nav-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h1l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/><circle cx="9.5" cy="21" r="1"/><circle cx="18.5" cy="21" r="1"/><polyline points="9 10 11 12 15 8"/></svg></span>
+                    <span class="nav-text">Purchased</span>
+                </a>
                 <a class="nav-button" data-page="active-downloads" href="/active-downloads">
                     <span class="nav-icon"><svg class="nav-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></span>
                     <span class="nav-text">Downloads</span>
@@ -10951,6 +10955,57 @@
                 </div>
             </div>
 
+            <!-- ═══════════════════════════════════════════════════════════════════
+                 PURCHASED PAGE
+                 ═══════════════════════════════════════════════════════════════════ -->
+            <div class="page" id="purchased-page">
+                <div class="page-shell purchased-page-container">
+                    <!-- Header -->
+                    <div class="library-header">
+                        <div class="library-header-content">
+                            <h2 class="library-title"><span class="purchased-page-title-icon">✅</span><span>Purchased</span></h2>
+                            <p class="library-subtitle">Music you've bought, kept separate from what's still just downloaded</p>
+                        </div>
+                        <div class="library-stats" id="purchased-stats">
+                            <span class="library-stat">
+                                <span class="stat-number" id="purchased-album-count">0</span>
+                                <span class="stat-label">Albums</span>
+                            </span>
+                        </div>
+                    </div>
+
+                    <!-- Search -->
+                    <div class="library-controls">
+                        <div class="library-search-container">
+                            <input type="text" id="purchased-search-input" class="library-search-input"
+                                placeholder="Filter by title, artist, or album…">
+                            <div class="library-search-icon">🔍</div>
+                        </div>
+                    </div>
+
+                    <!-- Album-grouped purchase list -->
+                    <div class="purchased-albums-list" id="purchased-albums-list">
+                        <div class="purchased-loading" id="purchased-loading">Loading…</div>
+                    </div>
+
+                    <!-- Empty state -->
+                    <div class="purchased-empty-state hidden" id="purchased-empty-state">
+                        <div class="purchased-empty-icon">
+                            <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="1.5"><path d="M4 4h1l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/><circle cx="9.5" cy="21" r="1"/><circle cx="18.5" cy="21" r="1"/></svg>
+                        </div>
+                        <h3>Nothing purchased yet</h3>
+                        <p>Mark a track or album purchased from the Library page — it'll show up here as a permanent record, separate from your to-be-purchased shopping list.</p>
+                    </div>
+
+                    <!-- Pagination -->
+                    <div class="purchased-pagination hidden" id="purchased-pagination">
+                        <button class="btn btn--secondary" id="purchased-prev-btn">&larr; Previous</button>
+                        <span id="purchased-page-indicator">Page 1</span>
+                        <button class="btn btn--secondary" id="purchased-next-btn">Next &rarr;</button>
+                    </div>
+                </div>
+            </div>
+
         </div> <!-- /main-content -->
     </div> <!-- /main-container -->
 
@@ -12030,6 +12085,7 @@
     <script src="{{ url_for('static', filename='sync-soulsync-discovery.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='api-monitor.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='library.js', v=static_v) }}"></script>
+    <script src="{{ url_for('static', filename='purchased.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='beatport-ui.js', v=static_v) }}"></script>
     <!-- Artist Web graph stack (sigma.js): graphology = data model, sigma = WebGL renderer,
          graphology-library = utils incl. forceAtlas2 layout. CDN/UMD (SoulSync is vanilla). -->

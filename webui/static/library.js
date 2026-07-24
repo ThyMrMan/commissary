@@ -4368,6 +4368,13 @@ function renderExpandedAlbumHeader(album) {
         writeTagsBtn.onclick = (e) => { e.stopPropagation(); writeAlbumTags(album.id); };
         enrichRow.appendChild(writeTagsBtn);
 
+        const markPurchasedBtn = document.createElement('button');
+        markPurchasedBtn.className = 'enhanced-mark-purchased-album-btn';
+        markPurchasedBtn.innerHTML = '✅ Mark Album Purchased';
+        markPurchasedBtn.title = 'Mark every track in this album as purchased';
+        markPurchasedBtn.onclick = (e) => { e.stopPropagation(); markAlbumPurchased(album.id); };
+        enrichRow.appendChild(markPurchasedBtn);
+
         const rgAlbumBtn = document.createElement('button');
         rgAlbumBtn.className = 'enhanced-rg-album-btn';
         rgAlbumBtn.innerHTML = '&#9835; ReplayGain';
@@ -4856,10 +4863,14 @@ function _buildTrackRow(track, album, admin) {
                 </div>
             `;
         } else {
-            const tbpOn = !!track.to_be_purchased;
+            const tbpState = _tbpTrackState(track);
+            const tbpIcon = tbpState === 'purchased' ? '✅' : '🛒';
+            const tbpTitle = tbpState === 'neutral' ? 'Mark to be purchased'
+                : tbpState === 'to_buy' ? 'Mark purchased' : 'Unmark purchased';
+            const tbpCls = tbpState === 'neutral' ? '' : (' ' + (tbpState === 'to_buy' ? 'to-buy' : 'purchased'));
             actionsTd.innerHTML = `
                 <div class="enhanced-track-actions-group">
-                    <button class="enhanced-tbp-btn${tbpOn ? ' active' : ''}" title="${tbpOn ? 'Mark purchased' : 'Mark to be purchased'}">🛒</button>
+                    <button class="enhanced-tbp-btn${tbpCls}" title="${tbpTitle}">${tbpIcon}</button>
                     <button class="enhanced-source-info-btn" title="View download source info">ℹ</button>
                     <button class="enhanced-reidentify-btn" title="Re-identify — file this track under a different release">&#8644;</button>
                     <button class="enhanced-redownload-btn" title="Redownload this track">&#8635;</button>
@@ -5152,8 +5163,11 @@ function _showMobileTrackActions(track, album) {
         actions.push({ icon: '✎', label: 'Write Tags', action: () => showTagPreview(track.id) });
     }
     if (admin) {
+        const _tbpMobileState = _tbpTrackState(track);
         actions.push({
-            icon: '🛒', label: track.to_be_purchased ? 'Mark Purchased' : 'Mark To Be Purchased',
+            icon: _tbpMobileState === 'purchased' ? '✅' : '🛒',
+            label: _tbpMobileState === 'purchased' ? 'Unmark Purchased'
+                : _tbpMobileState === 'to_buy' ? 'Mark Purchased' : 'Mark To Be Purchased',
             action: () => _toggleTrackToBePurchasedMobile(track)
         });
         actions.push({ icon: 'ℹ', label: 'Source Info', action: () => showTrackSourceInfo(track, null) });
@@ -10081,12 +10095,23 @@ function _tbpRowHtml(track) {
     '</div>';
 }
 
+// Three states a track can be in, derived from the two DB columns:
+//   neutral  — to_be_purchased=0, purchased_at=NULL (a normal track)
+//   to_buy   — to_be_purchased=1 (on the shopping list, not bought yet)
+//   purchased — purchased_at is set (a durable purchase record; shows on
+//               the Purchased nav page)
+function _tbpTrackState(track) {
+    if (track && track.purchased_at) return 'purchased';
+    if (track && track.to_be_purchased) return 'to_buy';
+    return 'neutral';
+}
+
 async function _tbpMarkPurchased(trackId, rowEl) {
     try {
-        const res = await fetch('/api/library/track/' + encodeURIComponent(trackId), {
-            method: 'PUT',
+        const res = await fetch('/api/library/tracks/mark-purchased', {
+            method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ to_be_purchased: 0 })
+            body: JSON.stringify({ track_ids: [trackId] })
         });
         const data = await res.json();
         if (!data.success) throw new Error(data.error || 'Failed to update');
@@ -10102,24 +10127,49 @@ async function _tbpMarkPurchased(trackId, rowEl) {
     }
 }
 
-// Per-track toggle in the artist drill-down (_buildTrackRow's action group) —
-// same underlying flag/endpoint as the shopping-list modal above, so a user
-// can flag/unflag while just browsing an artist, not only from the list.
+// Per-track cart icon in the artist drill-down (_buildTrackRow's action
+// group) — cycles neutral -> to-buy -> purchased -> neutral on click, using
+// the same flag/endpoints as the shopping-list modal and the Purchased page
+// above, so all three views always agree.
 async function _toggleTrackToBePurchased(trackId, btnEl) {
     if (!btnEl) return;
-    const turningOn = !btnEl.classList.contains('active');
+    const tr = btnEl.closest('tr[data-track-id]');
+    const track = tr && tr._enhancedTrack;
+    const state = track ? _tbpTrackState(track)
+        : (btnEl.classList.contains('purchased') ? 'purchased' : (btnEl.classList.contains('to-buy') ? 'to_buy' : 'neutral'));
     try {
-        const res = await fetch('/api/library/track/' + encodeURIComponent(trackId), {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ to_be_purchased: turningOn ? 1 : 0 })
-        });
+        let nextState, res;
+        if (state === 'neutral') {
+            res = await fetch('/api/library/track/' + encodeURIComponent(trackId), {
+                method: 'PUT', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ to_be_purchased: 1 })
+            });
+            nextState = 'to_buy';
+        } else if (state === 'to_buy') {
+            res = await fetch('/api/library/tracks/mark-purchased', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ track_ids: [trackId] })
+            });
+            nextState = 'purchased';
+        } else {
+            res = await fetch('/api/library/tracks/unmark-purchased', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ track_ids: [trackId] })
+            });
+            nextState = 'neutral';
+        }
         const data = await res.json();
         if (!data.success) throw new Error(data.error || 'Failed to update');
-        btnEl.classList.toggle('active', turningOn);
-        btnEl.title = turningOn ? 'Mark purchased' : 'Mark to be purchased';
-        const tr = btnEl.closest('tr[data-track-id]');
-        if (tr && tr._enhancedTrack) tr._enhancedTrack.to_be_purchased = turningOn ? 1 : 0;
+
+        btnEl.classList.remove('to-buy', 'purchased');
+        if (nextState !== 'neutral') btnEl.classList.add(nextState === 'to_buy' ? 'to-buy' : 'purchased');
+        btnEl.textContent = nextState === 'purchased' ? '✅' : '🛒';
+        btnEl.title = nextState === 'neutral' ? 'Mark to be purchased'
+            : nextState === 'to_buy' ? 'Mark purchased' : 'Unmark purchased';
+        if (track) {
+            track.to_be_purchased = nextState === 'to_buy' ? 1 : 0;
+            track.purchased_at = nextState === 'purchased' ? new Date().toISOString() : null;
+        }
         loadToBePurchasedCount();
     } catch (err) {
         if (typeof showToast === 'function') showToast('Could not update: ' + (err.message || err), 'error');
@@ -10130,20 +10180,69 @@ async function _toggleTrackToBePurchased(trackId, btnEl) {
 // (the popover closes immediately on tap), so just persist + toast + update
 // the in-memory track object for if the row re-renders without a refetch.
 async function _toggleTrackToBePurchasedMobile(track) {
-    const turningOn = !track.to_be_purchased;
+    const state = _tbpTrackState(track);
     try {
-        const res = await fetch('/api/library/track/' + encodeURIComponent(track.id), {
-            method: 'PUT',
+        let res, toastMsg;
+        if (state === 'neutral') {
+            res = await fetch('/api/library/track/' + encodeURIComponent(track.id), {
+                method: 'PUT', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ to_be_purchased: 1 })
+            });
+            toastMsg = 'Marked to be purchased';
+        } else if (state === 'to_buy') {
+            res = await fetch('/api/library/tracks/mark-purchased', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ track_ids: [track.id] })
+            });
+            toastMsg = 'Marked purchased';
+        } else {
+            res = await fetch('/api/library/tracks/unmark-purchased', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ track_ids: [track.id] })
+            });
+            toastMsg = 'Purchase unmarked';
+        }
+        const data = await res.json();
+        if (!data.success) throw new Error(data.error || 'Failed to update');
+
+        if (state === 'neutral') track.to_be_purchased = 1;
+        else if (state === 'to_buy') { track.to_be_purchased = 0; track.purchased_at = new Date().toISOString(); }
+        else track.purchased_at = null;
+
+        loadToBePurchasedCount();
+        if (typeof showToast === 'function') showToast(toastMsg, 'success');
+    } catch (err) {
+        if (typeof showToast === 'function') showToast('Could not update: ' + (err.message || err), 'error');
+    }
+}
+
+// Mirrors writeAlbumTags()'s pattern: collect every track id in the album
+// client-side (already loaded into artistDetailPageState.enhancedData) and
+// fire ONE mark-purchased batch call. Applies to every track regardless of
+// its current flag state — buying an album is a statement about the whole
+// thing, not just whatever happened to be on the shopping list.
+async function markAlbumPurchased(albumId) {
+    const album = findEnhancedAlbum(albumId);
+    if (!album) return;
+    const trackIds = (album.tracks || []).map(t => t.id).filter(Boolean);
+    if (!trackIds.length) { if (typeof showToast === 'function') showToast('No tracks in this album', 'error'); return; }
+    try {
+        const res = await fetch('/api/library/tracks/mark-purchased', {
+            method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ to_be_purchased: turningOn ? 1 : 0 })
+            body: JSON.stringify({ track_ids: trackIds })
         });
         const data = await res.json();
         if (!data.success) throw new Error(data.error || 'Failed to update');
-        track.to_be_purchased = turningOn ? 1 : 0;
+        const now = new Date().toISOString();
+        (album.tracks || []).forEach(t => { t.to_be_purchased = 0; t.purchased_at = now; });
         loadToBePurchasedCount();
-        if (typeof showToast === 'function') showToast(turningOn ? 'Marked to be purchased' : 'Marked purchased', 'success');
+        if (typeof showToast === 'function') showToast(`Marked ${data.updated || trackIds.length} track(s) purchased`, 'success');
+        // Re-render from the (now-mutated) in-memory state so every row's icon
+        // reflects the new purchased status immediately — same pattern deleteLibraryTrack uses.
+        if (typeof renderEnhancedView === 'function') renderEnhancedView();
     } catch (err) {
-        if (typeof showToast === 'function') showToast('Could not update: ' + (err.message || err), 'error');
+        if (typeof showToast === 'function') showToast('Could not mark album purchased: ' + (err.message || err), 'error');
     }
 }
 
