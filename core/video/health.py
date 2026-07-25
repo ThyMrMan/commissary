@@ -15,8 +15,45 @@ from utils.logging_config import get_logger
 
 logger = get_logger("video.health")
 
-_ROOTS = (("movies_path", "Movie library"), ("tv_path", "TV library"),
-          ("youtube_path", "YouTube library"))
+_LEGACY_ROOTS = (("movies_path", "Movie library"), ("tv_path", "TV library"),
+                 ("youtube_path", "YouTube library"))
+
+_KIND_LABEL = {"movie": "Movie library", "show": "TV library", "youtube": "YouTube library"}
+
+
+def _checked_roots(db) -> list:
+    """(check_id, label, path) for every folder that can receive video files.
+
+    The Libraries registry (Settings → Connections) plus the legacy flat paths
+    (Settings → Downloads), de-duplicated. Both are live — a library with no
+    Destination Folder of its own falls back to the flat one — so an
+    unreachable path in either is worth reporting. Registry entries are
+    labelled with the library's own name so a multi-library install can tell
+    which mount is down; the flat ones keep their historical check ids.
+    """
+    import os as _os
+    roots, seen = [], set()
+
+    try:
+        rows = db.all_library_rows()
+    except Exception:   # noqa: BLE001 - health must never 500 over one probe
+        rows = []
+    for row in rows:
+        path = str(row.get("path") or "").strip()
+        if not path or _os.path.abspath(path) in seen:
+            continue
+        seen.add(_os.path.abspath(path))
+        name = (row.get("label") or row.get("server_title") or "").strip()
+        kind = _KIND_LABEL.get(row.get("content_kind"), "Library")
+        roots.append((f"library_{row.get('id')}", f"{kind}: {name}" if name else kind, path))
+
+    for key, label in _LEGACY_ROOTS:
+        path = str(db.get_setting(key) or "").strip()
+        if not path or _os.path.abspath(path) in seen:
+            continue
+        seen.add(_os.path.abspath(path))
+        roots.append((key, label, path))
+    return roots
 
 
 def _check(cid, label, status, detail) -> dict:
@@ -30,10 +67,7 @@ def collect(db) -> dict:
     # 1) library folders: set-but-unreachable = a down mount (error); unset is fine
     from core.video import organization
     settings = organization.load(db)
-    for key, label in _ROOTS:
-        path = str(db.get_setting(key) or "").strip()
-        if not path:
-            continue
+    for key, label, path in _checked_roots(db):
         if not os.path.isdir(path):
             checks.append(_check(key, label, "error",
                                  f"{path} is unreachable — a drive or mount may be down"))

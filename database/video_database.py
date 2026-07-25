@@ -2656,6 +2656,48 @@ class VideoDatabase:
         finally:
             conn.close()
 
+    # Content-kind ordering used by all_library_rows: movies, then shows, then
+    # YouTube — matches the legacy movies_path/tv_path/youtube_path order the
+    # flat settings used, so callers that union the two keep a stable list.
+    _KIND_ORDER = "CASE content_kind WHEN 'movie' THEN 0 WHEN 'show' THEN 1 ELSE 2 END"
+
+    def all_library_rows(self, kind: str | None = None) -> list:
+        """Every configured library row, ordered kind then sort_order.
+
+        Server-AGNOSTIC on purpose, unlike list_libraries/primary_root_folder.
+        Callers here (health checks, the recycle bin, path re-resolution, the
+        naming-conformance job) care about folders on disk, not about which
+        media server indexes them — and resolve_video_server() returns None on
+        an install with no server configured, which would make a server-scoped
+        query silently yield nothing and reintroduce the very bug this exists
+        to fix. root_folders.path is globally UNIQUE, so an unscoped query
+        cannot double-count.
+
+        Deliberately does NOT run _migrate_legacy_libraries (that needs a
+        server): an install that never opened the Libraries editor simply has
+        no rows, and its callers fall through to the legacy scalars.
+        """
+        sql = ("SELECT id, path, content_kind, server, server_title, label, sort_order, category "
+               "FROM root_folders")
+        params = ()
+        if kind:
+            content_kind = {"movie": "movie", "movies": "movie", "show": "show",
+                            "shows": "show", "tv": "show"}.get(str(kind).lower(), str(kind).lower())
+            sql += " WHERE content_kind=?"
+            params = (content_kind,)
+        sql += f" ORDER BY {self._KIND_ORDER}, sort_order, id"
+
+        conn = self._get_connection()
+        try:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        finally:
+            conn.close()
+
+    def all_library_paths(self, kind: str | None = None) -> list:
+        """Just the destination paths from all_library_rows, blanks dropped."""
+        return [p for p in (str(r.get("path") or "").strip()
+                            for r in self.all_library_rows(kind)) if p]
+
     def get_root_folder(self, root_folder_id) -> dict | None:
         """A single library row by id (for resolving a grab's chosen
         destination). None if unknown."""

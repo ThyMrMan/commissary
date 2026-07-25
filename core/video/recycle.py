@@ -32,19 +32,14 @@ logger = get_logger("video.recycle")
 
 TRASH_DIRNAME = "ss_recycle"
 
-_ROOT_SETTINGS = ("movies_path", "tv_path", "youtube_path")
-
-
 def _library_roots(db) -> list:
-    roots = []
-    for key in _ROOT_SETTINGS:
-        try:
-            v = str(db.get_setting(key) or "").strip()
-        except Exception:   # noqa: BLE001
-            v = ""
-        if v:
-            roots.append(v)
-    return roots
+    """Every configured library root — the registry (Settings → Connections)
+    unioned with the legacy flat paths. Before this read only the flat paths,
+    so an install that configured its libraries in Connections and left the
+    Downloads fields blank had NO recycle roots at all and every delete was
+    permanent."""
+    from core.video.path_resolver import library_roots
+    return library_roots(db)
 
 
 def _root_for(path: str, roots) -> Optional[str]:

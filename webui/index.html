@@ -7110,24 +7110,28 @@
                             <div class="settings-group" data-stg="downloads" data-video-only>
                                 <h3>Video Download Folders</h3>
                                 <div class="setting-help-text">
-                                    One shared download folder (where slskd / torrent drop files), then a separate library folder per type — finished files are sorted to the right one automatically. SEPARATE from your Music paths.
+                                    One shared download folder (where slskd / torrent drop files), then a library folder per type — finished files are sorted to the right one automatically. SEPARATE from your Music paths.
                                 </div>
                                 <div class="form-group">
                                     <label>Download Folder (Input — shared with Music):</label>
                                     <input type="text" id="video-download-path" placeholder="./downloads">
                                     <div class="setting-help-text">Where downloads land — point this at the same folder as your slskd / torrent client. This is the SAME folder as the Music side; changing it here changes it there too.</div>
                                 </div>
+                                <div class="setting-help-text" style="margin-top: 14px;">
+                                    <strong>Movies and TV Shows below are fallbacks.</strong> Each library you configure in <em>Settings → Connections → Libraries</em> has its own Destination Folder, and that always wins for downloads into it — these two only apply to a library that has none set, or to an install with no libraries configured. Set either way, every folder named here is watched for free space, used by the recycle bin, and searched when a file has moved.
+                                </div>
                                 <div class="form-group">
-                                    <label>🎬 Movies Library:</label>
+                                    <label>🎬 Movies Library (fallback):</label>
                                     <input type="text" id="video-movies-path" placeholder="/media/movies">
                                 </div>
                                 <div class="form-group">
-                                    <label>📺 TV Shows Library:</label>
+                                    <label>📺 TV Shows Library (fallback):</label>
                                     <input type="text" id="video-tv-path" placeholder="/media/tv">
                                 </div>
                                 <div class="form-group">
                                     <label>▶️ YouTube Library:</label>
                                     <input type="text" id="video-youtube-path" placeholder="/media/youtube">
+                                    <div class="setting-help-text">Unlike the two above, this one is <strong>not</strong> a fallback — it is where followed-channel downloads always go. Libraries in Connections cover movies and shows only.</div>
                                 </div>
                             </div>
                             <div class="settings-group" data-stg="downloads" data-video-only>

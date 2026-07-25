@@ -20,18 +20,66 @@ from typing import Callable, Optional
 # How many trailing path segments to re-root (file, its folder, a parent…).
 _PROBE_DEPTH = 4
 
+# The flat per-kind destination settings, in the order they have always been
+# read. These predate the Libraries registry (root_folders) and remain the
+# fallback for installs with no libraries configured — resolve_download_root
+# in download_pipeline.py treats them the same way.
+_LEGACY_PATH_KEYS = {"movie": "movies_path", "show": "tv_path", "youtube": "youtube_path"}
+
+
+def _setting(db, key) -> str:
+    try:
+        return str(db.get_setting(key) or "").strip()
+    except Exception:   # noqa: BLE001 - a settings hiccup must not break a scan
+        return ""
+
+
+def library_roots(db, kind: str | None = None) -> list:
+    """Every folder SoulSync treats as a video library root.
+
+    The Libraries registry (Settings → Connections) is the source of truth; the
+    flat movies_path/tv_path/youtube_path settings (Settings → Downloads) are
+    unioned in behind it as the documented fallback. Both are live: a library
+    with no Destination Folder of its own falls back to the scalar, so a folder
+    named by either can genuinely receive files and both deserve to be
+    health-checked, recycled from, and searched when re-rooting a moved file.
+
+    Registry paths come FIRST and the list is de-duplicated by absolute path,
+    so a scalar that merely repeats a library path doesn't appear twice.
+    """
+    roots, seen = [], set()
+
+    def _add(path):
+        p = str(path or "").strip()
+        if not p:
+            return
+        key = os.path.abspath(p)
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append(p)
+
+    try:
+        for path in db.all_library_paths(kind):
+            _add(path)
+    except Exception:   # noqa: BLE001 - an old DB without the registry still works
+        pass
+
+    keys = ([_LEGACY_PATH_KEYS[kind]] if kind in _LEGACY_PATH_KEYS
+            else list(_LEGACY_PATH_KEYS.values()))
+    for key in keys:
+        _add(_setting(db, key))
+    return roots
+
 
 def video_base_dirs(db) -> list:
-    """The local folders video files can live under, per the user's settings:
-    the movie/TV library roots + the transfer folder. Missing/blank skipped."""
-    dirs = []
-    for key in ("movies_path", "tv_path", "transfer_path"):
-        try:
-            v = db.get_setting(key)
-        except Exception:   # noqa: BLE001 - a settings hiccup just narrows the search
-            v = None
-        if v:
-            dirs.append(str(v))
+    """The local folders video files can live under: every library root, plus
+    the transfer folder (a staging area, NOT a library — which is why it isn't
+    part of library_roots)."""
+    dirs = library_roots(db)
+    transfer = _setting(db, "transfer_path")
+    if transfer and os.path.abspath(transfer) not in {os.path.abspath(d) for d in dirs}:
+        dirs.append(transfer)
     return dirs
 
 

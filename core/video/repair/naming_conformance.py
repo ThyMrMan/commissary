@@ -97,10 +97,18 @@ class NamingConformanceJob(VideoRepairJob):
         from core.video import organization
         from core.video.path_resolver import resolve_video_file_path, video_base_dirs
         result = JobResult()
+        from core.video.path_resolver import library_roots
+        from core.video.recycle import _root_for
         settings = organization.load(context.db)
         base_dirs = video_base_dirs(context.db)
-        roots = {"movie": str(context.db.get_setting("movies_path") or "").strip(),
-                 "episode": str(context.db.get_setting("tv_path") or "").strip()}
+        # Every configured root per scope — the Libraries registry plus the
+        # legacy flat paths. This used to read ONLY movies_path/tv_path, so an
+        # install that set its destinations in Settings → Connections skipped
+        # every single file below. Multiple roots per kind are normal now
+        # ("Movies" + "Anime Movies"), so the right root is the one that
+        # actually contains the file, not whichever comes first.
+        roots = {"movie": library_roots(context.db, "movie"),
+                 "episode": library_roots(context.db, "show")}
         rows = context.db.repair_library_files() or []
         context.report(total=len(rows), phase="checking names")
         valid = []
@@ -108,8 +116,8 @@ class NamingConformanceJob(VideoRepairJob):
             context.check_stop()
             result.scanned += 1
             context.report(processed=i, current_item=r.get("title"))
-            root = roots.get(r["scope"])
-            if not root:
+            scope_roots = roots.get(r["scope"]) or []
+            if not scope_roots:
                 result.skipped += 1          # that library has no configured folder
                 continue
             real = resolve_video_file_path(r.get("relative_path"), base_dirs,
@@ -117,6 +125,13 @@ class NamingConformanceJob(VideoRepairJob):
             if not real:
                 result.skipped += 1          # can't locate locally — never guess
                 continue
+            # Deepest-wins containment (shared with the recycle bin). A file
+            # outside every root falls back to the primary one rather than
+            # being skipped — the template still describes where it belongs.
+            # abspath on both branches: _root_for already returns one, and
+            # _same_path below normalizes but does NOT absolutize — a relative
+            # root mixed with an absolute `real` would flag every file.
+            root = _root_for(real, scope_roots) or os.path.abspath(scope_roots[0])
             ext = os.path.splitext(real)[1]
             expected = organization.render_path(r["scope"], root, _fields_of(r),
                                                 settings, ext)["path"]
