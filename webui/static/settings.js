@@ -1563,13 +1563,13 @@ async function loadSettingsData() {
         if (_tcCat) _tcCat.value = settings.torrent_client?.category || 'soulsync';
         if (_tcPath) _tcPath.value = settings.torrent_client?.save_path || '';
         // Seeding goals (torrent grabs) — off (0) by default, mirrors the video side.
-        const _tcRatio = document.getElementById('music-seed-ratio');
-        const _tcHours = document.getElementById('music-seed-hours');
-        const _tcRemove = document.getElementById('music-seed-remove-data');
+        const _tcRatio = document.getElementById('shared-seed-ratio');
+        const _tcHours = document.getElementById('shared-seed-hours');
+        const _tcRemove = document.getElementById('shared-seed-remove-data');
         if (_tcRatio) _tcRatio.value = settings.torrent_client?.seed_ratio_goal != null ? settings.torrent_client.seed_ratio_goal : 0;
         if (_tcHours) _tcHours.value = settings.torrent_client?.seed_time_goal_hours != null ? settings.torrent_client.seed_time_goal_hours : 0;
         if (_tcRemove) _tcRemove.checked = settings.torrent_client?.seed_remove_data !== false;
-        const _tcSeedMode = document.getElementById('music-seed-mode');
+        const _tcSeedMode = document.getElementById('shared-seed-mode');
         if (_tcSeedMode) _tcSeedMode.value = settings.torrent_client?.seed_mode || 'soulsync';
         // Stalled-torrent knobs live under download_source but render in the
         // torrent client section. Timeout is stored in SECONDS, shown in MINUTES.
@@ -4417,10 +4417,10 @@ const SHARED_SECTION_BUILDERS = {
         password: document.getElementById('torrent-client-password')?.value || '',
         category: document.getElementById('torrent-client-category')?.value || 'soulsync',
         save_path: document.getElementById('torrent-client-save-path')?.value || '',
-        seed_ratio_goal: parseFloat(document.getElementById('music-seed-ratio')?.value) || 0,
-        seed_time_goal_hours: parseInt(document.getElementById('music-seed-hours')?.value, 10) || 0,
-        seed_remove_data: !!(document.getElementById('music-seed-remove-data') || {}).checked,
-        seed_mode: document.getElementById('music-seed-mode')?.value || 'soulsync',
+        seed_ratio_goal: parseFloat(document.getElementById('shared-seed-ratio')?.value) || 0,
+        seed_time_goal_hours: parseInt(document.getElementById('shared-seed-hours')?.value, 10) || 0,
+        seed_remove_data: !!(document.getElementById('shared-seed-remove-data') || {}).checked,
+        seed_mode: document.getElementById('shared-seed-mode')?.value || 'soulsync',
     }),
     usenet_client: () => ({
         type: document.getElementById('usenet-client-type')?.value || 'sabnzbd',

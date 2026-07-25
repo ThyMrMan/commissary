@@ -7150,27 +7150,12 @@
                                     <div class="setting-help-text" style="margin-top:10px;">Use the arrows to order sources. Enable the ones you want — downloads try each enabled source in order.</div>
                                     <div class="hybrid-source-list" id="video-hybrid-rows"></div>
                                 </div>
-                                <!-- Seeding lifecycle (arr-parity P5) — torrent grabs only -->
-                                <div class="form-group" id="video-seeding-goals">
-                                    <label>Seeding goals (torrents):</label>
-                                    <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
-                                        <span class="settings-hint">Ratio</span>
-                                        <input type="number" id="video-seed-ratio" min="0" step="0.1" style="max-width:90px;" placeholder="0">
-                                        <span class="settings-hint">or hours seeded</span>
-                                        <input type="number" id="video-seed-hours" min="0" step="1" style="max-width:90px;" placeholder="0">
-                                        <label style="display:flex; align-items:center; gap:6px; font-size:12.5px;">
-                                            <input type="checkbox" id="video-seed-remove-data" checked> also delete the client's copy
-                                        </label>
-                                    </div>
-                                    <div style="display:flex; gap:8px; align-items:center; margin-top:8px;">
-                                        <span class="settings-hint">Enforced by</span>
-                                        <select id="video-seed-mode" class="form-select" style="max-width:260px;">
-                                            <option value="soulsync">SoulSync (watches the client + removes)</option>
-                                            <option value="client">Torrent client (writes its own seed limit)</option>
-                                        </select>
-                                    </div>
-                                    <small class="settings-hint">Both at 0 = never remove (the old behavior). <strong>SoulSync</strong>: SS polls the client and removes when a goal is hit (your imported library copy is separate and never touched). <strong>Torrent client</strong>: SS writes the ratio/time limit into the client (arr-style) and lets it enforce — it shows in the client's share-limit dialog and works even when SS is off.</small>
-                                </div>
+                                <!-- Seeding lifecycle (arr-parity P5) lived here as a SECOND copy of
+                                     the same controls. Music and video drive the same physical torrent
+                                     client, so two goal sets meant two sweeps could push conflicting
+                                     share limits at it. There is now one set, in the data-shared
+                                     Torrent Client section below (#shared-seed-*), which is visible on
+                                     both sides. -->
                                 <!-- Import lists (arr-parity P6) -->
                                 <div class="form-group" id="video-import-lists">
                                     <label>Import lists:</label>
@@ -8400,16 +8385,16 @@
                                             <label>Seeding goals (torrents):</label>
                                             <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
                                                 <span class="settings-hint">Ratio</span>
-                                                <input type="number" id="music-seed-ratio" min="0" step="0.1" style="max-width:90px;" placeholder="0">
+                                                <input type="number" id="shared-seed-ratio" min="0" step="0.1" style="max-width:90px;" placeholder="0">
                                                 <span class="settings-hint">or hours seeded</span>
-                                                <input type="number" id="music-seed-hours" min="0" step="1" style="max-width:90px;" placeholder="0">
+                                                <input type="number" id="shared-seed-hours" min="0" step="1" style="max-width:90px;" placeholder="0">
                                                 <label style="display:flex; align-items:center; gap:6px; font-size:12.5px;">
-                                                    <input type="checkbox" id="music-seed-remove-data" checked> also delete the client's copy
+                                                    <input type="checkbox" id="shared-seed-remove-data" checked> also delete the client's copy
                                                 </label>
                                             </div>
                                             <div style="display:flex; gap:8px; align-items:center; margin-top:8px;">
                                                 <span class="settings-hint">Enforced by</span>
-                                                <select id="music-seed-mode" class="form-select" style="max-width:260px;">
+                                                <select id="shared-seed-mode" class="form-select" style="max-width:260px;">
                                                     <option value="soulsync">SoulSync (watches the client + removes)</option>
                                                     <option value="client">Torrent client (writes its own seed limit)</option>
                                                 </select>

@@ -6,14 +6,23 @@ APIs — those are music-only). ``download_mode`` is one of those three, or
 the (later-phase) engine tries in turn.
 
 Pure normalize here (no DB, no network) so it's unit-tested in isolation. Stored in
-video.db's ``video_settings`` (``download_mode`` + ``hybrid_order`` JSON). Isolated:
-imports only json/typing, and the music side never imports it.
+video.db's ``video_settings`` (``download_mode`` + ``hybrid_order`` JSON), and the
+music side never imports this module.
+
+EXCEPT the seeding-lifecycle keys, which are SHARED with music — see
+``_SEED_KEYS``. They ride this config payload (so ``core.video.seeding`` keeps
+reading them off the same dict) but live in the app-wide config store, not
+video.db.
 """
 
 from __future__ import annotations
 
 import json
 from typing import Any
+
+from utils.logging_config import get_logger
+
+logger = get_logger("video.download_config")
 
 SOURCES = ("soulseek", "torrent", "usenet")
 MODES = SOURCES + ("hybrid",)
@@ -60,37 +69,127 @@ def _norm_seed_mode(value: Any) -> str:
     return "client" if str(value or "").strip().lower() == "client" else "soulsync"
 
 
+# Seeding lifecycle (arr-parity P5) — SHARED with music. Both sides drive the
+# SAME physical torrent client through core.torrent_clients, and each runs its
+# own sweep (core.automation.handlers.seeding_sweep / video_seeding_sweep). When
+# these lived in video.db too, the two sweeps judged the same client against two
+# independent goal sets, and in seed_mode="client" both wrote share limits into
+# it — potentially conflicting ones. One physical resource, one setting: they
+# live in the app-wide config under torrent_client.*, which video already reads
+# for the client category (core/video/client_grab.py).
+#
+# BOTH goals default 0 = the sweep is OFF and torrents behave exactly as before —
+# managing (and deleting from) someone's torrent client is strictly opt-in.
+_SEED_KEYS = {
+    "seed_ratio_goal": ("torrent_client.seed_ratio_goal", 0),
+    "seed_time_goal_hours": ("torrent_client.seed_time_goal_hours", 0),
+    "seed_remove_data": ("torrent_client.seed_remove_data", True),
+    # Who enforces the goal: "soulsync" (sweep polls + removes) or "client"
+    # (write the ratio/time limit into the torrent client, arr-style).
+    "seed_mode": ("torrent_client.seed_mode", "soulsync"),
+}
+
+# Marker row in video.db recording that the one-shot promotion below has run.
+_SEED_PROMOTION_MARKER = "seed_goals_promoted"
+_promotion_checked = False
+
+
+def _promote_seed_goals_once(db) -> None:
+    """One-shot: fold any pre-split video.db seeding goals into the shared
+    config. Runs before the first read so no consumer ever sees a half-migrated
+    state; the video.db marker makes it permanent, the module flag makes repeat
+    calls free.
+
+    Existing installs have values in BOTH stores and there is no merge that
+    leaves both sides unchanged, so every field resolves toward whichever
+    setting DELETES LESS. A migration may leave torrents seeding longer than
+    intended; it must never start removing data (or removing it sooner) than
+    what the user configured on either side.
+    """
+    global _promotion_checked
+    if _promotion_checked:
+        return
+    try:
+        if str(db.get_setting(_SEED_PROMOTION_MARKER) or "") == "1":
+            _promotion_checked = True
+            return
+        from config.settings import config_manager
+
+        raw = {k: db.get_setting(k) for k in _SEED_KEYS}
+        if any(v is not None for v in raw.values()):
+            v_ratio = _norm_ratio(raw["seed_ratio_goal"])
+            v_hours = _norm_hours(raw["seed_time_goal_hours"])
+            v_remove = (raw["seed_remove_data"] or "1") != "0"
+            v_mode = _norm_seed_mode(raw["seed_mode"])
+
+            m_ratio = _norm_ratio(config_manager.get("torrent_client.seed_ratio_goal", 0))
+            m_hours = _norm_hours(config_manager.get("torrent_client.seed_time_goal_hours", 0))
+            m_remove = bool(config_manager.get("torrent_client.seed_remove_data", True))
+            m_mode = _norm_seed_mode(config_manager.get("torrent_client.seed_mode", "soulsync"))
+
+            # 0 means "seed forever" — the safest state, so it always wins.
+            merged_ratio = 0.0 if (v_ratio == 0 or m_ratio == 0) else max(v_ratio, m_ratio)
+            merged_hours = 0 if (v_hours == 0 or m_hours == 0) else max(v_hours, m_hours)
+            # Off wins: never newly enable deleting the client's data.
+            merged_remove = bool(v_remove and m_remove)
+            # "client" pushes limits into the user's own client — keep it only
+            # if both sides had already chosen it.
+            merged_mode = "client" if (v_mode == "client" and m_mode == "client") else "soulsync"
+
+            if (v_ratio, v_hours, v_remove, v_mode) != (m_ratio, m_hours, m_remove, m_mode):
+                logger.warning(
+                    "Seeding goals differed between the video and music sides and are now "
+                    "shared; merged to the setting that deletes less. video=%s music=%s -> %s",
+                    (v_ratio, v_hours, v_remove, v_mode),
+                    (m_ratio, m_hours, m_remove, m_mode),
+                    (merged_ratio, merged_hours, merged_remove, merged_mode))
+
+            config_manager.set("torrent_client.seed_ratio_goal", merged_ratio)
+            config_manager.set("torrent_client.seed_time_goal_hours", merged_hours)
+            config_manager.set("torrent_client.seed_remove_data", merged_remove)
+            config_manager.set("torrent_client.seed_mode", merged_mode)
+
+        # The old video.db rows are left in place but are never read again —
+        # the marker is what stops this re-running.
+        db.set_setting(_SEED_PROMOTION_MARKER, "1")
+        _promotion_checked = True
+    except Exception:
+        # Never let a migration hiccup break loading the download config; the
+        # marker stays unset so the next call retries.
+        logger.exception("seed-goal promotion failed (non-fatal)")
+
+
 def load(db) -> dict:
+    from config.settings import config_manager
+    _promote_seed_goals_once(db)
     return {
         "download_mode": normalize_mode(db.get_setting("download_mode")),
         "hybrid_order": normalize_hybrid_order(db.get_setting("hybrid_order")),
-        # Seeding lifecycle (arr-parity P5). BOTH goals default 0 = the sweep
-        # is OFF and torrents behave exactly as before — managing (and deleting
-        # from) someone's torrent client is strictly opt-in.
-        "seed_ratio_goal": _norm_ratio(db.get_setting("seed_ratio_goal")),
-        "seed_time_goal_hours": _norm_hours(db.get_setting("seed_time_goal_hours")),
-        "seed_remove_data": (db.get_setting("seed_remove_data") or "1") != "0",
-        # Who enforces the goal: "soulsync" (sweep polls + removes) or "client"
-        # (write the ratio/time limit into the torrent client, arr-style).
-        "seed_mode": _norm_seed_mode(db.get_setting("seed_mode")),
+        "seed_ratio_goal": _norm_ratio(config_manager.get(*_SEED_KEYS["seed_ratio_goal"])),
+        "seed_time_goal_hours": _norm_hours(config_manager.get(*_SEED_KEYS["seed_time_goal_hours"])),
+        "seed_remove_data": bool(config_manager.get(*_SEED_KEYS["seed_remove_data"])),
+        "seed_mode": _norm_seed_mode(config_manager.get(*_SEED_KEYS["seed_mode"])),
     }
 
 
 def save(db, body: Any) -> dict:
-    """Persist whichever known keys are present in ``body``."""
+    """Persist whichever known keys are present in ``body``. The video-specific
+    source config goes to video.db; the seeding keys go to the shared config."""
+    from config.settings import config_manager
     body = body if isinstance(body, dict) else {}
+    _promote_seed_goals_once(db)
     if "download_mode" in body:
         db.set_setting("download_mode", normalize_mode(body.get("download_mode")))
     if "hybrid_order" in body:
         db.set_setting("hybrid_order", json.dumps(normalize_hybrid_order(body.get("hybrid_order"))))
     if "seed_ratio_goal" in body:
-        db.set_setting("seed_ratio_goal", str(_norm_ratio(body.get("seed_ratio_goal"))))
+        config_manager.set(_SEED_KEYS["seed_ratio_goal"][0], _norm_ratio(body.get("seed_ratio_goal")))
     if "seed_time_goal_hours" in body:
-        db.set_setting("seed_time_goal_hours", str(_norm_hours(body.get("seed_time_goal_hours"))))
+        config_manager.set(_SEED_KEYS["seed_time_goal_hours"][0], _norm_hours(body.get("seed_time_goal_hours")))
     if "seed_remove_data" in body:
-        db.set_setting("seed_remove_data", "1" if body.get("seed_remove_data") else "0")
+        config_manager.set(_SEED_KEYS["seed_remove_data"][0], bool(body.get("seed_remove_data")))
     if "seed_mode" in body:
-        db.set_setting("seed_mode", _norm_seed_mode(body.get("seed_mode")))
+        config_manager.set(_SEED_KEYS["seed_mode"][0], _norm_seed_mode(body.get("seed_mode")))
     return load(db)
 
 

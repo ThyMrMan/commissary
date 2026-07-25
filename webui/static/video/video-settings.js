@@ -482,12 +482,9 @@
                 _videoHybrid = (d.hybrid_order && d.hybrid_order.length) ? d.hybrid_order : ['soulseek'];
                 var ms = document.getElementById('video-download-mode');
                 if (ms) ms.value = _videoMode;
-                setP('video-seed-ratio', d.seed_ratio_goal != null ? d.seed_ratio_goal : 0);
-                setP('video-seed-hours', d.seed_time_goal_hours != null ? d.seed_time_goal_hours : 0);
-                var srd = document.getElementById('video-seed-remove-data');
-                if (srd) srd.checked = d.seed_remove_data !== false;
-                var smd = document.getElementById('video-seed-mode');
-                if (smd) smd.value = d.seed_mode || 'soulsync';
+                // The seeding goals are SHARED with music (one torrent client, one
+                // set of goals) and are rendered by the data-shared Torrent Client
+                // section, loaded and saved by settings.js. Nothing to do here.
                 renderVideoHybrid();
                 updateVideoSourceUI();
             })
@@ -505,10 +502,8 @@
                 youtube_path: val('video-youtube-path'),
                 download_mode: _videoMode,
                 hybrid_order: _videoHybrid,
-                seed_ratio_goal: parseFloat(val('video-seed-ratio')) || 0,
-                seed_time_goal_hours: parseInt(val('video-seed-hours'), 10) || 0,
-                seed_remove_data: !!(document.getElementById('video-seed-remove-data') || {}).checked,
-                seed_mode: val('video-seed-mode') || 'soulsync',
+                // seed_* deliberately omitted — shared with music, saved by the
+                // data-shared Torrent Client section via /api/settings.
             })
         }).then(function () { if (!silent) toast('Download folders saved', 'success'); })
           .catch(function () { /* ignore */ });

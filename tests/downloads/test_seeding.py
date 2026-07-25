@@ -199,6 +199,6 @@ def test_automation_wiring_exists():
 
 
 def test_settings_ui_has_the_goal_fields():
-    assert 'id="music-seed-ratio"' in _INDEX and 'id="music-seed-hours"' in _INDEX
-    assert 'id="music-seed-remove-data"' in _INDEX
+    assert 'id="shared-seed-ratio"' in _INDEX and 'id="shared-seed-hours"' in _INDEX
+    assert 'id="shared-seed-remove-data"' in _INDEX
     assert "seed_ratio_goal" in _SETTINGS_JS and "seed_time_goal_hours" in _SETTINGS_JS

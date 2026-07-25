@@ -21,6 +21,9 @@ from database.video_database import VideoDatabase
 _ROOT = Path(__file__).resolve().parent.parent
 _INDEX = (_ROOT / "webui" / "index.html").read_text(encoding="utf-8")
 _SETTINGS_JS = (_ROOT / "webui" / "static" / "video" / "video-settings.js").read_text(encoding="utf-8")
+# The seed goals are shared, so they're loaded/saved by MUSIC's settings.js (the
+# data-shared Torrent Client section), not by the video module.
+_MUSIC_SETTINGS_JS = (_ROOT / "webui" / "static" / "settings.js").read_text(encoding="utf-8")
 
 
 @pytest.fixture()
@@ -30,6 +33,29 @@ def db(tmp_path):
     videoapi._video_db = d
     yield d
     videoapi._video_db = None
+
+
+@pytest.fixture(autouse=True)
+def _isolated_seed_config(monkeypatch):
+    """The seed goals are SHARED with music and live in the app-wide config
+    (torrent_client.*), not video.db — so stub that store, or these tests read
+    whatever the real config happens to hold and the "defaults off" cases go
+    non-deterministic. Same stub the slskd shared-config test uses."""
+    import config.settings as cfg
+    import core.video.download_config as dc
+
+    class _Cfg:
+        def __init__(self):
+            self._d = {}
+
+        def get(self, key, default=None):
+            return self._d.get(key, default)
+
+        def set(self, key, value):
+            self._d[key] = value
+
+    monkeypatch.setattr(cfg, "config_manager", _Cfg(), raising=False)
+    monkeypatch.setattr(dc, "_promotion_checked", False, raising=False)
 
 
 def _torrent_row(db, ref="hash1", title="Heat"):
@@ -144,9 +170,16 @@ def test_automation_wiring_exists():
 
 
 def test_settings_ui_has_the_goal_fields():
-    assert 'id="video-seed-ratio"' in _INDEX and 'id="video-seed-hours"' in _INDEX
-    assert 'id="video-seed-remove-data"' in _INDEX
-    assert "seed_ratio_goal" in _SETTINGS_JS and "seed_time_goal_hours" in _SETTINGS_JS
+    """One set of controls, in the data-shared Torrent Client section — visible
+    on BOTH sides. The old video-only duplicate is gone: two sets meant the two
+    sweeps could push conflicting share limits at the same client."""
+    assert 'id="shared-seed-ratio"' in _INDEX and 'id="shared-seed-hours"' in _INDEX
+    assert 'id="shared-seed-remove-data"' in _INDEX
+    assert 'id="video-seed-ratio"' not in _INDEX, "the duplicate video-only seed controls are back"
+    assert "seed_ratio_goal" in _MUSIC_SETTINGS_JS and "seed_time_goal_hours" in _MUSIC_SETTINGS_JS
+    assert "seed_ratio_goal" not in _SETTINGS_JS, (
+        "video-settings.js is posting seed goals again — they belong to the "
+        "shared section, and a second writer reintroduces the drift")
 
 
 # ---------------------------------------------------------------------------
@@ -216,5 +249,6 @@ def test_client_mode_fallback_removes_when_goal_met(db, monkeypatch):
 
 
 def test_seed_mode_ui_present():
-    assert 'id="video-seed-mode"' in _INDEX
-    assert "seed_mode" in _SETTINGS_JS
+    assert 'id="shared-seed-mode"' in _INDEX
+    assert 'id="video-seed-mode"' not in _INDEX
+    assert "seed_mode" in _MUSIC_SETTINGS_JS
