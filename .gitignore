@@ -40,5 +40,8 @@ Staging/
 Transfer/
 tools/ffmpeg.exe
 tools/ffprobe.exe
-# Any hidden folders
+# Any hidden folders (editor/tool state: .idea/, .vscode/, .venv/, .claude/, …)
 **/.*/
+# …except CI config, which is project source. Re-include the directory itself —
+# git won't descend into an excluded dir, so negating only its contents can't work.
+!.github/

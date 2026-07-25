@@ -1,0 +1,67 @@
+name: Compile the app and run tests
+
+on:
+  push:
+    branches-ignore:
+      - main
+      - dev
+
+jobs:
+  sanity-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
+
+      - name: Lint with ruff
+        run: python -m ruff check --output-format=github .
+
+      - name: Build app
+        run: python -m compileall api core database services scripts web_server.py wsgi.py beatport_unified_scraper.py
+
+      - name: Run tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest
+
+  webui:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: webui
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          # Matches the Dockerfile's node:24-slim webui-builder stage
+          node-version: 24
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint and format check
+        run: npm run check
+
+      - name: Build webui
+        run: npm run build
+
+      - name: Run tests
+        run: npm test
