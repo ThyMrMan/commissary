@@ -186,15 +186,115 @@ def test_every_video_card_is_registered():
         f"video dashboard cards missing from the registry: {sorted(cards - registered)}")
 
 
+# Registry entries that address their element by CSS selector rather than a
+# data-card attribute (header controls and sidebar nav entries).
+_NON_CARD_SUFFIXES = ('header-enrich', 'manage-workers', 'nav-')
+
+
+def _is_card(widget_id):
+    name = widget_id.split('.', 1)[1]
+    return not any(name.startswith(s) or name == s for s in _NON_CARD_SUFFIXES)
+
+
 def test_no_registered_card_is_missing_from_the_markup():
     """The other direction: a registry entry with no matching card is a
     checkbox that does nothing."""
     in_markup = set(re.findall(r'data-card="([\w-]+)"', _INDEX))
     for wid in _registry_ids():
-        side, name = wid.split('.', 1)
-        if 'header-enrich' in name:
-            continue  # container selector, not a data-card
-        assert name in in_markup, f"{wid} has no data-card in index.html"
+        if not _is_card(wid):
+            continue
+        assert wid.split('.', 1)[1] in in_markup, f"{wid} has no data-card in index.html"
+
+
+# ── nav entries: hiding the link must also block the page ────────────────────
+
+def test_nav_widgets_name_a_real_page():
+    """A nav entry with no `page` couldn't block navigation, and one naming a
+    page the server rejects would be unenforceable from the profile side."""
+    pages = set(re.findall(r"page:\s*'([\w-]+)'", _WIDGETS_JS))
+    assert {'automations', 'chat', 'tools', 'video-chat', 'video-tools'} <= pages
+    # Every nav widget's selector must target the nav button for that page.
+    for page in ('chat', 'tools', 'automations'):
+        assert f'data-page="{page}"' in _WIDGETS_JS
+
+
+def test_hidden_nav_blocks_navigation_not_just_the_link():
+    """Without this the page is still reachable by URL and the toggle is
+    decorative. isPageAllowed is the single gate navigateToPage consults."""
+    init_js = _read('webui/static/init.js')
+    start = init_js.index('function isPageAllowed')
+    body = init_js[start:init_js.index('\nfunction ', start + 10)]
+    assert 'isPageHiddenByPolicy' in body, (
+        "isPageAllowed ignores the widget policy — a hidden Chat/Tools page "
+        "would still load by typing its URL")
+
+
+def test_nav_filter_loop_applies_the_policy_itself():
+    """The loop reruns on every profile change and sets display unconditionally,
+    so it must consult the policy or it silently undoes applyWidgetPolicy."""
+    init_js = _read('webui/static/init.js')
+    assert init_js.count('isPageHiddenByPolicy') >= 3, (
+        "expected the policy check in isPageAllowed plus BOTH nav filter loops")
+
+
+def test_policy_composes_with_allowed_pages_rather_than_replacing_it():
+    """Hidden by either must mean hidden — the per-profile list still narrows."""
+    init_js = _read('webui/static/init.js')
+    start = init_js.index('Filter sidebar pages based on profile permissions')
+    body = init_js[start:start + 1200]
+    assert 'allowed_pages' in body and 'isPageHiddenByPolicy' in body
+
+
+# ── the 1.2.0 -> 1.3.0 header split ──────────────────────────────────────────
+
+def test_manage_workers_is_separately_hideable():
+    assert 'music.manage-workers' in web_server.VALID_WIDGET_IDS
+    assert 'video.manage-workers' in web_server.VALID_WIDGET_IDS
+
+
+def test_header_icons_selector_excludes_the_manage_button():
+    """Otherwise hiding the icons would take Manage Workers with it and the
+    split would be meaningless."""
+    assert ':not(.em-manage-btn)' in _WIDGETS_JS
+
+
+def test_header_split_migration_carries_the_old_setting_across(monkeypatch):
+    """An install that hid the combined 1.2.0 widget meant "hide Manage Workers
+    too"; upgrading must not silently reveal the button."""
+    config_manager.set('dashboard_widgets.member_hidden',
+                       ['music.header-enrich', 'video.header-enrich'])
+    config_manager.set('dashboard_widgets.header_split_migrated', False)
+    monkeypatch.setattr(web_server, '_header_split_checked', False)
+
+    web_server.migrate_header_widget_split_once()
+
+    hidden = config_manager.get('dashboard_widgets.member_hidden')
+    assert 'music.manage-workers' in hidden
+    assert 'video.manage-workers' in hidden
+    assert config_manager.get('dashboard_widgets.header_split_migrated') is True
+
+
+def test_header_split_migration_is_idempotent(monkeypatch):
+    config_manager.set('dashboard_widgets.member_hidden', ['music.header-enrich'])
+    config_manager.set('dashboard_widgets.header_split_migrated', False)
+    monkeypatch.setattr(web_server, '_header_split_checked', False)
+    web_server.migrate_header_widget_split_once()
+    first = list(config_manager.get('dashboard_widgets.member_hidden'))
+
+    # Re-running must not re-add, and must not undo a deliberate later unhide.
+    monkeypatch.setattr(web_server, '_header_split_checked', False)
+    config_manager.set('dashboard_widgets.member_hidden', ['music.header-enrich'])
+    web_server.migrate_header_widget_split_once()
+    assert config_manager.get('dashboard_widgets.member_hidden') == ['music.header-enrich']
+    assert 'music.manage-workers' in first
+
+
+def test_migration_does_not_touch_an_untouched_install(monkeypatch):
+    config_manager.set('dashboard_widgets.member_hidden', [])
+    config_manager.set('dashboard_widgets.header_split_migrated', False)
+    monkeypatch.setattr(web_server, '_header_split_checked', False)
+    web_server.migrate_header_widget_split_once()
+    assert config_manager.get('dashboard_widgets.member_hidden') == []
 
 
 # ── source guards: the wiring the feature depends on ─────────────────────────
@@ -226,7 +326,7 @@ def test_admins_are_exempt_everywhere():
 def test_settings_group_is_shared_so_it_saves_from_the_video_side():
     """One policy covers both dashboards, so the group must be data-shared —
     otherwise editing it from the video Settings nav is silently discarded."""
-    start = _INDEX.index('Standard User Dashboard')
+    start = _INDEX.index('<h3>Standard User Interface</h3>')
     block = _INDEX[start:start + 2000]
     assert 'data-shared' in block
     assert 'id="dashboard-widget-options"' in block

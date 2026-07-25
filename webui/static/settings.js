@@ -4493,10 +4493,19 @@ function renderDashboardWidgetOptions(hiddenIds) {
     if (!host || typeof DASHBOARD_WIDGETS === 'undefined') return;
 
     const hidden = new Set(Array.isArray(hiddenIds) ? hiddenIds : []);
-    const sides = [['music', 'Music Dashboard'], ['video', 'Video Dashboard']];
+    const groups = [
+        ['music', 'card',   'Music Dashboard'],
+        ['music', 'header', 'Music Dashboard Header'],
+        ['music', 'nav',    'Music Sidebar · System'],
+        ['video', 'card',   'Video Dashboard'],
+        ['video', 'header', 'Video Dashboard Header'],
+        ['video', 'nav',    'Video Sidebar · System'],
+    ];
 
-    host.innerHTML = sides.map(([side, heading]) => {
-        const rows = DASHBOARD_WIDGETS.filter(w => w.side === side).map(w => `
+    host.innerHTML = groups.map(([side, kind, heading]) => {
+        const items = DASHBOARD_WIDGETS.filter(w => w.side === side && w.kind === kind);
+        if (!items.length) return '';
+        const rows = items.map(w => `
             <label class="toggle-label">
                 <input type="checkbox" data-widget-id="${w.id}" ${hidden.has(w.id) ? '' : 'checked'}>
                 <span>${w.label}</span>

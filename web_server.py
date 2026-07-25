@@ -47,7 +47,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.2.0"
+_SOULSYNC_BASE_VERSION = "1.3.0"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -939,6 +939,10 @@ VALID_WIDGET_IDS = {
     'music.active-downloads',
     'music.enrichment',
     'music.header-enrich',
+    'music.manage-workers',
+    'music.nav-automations',
+    'music.nav-chat',
+    'music.nav-tools',
     'video.recent',
     'video.stats',
     'video.library',
@@ -946,7 +950,36 @@ VALID_WIDGET_IDS = {
     'video.tools',
     'video.studios',
     'video.header-enrich',
+    'video.manage-workers',
+    # No video.nav-automations: video Automations is already admin-only.
+    'video.nav-chat',
+    'video.nav-tools',
 }
+
+# 1.2.0 shipped ONE "header controls" widget covering both the enrichment icons
+# and the Manage Workers button; 1.3.0 splits them. An install that hid the
+# combined widget meant "hide Manage Workers too", so carry that across rather
+# than silently revealing the button on upgrade.
+_HEADER_SPLIT_MARKER = 'header_split_migrated'
+_header_split_checked = False
+
+
+def migrate_header_widget_split_once():
+    global _header_split_checked
+    if _header_split_checked or not config_manager:
+        return
+    _header_split_checked = True
+
+    if config_manager.get(f'dashboard_widgets.{_HEADER_SPLIT_MARKER}', False):
+        return
+
+    hidden = list(config_manager.get('dashboard_widgets.member_hidden', []) or [])
+    for side in ('music', 'video'):
+        if f'{side}.header-enrich' in hidden and f'{side}.manage-workers' not in hidden:
+            hidden.append(f'{side}.manage-workers')
+
+    config_manager.set('dashboard_widgets.member_hidden', sanitize_widget_ids(hidden))
+    config_manager.set(f'dashboard_widgets.{_HEADER_SPLIT_MARKER}', True)
 
 
 def sanitize_widget_ids(value):
@@ -28810,6 +28843,7 @@ def get_current_profile():
         # global config, not per-profile, and the frontend caches it here
         # BEFORE a profile is picked — otherwise the profile-picker path
         # (no session profile yet) would reach the dashboard with no policy.
+        migrate_header_widget_split_once()
         widgets_hidden = sanitize_widget_ids(
             config_manager.get('dashboard_widgets.member_hidden', []) if config_manager else []
         )

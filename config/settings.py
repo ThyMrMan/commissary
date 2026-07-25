@@ -720,7 +720,11 @@ class ConfigManager:
                 # everything. Stored as the hidden set rather than the visible
                 # one so a card added in a later release shows up by default
                 # instead of being silently absent from every saved list.
-                "member_hidden": []
+                "member_hidden": [],
+                # One-shot marker: the 1.2.0 "header controls" widget was split
+                # into icons + Manage Workers in 1.3.0 (see
+                # migrate_header_widget_split_once in web_server.py).
+                "header_split_migrated": False
             },
             "lossy_copy": {
                 "enabled": False,

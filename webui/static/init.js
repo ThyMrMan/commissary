@@ -531,6 +531,10 @@ function isPageAllowed(pageId) {
     const normalizedPageId = normalizeProfilePageId(pageId);
     if (normalizedPageId === 'help' || normalizedPageId === 'issues') return true;
     if (normalizedPageId === 'settings') return currentProfile.is_admin;
+    // Global admin policy (Settings -> Users). Composes with allowed_pages
+    // below: hidden by EITHER means hidden. Checked here rather than only in
+    // the nav filter so the page isn't still reachable by typing its URL.
+    if (isPageHiddenByPolicy(normalizedPageId)) return false;
     if (normalizedPageId === 'artist-detail') {
         const ap = normalizeProfilePageList(currentProfile.allowed_pages);
         if (!ap) return true;
@@ -1503,6 +1507,11 @@ function updateProfileIndicator() {
             btn.style.display = ''; // Always visible
         } else if (currentProfile.id === 1) {
             btn.style.display = ''; // Root admin sees all
+        } else if (isPageHiddenByPolicy(page)) {
+            // Global admin policy wins over allowed_pages — this loop reruns on
+            // every profile change, so it has to apply the policy itself or it
+            // would undo applyWidgetPolicy()'s hiding.
+            btn.style.display = 'none';
         } else {
             const ap = currentProfile.allowed_pages;
             btn.style.display = (!ap || ap.includes(page)) ? '' : 'none';
@@ -1519,6 +1528,7 @@ function updateProfileIndicator() {
         if (page === 'video-help' || page === 'video-issues') { btn.style.display = ''; return; }
         if (VIDEO_ADMIN_ONLY.includes(page)) { btn.style.display = currentProfile.is_admin ? '' : 'none'; return; }
         if (currentProfile.id === 1) { btn.style.display = ''; return; }
+        if (isPageHiddenByPolicy(page)) { btn.style.display = 'none'; return; }
         const ap = currentProfile.allowed_pages;
         btn.style.display = (!ap || ap.includes(page)) ? '' : 'none';
     });

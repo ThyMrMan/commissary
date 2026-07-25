@@ -3484,12 +3484,12 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.2.0': [
-        { date: 'July 2026 · 1.2.0' },
-        { title: 'Choose what standard users see on the dashboard', desc: 'the dashboard showed every card to everyone, so a standard user — typically someone who signed in with Plex — landed on Service Status, System Stats and Quick Actions: operator tooling they can\'t act on. The only lever was hiding the whole page. Settings → Users → Standard User Dashboard now has a checkbox per card, covering both the Music and Video dashboards. Admins always see everything.' },
-        { title: 'Hidden cards stop working in the background', desc: 'unchecking a card doesn\'t just hide it — its data fetches and refresh timers never start, and the live push updates it would have rendered are dropped. The dashboard runs a 2-second activity poll and two 10-second polls, so a standard user with those hidden stops making roughly two thousand pointless requests an hour.' },
-        { title: 'Dashboard timers no longer pile up', desc: 'every trip back to the dashboard started another set of refresh timers without stopping the previous ones, so the polling rate crept upward the longer a session ran. They\'re cleared and restarted properly now.' },
-        { title: 'Earlier versions', desc: '1.1.0 brought the Purchased page and a settings clean-up: the Video side\'s settings actually save, every configured Video Library is visible to members, settings that existed twice are down to one, video server credentials are encrypted at rest, and four dead controls were fixed or removed. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
+    '1.3.0': [
+        { date: 'July 2026 · 1.3.0' },
+        { title: 'Hide sidebar entries too, not just dashboard cards', desc: 'Automations, Chat and Tools under System can now be hidden from standard profiles — Chat had no toggle anywhere before, and Tools had one the server understood but no checkbox ever offered. Hiding an entry blocks the page itself, not just the link, so it can\'t be reached by typing the URL. Video Automations already required admin, so it deliberately gets no checkbox rather than a control that does nothing.' },
+        { title: 'Manage Workers is its own toggle', desc: 'it used to hide only as part of the whole dashboard header. Now the enrichment/repair icons and the Manage Workers button are separate checkboxes on both dashboards. If you\'d already hidden the combined control in 1.2.0, that carries across — upgrading won\'t quietly put the button back.' },
+        { title: 'Your per-profile page permissions still apply', desc: 'the new switches are one global policy for every standard profile, including anyone who signs in with Plex tomorrow. The per-profile list under Manage Profiles keeps working on top of it: hidden by either means hidden, so nothing you\'ve already set up loosens.' },
+        { title: 'Earlier versions', desc: '1.2.0 let admins choose which dashboard cards standard users see, and stopped hidden cards polling in the background. 1.1.0 brought the Purchased page and a settings clean-up — the Video side\'s settings actually save, every configured Video Library is visible to members, settings that existed twice are down to one, and video server credentials are encrypted at rest. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
     ],
 };
 
@@ -3520,16 +3520,28 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.2.0: a dashboard that fits the person looking at it",
+        title: "1.3.0: the sidebar joins in",
+        description: "1.2.0 let you trim the dashboard for standard users. This extends the same switch to the sidebar's System group and splits Manage Workers into its own toggle — so a standard profile can be given a genuinely reduced app, not just a reduced home page.",
+        features: [
+            "Automations, Chat and Tools under System can be hidden from standard profiles, on both the Music and Video sidebars. Chat previously had no way to hide it at all, and Tools had server-side support with no checkbox ever offering it",
+            "hiding a sidebar entry blocks the PAGE, not just the link — a hidden Chat or Tools redirects to the profile's home page instead of loading, so it can't be reached from a bookmark or a typed URL",
+            "Manage Workers is now its own checkbox on each dashboard, separate from the enrichment/repair icons it used to be bundled with. An install that hid the combined 1.2.0 control keeps Manage Workers hidden — the setting is carried across on upgrade",
+            "no checkbox for Video Automations: it already requires admin, so offering one would be a control that does nothing",
+            "this is one global policy covering every standard profile, so a Plex user who signs in tomorrow inherits it with no per-person setup. The per-profile page list under Manage Profiles still applies on top — hidden by either means hidden, and nothing you've already configured loosens",
+        ],
+        usage_note: "Settings → Users → Standard User Interface (renamed from Standard User Dashboard, since it now covers the sidebar and header too). Admins always see everything.",
+    },
+    {
+        title: "Earlier in 1.2.0 — a dashboard that fits the person looking at it",
         description: "the dashboard showed every card to everyone. A standard user — usually someone who signed in with Plex — got Service Status, System Stats and Quick Actions: operator tooling they can't use, and the only way to remove it was to take the whole page away. You now pick, card by card, what standard profiles see. Admins always see everything.",
         features: [
-            "Settings → Users → Standard User Dashboard: one checkbox per card, covering BOTH the Music dashboard (Service Status, System Stats, Library, Recent Syncs, Quick Actions, Recent Activity, Active Downloads, Enrichment Services) and the Video one (Recently Added, System Stats, Library, Upcoming, Quick Actions, Studios), plus the enrichment controls in each dashboard header",
+            "Settings → Users → Standard User Interface: one checkbox per card, covering BOTH the Music dashboard (Service Status, System Stats, Library, Recent Syncs, Quick Actions, Recent Activity, Active Downloads, Enrichment Services) and the Video one (Recently Added, System Stats, Library, Upcoming, Quick Actions, Studios), plus the enrichment controls in each dashboard header",
             "admins are exempt by design — this only shapes what standard profiles see, so you can hand someone a trimmed dashboard instead of hiding the page from them entirely",
             "hidden means hidden, not just invisible: a hidden card's fetches and refresh timers never start, and the live push updates it would have rendered are dropped. The dashboard runs a 2-second activity poll and two 10-second polls, so a standard user with those turned off stops making roughly two thousand pointless requests an hour",
             "nothing changes on upgrade — every card starts visible, exactly as before, until you uncheck something",
             "fixed alongside: every visit to the dashboard started another set of refresh timers without stopping the last, so polling quietly accelerated the longer a session stayed open",
         ],
-        usage_note: "Settings → Users → Standard User Dashboard. The setting is one policy covering both dashboards, so it reads and saves the same from either the Music or Video side. Service Status is hidden from the dashboard but still feeds the sidebar indicator every user sees.",
+        usage_note: "Settings → Users → Standard User Interface. The setting is one policy covering both dashboards, so it reads and saves the same from either the Music or Video side. Service Status is hidden from the dashboard but still feeds the sidebar indicator every user sees.",
     },
     {
         title: "Earlier in 1.1.0 — purchases, and settings that mean it",
