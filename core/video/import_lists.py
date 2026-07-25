@@ -157,7 +157,14 @@ def _fetch_members(entry: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
 
 
 def _fetch_plex_watchlist(limit: int) -> List[Dict[str, Any]]:
-    """The Plex ACCOUNT watchlist via plexapi. Needs an account token."""
+    """The Plex ACCOUNT watchlist via plexapi. Needs an account token.
+
+    DELIBERATELY ignores the video side's own Plex override: that one is a
+    SERVER token (it addresses a specific server's sections), while
+    MyPlexAccount needs an ACCOUNT token. Routing this through the video
+    override would break the list for anyone who set one. Not a bug — don't
+    "unify" it with the video creds.
+    """
     from config.settings import config_manager
     from plexapi.myplex import MyPlexAccount
     token = config_manager.get("plex.token", "") or ""

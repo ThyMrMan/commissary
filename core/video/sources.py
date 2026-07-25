@@ -87,45 +87,84 @@ def _vdb(db=None):
         return None
 
 
-def video_plex_config(db=None):
-    """VIDEO's effective Plex connection: the video side's OWN stored creds
-    (video.db) when set, otherwise INHERITED read-only from the music config.
-    The video side never writes the music config, so this is one-way."""
+# The video side's own server override. It lives in the app-wide config (under
+# video_plex.* / video_jellyfin.*) rather than video.db so the tokens get the
+# same Fernet-at-rest treatment as music's — see ConfigManager._SENSITIVE_PATHS.
+# A marker-guarded one-shot moves any pre-existing plaintext video.db pair.
+_VIDEO_SERVER_KEYS = {
+    "plex": (("video_plex.base_url", "video_plex.token"),
+             ("video_plex_url", "video_plex_token")),
+    "jellyfin": (("video_jellyfin.base_url", "video_jellyfin.api_key"),
+                 ("video_jellyfin_url", "video_jellyfin_key")),
+}
+_VIDEO_CREDS_MARKER = "video_server_creds_promoted"
+_creds_promotion_checked = False
+
+
+def promote_video_server_creds_once(db=None) -> None:
+    """Move plaintext video.db server creds into the encrypted app config, once."""
+    global _creds_promotion_checked
+    if _creds_promotion_checked:
+        return
     db = _vdb(db)
+    if db is None:
+        return
     try:
-        url = (db.get_setting("video_plex_url") or "").strip() if db else ""
-        token = (db.get_setting("video_plex_token") or "").strip() if db else ""
+        if str(db.get_setting(_VIDEO_CREDS_MARKER) or "") == "1":
+            _creds_promotion_checked = True
+            return
+        from config.settings import config_manager
+        for (cfg_url, cfg_secret), (old_url, old_secret) in _VIDEO_SERVER_KEYS.values():
+            url = (db.get_setting(old_url) or "").strip()
+            secret = (db.get_setting(old_secret) or "").strip()
+            if url and secret:
+                config_manager.set(cfg_url, url)
+                config_manager.set(cfg_secret, secret)
+            # Blank the plaintext copies — the whole point is to stop storing
+            # tokens in the clear. (set() refuses '' for sensitive paths, so the
+            # newly-written config value is safe from this.)
+            if url or secret:
+                db.set_setting(old_url, "")
+                db.set_setting(old_secret, "")
+        db.set_setting(_VIDEO_CREDS_MARKER, "1")
+        _creds_promotion_checked = True
     except Exception:
-        url, token = "", ""
-    if url and token:
-        return {"base_url": url, "token": token, "source": "video"}
+        logger.exception("video server credential promotion failed (non-fatal)")
+
+
+def _video_server_config(db, kind: str, secret_field: str) -> dict:
+    """VIDEO's effective connection for one server: the video side's OWN stored
+    creds when set, otherwise INHERITED read-only from the music config. The
+    video side never writes the music config, so this is one-way.
+
+    The override is all-or-nothing on purpose: a URL without its secret (or the
+    reverse) is a half-configured server, which is worse than none — so it falls
+    back to music's pair entirely rather than mixing the two.
+    """
+    promote_video_server_creds_once(db)
+    (cfg_url, cfg_secret), _legacy = _VIDEO_SERVER_KEYS[kind]
     try:
         from config.settings import config_manager
-        cfg = config_manager.get_plex_config() or {}
-        return {"base_url": cfg.get("base_url") or "", "token": cfg.get("token") or "",
+        url = (config_manager.get(cfg_url, "") or "").strip()
+        secret = (config_manager.get(cfg_secret, "") or "").strip()
+        if url and secret:
+            return {"base_url": url, secret_field: secret, "source": "video"}
+        getter = (config_manager.get_plex_config if kind == "plex"
+                  else config_manager.get_jellyfin_config)
+        cfg = getter() or {}
+        return {"base_url": cfg.get("base_url") or "",
+                secret_field: cfg.get("token" if kind == "plex" else "api_key") or "",
                 "source": "music"}
     except Exception:
-        return {"base_url": "", "token": "", "source": "music"}
+        return {"base_url": "", secret_field: "", "source": "music"}
+
+
+def video_plex_config(db=None):
+    return _video_server_config(_vdb(db), "plex", "token")
 
 
 def video_jellyfin_config(db=None):
-    """VIDEO's effective Jellyfin connection: the video side's OWN stored creds
-    when set, otherwise INHERITED read-only from the music config."""
-    db = _vdb(db)
-    try:
-        url = (db.get_setting("video_jellyfin_url") or "").strip() if db else ""
-        key = (db.get_setting("video_jellyfin_key") or "").strip() if db else ""
-    except Exception:
-        url, key = "", ""
-    if url and key:
-        return {"base_url": url, "api_key": key, "source": "video"}
-    try:
-        from config.settings import config_manager
-        cfg = config_manager.get_jellyfin_config() or {}
-        return {"base_url": cfg.get("base_url") or "", "api_key": cfg.get("api_key") or "",
-                "source": "music"}
-    except Exception:
-        return {"base_url": "", "api_key": "", "source": "music"}
+    return _video_server_config(_vdb(db), "jellyfin", "api_key")
 
 
 def resolve_video_server(db=None):

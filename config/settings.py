@@ -89,6 +89,10 @@ class ConfigManager:
         'plex.token',
         'jellyfin.api_key',
         'navidrome.password',
+        # The VIDEO side's own server override (when it points at a different
+        # server than music). Lived unencrypted in video.db until it moved here.
+        'video_plex.token',
+        'video_jellyfin.api_key',
         # Download sources
         'soulseek.api_key',
         'deezer_download.arl',

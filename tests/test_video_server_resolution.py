@@ -12,12 +12,24 @@ from core.video.sources import (resolve_video_server, video_plex_config,
 from database.video_database import VideoDatabase
 
 
-def _set_cm(monkeypatch, plex, jelly, active):
+def _set_cm(monkeypatch, plex, jelly, active, overrides=None):
+    """Stub the app-wide config. ``overrides`` seeds the video side's OWN server
+    creds, which now live here (encrypted) rather than in video.db."""
+    store = dict(overrides or {})
+
     class CM:
         def get_plex_config(self): return {"base_url": "http://p", "token": "t"} if plex else {}
         def get_jellyfin_config(self): return {"base_url": "http://j", "api_key": "k"} if jelly else {}
         def get_active_media_server(self): return active
-    monkeypatch.setattr(cs, "config_manager", CM())
+        def get(self, key, default=None): return store.get(key, default)
+        def set(self, key, value): store[key] = value
+
+    cm = CM()
+    monkeypatch.setattr(cs, "config_manager", cm)
+    # The one-shot legacy promotion is process-global; reset it per test.
+    import core.video.sources as vs
+    monkeypatch.setattr(vs, "_creds_promotion_checked", False, raising=False)
+    return store
 
 
 @pytest.fixture()
@@ -105,3 +117,40 @@ def test_partial_own_creds_falls_back_to_inherited(monkeypatch, vdb):
     vdb.set_setting("video_plex_url", "http://video-plex")  # token missing
     cfg = video_plex_config(vdb)
     assert cfg["base_url"] == "http://p" and cfg["source"] == "music"
+
+
+# ── the creds live in the encrypted app config, not plaintext in video.db ────
+
+def test_promotion_moves_plaintext_creds_out_of_video_db(monkeypatch, vdb):
+    """These tokens sat in video.db in the CLEAR while music's equivalents were
+    Fernet-encrypted. The one-shot moves them to the app config (where
+    _SENSITIVE_PATHS covers them) and blanks the plaintext copies."""
+    store = _set_cm(monkeypatch, True, False, "plex")
+    vdb.set_setting("video_plex_url", "http://video-plex")
+    vdb.set_setting("video_plex_token", "SECRET-TOKEN")
+
+    cfg = video_plex_config(vdb)
+    assert cfg["source"] == "video" and cfg["token"] == "SECRET-TOKEN"
+    assert store["video_plex.token"] == "SECRET-TOKEN"
+    assert (vdb.get_setting("video_plex_token") or "") == "", "the plaintext token survived"
+    assert (vdb.get_setting("video_plex_url") or "") == ""
+
+
+def test_promotion_is_idempotent_and_does_not_resurrect_cleared_creds(monkeypatch, vdb):
+    store = _set_cm(monkeypatch, True, False, "plex")
+    vdb.set_setting("video_plex_url", "http://video-plex")
+    vdb.set_setting("video_plex_token", "vt")
+    assert video_plex_config(vdb)["source"] == "video"
+
+    # Clear the override, then let a fresh process re-run the promotion.
+    store["video_plex.base_url"] = ""
+    import core.video.sources as vs
+    monkeypatch.setattr(vs, "_creds_promotion_checked", False, raising=False)
+    assert video_plex_config(vdb)["source"] == "music", (
+        "the promotion re-ran and restored an override the user had cleared")
+
+
+def test_video_server_secrets_are_registered_as_sensitive():
+    from config.settings import ConfigManager
+    assert 'video_plex.token' in ConfigManager._SENSITIVE_PATHS
+    assert 'video_jellyfin.api_key' in ConfigManager._SENSITIVE_PATHS

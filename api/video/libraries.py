@@ -152,31 +152,38 @@ def register_routes(bp):
 
     @bp.route("/server-config", methods=["POST"])
     def video_server_config_set():
-        """Save the video side's OWN Plex/Jellyfin creds to video.db (NEVER the music
-        config). An empty/blank field clears that override → video falls back to
+        """Save the video side's OWN Plex/Jellyfin creds (NEVER the music server's).
+        They live in the app-wide config under video_plex.* / video_jellyfin.* so the
+        tokens are encrypted at rest like music's; they used to sit in video.db in
+        plaintext. An empty/blank field clears that override → video falls back to
         inheriting music's value. A masked token (all •) is left untouched."""
+        from config.settings import config_manager
+        from core.video.sources import _VIDEO_SERVER_KEYS, promote_video_server_creds_once
         from . import get_video_db
         body = request.get_json(silent=True) or {}
-        db = get_video_db()
+        promote_video_server_creds_once(get_video_db())
 
         def is_mask(v):
             return bool(v) and set(str(v)) == {"•"}
 
-        def put(key, val):
-            if is_mask(val):
-                return  # unchanged masked secret — keep what's stored
-            db.set_setting(key, (val or "").strip())
-
-        plex = body.get("plex") or {}
-        jelly = body.get("jellyfin") or {}
-        if "base_url" in plex:
-            put("video_plex_url", plex.get("base_url"))
-        if "token" in plex:
-            put("video_plex_token", plex.get("token"))
-        if "base_url" in jelly:
-            put("video_jellyfin_url", jelly.get("base_url"))
-        if "api_key" in jelly:
-            put("video_jellyfin_key", jelly.get("api_key"))
+        for kind, secret_field in (("plex", "token"), ("jellyfin", "api_key")):
+            (cfg_url, cfg_secret), _legacy = _VIDEO_SERVER_KEYS[kind]
+            section = body.get(kind) or {}
+            if "base_url" in section:
+                config_manager.set(cfg_url, (section.get("base_url") or "").strip())
+            if secret_field in section:
+                val = section.get(secret_field)
+                if not is_mask(val):        # a mask means "unchanged" — keep the stored one
+                    val = (val or "").strip()
+                    if val:
+                        config_manager.set(cfg_secret, val)
+                    else:
+                        # ConfigManager.set() ignores '' on a sensitive path (so a
+                        # settings autosave can't wipe a secret), so clearing has to
+                        # go through the URL: the override is all-or-nothing, and a
+                        # blank base_url turns it off. The old encrypted token stays
+                        # behind, inert, until a new one replaces it.
+                        config_manager.set(cfg_url, "")
         return jsonify({"status": "saved"})
 
     @bp.route("/server-config/test", methods=["POST"])
