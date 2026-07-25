@@ -496,6 +496,9 @@ function notifyProfileContextChanged() {
 
 function setCurrentProfile(profile) {
     currentProfile = profile;
+    // Dashboard widget policy is global config (cached from
+    // /api/profiles/current); only the admin flag varies per profile.
+    setDashboardWidgetPolicy(dashboardWidgetsHidden, !!(profile && profile.is_admin));
     updateProfileIndicator();
     notifyProfileContextChanged();
 }
@@ -599,6 +602,11 @@ async function initProfileSystem() {
         const currentRes = await fetch('/api/profiles/current');
         const currentData = await currentRes.json();
         plexLoginEnabled = !!currentData.plex_login_enabled;
+        // Cached before any profile exists — every branch below returns it, so
+        // the picker path reaches the dashboard with the policy already known.
+        dashboardWidgetsHidden = Array.isArray(currentData.dashboard_widgets_hidden)
+            ? currentData.dashboard_widgets_hidden
+            : dashboardWidgetsHidden;
         // Login mode: show the sign-in screen and defer everything else until
         // the user authenticates.
         if (currentData.login_required) {
@@ -2965,6 +2973,10 @@ function initApp() {
     // body.app-locked so a bypassed overlay shows nothing). Do this FIRST so
     // component init below measures real layout, not a display:none container.
     document.body.classList.remove('app-locked');
+    // Hide dashboard cards this profile isn't allowed to see, before anything
+    // renders into them. The policy is already loaded — initProfileSystem() is
+    // awaited ahead of this call.
+    applyWidgetPolicy();
     // Initialize components
     initializeNavigation();
     initializeMobileNavigation();
@@ -3365,8 +3377,9 @@ async function loadPageData(pageId) {
         }
         switch (pageId) {
             case 'dashboard':
+                applyWidgetPolicy();
                 await loadDashboardData();
-                loadDashboardSyncHistory();
+                if (isWidgetVisible('music.syncs')) loadDashboardSyncHistory();
                 break;
             case 'sync':
                 initializeSyncPage();

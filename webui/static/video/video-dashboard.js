@@ -403,16 +403,33 @@
             }).catch(function () { host.hidden = true; });
     }
 
+    // Dashboard widget visibility lives in the SHARED dashboard-widgets.js —
+    // an admin can hide cards from non-admin profiles. Bare identifiers with a
+    // typeof guard keep this module isolated (no global-object lookup) and
+    // degrade to "everything visible" if that script isn't present.
+    function widgetOn(id) {
+        return (typeof isWidgetVisible !== 'function') || isWidgetVisible(id);
+    }
+
     function onPageShown(e) {
         if (!e || e.detail !== DASHBOARD_ID) return;
+        if (typeof applyWidgetPolicy === 'function') applyWidgetPolicy();
         loadHealth();
-        loadStats();
-        loadUpcoming();
+        // One request feeding the stats, recent and library cards — always
+        // worth making unless every one of them is hidden.
+        if (widgetOn('video.stats') || widgetOn('video.recent') || widgetOn('video.library')) {
+            loadStats();
+        }
+        if (widgetOn('video.upcoming')) loadUpcoming();
         loadAttention();            // open issues + pending maintenance findings
-        gateStudioCards();
-        loadStudioCoverage();       // TMDB/TVDB coverage bars on the Studio cards
-        loadSystemStats();          // immediate fill (memory/uptime)
-        startSystemStatsPolling();  // then keep it live
+        if (widgetOn('video.studios')) {
+            gateStudioCards();
+            loadStudioCoverage();   // TMDB/TVDB coverage bars on the Studio cards
+        }
+        if (widgetOn('video.stats')) {
+            loadSystemStats();          // immediate fill (memory/uptime)
+            startSystemStatsPolling();  // then keep it live
+        }
     }
 
     // ── Library card: live scan progress (parity with the music dashboard) ──

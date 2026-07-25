@@ -714,6 +714,14 @@ class ConfigManager:
             "settings": {
                 "audio_quality": "flac"
             },
+            "dashboard_widgets": {
+                # Dashboard cards HIDDEN from non-admin profiles, by widget id
+                # (see VALID_WIDGET_IDS in web_server.py). Admins always see
+                # everything. Stored as the hidden set rather than the visible
+                # one so a card added in a later release shows up by default
+                # instead of being silently absent from every saved list.
+                "member_hidden": []
+            },
             "lossy_copy": {
                 "enabled": False,
                 "codec": "mp3",

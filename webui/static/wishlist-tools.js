@@ -7315,13 +7315,34 @@ async function initializeToolsPage() {
     toolsPageState.isInitialized = true;
 }
 
+let dashboardIntervals = [];
+
+function stopDashboardPolling() {
+    dashboardIntervals.forEach(clearInterval);
+    dashboardIntervals = [];
+}
+
 async function loadDashboardData() {
     // Start periodic refreshers up front (independent of the initial loads).
     stopWishlistCountPolling(); // Ensure no duplicates
+    stopDashboardPolling();     // ...same for the rest: this runs on every
+                                // navigation back to the dashboard, and the
+                                // timers used to accumulate one set per visit.
     wishlistCountInterval = setInterval(updateWishlistCount, 10000);
-    setInterval(fetchAndUpdateSystemStats, 10000);   // dashboard-specific (service status polled globally)
-    setInterval(fetchAndUpdateActivityFeed, 2000);   // responsive activity feed
-    setInterval(checkForActivityToasts, 3000);
+
+    // Cards hidden from this profile never poll. For a member with System
+    // Stats and Recent Activity hidden that's ~2,000 requests an hour saved,
+    // all of which would have rendered into a display:none card.
+    // NOTE: service status is deliberately absent — fetchAndUpdateServiceStatus
+    // also drives the SIDEBAR indicators every user sees, and is polled
+    // globally from initApp(). Hiding that card is presentation-only.
+    if (isWidgetVisible('music.stats')) {
+        dashboardIntervals.push(setInterval(fetchAndUpdateSystemStats, 10000));
+    }
+    if (isWidgetVisible('music.activity')) {
+        dashboardIntervals.push(setInterval(fetchAndUpdateActivityFeed, 2000));
+    }
+    dashboardIntervals.push(setInterval(checkForActivityToasts, 3000));
 
     // Fire all independent initial loads in parallel instead of sequentially.
     // Sequential awaits meant 6 back-to-back round-trips, each triggering its own
@@ -7330,9 +7351,9 @@ async function loadDashboardData() {
     await Promise.all([
         updateWishlistCount(),
         fetchAndUpdateServiceStatus(),
-        fetchAndUpdateSystemStats(),
-        fetchAndUpdateDbStats(),
-        fetchAndUpdateActivityFeed(),
+        isWidgetVisible('music.stats') ? fetchAndUpdateSystemStats() : null,
+        isWidgetVisible('music.library') ? fetchAndUpdateDbStats() : null,
+        isWidgetVisible('music.activity') ? fetchAndUpdateActivityFeed() : null,
         checkForActiveProcesses(),
     ]);
 
@@ -7682,6 +7703,10 @@ async function dashboardLibraryDeepScan() {
  * Called from artist, search, and discover update points (event-driven, no polling).
  */
 function updateDashboardDownloads() {
+    // Hidden for this profile — bail before the reveal below would undo
+    // applyWidgetPolicy()'s display:none the moment a download starts.
+    if (!isWidgetVisible('music.active-downloads')) return;
+
     const section = document.getElementById('dashboard-active-downloads-section');
     const container = document.getElementById('dashboard-downloads-container');
     if (!section || !container) return;

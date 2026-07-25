@@ -3484,15 +3484,12 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.1.0': [
-        { date: 'July 2026 · 1.1.0' },
-        { title: 'Purchased: a real record of what you bought', desc: 'the old "To Be Purchased" flag was a shopping list that forgot everything the moment you ticked something off. Marking a track purchased now files it in a new Purchased page in the sidebar, kept permanently and grouped by album — and you can mark a WHOLE album purchased in one action instead of track by track. The cart icon in the library drill-down cycles neutral → to-buy → purchased.' },
-        { title: 'Video settings on the Video side actually save', desc: 'the Video nav opens the same settings page as Music, filtered per side — but its Save button only flushed the video endpoints and blocked the music one, and auto-save was switched off entirely there. So Prowlarr, the torrent and usenet clients, and the whole Appearance, Security and Database tabs silently threw away every edit made from Video while working fine from Music. They save from either side now.' },
-        { title: 'Every configured Video Library is visible to members', desc: 'the endpoint that builds the Library page\'s tab bar was admin-only, and the page quietly swallowed the refusal — so anyone who wasn\'t an admin (notably profiles that sign in with Plex) fell back to the two hardcoded Movies/Shows tabs and never saw the extra libraries. It also disabled their download destination picker. Members get the library list; server discovery and filesystem paths stay admin-only.' },
-        { title: 'One setting per thing, not two', desc: 'torrent seeding goals existed on both sides driving the SAME torrent client, so two sweeps could push conflicting share limits at it. The minimum-free-disk floor existed twice with different defaults (5 GB vs off). Both are now single shared settings. Existing pairs are merged toward whichever value deletes less — a migration may leave torrents seeding longer than you meant, but it will never start removing data you didn\'t ask it to.' },
-        { title: 'Video server credentials are encrypted at rest', desc: 'the video side\'s own Plex token / Jellyfin key were stored in plain text while the music equivalents were encrypted. Same class of secret, protected on one side only — they now get the same treatment, and existing ones are migrated out of the clear.' },
-        { title: 'Four settings that did nothing', desc: 'the "Where to watch" region was read from a key nothing ever wrote, so the streaming overlay was pinned to US whatever you picked. The audio preference (Any/Surround/Lossless/Atmos) never reached the scorer. The YouTube Libraries editor wrote rows nothing read back while claiming the first was your default destination. And the YouTube cookie fields — genuinely used for video downloads — were unreachable from the Video side. Fixed, wired up, or removed.' },
-        { title: 'Earlier versions', desc: '1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5: best-in-class Soulseek chat, choosable discography sources, wishlist artist tools, background Fix All, and a multi-user isolation hardening pass.' },
+    '1.2.0': [
+        { date: 'July 2026 · 1.2.0' },
+        { title: 'Choose what standard users see on the dashboard', desc: 'the dashboard showed every card to everyone, so a standard user — typically someone who signed in with Plex — landed on Service Status, System Stats and Quick Actions: operator tooling they can\'t act on. The only lever was hiding the whole page. Settings → Users → Standard User Dashboard now has a checkbox per card, covering both the Music and Video dashboards. Admins always see everything.' },
+        { title: 'Hidden cards stop working in the background', desc: 'unchecking a card doesn\'t just hide it — its data fetches and refresh timers never start, and the live push updates it would have rendered are dropped. The dashboard runs a 2-second activity poll and two 10-second polls, so a standard user with those hidden stops making roughly two thousand pointless requests an hour.' },
+        { title: 'Dashboard timers no longer pile up', desc: 'every trip back to the dashboard started another set of refresh timers without stopping the previous ones, so the polling rate crept upward the longer a session ran. They\'re cleared and restarted properly now.' },
+        { title: 'Earlier versions', desc: '1.1.0 brought the Purchased page and a settings clean-up: the Video side\'s settings actually save, every configured Video Library is visible to members, settings that existed twice are down to one, video server credentials are encrypted at rest, and four dead controls were fixed or removed. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
     ],
 };
 
@@ -3523,7 +3520,19 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.1.0: purchases, and settings that mean it",
+        title: "1.2.0: a dashboard that fits the person looking at it",
+        description: "the dashboard showed every card to everyone. A standard user — usually someone who signed in with Plex — got Service Status, System Stats and Quick Actions: operator tooling they can't use, and the only way to remove it was to take the whole page away. You now pick, card by card, what standard profiles see. Admins always see everything.",
+        features: [
+            "Settings → Users → Standard User Dashboard: one checkbox per card, covering BOTH the Music dashboard (Service Status, System Stats, Library, Recent Syncs, Quick Actions, Recent Activity, Active Downloads, Enrichment Services) and the Video one (Recently Added, System Stats, Library, Upcoming, Quick Actions, Studios), plus the enrichment controls in each dashboard header",
+            "admins are exempt by design — this only shapes what standard profiles see, so you can hand someone a trimmed dashboard instead of hiding the page from them entirely",
+            "hidden means hidden, not just invisible: a hidden card's fetches and refresh timers never start, and the live push updates it would have rendered are dropped. The dashboard runs a 2-second activity poll and two 10-second polls, so a standard user with those turned off stops making roughly two thousand pointless requests an hour",
+            "nothing changes on upgrade — every card starts visible, exactly as before, until you uncheck something",
+            "fixed alongside: every visit to the dashboard started another set of refresh timers without stopping the last, so polling quietly accelerated the longer a session stayed open",
+        ],
+        usage_note: "Settings → Users → Standard User Dashboard. The setting is one policy covering both dashboards, so it reads and saves the same from either the Music or Video side. Service Status is hidden from the dashboard but still feeds the sidebar indicator every user sees.",
+    },
+    {
+        title: "Earlier in 1.1.0 — purchases, and settings that mean it",
         description: "marking music purchased finally keeps a record — a new Purchased page, and whole albums in one action. On the settings side: the fields on the Video page that silently discarded your edits now save, every configured Video Library is visible to non-admins again, settings that existed twice are down to one, and four controls that did nothing are fixed or gone.",
         features: [
             "Purchased (Music sidebar): marking a track bought files it permanently instead of just clearing a flag, grouped by album with per-track and whole-album unmark. Mark an ENTIRE album purchased in one action — including tracks that were never on the to-buy list. The drill-down cart icon now cycles neutral → to-buy → purchased",

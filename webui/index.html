@@ -9351,6 +9351,26 @@
                             </div>
                             </div><!-- end Sign in with Plex body -->
 
+                            <!-- Standard User Dashboard — which dashboard cards non-admin
+                                 profiles see. data-shared: this is one policy covering BOTH
+                                 dashboards, so it must save from the video side's Settings
+                                 nav too. Checkboxes are rendered from DASHBOARD_WIDGETS
+                                 (dashboard-widgets.js) rather than hardcoded here, so the
+                                 registry stays the single source of truth. -->
+                            <div class="settings-section-header collapsed" data-stg="users" data-shared onclick="this.classList.toggle('collapsed'); const b=this.nextElementSibling; b.classList.toggle('collapsed'); b.style.display=b.classList.contains('collapsed')?'none':''">
+                                <span class="settings-section-arrow">&#9660;</span>
+                                <h3>Standard User Dashboard</h3>
+                                <span class="settings-section-hint">Cards non-admin profiles can see</span>
+                            </div>
+                            <div class="settings-section-body collapsed" data-stg="users" data-shared>
+                            <div class="settings-group" data-stg="users" data-shared>
+                                <div class="setting-help-text" style="margin-bottom: 12px;">
+                                    Admins always see every card — this only affects standard profiles, including anyone who signed in with Plex. Unchecking a card also stops the browser fetching its data, so hidden cards cost nothing to poll.
+                                </div>
+                                <div id="dashboard-widget-options"></div>
+                            </div>
+                            </div><!-- end Standard User Dashboard body -->
+
                             <!-- Import from Plex -->
                             <div class="settings-section-header collapsed" data-stg="users" onclick="this.classList.toggle('collapsed'); const b=this.nextElementSibling; b.classList.toggle('collapsed'); b.style.display=b.classList.contains('collapsed')?'none':''">
                                 <span class="settings-section-arrow">&#9660;</span>
@@ -12065,6 +12085,9 @@
     <script src="{{ url_for('static', filename='setup-wizard.js', v=static_v) }}"></script>
     <!-- Split modules (was: script.js) — core.js must load first, init.js before shell-bridge.js -->
     <script src="{{ url_for('static', filename='core.js', v=static_v) }}"></script>
+    <!-- Dashboard widget visibility registry — must load before any dashboard
+         data layer, which gates its fetches on isWidgetVisible(). -->
+    <script src="{{ url_for('static', filename='dashboard-widgets.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='shared-helpers.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='media-player.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='settings.js', v=static_v) }}"></script>

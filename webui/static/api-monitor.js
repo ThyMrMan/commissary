@@ -83,6 +83,7 @@ function _gArc(startDeg, endDeg, radius) {
 }
 
 function _handleRateMonitorUpdate(data) {
+    if (!isWidgetVisible('music.enrichment')) return; // Card hidden for this profile
     const grid = document.getElementById('rate-monitor-grid');
     if (!grid) return;
 
@@ -920,6 +921,7 @@ function _updateSpotifyEndpoints() {
 }
 
 async function fetchAndUpdateSystemStats() {
+    if (!isWidgetVisible('music.stats')) return; // Card hidden for this profile
     if (socketConnected) return; // WebSocket handles this
     if (document.hidden) return; // Skip polling when tab is not visible
     try {
@@ -959,6 +961,7 @@ function updateStatCard(cardId, value, subtitle) {
 }
 
 async function fetchAndUpdateActivityFeed() {
+    if (!isWidgetVisible('music.activity')) return; // Card hidden for this profile
     if (socketConnected) return; // WebSocket handles this
     if (document.hidden) return; // Skip polling when tab is not visible
     try {

@@ -47,7 +47,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.1.0"
+_SOULSYNC_BASE_VERSION = "1.2.0"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -923,6 +923,43 @@ VALID_PAGE_IDS = {
     'video-calendar',
     'video-tools',
 }
+
+# Dashboard cards an admin can hide from non-admin profiles
+# (config: dashboard_widgets.member_hidden). IDs are namespaced by side
+# because "stats", "library" and "tools" each exist on BOTH dashboards.
+# Must stay in sync with DASHBOARD_WIDGETS in webui/static/dashboard-widgets.js
+# — tests/test_dashboard_widgets.py asserts both directions.
+VALID_WIDGET_IDS = {
+    'music.services',
+    'music.stats',
+    'music.library',
+    'music.syncs',
+    'music.tools',
+    'music.activity',
+    'music.active-downloads',
+    'music.enrichment',
+    'music.header-enrich',
+    'video.recent',
+    'video.stats',
+    'video.library',
+    'video.upcoming',
+    'video.tools',
+    'video.studios',
+    'video.header-enrich',
+}
+
+
+def sanitize_widget_ids(value):
+    """Keep only known widget ids from a client-supplied list.
+
+    Mirrors how allowed_pages is validated against VALID_PAGE_IDS: unknown
+    ids are dropped silently rather than 400'ing, so an older client posting
+    a stale list can't lock the admin out of the setting.
+    """
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    return sorted({v for v in value if v in VALID_WIDGET_IDS})
+
 
 def check_download_permission():
     """Check if current profile has download permission. Returns error response or None if allowed."""
@@ -3556,11 +3593,16 @@ def handle_settings():
             if 'active_media_server' in new_settings:
                 config_manager.set_active_media_server(new_settings['active_media_server'])
 
+            # Drop unknown widget ids before the generic per-key loop writes them.
+            _widgets_in = new_settings.get('dashboard_widgets')
+            if isinstance(_widgets_in, dict) and 'member_hidden' in _widgets_in:
+                _widgets_in['member_hidden'] = sanitize_widget_ids(_widgets_in['member_hidden'])
+
             if isinstance(_experimental_in, dict):
                 for key, value in _experimental_in.items():
                     config_manager.set(f'experimental.{key}', value)
 
-            for service in ['spotify', 'plex', 'jellyfin', 'navidrome', 'soulseek', 'download_source', 'settings', 'database', 'metadata_enhancement', 'file_organization', 'playlist_sync', 'tidal', 'tidal_download', 'qobuz', 'hifi_download', 'deezer_download', 'amazon_download', 'lidarr_download', 'prowlarr', 'torrent_client', 'usenet_client', 'listenbrainz', 'acoustid', 'lastfm', 'genius', 'import', 'lossy_copy', 'album_downloads', 'listening_stats', 'ui_appearance', 'youtube', 'content_filter', 'itunes', 'm3u_export', 'musicbrainz', 'deezer', 'audiodb', 'metadata', 'hydrabase', 'security', 'discogs', 'library', 'discover', 'wishlist', 'genre_whitelist', 'post_processing', 'playlists', 'experimental']:
+            for service in ['spotify', 'plex', 'jellyfin', 'navidrome', 'soulseek', 'download_source', 'settings', 'database', 'metadata_enhancement', 'file_organization', 'playlist_sync', 'tidal', 'tidal_download', 'qobuz', 'hifi_download', 'deezer_download', 'amazon_download', 'lidarr_download', 'prowlarr', 'torrent_client', 'usenet_client', 'listenbrainz', 'acoustid', 'lastfm', 'genius', 'import', 'lossy_copy', 'album_downloads', 'listening_stats', 'ui_appearance', 'youtube', 'content_filter', 'itunes', 'm3u_export', 'musicbrainz', 'deezer', 'audiodb', 'metadata', 'hydrabase', 'security', 'discogs', 'library', 'discover', 'wishlist', 'genre_whitelist', 'post_processing', 'playlists', 'dashboard_widgets', 'experimental']:
                 if service in new_settings:
                     if service == 'experimental' and isinstance(_experimental_in, dict):
                         continue
@@ -28763,14 +28805,25 @@ def get_current_profile():
         # plex_login_enabled here too — the sign-in screen needs it to decide
         # whether to show the "Sign in with Plex" button, and this branch
         # returns before the normal payload below would ever set it.
+        #
+        # dashboard_widgets_hidden rides along for the same reason: it is
+        # global config, not per-profile, and the frontend caches it here
+        # BEFORE a profile is picked — otherwise the profile-picker path
+        # (no session profile yet) would reach the dashboard with no policy.
+        widgets_hidden = sanitize_widget_ids(
+            config_manager.get('dashboard_widgets.member_hidden', []) if config_manager else []
+        )
+
         if _require_login_enabled() and not session.get('login_authenticated', False):
             return jsonify({'success': False, 'login_required': True,
-                            'plex_login_enabled': _plex_login_enabled()}), 200
+                            'plex_login_enabled': _plex_login_enabled(),
+                            'dashboard_widgets_hidden': widgets_hidden}), 200
 
         pid = session.get('profile_id')
         if not pid:
             return jsonify({'success': False, 'error': 'No profile selected',
-                            'plex_login_enabled': _plex_login_enabled()}), 200
+                            'plex_login_enabled': _plex_login_enabled(),
+                            'dashboard_widgets_hidden': widgets_hidden}), 200
 
         database = get_database()
         profile = database.get_profile(pid)
@@ -28793,6 +28846,7 @@ def get_current_profile():
             'launch_pin_required': bool(require_pin) and not pin_verified,
             'login_mode': _require_login_enabled(),
             'plex_login_enabled': _plex_login_enabled(),
+            'dashboard_widgets_hidden': widgets_hidden,
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500

@@ -712,6 +712,9 @@ function unsubscribeFromDownloadBatch(batchId) {
 // --- Phase 2: Dashboard event handlers ---
 
 function handleDashboardStats(data) {
+    // The server broadcasts to every client, so the visibility check has to
+    // happen here too — the polling guard doesn't cover the socket path.
+    if (!isWidgetVisible('music.stats')) return;
     // Same logic as fetchAndUpdateSystemStats response handler
     updateStatCard('active-downloads-card', data.active_downloads, 'Currently downloading');
     updateStatCard('finished-downloads-card', data.finished_downloads, 'Completed downloads');
@@ -725,6 +728,7 @@ function handleDashboardStats(data) {
 }
 
 function handleDashboardActivity(data) {
+    if (!isWidgetVisible('music.activity')) return;
     // Same logic as fetchAndUpdateActivityFeed response handler
     updateActivityFeed(data.activities || []);
 }

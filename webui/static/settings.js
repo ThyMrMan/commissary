@@ -1895,6 +1895,8 @@ async function loadSettingsData() {
             const allowPlexLogin = document.getElementById('security-allow-plex-login');
             if (allowPlexLogin) allowPlexLogin.checked = settings.security?.allow_plex_login || false;
 
+            renderDashboardWidgetOptions(settings.dashboard_widgets?.member_hidden || []);
+
             // Check if admin has a PIN set
             const profilesRes = await fetch('/api/profiles');
             const profilesData = await profilesRes.json();
@@ -4471,12 +4473,56 @@ const SHARED_SECTION_BUILDERS = {
         cookies_browser: document.getElementById('youtube-cookies-browser')?.value || '',
         cookies_paste: document.getElementById('youtube-cookies-paste')?.value || '',
     }),
+    // Which dashboard cards non-admin profiles see. The checkboxes read
+    // "visible", but what's stored is the HIDDEN set — so a card added in a
+    // later release shows up by default instead of being absent from every
+    // already-saved list.
+    dashboard_widgets: () => ({
+        member_hidden: collectHiddenDashboardWidgets(),
+    }),
 };
+
+// Reads the checkbox group rendered by renderDashboardWidgetOptions(). Returns
+// null when the group isn't in the DOM at all, which collectSharedSettings()
+// drops from the payload — /api/settings merges per key, so an unrendered
+// group can never blank the saved policy.
+// Builds the checkbox list from DASHBOARD_WIDGETS so adding a card to the
+// registry is the only step needed to make it configurable here.
+function renderDashboardWidgetOptions(hiddenIds) {
+    const host = document.getElementById('dashboard-widget-options');
+    if (!host || typeof DASHBOARD_WIDGETS === 'undefined') return;
+
+    const hidden = new Set(Array.isArray(hiddenIds) ? hiddenIds : []);
+    const sides = [['music', 'Music Dashboard'], ['video', 'Video Dashboard']];
+
+    host.innerHTML = sides.map(([side, heading]) => {
+        const rows = DASHBOARD_WIDGETS.filter(w => w.side === side).map(w => `
+            <label class="toggle-label">
+                <input type="checkbox" data-widget-id="${w.id}" ${hidden.has(w.id) ? '' : 'checked'}>
+                <span>${w.label}</span>
+            </label>`).join('');
+        return `<div class="form-group"><label>${heading}</label>${rows}</div>`;
+    }).join('');
+}
+
+function collectHiddenDashboardWidgets() {
+    const host = document.getElementById('dashboard-widget-options');
+    if (!host) return null;
+    const boxes = host.querySelectorAll('input[type="checkbox"][data-widget-id]');
+    if (!boxes.length) return null;
+    return Array.from(boxes).filter(cb => !cb.checked).map(cb => cb.dataset.widgetId);
+}
 
 function collectSharedSettings() {
     const out = {};
     for (const section of Object.keys(SHARED_SECTION_BUILDERS)) {
-        out[section] = SHARED_SECTION_BUILDERS[section]();
+        const built = SHARED_SECTION_BUILDERS[section]();
+        // Drop keys a builder reported as "not present in the DOM" so a partial
+        // form can't overwrite stored config with an empty value.
+        for (const key of Object.keys(built)) {
+            if (built[key] === null) delete built[key];
+        }
+        if (Object.keys(built).length) out[section] = built;
     }
     return out;
 }
