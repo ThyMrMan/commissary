@@ -3482,21 +3482,17 @@ function closeHelperSearch() {
 const WHATS_NEW = {
     // Convention: keep only the CURRENT release here, plus a single brief
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
-    // 1.0.0 = this fork's baseline release — the content below is upstream's
-    // real 3.1.5 changelog, relabeled as the starting point for this fork's
-    // own version tracking (see _SOULSYNC_BASE_VERSION in web_server.py).
-    '1.0.0': [
-        { date: 'July 2026 · 1.0.0' },
-        { title: 'Chat, best in class', desc: 'join ANY public Soulseek room — a rooms rail with a full room browser, not just the SoulSync room. The user list got a real overhaul (roles, sorting, local mute), you can browse any user\'s shared files and download right from chat, search your message history, copy any message, and the composer was redesigned.' },
-        { title: 'Choose your discography source (ragnarlotus)', desc: 'a new Library Discography Source setting decides which metadata source paints library artists\' discographies — your primary, automatic fallback, or a specific source. An artist a source genuinely doesn\'t know no longer reads as an error.' },
-        { title: 'Other sources on the discography (#1067)', desc: 'a view option on artist pages that appends releases OTHER metadata sources know but your current view doesn\'t — slotted into the real Albums/EPs/Singles sections, marked with their source, each downloadable (Download Discography includes them too). Off by default, purely additive.' },
-        { title: 'Wishlist: artist selection + smarter retries', desc: 'select, download, or remove a whole artist\'s wishlist entries at once (#1065). Failed tracks now carry REAL attempt counts, back off progressively instead of retrying every cycle, and the auto-ignore TTL is configurable (javiavid).' },
-        { title: 'Search by MusicBrainz ID (Jordan H)', desc: 'paste a bare MusicBrainz ID into search and it resolves directly to the release — Lidarr-style exact lookups.' },
-        { title: 'Tools: Fix All grew up', desc: 'Fix All runs in the background with live progress and a Stop button — a 5000-finding retag no longer times out the page while secretly still working (pertti). Album Tag Consistency now says exactly which albums were excluded and why, and warns when files weren\'t readable from SoulSync\'s side (clouddead89). Findings page size is adjustable, and Genre Tag Cleanup scans (and counts) the whole library (#1066).' },
-        { title: 'Multi-user hardening', desc: 'a profile-isolation audit: profile-scoped APIs verify ownership, deleting a profile sweeps every table that references it, and socket rooms derive from the session — one profile can\'t see or touch another\'s data.' },
-        { title: 'Reported fixes', desc: 'singles/EPs no longer file as Albums when the source has no type signal (#1064); the artist photo picker works on Navidrome/Jellyfin (#1069); enabling Usenet in source priority survives reload (Fl3m); the music Manage Workers modal gets Retry All Failed; video\'s "block release and retry" actually retries with another release.' },
-        { title: 'Community PRs', desc: 'the Library Discography Source setting and the typed provider-outcome rework behind it are ragnarlotus\'s work (#1068).' },
-        { title: 'Earlier versions', desc: '3.1.4 added the Comma Artist Splitter + ReplayGain targets and grew up the video Requests page. 3.1.3 added record-label following. 3.1.2 brought the Soulseek chat page. 3.1.1 added Continue Watching.' },
+    // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
+    // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
+    '1.1.0': [
+        { date: 'July 2026 · 1.1.0' },
+        { title: 'Purchased: a real record of what you bought', desc: 'the old "To Be Purchased" flag was a shopping list that forgot everything the moment you ticked something off. Marking a track purchased now files it in a new Purchased page in the sidebar, kept permanently and grouped by album — and you can mark a WHOLE album purchased in one action instead of track by track. The cart icon in the library drill-down cycles neutral → to-buy → purchased.' },
+        { title: 'Video settings on the Video side actually save', desc: 'the Video nav opens the same settings page as Music, filtered per side — but its Save button only flushed the video endpoints and blocked the music one, and auto-save was switched off entirely there. So Prowlarr, the torrent and usenet clients, and the whole Appearance, Security and Database tabs silently threw away every edit made from Video while working fine from Music. They save from either side now.' },
+        { title: 'Every configured Video Library is visible to members', desc: 'the endpoint that builds the Library page\'s tab bar was admin-only, and the page quietly swallowed the refusal — so anyone who wasn\'t an admin (notably profiles that sign in with Plex) fell back to the two hardcoded Movies/Shows tabs and never saw the extra libraries. It also disabled their download destination picker. Members get the library list; server discovery and filesystem paths stay admin-only.' },
+        { title: 'One setting per thing, not two', desc: 'torrent seeding goals existed on both sides driving the SAME torrent client, so two sweeps could push conflicting share limits at it. The minimum-free-disk floor existed twice with different defaults (5 GB vs off). Both are now single shared settings. Existing pairs are merged toward whichever value deletes less — a migration may leave torrents seeding longer than you meant, but it will never start removing data you didn\'t ask it to.' },
+        { title: 'Video server credentials are encrypted at rest', desc: 'the video side\'s own Plex token / Jellyfin key were stored in plain text while the music equivalents were encrypted. Same class of secret, protected on one side only — they now get the same treatment, and existing ones are migrated out of the clear.' },
+        { title: 'Four settings that did nothing', desc: 'the "Where to watch" region was read from a key nothing ever wrote, so the streaming overlay was pinned to US whatever you picked. The audio preference (Any/Surround/Lossless/Atmos) never reached the scorer. The YouTube Libraries editor wrote rows nothing read back while claiming the first was your default destination. And the YouTube cookie fields — genuinely used for video downloads — were unreachable from the Video side. Fixed, wired up, or removed.' },
+        { title: 'Earlier versions', desc: '1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5: best-in-class Soulseek chat, choosable discography sources, wishlist artist tools, background Fix All, and a multi-user isolation hardening pass.' },
     ],
 };
 
@@ -3527,7 +3523,20 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.0.0: the chat + discography release",
+        title: "1.1.0: purchases, and settings that mean it",
+        description: "marking music purchased finally keeps a record — a new Purchased page, and whole albums in one action. On the settings side: the fields on the Video page that silently discarded your edits now save, every configured Video Library is visible to non-admins again, settings that existed twice are down to one, and four controls that did nothing are fixed or gone.",
+        features: [
+            "Purchased (Music sidebar): marking a track bought files it permanently instead of just clearing a flag, grouped by album with per-track and whole-album unmark. Mark an ENTIRE album purchased in one action — including tracks that were never on the to-buy list. The drill-down cart icon now cycles neutral → to-buy → purchased",
+            "video settings that save: the Video side shows the same settings page as Music, but its Save button flushed only the video endpoints and auto-save was off there — so Prowlarr, the torrent/usenet clients and the whole Appearance, Security and Database tabs discarded every edit made from Video while working from Music. They now persist from either side, and editing a video-only field still can't touch the music config",
+            "every Video Library visible to members: the endpoint feeding the Library tab bar was admin-only and the page swallowed the refusal, so non-admins — notably Plex sign-ins — only ever saw the default Movies and TV Shows tabs and had no download destination picker. Members get the configured library list; live server discovery and filesystem paths remain admin-only",
+            "one setting per thing: torrent seeding goals and the minimum-free-disk floor each existed on BOTH sides for the same physical resource — two sweeps could push conflicting share limits at the same torrent client, and the disk floor had different defaults (5 GB vs off). Now single shared settings, with existing pairs merged toward whichever value deletes less",
+            "video Plex/Jellyfin credentials are encrypted at rest like the music ones, instead of sitting in plain text, and existing ones are migrated out of the clear",
+            "four dead controls: the 'Where to watch' region was read from a key nothing wrote (the streaming overlay was stuck on US), the audio preference never reached the release scorer, the YouTube Libraries editor wrote rows nothing read while claiming the first was your default destination, and the YouTube cookie fields — used for video downloads too — couldn't be reached from the Video side",
+        ],
+        usage_note: "Purchased is in the Music sidebar under Wishlist; mark a whole album from its header in the library drill-down. The now-shared settings (seeding goals, minimum free disk, Prowlarr, torrent/usenet, appearance, security) show the same value whichever side you open them from.",
+    },
+    {
+        title: "Earlier in 1.0.0 — the chat + discography release",
         description: "chat goes best-in-class (any public room, user shares, history search), you choose which source paints your discographies — and see what the others know — the wishlist learns artists and smarter retries, Fix All runs in the background, and multi-user gets a security hardening pass.",
         features: [
             "chat, best in class: join ANY public soulseek room via a rooms rail + full room browser, a real user list (roles, sorting, local mute), browse any user's shared files and download them right from chat, search your message history, copy any message, and a redesigned composer",

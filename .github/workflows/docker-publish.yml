@@ -1,17 +1,15 @@
 name: Build and Push Docker Image
 
 on:
-  # Auto-build :latest on every push to main
-  push:
-    branches:
-      - main
-  # Manual trigger for tagged releases (e.g. 2.33)
+  # MANUAL ONLY. There is deliberately no `push:` trigger — publishing to Docker
+  # Hub is a release decision, not something every commit to main should do.
+  # Run it from Actions → "Build and Push Docker Image" → Run workflow.
   workflow_dispatch:
     inputs:
       version_tag:
-        description: 'Version tag (e.g. 1.0.0)'
+        description: 'Version tag (e.g. 1.1.0). Also published as :latest.'
         required: true
-        default: '1.0.0'
+        default: '1.1.0'
 
 jobs:
   build-and-push:
