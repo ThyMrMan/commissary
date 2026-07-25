@@ -4463,6 +4463,14 @@ const SHARED_SECTION_BUILDERS = {
     settings: () => ({
         min_free_disk_gb: Math.max(0, parseFloat(document.getElementById('min-free-disk-gb')?.value) || 0),
     }),
+    // ONLY the cookie keys: yt-dlp uses them for both music and video YouTube
+    // downloads. youtube.download_delay stays music-only and is sent by
+    // saveSettings' own youtube block — safe because /api/settings merges
+    // per-key, so this partial section never clears it.
+    youtube: () => ({
+        cookies_browser: document.getElementById('youtube-cookies-browser')?.value || '',
+        cookies_paste: document.getElementById('youtube-cookies-paste')?.value || '',
+    }),
 };
 
 function collectSharedSettings() {

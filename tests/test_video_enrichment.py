@@ -803,6 +803,10 @@ def test_item_extras_adds_jellyfin_watch_link(db, monkeypatch):
     class CM:
         def get_jellyfin_config(self): return {"base_url": "http://jelly:8096/"}
         def get_plex_config(self): return {}
+        # The video side's own server override lives in the app config now, so
+        # the stub needs the generic accessors (unset → inherit music's).
+        def get(self, key, default=None): return default
+        def set(self, key, value): pass
     monkeypatch.setattr(cs, "config_manager", CM())
     ex = VideoEnrichmentEngine(db, {}).item_extras("movie", mid)      # no tmdb worker needed
     assert ex["server"] == {"server": "Jellyfin",
@@ -815,6 +819,10 @@ def test_item_extras_adds_plex_watch_link(db, monkeypatch):
     class CM:
         def get_plex_config(self): return {"base_url": "http://plex:32400", "token": "T"}
         def get_jellyfin_config(self): return {}
+        # The video side's own server override lives in the app config now, so
+        # the stub needs the generic accessors (unset → inherit music's).
+        def get(self, key, default=None): return default
+        def set(self, key, value): pass
     monkeypatch.setattr(cs, "config_manager", CM())
     class _R:
         text = ""
@@ -832,6 +840,10 @@ def test_item_extras_no_server_link_when_unowned(db, monkeypatch):
     class CM:
         def get_plex_config(self): return {"base_url": "http://plex:32400", "token": "T"}
         def get_jellyfin_config(self): return {}
+        # The video side's own server override lives in the app config now, so
+        # the stub needs the generic accessors (unset → inherit music's).
+        def get(self, key, default=None): return default
+        def set(self, key, value): pass
     monkeypatch.setattr(cs, "config_manager", CM())
     with db.connect() as c:
         c.execute("INSERT INTO movies (title, server_source, server_id) VALUES ('W', NULL, NULL)")

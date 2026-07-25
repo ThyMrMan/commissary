@@ -6719,14 +6719,14 @@
                                         Torrent Client section's default. The FIRST checked one in each group is the
                                         default destination for unattended grabs (wishlist, RSS). <span data-video-lib-status></span>
                                     </small>
-                                    <label style="margin-top: 12px;">▶️ YouTube Libraries:</label>
-                                    <div class="library-editor-list yt-library-list" data-video-lib-group="youtube">Loading…</div>
-                                    <button class="test-button" type="button" data-video-ytlib-add>+ Add library</button>
-                                    <small style="color: #999; font-size: 0.9em; display: block; margin-top: 5px;">
-                                        YouTube isn't scanned from a Plex/Jellyfin section, so these are named by hand —
-                                        give each one a name and the folder its channels' downloads land in. The FIRST
-                                        one is the default destination for new channel subscriptions.
-                                    </small>
+                                    <!-- A "YouTube Libraries" editor lived here. It round-tripped into
+                                         root_folders but NOTHING read it back: primary_root_folder maps
+                                         content_kind to movie/show only, so a youtube row could never be
+                                         returned, and every YouTube destination reads the youtube_path
+                                         scalar (Settings → Downloads → YouTube folder). Its claim that
+                                         "the FIRST one is the default destination" was simply false.
+                                         Per-channel destination routing is a real feature, not a
+                                         settings fix — it belongs in its own change. -->
                                 </div>
                             </div>
                             <!-- Video Library Organization — uses the SAME settings vocabulary as the
@@ -7779,36 +7779,6 @@
                                 <!-- YouTube Settings (shown when youtube or hybrid mode) -->
                                 <div id="youtube-settings-container" style="display: none;">
                                     <div class="form-group">
-                                        <label>YouTube Browser Cookies:</label>
-                                        <select id="youtube-cookies-browser" class="form-select">
-                                            <option value="">None (No cookies)</option>
-                                            <option value="chrome">Chrome</option>
-                                            <option value="firefox">Firefox</option>
-                                            <option value="edge">Edge</option>
-                                            <option value="brave">Brave</option>
-                                            <option value="opera">Opera</option>
-                                            <option value="safari">Safari</option>
-                                            <option value="custom">Paste cookies.txt (server / Docker)</option>
-                                        </select>
-                                        <div class="setting-help-text">
-                                            If YouTube shows "Sign in to confirm you're not a bot", select your browser here.
-                                            SoulSync will use your browser's YouTube cookies to authenticate. Reading a browser
-                                            only works when that browser is on the same machine as SoulSync &mdash; on a
-                                            server/Docker box, choose <strong>Paste cookies.txt</strong> instead.
-                                        </div>
-                                    </div>
-                                    <div class="form-group" id="youtube-cookies-paste-group" style="display:none;">
-                                        <label>Paste cookies.txt:</label>
-                                        <textarea id="youtube-cookies-paste" class="form-input" rows="6"
-                                                  placeholder="# Netscape HTTP Cookie File&#10;.youtube.com&#9;TRUE&#9;/&#9;TRUE&#9;...&#9;NAME&#9;VALUE"></textarea>
-                                        <div class="setting-help-text">
-                                            For server/Docker installs with no local browser. Export your YouTube cookies
-                                            with a "Get cookies.txt LOCALLY" browser extension and paste the whole file.
-                                            Required for private playlists like your <strong>Liked Music</strong>.
-                                            Stored on the server and they expire periodically &mdash; re-paste if YouTube stops working.
-                                        </div>
-                                    </div>
-                                    <div class="form-group">
                                         <label>YouTube Download Delay:</label>
                                         <input type="number" id="youtube-download-delay" min="0" max="30" step="1"
                                             value="3" placeholder="3">
@@ -8219,6 +8189,51 @@
                             </div><!-- end qp-layout -->
 
                             <!-- ═══ INDEXERS & DOWNLOADERS (gated: only shown when torrent/usenet is a selected source — see updateDownloadSourceUI) ═══ -->
+                            <!-- YouTube cookies — SHARED. yt-dlp uses these for BOTH music
+                                 and video YouTube downloads (core/video/youtube.py reads the
+                                 same youtube.cookies_* keys), but the only editor used to live
+                                 inside #youtube-settings-container, which is hidden unless the
+                                 MUSIC download mode is youtube/hybrid — so a video-only user
+                                 could never set them. Own section, data-shared, no mode gate. -->
+                            <div class="settings-section-header collapsed" data-stg="downloads" data-shared onclick="this.classList.toggle('collapsed'); const b=this.nextElementSibling; b.classList.toggle('collapsed'); b.style.display=b.classList.contains('collapsed')?'none':''">
+                                <span class="settings-section-arrow">&#9660;</span>
+                                <h3>YouTube Cookies</h3>
+                                <span class="settings-section-hint">Shared &middot; music + video</span>
+                            </div>
+                            <div class="settings-section-body collapsed" data-stg="downloads" data-shared style="display:none">
+                                <div class="settings-group" data-stg="downloads" data-shared>
+                                <div class="form-group">
+                                    <label>YouTube Browser Cookies:</label>
+                                    <select id="youtube-cookies-browser" class="form-select">
+                                        <option value="">None (No cookies)</option>
+                                        <option value="chrome">Chrome</option>
+                                        <option value="firefox">Firefox</option>
+                                        <option value="edge">Edge</option>
+                                        <option value="brave">Brave</option>
+                                        <option value="opera">Opera</option>
+                                        <option value="safari">Safari</option>
+                                        <option value="custom">Paste cookies.txt (server / Docker)</option>
+                                    </select>
+                                    <div class="setting-help-text">
+                                        If YouTube shows "Sign in to confirm you're not a bot", select your browser here.
+                                        SoulSync will use your browser's YouTube cookies to authenticate. Reading a browser
+                                        only works when that browser is on the same machine as SoulSync &mdash; on a
+                                        server/Docker box, choose <strong>Paste cookies.txt</strong> instead.
+                                    </div>
+                                </div>
+                                <div class="form-group" id="youtube-cookies-paste-group" style="display:none;">
+                                    <label>Paste cookies.txt:</label>
+                                    <textarea id="youtube-cookies-paste" class="form-input" rows="6"
+                                              placeholder="# Netscape HTTP Cookie File&#10;.youtube.com&#9;TRUE&#9;/&#9;TRUE&#9;...&#9;NAME&#9;VALUE"></textarea>
+                                    <div class="setting-help-text">
+                                        For server/Docker installs with no local browser. Export your YouTube cookies
+                                        with a "Get cookies.txt LOCALLY" browser extension and paste the whole file.
+                                        Required for private playlists like your <strong>Liked Music</strong>.
+                                        Stored on the server and they expire periodically &mdash; re-paste if YouTube stops working.
+                                    </div>
+                                </div>
+                                </div>
+                            </div>
                             <div id="indexers-downloaders-section" data-stg="downloads" data-shared>
                             <!-- Compact collapsible filesystem note (flow/intro text removed per design) -->
                             <div class="ind-hero-warning" style="margin-bottom:12px;">

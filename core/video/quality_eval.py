@@ -111,6 +111,16 @@ _SRC_TIER = {"remux": "remux", "bluray": "bluray", "web-dl": "web",
 _RES_SCORE = {"2160p": 400, "1080p": 300, "720p": 200, "480p": 100}
 _SRC_SCORE = {"remux": 90, "bluray": 70, "web-dl": 55, "webrip": 40, "hdtv": 25, "dvd": 10}
 
+# Which parsed audio tracks earn the audio bonus, per profile["prefer_audio"].
+# "any" is the historical set (the bonus used to be unconditional on it), so
+# existing profiles are unaffected; the other modes narrow or widen it.
+_AUDIO_PREF_SETS = {
+    "any": ("atmos", "truehd", "dts-hd"),
+    "lossless": ("atmos", "truehd", "dts-hd"),
+    "atmos": ("atmos",),
+    "surround": ("atmos", "truehd", "dts-hd", "dts", "eac3", "ac3"),
+}
+
 
 def tier_key(source, resolution) -> str:
     """The quality-ladder key for a parsed (source, resolution), or '' if it isn't a
@@ -261,7 +271,11 @@ def evaluate_release(parsed, profile, *, scope="movie", want_season=None,
         score += 40
     if parsed.get("hdr") and profile.get("prefer_hdr") in ("prefer", "require"):
         score += 30
-    if parsed.get("audio") in ("atmos", "truehd", "dts-hd"):
+    # Audio preference (SOFT — scores, never rejects; a hidden audio filter would
+    # starve grabs). "any" keeps the historical flat bonus for lossless tracks so
+    # every existing profile scores exactly as before.
+    if parsed.get("audio") in _AUDIO_PREF_SETS.get(profile.get("prefer_audio") or "any",
+                                                   _AUDIO_PREF_SETS["any"]):
         score += 15
     if profile.get("prefer_repack") and (parsed.get("repack") or parsed.get("proper")):
         score += 10

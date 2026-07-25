@@ -254,8 +254,12 @@ def register_routes(bp):
             server = resolve_video_server()
             if not server:
                 return jsonify({"error": "no video server"}), 400
+            # ``youtube`` is deliberately NOT accepted: a content_kind='youtube'
+            # root_folder was never read back (primary_root_folder maps only
+            # movie/show), so the editor that wrote them was decorative. The
+            # YouTube destination is the youtube_path scalar.
             configured = get_video_db().save_libraries(
-                server, body.get("movies"), body.get("tv"), body.get("youtube"))
+                server, body.get("movies"), body.get("tv"), None)
             return jsonify({"status": "saved", "server": server, "configured": configured})
         except Exception:
             logger.exception("Failed to save video libraries")

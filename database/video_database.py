@@ -444,6 +444,7 @@ class VideoDatabase:
             self._ensure_columns(conn)
             self._ensure_indexes(conn)
             self._seed_named_links_from_scalar(conn)
+            self._rescue_orphan_youtube_library_path(conn)
             self._run_data_migrations(conn, prev_version)
             conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
             conn.commit()
@@ -2860,6 +2861,39 @@ class VideoDatabase:
             rid = conn.execute(f"SELECT id FROM {ref_table} WHERE name=? COLLATE NOCASE", (name,)).fetchone()["id"]
             conn.execute(f"INSERT OR IGNORE INTO {link_table} ({owner_col}, {ref_fk}) VALUES (?, ?)",
                          (owner_id, rid))
+
+    @staticmethod
+    def _rescue_orphan_youtube_library_path(conn) -> None:
+        """One-time: the removed "YouTube Libraries" editor wrote root_folders rows
+        with content_kind='youtube' that NOTHING ever read back — primary_root_folder
+        maps only movie/show, and every YouTube destination reads the youtube_path
+        scalar. Anyone who configured a folder there had it silently ignored; if
+        youtube_path is still blank, adopt the first such row so their setting
+        finally takes effect instead of vanishing with the editor. Marker-guarded."""
+        try:
+            row = conn.execute(
+                "SELECT value FROM video_settings WHERE key='youtube_lib_path_rescued'").fetchone()
+            if row and str(row[0]) == '1':
+                return
+            current = conn.execute(
+                "SELECT value FROM video_settings WHERE key='youtube_path'").fetchone()
+            if not (current and str(current[0] or "").strip()):
+                orphan = conn.execute(
+                    "SELECT path FROM root_folders WHERE content_kind='youtube' "
+                    "AND path IS NOT NULL AND TRIM(path) != '' ORDER BY sort_order, id "
+                    "LIMIT 1").fetchone()
+                if orphan:
+                    conn.execute("INSERT INTO video_settings(key, value, updated_at) "
+                                 "VALUES('youtube_path', ?, CURRENT_TIMESTAMP) "
+                                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                                 "updated_at=CURRENT_TIMESTAMP", (str(orphan[0]),))
+                    logger.info("Adopted an orphaned YouTube library folder as youtube_path: %s",
+                                orphan[0])
+            conn.execute("INSERT INTO video_settings(key, value, updated_at) "
+                         "VALUES('youtube_lib_path_rescued', '1', CURRENT_TIMESTAMP) "
+                         "ON CONFLICT(key) DO UPDATE SET value='1', updated_at=CURRENT_TIMESTAMP")
+        except sqlite3.Error:
+            logger.exception("YouTube library path rescue failed (non-fatal)")
 
     @staticmethod
     def _seed_named_links_from_scalar(conn) -> None:
