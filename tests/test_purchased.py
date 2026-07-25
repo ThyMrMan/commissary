@@ -334,3 +334,79 @@ def test_purchased_controls_row_is_scoped_to_this_page():
 def test_toggle_reports_state_to_assistive_tech():
     assert "aria-expanded" in _PURCHASED_JS
     assert "aria-label" in _PURCHASED_JS
+
+
+# ── unmarking is admin-only ──────────────────────────────────────────────────
+#
+# Recording a purchase is something any profile may do; ERASING one destroys
+# history nothing else can rebuild, so standard profiles (including anyone
+# signed in with Plex) can't. Gated on the SERVER — hiding the buttons alone
+# would leave the endpoint open to anyone who can reach the box.
+
+
+def _make_profile(is_admin: bool, name: str) -> int:
+    return web_server.get_database().create_profile(name=name, is_admin=is_admin)
+
+
+def test_unmark_is_refused_for_a_standard_profile(client):
+    wdb = web_server.get_database()
+    _insert_track(wdb, track_id="pwt9", title="Kept Song", to_be_purchased=1,
+                  artist_id="pwar9", album_id="pwa9")
+    client.post("/api/library/tracks/mark-purchased", json={"track_ids": ["pwt9"]})
+
+    pid = _make_profile(False, "Standard Listener")
+    with client.session_transaction() as sess:
+        sess["profile_id"] = pid
+
+    r = client.post("/api/library/tracks/unmark-purchased", json={"track_ids": ["pwt9"]})
+    assert r.status_code == 403, "a standard profile erased a purchase record"
+
+    # ...and the record really is untouched, not just the response refused.
+    with client.session_transaction() as sess:
+        sess.pop("profile_id", None)
+    purchased = client.get("/api/library/purchased").get_json()
+    assert any(a["album_id"] == "pwa9" for a in purchased["albums"])
+
+
+def test_a_second_admin_profile_may_still_unmark(client):
+    """Gated on is_admin, not profile_id == 1 — @admin_only would have locked
+    out every admin except the first one."""
+    wdb = web_server.get_database()
+    _insert_track(wdb, track_id="pwt10", title="Second Admin Song", to_be_purchased=1,
+                  artist_id="pwar10", album_id="pwa10")
+    client.post("/api/library/tracks/mark-purchased", json={"track_ids": ["pwt10"]})
+
+    pid = _make_profile(True, "Second Admin")
+    with client.session_transaction() as sess:
+        sess["profile_id"] = pid
+
+    r = client.post("/api/library/tracks/unmark-purchased", json={"track_ids": ["pwt10"]})
+    assert r.status_code == 200 and r.get_json()["success"] is True
+
+
+def test_a_standard_profile_may_still_mark_purchased(client):
+    """Only UNmarking is restricted — recording a purchase stays open."""
+    wdb = web_server.get_database()
+    _insert_track(wdb, track_id="pwt11", title="Buyable", to_be_purchased=1,
+                  artist_id="pwar11", album_id="pwa11")
+
+    pid = _make_profile(False, "Standard Buyer")
+    with client.session_transaction() as sess:
+        sess["profile_id"] = pid
+
+    r = client.post("/api/library/tracks/mark-purchased", json={"track_ids": ["pwt11"]})
+    assert r.status_code == 200 and r.get_json()["success"] is True
+
+
+def test_unmark_buttons_are_not_rendered_for_a_standard_profile():
+    """UI half. Both buttons hit the SAME endpoint, so there is no coherent
+    'albums only' restriction — unmarking each track in turn is the same act."""
+    assert "_purchasedCanUnmark" in _PURCHASED_JS
+    for marker in ("purchased-album-unmark-btn", "purchased-track-unmark-btn"):
+        idx = _PURCHASED_JS.index(marker)
+        window = _PURCHASED_JS[max(0, idx - 400):idx]
+        assert "canUnmark" in window, f"{marker} rendered unconditionally"
+
+
+def test_readonly_rows_drop_the_unmark_column():
+    assert ".purchased-album-card--readonly .purchased-track-row" in _STYLE_CSS

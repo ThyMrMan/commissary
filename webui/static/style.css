@@ -70994,6 +70994,11 @@ body.em-scroll-lock { overflow: hidden; }
     transition: background .12s ease;
 }
 .purchased-track-row:hover { background: rgba(255,255,255,0.04); }
+/* Standard profiles can't unmark a purchase (admin-only), so the Unmark
+   column isn't rendered — drop it rather than leaving a dead gutter. */
+.purchased-album-card--readonly .purchased-track-row {
+    grid-template-columns: 28px 1fr auto;
+}
 .purchased-track-num { color: rgba(255,255,255,0.35); font-size: 12px; text-align: right; }
 .purchased-track-title { color: rgba(255,255,255,0.85); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .purchased-track-date { color: rgba(255,255,255,0.4); font-size: 11px; white-space: nowrap; }

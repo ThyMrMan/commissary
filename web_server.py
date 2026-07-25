@@ -47,7 +47,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.3.1"
+_SOULSYNC_BASE_VERSION = "1.3.2"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -954,6 +954,8 @@ VALID_WIDGET_IDS = {
     # No video.nav-automations: video Automations is already admin-only.
     'video.nav-chat',
     'video.nav-tools',
+    # App chrome — floats over both sides, so it belongs to neither.
+    'shared.help-button',
 }
 
 # 1.2.0 shipped ONE "header controls" widget covering both the enrichment icons
@@ -9621,7 +9623,21 @@ def mark_library_tracks_purchased():
 def unmark_library_tracks_purchased():
     """Undo a purchase mark — clears purchased_at only (does not re-add the
     track to the to-be-purchased shopping list; see
-    Database.unmark_tracks_purchased)."""
+    Database.unmark_tracks_purchased).
+
+    ADMIN ONLY, unlike mark-purchased. Unmarking destroys purchase history
+    that nothing else can reconstruct, so standard profiles (including anyone
+    signed in with Plex) can record a purchase but not erase one.
+
+    Gated on g.is_admin rather than the @admin_only decorator: that decorator
+    tests profile_id == 1 specifically, which would also lock out a second
+    admin profile — not what "admins can unmark" means. Defaults to allow so
+    single-profile installs, where there is no profile context to speak of,
+    behave exactly as before.
+    """
+    if not getattr(g, 'is_admin', True):
+        return jsonify({"success": False,
+                        "error": "Only an admin can unmark a purchase"}), 403
     try:
         data = request.get_json() or {}
         track_ids = data.get('track_ids') or []

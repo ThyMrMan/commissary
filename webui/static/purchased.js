@@ -163,19 +163,21 @@ function _purchasedAlbumCardHtml(album) {
     const badgeCls = fullyPurchased ? 'purchased-album-badge purchased-album-badge--full' : 'purchased-album-badge';
     const lastDate = album.last_purchased_at ? _formatPurchasedDate(album.last_purchased_at) : '';
     const trackIds = (album.tracks || []).map(t => t.id);
+    const canUnmark = _purchasedCanUnmark();
 
     const trackRows = (album.tracks || []).map(t => `
         <div class="purchased-track-row">
             <span class="purchased-track-num">${t.track_number || ''}</span>
             <span class="purchased-track-title">${escapeHtml(t.title || 'Untitled')}</span>
             <span class="purchased-track-date">${_formatPurchasedDate(t.purchased_at)}</span>
-            <button class="btn btn--secondary purchased-track-unmark-btn" data-track-id="${escapeHtml(String(t.id))}" title="Undo this purchase record">Unmark</button>
+            ${canUnmark ? `<button class="btn btn--secondary purchased-track-unmark-btn" data-track-id="${escapeHtml(String(t.id))}" title="Undo this purchase record">Unmark</button>` : ''}
         </div>
     `).join('');
 
     const albumId = String(album.album_id);
     const isCollapsed = purchasedPageState.collapsed.has(albumId);
-    const cardCls = 'purchased-album-card' + (isCollapsed ? ' purchased-album-card--collapsed' : '');
+    const cardCls = 'purchased-album-card' + (isCollapsed ? ' purchased-album-card--collapsed' : '')
+        + (canUnmark ? '' : ' purchased-album-card--readonly');
     const trackCount = (album.tracks || []).length;
 
     return `
@@ -194,11 +196,22 @@ function _purchasedAlbumCardHtml(album) {
                 </div>
                 <span class="${badgeCls}">${album.purchased_count}/${album.total_track_count} purchased</span>
                 <span class="purchased-album-date">${lastDate}</span>
-                <button class="btn btn--secondary purchased-album-unmark-btn" data-album-id="${escapeHtml(String(album.album_id))}" data-track-ids="${escapeHtml(trackIds.join(','))}" title="Undo the purchase record for every track shown below">Unmark Album</button>
+                ${canUnmark ? `<button class="btn btn--secondary purchased-album-unmark-btn" data-album-id="${escapeHtml(String(album.album_id))}" data-track-ids="${escapeHtml(trackIds.join(','))}" title="Undo the purchase record for every track shown below">Unmark Album</button>` : ''}
             </div>
             <div class="purchased-track-rows">${trackRows}</div>
         </div>
     `;
+}
+
+// Unmarking is admin-only (POST /api/library/tracks/unmark-purchased returns
+// 403 otherwise): it destroys purchase history nothing else can rebuild.
+// Both the per-track and the whole-album button hit that ONE endpoint, so
+// there is no coherent "albums only" restriction — unmarking each track in
+// turn is the same act. Defaults to allowed, matching the server's default
+// for single-profile installs.
+function _purchasedCanUnmark() {
+    return typeof currentProfile === 'undefined' || !currentProfile
+        || currentProfile.is_admin !== false;
 }
 
 function _formatPurchasedDate(isoLike) {

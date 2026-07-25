@@ -3484,13 +3484,13 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.3.1': [
-        { date: 'July 2026 · 1.3.1' },
-        { title: 'Collapse albums in the Purchased list', desc: 'a long purchase history meant a lot of scrolling past track rows you weren\'t looking for. Click an album header — or its new chevron — to fold its tracks away, with Collapse all / Expand all beside the search box. What you\'ve collapsed is remembered, including across the refresh that follows unmarking something, and across reloads.' },
-        { title: 'Hide sidebar entries too, not just dashboard cards', desc: 'Automations, Chat and Tools under System can now be hidden from standard profiles — Chat had no toggle anywhere before, and Tools had one the server understood but no checkbox ever offered. Hiding an entry blocks the page itself, not just the link, so it can\'t be reached by typing the URL. Video Automations already required admin, so it deliberately gets no checkbox rather than a control that does nothing.' },
-        { title: 'Manage Workers is its own toggle', desc: 'it used to hide only as part of the whole dashboard header. Now the enrichment/repair icons and the Manage Workers button are separate checkboxes on both dashboards. If you\'d already hidden the combined control in 1.2.0, that carries across — upgrading won\'t quietly put the button back.' },
-        { title: 'Your per-profile page permissions still apply', desc: 'the new switches are one global policy for every standard profile, including anyone who signs in with Plex tomorrow. The per-profile list under Manage Profiles keeps working on top of it: hidden by either means hidden, so nothing you\'ve already set up loosens.' },
-        { title: 'Earlier versions', desc: '1.2.0 let admins choose which dashboard cards standard users see, and stopped hidden cards polling in the background. 1.1.0 brought the Purchased page and a settings clean-up — the Video side\'s settings actually save, every configured Video Library is visible to members, settings that existed twice are down to one, and video server credentials are encrypted at rest. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
+    '1.3.2': [
+        { date: 'July 2026 · 1.3.2' },
+        { title: 'Your video Libraries now drive everything, not just downloads', desc: 'destination folders live in two places — each Library in Settings → Connections, and the flat Movies/TV boxes in Settings → Downloads. Downloads always honoured both. But the free-space health checks, the recycle bin, the "where did this file move to" resolver and the naming-repair job read ONLY the flat boxes. So the natural setup — set your paths per library, leave Downloads empty — silently meant no health checks, a recycle bin with nowhere to put anything (every delete permanent), and a naming job that skipped every single file. All four now read your Libraries. If you run two libraries of a kind, both are covered; a single flat box could only ever describe one.' },
+        { title: 'The Downloads folder boxes say what they are', desc: 'Movies and TV Shows there are labelled as fallbacks, because a Library\'s own Destination Folder wins for downloads into it. The YouTube box is called out separately — it is NOT a fallback, it is where followed-channel downloads always go, since Libraries cover movies and shows only.' },
+        { title: 'Standard users can\'t erase a purchase', desc: 'recording a purchase stays open to everyone; undoing one is now admin-only, on the server rather than by hiding a button. Both Unmark buttons go through the same call, so the per-track one is gone for standard profiles too — unmarking each track in turn was the same act as unmarking the album.' },
+        { title: 'The Interactive Help button can be hidden', desc: 'the floating ? is now a checkbox under Settings → Users → Standard User Interface, in a new "Both Sides" group since it floats over Music and Video alike.' },
+        { title: 'Earlier versions', desc: '1.3.1 added collapsible albums in Purchased. 1.3.0 extended the standard-user policy to the sidebar and split out Manage Workers. 1.2.0 let admins choose which dashboard cards standard users see. 1.1.0 brought the Purchased page and a settings clean-up. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
     ],
 };
 
@@ -3521,7 +3521,19 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.3.1: the sidebar joins in",
+        title: "1.3.2: settings that describe what they actually do",
+        description: "video destination folders were configured in two places with no explanation of how they related — and four subsystems quietly read only one of them. Your Libraries are now the source of truth everywhere, the Downloads boxes say plainly that they're fallbacks, and undoing a purchase becomes an admin action.",
+        features: [
+            "your video Libraries drive everything now: free-space health checks, the recycle bin, the moved-file resolver and the naming-repair job all read the Destination Folder on each Library in Settings → Connections. They previously read ONLY the flat Movies/TV boxes under Downloads — so setting your paths per library and leaving Downloads blank meant no health checks, a recycle bin that couldn't recycle (every delete permanent) and a naming job that skipped every file",
+            "two libraries of the same kind are both covered — a single flat path could only ever describe one of them, so an \"Anime Movies\" alongside \"Movies\" was never health-checked or recycled from",
+            "the Downloads folder boxes are relabelled: Movies and TV Shows are fallbacks that apply when a Library has no Destination Folder of its own. YouTube is flagged as the exception — it isn't a fallback, it's where followed-channel downloads always land, because Libraries cover movies and shows only",
+            "undoing a purchase is admin-only, enforced on the server instead of by hiding a button. Recording one stays open to every profile. Both Unmark buttons hit the same call, so the per-track one goes too for standard profiles — unmarking each track in turn was the same act",
+            "the floating Interactive Help ? button can be hidden from standard users, in a new \"Both Sides\" group since it isn't a Music or a Video element",
+        ],
+        usage_note: "Per-library Destination Folders are in Settings → Connections → Libraries; the fallbacks are in Settings → Downloads. The help-button toggle is with the rest under Settings → Users → Standard User Interface.",
+    },
+    {
+        title: "Earlier in 1.3.1 — the sidebar joins in",
         description: "1.2.0 let you trim the dashboard for standard users. This extends the same switch to the sidebar's System group and splits Manage Workers into its own toggle — so a standard profile can be given a genuinely reduced app, not just a reduced home page. Plus: albums in the Purchased list now fold away.",
         features: [
             "collapse albums in Purchased (1.3.1): click an album header or its chevron to fold its tracks away, with Collapse all / Expand all next to the search box. Collapsed albums stay collapsed through the refresh that follows an unmark, and across reloads",

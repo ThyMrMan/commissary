@@ -4500,6 +4500,7 @@ function renderDashboardWidgetOptions(hiddenIds) {
         ['video', 'card',   'Video Dashboard'],
         ['video', 'header', 'Video Dashboard Header'],
         ['video', 'nav',    'Video Sidebar · System'],
+        ['shared', 'chrome', 'Both Sides'],
     ];
 
     host.innerHTML = groups.map(([side, kind, heading]) => {

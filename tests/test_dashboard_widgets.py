@@ -188,7 +188,7 @@ def test_every_video_card_is_registered():
 
 # Registry entries that address their element by CSS selector rather than a
 # data-card attribute (header controls and sidebar nav entries).
-_NON_CARD_SUFFIXES = ('header-enrich', 'manage-workers', 'nav-')
+_NON_CARD_SUFFIXES = ('header-enrich', 'manage-workers', 'nav-', 'help-button')
 
 
 def _is_card(widget_id):
@@ -367,3 +367,38 @@ def test_socket_push_path_is_guarded():
         start = src.index(f'function {handler}')
         body = src[start:src.index('\n}', start)]
         assert f"isWidgetVisible('{widget}')" in body, f"{handler} unguarded"
+
+
+# ── app chrome: the Interactive Help button ──────────────────────────────────
+
+def test_help_button_is_hideable():
+    assert 'shared.help-button' in web_server.VALID_WIDGET_IDS
+    assert "selector: '#helper-float-btn'" in _WIDGETS_JS
+
+
+def test_help_button_belongs_to_neither_side():
+    """It floats over both sides, so filing it under Music or Video would
+    misrepresent what unchecking it does."""
+    start = _WIDGETS_JS.index("id: 'shared.help-button'")
+    entry = _WIDGETS_JS[start:_WIDGETS_JS.index('}', start)]
+    assert "side: 'shared'" in entry
+    assert 'global: true' in entry, (
+        "the button lives at body level, outside both dashboard roots — a "
+        "side-scoped lookup would never find it")
+
+
+def test_help_button_group_is_rendered_in_settings():
+    start = _SETTINGS_JS.index('const groups = [')
+    block = _SETTINGS_JS[start:_SETTINGS_JS.index('];', start)]
+    assert "'shared', 'chrome'" in block, (
+        "a registry entry with no matching group row renders nowhere — the "
+        "checkbox would silently not exist")
+
+
+def test_helper_js_never_fights_the_policy():
+    """applyWidgetPolicy hides via inline display:none. helper.js may toggle
+    classes on the button all it likes, but if it ever set style.display the
+    button would reappear for members."""
+    src = _read('webui/static/helper.js')
+    assert 'floatBtn.style.display' not in src
+    assert "getElementById('helper-float-btn').style.display" not in src

@@ -73,6 +73,13 @@ const DASHBOARD_WIDGETS = [
     // (VIDEO_ADMIN_ONLY in init.js), so a checkbox for it would do nothing.
     { id: 'video.nav-chat',  side: 'video', kind: 'nav', page: 'video-chat',  label: 'Chat',  selector: '.video-nav .nav-button[data-video-page="video-chat"]',  global: true },
     { id: 'video.nav-tools', side: 'video', kind: 'nav', page: 'video-tools', label: 'Tools', selector: '.video-nav .nav-button[data-video-page="video-tools"]', global: true },
+
+    // --- App chrome (neither side — floats over both) ---------------------
+    // helper.js only ever toggles CLASSES on this button (active, menu-open,
+    // undiscovered, has-badge), never style.display, so hiding it here can't
+    // be fought back. The What's New changelog has its own version button and
+    // is unaffected.
+    { id: 'shared.help-button', side: 'shared', kind: 'chrome', label: 'Interactive Help (? button)', selector: '#helper-float-btn', global: true },
 ];
 
 // Populated from the /api/profiles/current payload. `null` means "not loaded
