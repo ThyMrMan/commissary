@@ -12,7 +12,63 @@ const purchasedPageState = {
     search: '',
     totalPages: 1,
     debounceTimer: null,
+    // Album ids whose track list is collapsed. Held here (not read off the DOM)
+    // because every unmark re-fetches and re-renders the whole list — reading
+    // the old DOM would lose the state on exactly the action most likely to
+    // follow a collapse. Mirrored to localStorage so it survives a reload.
+    collapsed: new Set(),
 };
+
+const PURCHASED_COLLAPSED_KEY = 'purchasedCollapsedAlbums';
+
+function _loadPurchasedCollapsed() {
+    try {
+        const raw = JSON.parse(localStorage.getItem(PURCHASED_COLLAPSED_KEY) || '[]');
+        if (Array.isArray(raw)) purchasedPageState.collapsed = new Set(raw.map(String));
+    } catch (e) {
+        // Corrupt or unavailable storage is not worth failing the page over.
+    }
+}
+
+function _savePurchasedCollapsed() {
+    try {
+        // Cap it: an album collapsed once and never seen again would otherwise
+        // sit in storage forever.
+        const ids = Array.from(purchasedPageState.collapsed).slice(-500);
+        localStorage.setItem(PURCHASED_COLLAPSED_KEY, JSON.stringify(ids));
+    } catch (e) {
+        /* storage full or blocked — collapsing still works for this session */
+    }
+}
+
+function _setPurchasedCollapsed(albumId, collapsed) {
+    const id = String(albumId);
+    if (collapsed) purchasedPageState.collapsed.add(id);
+    else purchasedPageState.collapsed.delete(id);
+    _savePurchasedCollapsed();
+}
+
+function _applyPurchasedCollapseState(cardEl, collapsed) {
+    cardEl.classList.toggle('purchased-album-card--collapsed', collapsed);
+    const toggle = cardEl.querySelector('.purchased-album-toggle');
+    if (toggle) {
+        toggle.setAttribute('aria-expanded', String(!collapsed));
+        toggle.setAttribute('title', collapsed ? 'Show tracks' : 'Hide tracks');
+    }
+}
+
+// Are all the albums currently rendered collapsed? Drives the header button's
+// label, so it always offers the action that would actually change something.
+function _updatePurchasedCollapseAllBtn() {
+    const btn = document.getElementById('purchased-collapse-all-btn');
+    if (!btn) return;
+    const cards = document.querySelectorAll('#purchased-albums-list .purchased-album-card');
+    if (!cards.length) { btn.classList.add('hidden'); return; }
+    btn.classList.remove('hidden');
+    const allCollapsed = Array.from(cards).every(c => c.classList.contains('purchased-album-card--collapsed'));
+    btn.textContent = allCollapsed ? 'Expand all' : 'Collapse all';
+    btn.dataset.action = allCollapsed ? 'expand' : 'collapse';
+}
 
 async function initializePurchasedPage() {
     if (!purchasedPageState.isInitialized) {
@@ -35,6 +91,15 @@ async function initializePurchasedPage() {
         if (nextBtn) nextBtn.addEventListener('click', () => {
             if (purchasedPageState.page < purchasedPageState.totalPages) { purchasedPageState.page++; _loadPurchasedAlbums(); }
         });
+
+        const collapseAllBtn = document.getElementById('purchased-collapse-all-btn');
+        if (collapseAllBtn) {
+            collapseAllBtn.addEventListener('click', () => {
+                _togglePurchasedAll(collapseAllBtn.dataset.action !== 'expand');
+            });
+        }
+
+        _loadPurchasedCollapsed();
         purchasedPageState.isInitialized = true;
     }
     await _loadPurchasedAlbums();
@@ -64,6 +129,7 @@ async function _loadPurchasedAlbums() {
 
         if (!albums.length) {
             listEl.innerHTML = '';
+            _updatePurchasedCollapseAllBtn();
             if (emptyEl) {
                 emptyEl.classList.remove('hidden');
                 const heading = emptyEl.querySelector('h3');
@@ -72,6 +138,7 @@ async function _loadPurchasedAlbums() {
         } else {
             listEl.innerHTML = albums.map(_purchasedAlbumCardHtml).join('');
             _wirePurchasedRowButtons(listEl);
+            _updatePurchasedCollapseAllBtn();
         }
 
         if (paginationEl && purchasedPageState.totalPages > 1) {
@@ -106,9 +173,20 @@ function _purchasedAlbumCardHtml(album) {
         </div>
     `).join('');
 
+    const albumId = String(album.album_id);
+    const isCollapsed = purchasedPageState.collapsed.has(albumId);
+    const cardCls = 'purchased-album-card' + (isCollapsed ? ' purchased-album-card--collapsed' : '');
+    const trackCount = (album.tracks || []).length;
+
     return `
-        <div class="purchased-album-card" data-album-id="${escapeHtml(String(album.album_id))}">
+        <div class="${cardCls}" data-album-id="${escapeHtml(albumId)}">
             <div class="purchased-album-header">
+                <button class="purchased-album-toggle" type="button"
+                        aria-expanded="${String(!isCollapsed)}"
+                        aria-label="Toggle ${escapeHtml(String(trackCount))} track(s)"
+                        title="${isCollapsed ? 'Show tracks' : 'Hide tracks'}">
+                    <span class="purchased-album-chevron" aria-hidden="true">▾</span>
+                </button>
                 ${thumb}
                 <div class="purchased-album-info">
                     <div class="purchased-album-title">${escapeHtml(album.album_title || 'Unknown Album')}</div>
@@ -144,6 +222,33 @@ function _wirePurchasedRowButtons(container) {
             _purchasedUnmark(ids, btn.closest('.purchased-album-card'));
         });
     });
+
+    // Collapse/expand: the whole header is the hit target (the chevron alone is
+    // a small one), but a click that landed on a real control inside it —
+    // Unmark Album — must do that instead of toggling.
+    container.querySelectorAll('.purchased-album-header').forEach(header => {
+        header.addEventListener('click', (e) => {
+            if (e.target.closest('button:not(.purchased-album-toggle)')) return;
+            if (e.target.closest('a')) return;
+            _togglePurchasedAlbum(header.closest('.purchased-album-card'));
+        });
+    });
+}
+
+function _togglePurchasedAlbum(cardEl) {
+    if (!cardEl) return;
+    const collapsed = !cardEl.classList.contains('purchased-album-card--collapsed');
+    _setPurchasedCollapsed(cardEl.dataset.albumId, collapsed);
+    _applyPurchasedCollapseState(cardEl, collapsed);
+    _updatePurchasedCollapseAllBtn();
+}
+
+function _togglePurchasedAll(collapse) {
+    document.querySelectorAll('#purchased-albums-list .purchased-album-card').forEach(card => {
+        _setPurchasedCollapsed(card.dataset.albumId, collapse);
+        _applyPurchasedCollapseState(card, collapse);
+    });
+    _updatePurchasedCollapseAllBtn();
 }
 
 async function _purchasedUnmark(trackIds, cardEl) {

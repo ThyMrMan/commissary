@@ -3484,8 +3484,9 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.3.0': [
-        { date: 'July 2026 · 1.3.0' },
+    '1.3.1': [
+        { date: 'July 2026 · 1.3.1' },
+        { title: 'Collapse albums in the Purchased list', desc: 'a long purchase history meant a lot of scrolling past track rows you weren\'t looking for. Click an album header — or its new chevron — to fold its tracks away, with Collapse all / Expand all beside the search box. What you\'ve collapsed is remembered, including across the refresh that follows unmarking something, and across reloads.' },
         { title: 'Hide sidebar entries too, not just dashboard cards', desc: 'Automations, Chat and Tools under System can now be hidden from standard profiles — Chat had no toggle anywhere before, and Tools had one the server understood but no checkbox ever offered. Hiding an entry blocks the page itself, not just the link, so it can\'t be reached by typing the URL. Video Automations already required admin, so it deliberately gets no checkbox rather than a control that does nothing.' },
         { title: 'Manage Workers is its own toggle', desc: 'it used to hide only as part of the whole dashboard header. Now the enrichment/repair icons and the Manage Workers button are separate checkboxes on both dashboards. If you\'d already hidden the combined control in 1.2.0, that carries across — upgrading won\'t quietly put the button back.' },
         { title: 'Your per-profile page permissions still apply', desc: 'the new switches are one global policy for every standard profile, including anyone who signs in with Plex tomorrow. The per-profile list under Manage Profiles keeps working on top of it: hidden by either means hidden, so nothing you\'ve already set up loosens.' },
@@ -3520,16 +3521,17 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.3.0: the sidebar joins in",
-        description: "1.2.0 let you trim the dashboard for standard users. This extends the same switch to the sidebar's System group and splits Manage Workers into its own toggle — so a standard profile can be given a genuinely reduced app, not just a reduced home page.",
+        title: "1.3.1: the sidebar joins in",
+        description: "1.2.0 let you trim the dashboard for standard users. This extends the same switch to the sidebar's System group and splits Manage Workers into its own toggle — so a standard profile can be given a genuinely reduced app, not just a reduced home page. Plus: albums in the Purchased list now fold away.",
         features: [
+            "collapse albums in Purchased (1.3.1): click an album header or its chevron to fold its tracks away, with Collapse all / Expand all next to the search box. Collapsed albums stay collapsed through the refresh that follows an unmark, and across reloads",
             "Automations, Chat and Tools under System can be hidden from standard profiles, on both the Music and Video sidebars. Chat previously had no way to hide it at all, and Tools had server-side support with no checkbox ever offering it",
             "hiding a sidebar entry blocks the PAGE, not just the link — a hidden Chat or Tools redirects to the profile's home page instead of loading, so it can't be reached from a bookmark or a typed URL",
             "Manage Workers is now its own checkbox on each dashboard, separate from the enrichment/repair icons it used to be bundled with. An install that hid the combined 1.2.0 control keeps Manage Workers hidden — the setting is carried across on upgrade",
             "no checkbox for Video Automations: it already requires admin, so offering one would be a control that does nothing",
             "this is one global policy covering every standard profile, so a Plex user who signs in tomorrow inherits it with no per-person setup. The per-profile page list under Manage Profiles still applies on top — hidden by either means hidden, and nothing you've already configured loosens",
         ],
-        usage_note: "Settings → Users → Standard User Interface (renamed from Standard User Dashboard, since it now covers the sidebar and header too). Admins always see everything.",
+        usage_note: "Settings → Users → Standard User Interface (renamed from Standard User Dashboard, since it now covers the sidebar and header too). Admins always see everything. The Purchased collapse controls are on the Purchased page itself, under Music.",
     },
     {
         title: "Earlier in 1.2.0 — a dashboard that fits the person looking at it",

@@ -284,3 +284,53 @@ def test_full_round_trip_download_to_purchased_to_unmarked(client):
     assert not any(a["album_id"] == "pwa4" for a in purchased_gone["albums"])
     shopping_still_gone = client.get("/api/library/to-be-purchased").get_json()
     assert not any(t["id"] == "pwt4" for t in shopping_still_gone["tracks"])
+
+
+# ── collapsible album cards (UI source guards) ───────────────────────────────
+#
+# No JS runner in this repo, so these pin the wiring the feature depends on —
+# same approach as tests/test_settings_partial_save.py's source guards.
+
+_WEBUI = Path(__file__).resolve().parent.parent / "webui"
+_PURCHASED_JS = (_WEBUI / "static" / "purchased.js").read_text(encoding="utf-8")
+_STYLE_CSS = (_WEBUI / "static" / "style.css").read_text(encoding="utf-8")
+_INDEX_HTML = (_WEBUI / "index.html").read_text(encoding="utf-8", errors="replace")
+
+
+def test_collapse_state_survives_the_post_unmark_rerender():
+    """Every unmark re-fetches and re-renders the whole list, so collapse state
+    has to live outside the DOM or it is lost on the action most likely to
+    follow a collapse."""
+    assert "collapsed: new Set()" in _PURCHASED_JS
+    start = _PURCHASED_JS.index("function _purchasedAlbumCardHtml")
+    body = _PURCHASED_JS[start:_PURCHASED_JS.index("\nfunction ", start + 10)]
+    assert "purchasedPageState.collapsed.has(albumId)" in body, (
+        "the card renderer ignores the collapse set — a re-render would spring "
+        "every collapsed album back open")
+
+
+def test_unmark_album_button_does_not_toggle_the_card():
+    """The header is the click target for collapsing, and Unmark Album sits
+    inside it — without the guard, unmarking would also collapse the card."""
+    assert "button:not(.purchased-album-toggle)" in _PURCHASED_JS
+
+
+def test_collapse_all_button_exists_and_is_wired():
+    assert 'id="purchased-collapse-all-btn"' in _INDEX_HTML
+    assert "purchased-collapse-all-btn" in _PURCHASED_JS
+    assert "_togglePurchasedAll" in _PURCHASED_JS
+
+
+def test_collapsed_cards_hide_their_tracks():
+    assert ".purchased-album-card--collapsed .purchased-track-rows { display: none; }" in _STYLE_CSS
+
+
+def test_purchased_controls_row_is_scoped_to_this_page():
+    """.library-controls is shared with the Library page, which stacks its
+    children. Widening it globally would relayout that page too."""
+    assert ".purchased-page-container .library-controls {" in _STYLE_CSS
+
+
+def test_toggle_reports_state_to_assistive_tech():
+    assert "aria-expanded" in _PURCHASED_JS
+    assert "aria-label" in _PURCHASED_JS

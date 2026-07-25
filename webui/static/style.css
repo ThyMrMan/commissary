@@ -70933,7 +70933,34 @@ body.em-scroll-lock { overflow: hidden; }
 }
 .purchased-album-header {
     display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    cursor: pointer;  /* the whole header toggles the track list */
 }
+/* Chevron toggle. The header is the real hit target; this is the affordance
+   that says so, and the keyboard-reachable control. */
+.purchased-album-toggle {
+    display: flex; align-items: center; justify-content: center;
+    width: 24px; height: 24px; flex-shrink: 0; padding: 0;
+    background: transparent; border: none; border-radius: 6px;
+    color: rgba(255,255,255,0.45); cursor: pointer;
+    transition: background .12s ease, color .12s ease;
+}
+.purchased-album-toggle:hover { background: rgba(255,255,255,0.07); color: rgba(255,255,255,0.8); }
+.purchased-album-toggle:focus-visible { outline: 2px solid rgba(46,204,113,0.6); outline-offset: 1px; }
+.purchased-album-chevron {
+    font-size: 13px; line-height: 1;
+    transition: transform .16s ease;
+}
+.purchased-album-card--collapsed .purchased-album-chevron { transform: rotate(-90deg); }
+.purchased-album-card--collapsed .purchased-track-rows { display: none; }
+
+/* .library-controls is shared with the Library page and stacks its children;
+   here the Collapse-all button belongs beside the search box, so make just
+   this page's copy a row. */
+.purchased-page-container .library-controls {
+    flex-direction: row; align-items: center; gap: 12px; flex-wrap: wrap;
+}
+.purchased-page-container .library-search-container { flex: 1; }
+.purchased-collapse-all-btn { flex-shrink: 0; white-space: nowrap; }
 .purchased-album-thumb {
     width: 48px; height: 48px; border-radius: 7px; flex-shrink: 0;
     object-fit: cover; background: rgba(255,255,255,0.05);
