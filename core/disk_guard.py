@@ -48,15 +48,32 @@ def free_gb(path: str) -> float | None:
         return None
 
 
-def floor_gb() -> float:
-    """The configured minimum-free floor (GB). 0 = guard off."""
-    if _floor_override is not None:
-        return _floor_override
+def configured_floor_gb() -> float:
+    """The STORED minimum-free floor (GB), SHARED by both sides — ignoring the
+    test override.
+
+    Canonical key is ``settings.min_free_disk_gb``; the video side reads this
+    too (core/video/organization), so there is one floor rather than the old
+    pair with different defaults (music 5.0, video 0). Falls back to the legacy
+    music-only ``soulseek.min_free_disk_gb`` when the canonical key was never
+    written, so existing installs keep whatever they had configured.
+    """
     try:
         from config.settings import config_manager
-        return max(0.0, float(config_manager.get("soulseek.min_free_disk_gb", DEFAULT_FLOOR_GB)))
+        shared = config_manager.get("settings.min_free_disk_gb", None)
+        if shared is None or shared == "":
+            shared = config_manager.get("soulseek.min_free_disk_gb", DEFAULT_FLOOR_GB)
+        return max(0.0, float(shared))
     except Exception:   # noqa: BLE001 - config hiccup must never wedge downloads
         return DEFAULT_FLOOR_GB
+
+
+def floor_gb() -> float:
+    """The EFFECTIVE floor (GB) for a guard check. 0 = guard off. Honours the
+    test override so the suite never depends on the runner's real fill level."""
+    if _floor_override is not None:
+        return _floor_override
+    return configured_floor_gb()
 
 
 def music_has_room() -> tuple[bool, float | None, float]:

@@ -31,6 +31,10 @@ from __future__ import annotations
 import json
 import os
 import re
+
+from utils.logging_config import get_logger
+
+logger = get_logger("video.organization")
 from typing import Any
 
 from core.video.library_paths import sanitize, source_label
@@ -127,19 +131,69 @@ def normalize(raw: Any) -> dict:
     return d
 
 
+# ``min_free_disk_gb`` is SHARED with music — same concept, and it used to exist
+# twice with different defaults (music soulseek.min_free_disk_gb = 5.0, video's
+# organization blob = 0). It now lives on the app-wide ``settings.min_free_disk_gb``
+# and is merged into/out of this payload, so every caller
+# (disk_guard.has_room(target, organization.load(db))) is unchanged.
+_SHARED_MIN_FREE_KEY = "settings.min_free_disk_gb"
+_MIN_FREE_PROMOTION_MARKER = "min_free_disk_promoted"
+_min_free_promotion_checked = False
+
+
+def _shared_min_free() -> float:
+    # The STORED value: this is settings data being read back for the UI and for
+    # has_room's explicit-floor path, not a live guard decision, so it must not
+    # pick up the guard's test override.
+    from core.disk_guard import configured_floor_gb
+    return configured_floor_gb()
+
+
+def _promote_min_free_once(db, stored: dict) -> None:
+    """One-shot: an EXPLICIT non-zero video floor is a deliberate choice, so it
+    wins and becomes the shared value. A video side left at the 0 default simply
+    adopts the shared floor — which means such installs newly gain music's 5 GB
+    default. That only ever REFUSES a grab (never deletes anything) and is
+    reversible from the one field, so it's the safe direction."""
+    global _min_free_promotion_checked
+    if _min_free_promotion_checked:
+        return
+    try:
+        if str(db.get_setting(_MIN_FREE_PROMOTION_MARKER) or "") == "1":
+            _min_free_promotion_checked = True
+            return
+        from config.settings import config_manager
+        video_floor = float(stored.get("min_free_disk_gb") or 0)
+        if video_floor > 0:
+            config_manager.set(_SHARED_MIN_FREE_KEY, video_floor)
+        db.set_setting(_MIN_FREE_PROMOTION_MARKER, "1")
+        _min_free_promotion_checked = True
+    except Exception:
+        logger.exception("min-free-disk promotion failed (non-fatal)")
+
+
 def load(db) -> dict:
+    d = default_settings()
     raw = db.get_setting("organization")
     if raw:
         try:
-            return normalize(json.loads(raw))
+            d = normalize(json.loads(raw))
         except (ValueError, TypeError):
             pass
-    return default_settings()
+    _promote_min_free_once(db, d)
+    d["min_free_disk_gb"] = _shared_min_free()
+    return d
 
 
 def save(db, raw: Any) -> dict:
     s = normalize(raw)
-    db.set_setting("organization", json.dumps(s))
+    _promote_min_free_once(db, s)
+    if isinstance(raw, dict) and "min_free_disk_gb" in raw:
+        from config.settings import config_manager
+        config_manager.set(_SHARED_MIN_FREE_KEY, s["min_free_disk_gb"])
+    stored = {k: v for k, v in s.items() if k != "min_free_disk_gb"}
+    db.set_setting("organization", json.dumps(stored))
+    s["min_free_disk_gb"] = _shared_min_free()
     return s
 
 

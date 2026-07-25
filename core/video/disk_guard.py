@@ -37,13 +37,28 @@ def free_gb(path: str) -> float | None:
         return None
 
 
-def has_room(target_dir: str, settings: dict | None) -> tuple[bool, float | None]:
+def has_room(target_dir: str, settings: dict | None = None) -> tuple[bool, float | None]:
     """(ok, free_gb). ok False ONLY when the guard is on, the probe worked,
-    and free space is under the floor."""
-    try:
-        floor = float((settings or {}).get("min_free_disk_gb") or 0)
-    except (TypeError, ValueError):
-        floor = 0
+    and free space is under the floor.
+
+    The floor is SHARED with music (``settings.min_free_disk_gb``) — it used to
+    exist twice with different defaults. ``organization.load()`` merges the
+    shared value into the dict callers already pass, so an explicit
+    ``min_free_disk_gb`` here still wins; omit it to resolve the shared floor
+    directly.
+    """
+    floor = None
+    if settings and "min_free_disk_gb" in settings:
+        try:
+            floor = float(settings.get("min_free_disk_gb") or 0)
+        except (TypeError, ValueError):
+            floor = 0
+    if floor is None:
+        try:
+            from core.disk_guard import floor_gb
+            floor = floor_gb()
+        except Exception:   # noqa: BLE001 - never wedge downloads on a config hiccup
+            floor = 0
     if floor <= 0:
         return True, None
     free = free_gb(target_dir)

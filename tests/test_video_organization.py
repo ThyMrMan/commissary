@@ -5,6 +5,7 @@ movie/episode shape.
 
 from __future__ import annotations
 
+import json
 import os
 
 from core.video import organization
@@ -54,10 +55,18 @@ def test_load_save_roundtrip():
             self.store[key] = value
 
     db = FakeDB()
-    assert organization.load(db) == organization.default_settings()      # nothing stored yet
+    # min_free_disk_gb is SHARED with music (settings.min_free_disk_gb) rather
+    # than stored in this blob, so it reflects the app-wide floor, not the
+    # video-side default — compare everything else against the defaults.
+    def _video_only(d):
+        return {k: v for k, v in d.items() if k != "min_free_disk_gb"}
+
+    assert _video_only(organization.load(db)) == _video_only(organization.default_settings())
     saved = organization.save(db, {"transfer_mode": "move"})
     assert saved["transfer_mode"] == "move"
     assert organization.load(db)["transfer_mode"] == "move"              # persisted + reloads
+    # ...and the shared key is never written into the video blob.
+    assert "min_free_disk_gb" not in json.loads(db.store["organization"])
 
 
 # ── template rendering ────────────────────────────────────────────────────────

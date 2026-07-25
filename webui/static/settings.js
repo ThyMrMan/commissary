@@ -1522,7 +1522,10 @@ async function loadSettingsData() {
         document.getElementById('download-path').value = settings.soulseek?.download_path || './downloads';
         document.getElementById('transfer-path').value = settings.soulseek?.transfer_path || './Transfer';
         const minFree = document.getElementById('min-free-disk-gb');
-        if (minFree) minFree.value = settings.soulseek?.min_free_disk_gb ?? 5;
+        // Shared floor; falls back to the legacy music-only key for installs
+        // that predate the move (mirrors core/disk_guard.floor_gb).
+        if (minFree) minFree.value = settings.settings?.min_free_disk_gb
+            ?? settings.soulseek?.min_free_disk_gb ?? 5;
         applyPathsEnvironment(settings);
         document.getElementById('staging-path').value = settings.import?.staging_path || './Staging';
         document.getElementById('music-videos-path').value = settings.library?.music_videos_path || './MusicVideos';
@@ -4453,6 +4456,13 @@ const SHARED_SECTION_BUILDERS = {
     database: () => ({
         max_workers: parseInt(document.getElementById('max-workers').value)
     }),
+    // min_free_disk_gb is one floor for BOTH sides (core/disk_guard.floor_gb,
+    // which core/video/disk_guard resolves through). It used to exist twice —
+    // music's soulseek.min_free_disk_gb defaulting to 5 and video's
+    // organization blob defaulting to 0 — for the same concept.
+    settings: () => ({
+        min_free_disk_gb: Math.max(0, parseFloat(document.getElementById('min-free-disk-gb')?.value) || 0),
+    }),
 };
 
 function collectSharedSettings() {
@@ -4618,7 +4628,10 @@ async function saveSettings(quiet = false) {
             api_key: document.getElementById('soulseek-api-key').value,
             download_path: document.getElementById('download-path').value,
             transfer_path: document.getElementById('transfer-path').value,
-            min_free_disk_gb: Math.max(0, parseFloat(document.getElementById('min-free-disk-gb')?.value) || 0),
+            // min_free_disk_gb moved to the SHARED settings.* section — see
+            // SHARED_SECTION_BUILDERS. The legacy soulseek key is still READ as
+            // a fallback (core/disk_guard.floor_gb) so existing installs keep
+            // their configured value until the next save.
             search_timeout: parseInt(document.getElementById('soulseek-search-timeout').value) || 60,
             search_timeout_buffer: parseInt(document.getElementById('soulseek-search-timeout-buffer').value) || 15,
             search_min_delay_seconds: parseInt(document.getElementById('soulseek-search-min-delay-seconds').value) || 0,
