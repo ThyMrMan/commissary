@@ -74,7 +74,7 @@ def create_video_blueprint() -> Blueprint:
         # only ever hit by the admin-only Settings page).
         admin = _p("/api/video/overlays", "/api/video/import", "/api/video/collections",
                    "/api/video/repair",
-                   "/api/video/server-config", "/api/video/jellyfin", "/api/video/libraries",
+                   "/api/video/server-config", "/api/video/jellyfin",
                    "/api/video/organization", "/api/video/downloads/slskd",
                    "/api/video/enrichment/config", "/api/video/enrichment/priority",
                    "/api/video/notifications",   # P11: GETs return webhook URLs/bot tokens
@@ -82,7 +82,11 @@ def create_video_blueprint() -> Blueprint:
         # Config the Settings page WRITES but content views (download modal / grab)
         # legitimately READ — gate the writes, leave the GETs open.
         if writing:
-            admin = admin or _p("/api/video/server", "/api/video/downloads/config",
+            # /libraries GET is the Library page's tab bar + the download
+            # destination picker — content views, not settings. Only the POST
+            # (the Settings editor saving the registry) is admin.
+            admin = admin or _p("/api/video/libraries",
+                                 "/api/video/server", "/api/video/downloads/config",
                                  "/api/video/downloads/quality",
                                  "/api/video/downloads/youtube-quality",
                                  "/api/video/enrichment")   # all enrichment mutations

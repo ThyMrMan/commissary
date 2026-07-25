@@ -50,7 +50,6 @@ def test_settings_endpoints_are_admin_only(tmp_path):
         ("get", "/api/video/enrichment/config"),   # was returning every API key raw
         ("get", "/api/video/downloads/slskd"),     # was returning the shared slskd api_key
         ("get", "/api/video/server-config"),
-        ("get", "/api/video/libraries"),
         ("get", "/api/video/enrichment/priority"),
         ("post", "/api/video/enrichment/config"),
         ("post", "/api/video/downloads/slskd"),
@@ -540,6 +539,42 @@ def test_libraries_endpoint_lists_and_saves(tmp_path, monkeypatch):
         data2 = client.get("/api/video/libraries").get_json()
         assert [m["server_title"] for m in data2["configured"]["movies"]] == ["Movies"]
         assert [t["server_title"] for t in data2["configured"]["tv"]] == ["TV"]
+    finally:
+        videoapi._video_db = None
+
+
+def test_libraries_get_is_open_to_members_but_trimmed(tmp_path, monkeypatch):
+    """Regression: the Library page's tab bar and the download destination picker
+    both read GET /api/video/libraries. Gating it to admins made every member —
+    notably profiles that signed in with Plex — fall back to the hardcoded
+    Movies/Shows tabs, hiding every extra configured Library. It stays open, but
+    a member gets only the configured registry: no live server discovery, and no
+    filesystem paths."""
+    c = _client_as(tmp_path, is_admin=False)
+    import api.video as videoapi
+    try:
+        import core.video.sources as vs
+        monkeypatch.setattr(vs, "resolve_video_server", lambda: "plex")
+        def _boom():
+            raise AssertionError("members must not trigger server discovery")
+        monkeypatch.setattr(vs, "list_video_libraries", _boom)
+
+        videoapi.get_video_db().save_libraries(
+            "plex",
+            [{"server_title": "Movies", "path": "/media/movies"},
+             {"server_title": "Anime Movies", "label": "Anime", "path": "/media/anime"}],
+            [{"server_title": "TV", "path": "/media/tv"}], None)
+
+        r = c.get("/api/video/libraries")
+        assert r.status_code == 200, "members need the tab bar's library list"
+        cfg = r.get_json()["configured"]
+        assert [m["label"] or m["server_title"] for m in cfg["movies"]] == ["Movies", "Anime"]
+        assert [t["server_title"] for t in cfg["tv"]] == ["TV"]
+        assert all("path" not in e for e in cfg["movies"] + cfg["tv"])
+        assert cfg["movies"][0]["id"]      # the tab's rootFolderId
+
+        # ...but SAVING the registry is still Settings-only.
+        assert c.post("/api/video/libraries", json={}).status_code == 403
     finally:
         videoapi._video_db = None
 

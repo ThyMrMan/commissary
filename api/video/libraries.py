@@ -4,6 +4,10 @@ GET  /api/video/libraries -> discover the active server's Movies/TV sections,
                              plus the user's CONFIGURED Libraries for it (each:
                              {id, server_title, label, path, sort_order}) —
                              including any manually-named YouTube libraries.
+                             Open to any video-side profile (the Library tab bar
+                             and the download destination picker both need it);
+                             non-admins get only the configured registry, with
+                             no server discovery and no filesystem paths.
 POST /api/video/libraries -> save {movies, tv, youtube} — arrays of Library
                              entries ({id?, server_title, label, path}) for
                              the active server. The scanner then reads only
@@ -24,15 +28,37 @@ logger = get_logger("video_api.libraries")
 
 
 def register_routes(bp):
+    # What a non-admin sees per configured Library: enough to render a tab and
+    # pick a download destination, and nothing else. Filesystem paths are
+    # settings-only detail, so they stay out of the member-facing payload.
+    _MEMBER_LIB_FIELDS = ("id", "server_title", "label", "sort_order", "category")
+
     @bp.route("/libraries", methods=["GET"])
     def video_libraries():
+        from flask import g
         from . import get_video_db
         try:
             from core.video.sources import list_video_libraries, resolve_video_server
-            libs = list_video_libraries() or {"server": None, "movies": [], "tv": []}
-            server = libs.get("server") or resolve_video_server()
-            libs["configured"] = (get_video_db().list_libraries(server)
-                                  if server else {"movies": [], "tv": [], "youtube": []})
+            is_admin = bool(getattr(g, "is_admin", getattr(g, "profile_id", 1) == 1))
+
+            if is_admin:
+                libs = list_video_libraries() or {"server": None, "movies": [], "tv": []}
+                server = libs.get("server") or resolve_video_server()
+            else:
+                # Members skip server DISCOVERY entirely — it's a live Plex/Jellyfin
+                # round-trip that enumerates every section on the server (Settings-only
+                # data). They only need the registry the admin already configured.
+                server = resolve_video_server()
+                libs = {"server": server, "movies": [], "tv": []}
+
+            configured = (get_video_db().list_libraries(server)
+                          if server else {"movies": [], "tv": [], "youtube": []})
+            if not is_admin:
+                configured = {
+                    kind: [{k: e.get(k) for k in _MEMBER_LIB_FIELDS} for e in (entries or [])]
+                    for kind, entries in configured.items()
+                }
+            libs["configured"] = configured
             return jsonify(libs)
         except Exception:
             logger.exception("Failed to list video libraries")
