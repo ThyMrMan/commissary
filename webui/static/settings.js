@@ -78,17 +78,11 @@ function syncRetryConditionalRows() {
 }
 window.syncRetryConditionalRows = syncRetryConditionalRows;
 
-function debouncedAutoSaveSettings() {
+function debouncedAutoSaveSettings(evt) {
     // Ignore changes made while the page is programmatically populating its
     // fields on load — those aren't user edits and must not trigger a full
     // save (which re-initializes every backend service client).
     if (window._suppressSettingsAutoSave) return;
-    // ISOLATION: the video side reuses this shared settings page, so editing a
-    // VIDEO field (TMDB key, region, autoplay…) would otherwise fire this MUSIC
-    // auto-save — which reads the server toggle from the DOM and would persist
-    // active_media_server, letting the video side change the music server. Video
-    // settings save themselves via /api/video/*; never auto-save music here.
-    if (document.body.getAttribute('data-side') === 'video') return;
     // #879: never auto-save while the last settings load failed — the form is
     // showing defaults, not the real config, so saving would wipe it.
     if (window._settingsLoadFailed) return;
@@ -97,6 +91,26 @@ function debouncedAutoSaveSettings() {
     // flooding app.log with "Settings saved" lines, drowning out the logs the
     // user is trying to read. Never auto-save while the Logs tab is active.
     if (document.querySelector('.stg-tab.active')?.dataset.tab === 'logs') return;
+    // ISOLATION: the video side reuses this shared settings page. Editing a
+    // VIDEO field (TMDB key, region, autoplay…) must NEVER fire the music
+    // auto-save — it reads the server toggle from the DOM and would persist
+    // active_media_server, letting the video side change the music server.
+    // Video's own settings save themselves via /api/video/*.
+    //
+    // But the page also shows genuinely SHARED sections on video (Prowlarr,
+    // torrent/usenet client, appearance, security, db workers), which are
+    // music-config-backed and used to be silently unsaveable there. So on the
+    // video side auto-save is SCOPED: only an edit inside a [data-shared]
+    // section triggers it, and it posts only the shared sections. This listener
+    // is bound to EVERY input on the page (see below), so the scope check is
+    // what keeps a video-only field from reaching the music config.
+    if (document.body.getAttribute('data-side') === 'video') {
+        const el = (evt && evt.target) || document.activeElement;
+        if (!el || typeof el.closest !== 'function' || !el.closest('[data-shared]')) return;
+        if (settingsAutoSaveTimer) clearTimeout(settingsAutoSaveTimer);
+        settingsAutoSaveTimer = setTimeout(() => saveSharedSettings(true), 2000);
+        return;
+    }
     if (settingsAutoSaveTimer) clearTimeout(settingsAutoSaveTimer);
     settingsAutoSaveTimer = setTimeout(() => saveSettings(true), 2000);
 }
@@ -4379,6 +4393,113 @@ function _getTagConfig(path) {
     return el ? el.checked : true;
 }
 
+// ── Shared (music + video) settings sections ─────────────────────────────────
+// This settings page is reused by BOTH sides (video-side.js maps video-settings
+// -> settings and CSS filters it per side). These sections configure ONE
+// physical resource or one app-wide preference, so both sides edit the same
+// config_manager keys — the boundary api/video/downloads.py's _SLSKD_KEYS
+// already draws for slskd, applied to the sections the video page shows.
+//
+// Defined once so music's full save and the video side's partial save can never
+// drift. Each builder returns ONLY the shared keys; saveSettings() merges them
+// OVER its own section object, so a shared section that also carries music-only
+// keys keeps them.
+const SHARED_SECTION_BUILDERS = {
+    prowlarr: () => ({
+        url: document.getElementById('prowlarr-url')?.value || '',
+        api_key: document.getElementById('prowlarr-api-key')?.value || '',
+        indexer_ids: document.getElementById('prowlarr-indexer-ids')?.value || '',
+    }),
+    torrent_client: () => ({
+        type: document.getElementById('torrent-client-type')?.value || 'qbittorrent',
+        url: document.getElementById('torrent-client-url')?.value || '',
+        username: document.getElementById('torrent-client-username')?.value || '',
+        password: document.getElementById('torrent-client-password')?.value || '',
+        category: document.getElementById('torrent-client-category')?.value || 'soulsync',
+        save_path: document.getElementById('torrent-client-save-path')?.value || '',
+        seed_ratio_goal: parseFloat(document.getElementById('music-seed-ratio')?.value) || 0,
+        seed_time_goal_hours: parseInt(document.getElementById('music-seed-hours')?.value, 10) || 0,
+        seed_remove_data: !!(document.getElementById('music-seed-remove-data') || {}).checked,
+        seed_mode: document.getElementById('music-seed-mode')?.value || 'soulsync',
+    }),
+    usenet_client: () => ({
+        type: document.getElementById('usenet-client-type')?.value || 'sabnzbd',
+        url: document.getElementById('usenet-client-url')?.value || '',
+        api_key: document.getElementById('usenet-client-api-key')?.value || '',
+        username: document.getElementById('usenet-client-username')?.value || '',
+        password: document.getElementById('usenet-client-password')?.value || '',
+        category: document.getElementById('usenet-client-category')?.value || 'soulsync',
+    }),
+    ui_appearance: () => ({
+        accent_preset: document.getElementById('accent-preset')?.value || '#1db954',
+        accent_color: document.getElementById('accent-custom-color')?.value || '#1db954',
+        sidebar_visualizer: document.getElementById('sidebar-visualizer-type')?.value || 'bars',
+        // Read the runtime flags / localStorage, not the checkboxes: while Max
+        // Performance is on it locks those boxes visually-off, but the user's real
+        // saved prefs live in the flags — so saving must not clobber them.
+        particles_enabled: window._particlesEnabled !== false,
+        worker_orbs_enabled: window._workerOrbsEnabled !== false,
+        reduce_effects: window._reduceEffectsActive === true,
+        max_performance: window._maxPerfActive === true,
+    }),
+    security: () => ({
+        require_pin_on_launch: document.getElementById('security-require-pin')?.checked || false,
+        cors_origins: document.getElementById('security-cors-origins')?.value?.trim() || '',
+        trust_reverse_proxy: document.getElementById('security-trust-proxy')?.checked || false,
+        auth_proxy_header: document.getElementById('security-auth-proxy-header')?.value?.trim() || '',
+        require_login: document.getElementById('security-require-login')?.checked || false,
+        allow_plex_login: document.getElementById('security-allow-plex-login')?.checked || false,
+    }),
+    database: () => ({
+        max_workers: parseInt(document.getElementById('max-workers').value)
+    }),
+};
+
+function collectSharedSettings() {
+    const out = {};
+    for (const section of Object.keys(SHARED_SECTION_BUILDERS)) {
+        out[section] = SHARED_SECTION_BUILDERS[section]();
+    }
+    return out;
+}
+
+// Persist ONLY the shared sections — used by the VIDEO side, whose own save
+// path (video-settings.js) intercepts the Save button and must not run music's
+// full saveSettings().
+//
+// Safe because POST /api/settings is a per-section, per-key merge: it writes
+// active_media_server only when that key is present, and within a section only
+// the keys present (web_server.py). So a partial body leaves every other
+// section byte-untouched, and omitting active_media_server means the video side
+// structurally CANNOT repoint the music server — a stronger guarantee than the
+// _persistedActiveServer restore below, which depends on a global being set.
+async function saveSharedSettings(quiet = true) {
+    // #879 parity: never save over a form that failed to load.
+    if (window._settingsLoadFailed) {
+        if (!quiet && typeof showToast === 'function') {
+            showToast("Settings didn't load — reload the page before saving (your config is untouched)", 'error');
+        }
+        return false;
+    }
+    try {
+        const response = await fetch(API.settings, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(collectSharedSettings()),
+        });
+        const result = await response.json();
+        if (!result.success) throw new Error(result.error || 'Save failed');
+        return true;
+    } catch (error) {
+        console.error('Error saving shared settings:', error);
+        if (!quiet && typeof showToast === 'function') {
+            showToast('Failed to save shared settings: ' + error.message, 'error');
+        }
+        return false;
+    }
+}
+window.saveSharedSettings = saveSharedSettings;
+
 async function saveSettings(quiet = false) {
     // #879: refuse to save if the settings never loaded successfully — the form
     // is showing defaults, not the user's real config, so saving would wipe it.
@@ -4596,31 +4717,8 @@ async function saveSettings(quiet = false) {
             url: document.getElementById('lidarr-url').value || '',
             api_key: document.getElementById('lidarr-api-key').value || '',
         },
-        prowlarr: {
-            url: document.getElementById('prowlarr-url')?.value || '',
-            api_key: document.getElementById('prowlarr-api-key')?.value || '',
-            indexer_ids: document.getElementById('prowlarr-indexer-ids')?.value || '',
-        },
-        torrent_client: {
-            type: document.getElementById('torrent-client-type')?.value || 'qbittorrent',
-            url: document.getElementById('torrent-client-url')?.value || '',
-            username: document.getElementById('torrent-client-username')?.value || '',
-            password: document.getElementById('torrent-client-password')?.value || '',
-            category: document.getElementById('torrent-client-category')?.value || 'soulsync',
-            save_path: document.getElementById('torrent-client-save-path')?.value || '',
-            seed_ratio_goal: parseFloat(document.getElementById('music-seed-ratio')?.value) || 0,
-            seed_time_goal_hours: parseInt(document.getElementById('music-seed-hours')?.value, 10) || 0,
-            seed_remove_data: !!(document.getElementById('music-seed-remove-data') || {}).checked,
-            seed_mode: document.getElementById('music-seed-mode')?.value || 'soulsync',
-        },
-        usenet_client: {
-            type: document.getElementById('usenet-client-type')?.value || 'sabnzbd',
-            url: document.getElementById('usenet-client-url')?.value || '',
-            api_key: document.getElementById('usenet-client-api-key')?.value || '',
-            username: document.getElementById('usenet-client-username')?.value || '',
-            password: document.getElementById('usenet-client-password')?.value || '',
-            category: document.getElementById('usenet-client-category')?.value || 'soulsync',
-        },
+        // prowlarr / torrent_client / usenet_client are SHARED sections —
+        // see SHARED_SECTION_BUILDERS, folded in below.
         soundcloud_download: {
             // No knobs yet — anonymous-only. Keeping the key present so
             // future tier-2 OAuth wiring (Go+ session token) doesn't have
@@ -4630,9 +4728,7 @@ async function saveSettings(quiet = false) {
             embed_tags: document.getElementById('embed-qobuz').checked,
             tags: _collectServiceTags('qobuz'),
         },
-        database: {
-            max_workers: parseInt(document.getElementById('max-workers').value)
-        },
+        // database is a SHARED section — see SHARED_SECTION_BUILDERS.
         metadata_enhancement: {
             enabled: document.getElementById('metadata-enabled').checked,
             embed_album_art: document.getElementById('embed-album-art').checked,
@@ -4745,18 +4841,7 @@ async function saveSettings(quiet = false) {
             library_enabled: document.getElementById('library-m3u-enabled')?.checked === true,
             library_path: document.getElementById('library-m3u-path')?.value || ''
         },
-        ui_appearance: {
-            accent_preset: document.getElementById('accent-preset')?.value || '#1db954',
-            accent_color: document.getElementById('accent-custom-color')?.value || '#1db954',
-            sidebar_visualizer: document.getElementById('sidebar-visualizer-type')?.value || 'bars',
-            // Read the runtime flags / localStorage, not the checkboxes: while Max
-            // Performance is on it locks those boxes visually-off, but the user's real
-            // saved prefs live in the flags — so saving must not clobber them.
-            particles_enabled: window._particlesEnabled !== false,
-            worker_orbs_enabled: window._workerOrbsEnabled !== false,
-            reduce_effects: window._reduceEffectsActive === true,
-            max_performance: window._maxPerfActive === true
-        },
+        // ui_appearance is a SHARED section — see SHARED_SECTION_BUILDERS.
         youtube: {
             cookies_browser: document.getElementById('youtube-cookies-browser').value,
             download_delay: parseInt(document.getElementById('youtube-download-delay').value) || 3,
@@ -4764,15 +4849,17 @@ async function saveSettings(quiet = false) {
             // only the path (never echoed back). Blank = keep any already-saved file.
             cookies_paste: document.getElementById('youtube-cookies-paste')?.value || '',
         },
-        security: {
-            require_pin_on_launch: document.getElementById('security-require-pin')?.checked || false,
-            cors_origins: document.getElementById('security-cors-origins')?.value?.trim() || '',
-            trust_reverse_proxy: document.getElementById('security-trust-proxy')?.checked || false,
-            auth_proxy_header: document.getElementById('security-auth-proxy-header')?.value?.trim() || '',
-            require_login: document.getElementById('security-require-login')?.checked || false,
-            allow_plex_login: document.getElementById('security-allow-plex-login')?.checked || false,
-        }
+        // security is a SHARED section — see SHARED_SECTION_BUILDERS.
     };
+
+    // Fold in the shared sections. Merged PER SECTION (not replaced) so a
+    // shared section that also carries music-only keys keeps them. The builders
+    // read the same DOM ids the inline literals used to, so the music-side
+    // payload is unchanged.
+    const _sharedSections = collectSharedSettings();
+    for (const _section of Object.keys(_sharedSections)) {
+        settings[_section] = Object.assign({}, settings[_section] || {}, _sharedSections[_section]);
+    }
 
     // Validate cors_origins entries — backend silently filters malformed
     // values, so warn the user up-front if any line doesn't look like a

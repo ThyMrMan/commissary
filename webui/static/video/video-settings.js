@@ -1579,18 +1579,35 @@
             })(testBtns[k]);
         }
         // The shared "Save Settings" button belongs to MUSIC (it runs music's
-        // saveSettings, which would fire a music-config write from the video page).
-        // On the video side we intercept it (capture phase, before music's bubble
-        // listener), block music's handler, flush all video settings, and toast —
-        // so the button is real here and can't reach into music. Music side: this
-        // does nothing, so its behaviour is unchanged.
+        // saveSettings, which would fire a FULL music-config write from the video
+        // page — including active_media_server). On the video side we intercept it
+        // (capture phase, before music's bubble listener), block music's handler,
+        // flush all video settings, and toast. Music side: this does nothing, so
+        // its behaviour is unchanged.
+        //
+        // saveSharedSettings() covers the data-shared sections the video page
+        // legitimately shows (Prowlarr, torrent/usenet client, appearance,
+        // security, db workers). Those are music-config-backed, so before it
+        // existed this intercept silently DISCARDED every edit to them — the
+        // field worked on Music and did nothing on Video. It posts only those
+        // sections, and never active_media_server, so it can't reach into the
+        // music server pointer.
         document.addEventListener('click', function (e) {
             if (document.body.getAttribute('data-side') !== 'video') return;
             if (!e.target.closest('#save-settings')) return;
             e.preventDefault();
             e.stopImmediatePropagation();
+            // Bare identifier, not a global-object lookup: this module attaches
+            // nothing to the global scope and is asserted to stay that way by
+            // test_video_settings_module_referenced_and_isolated. typeof on an
+            // undeclared name is safe, so this degrades quietly if settings.js
+            // ever stops shipping the helper.
+            var shared = (typeof saveSharedSettings === 'function')
+                ? saveSharedSettings(true)
+                : Promise.resolve(true);
             Promise.all([saveConn(true), save(true), saveKeys(true), savePrefs(true),
-                         saveDownloads(true), saveQuality(true), saveYtQuality(true), saveSlskd(true)])
+                         saveDownloads(true), saveQuality(true), saveYtQuality(true), saveSlskd(true),
+                         shared])
                 .then(function () { toast('Settings saved', 'success'); })
                 .catch(function () { toast('Some settings could not be saved', 'error'); });
         }, true);
