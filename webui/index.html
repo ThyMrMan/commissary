@@ -813,8 +813,16 @@
                                 </button>
                             </div>
                             <!-- Watchlist / Wishlist quick-nav (top-right corner) — same as
-                                 music; navigates to the video pages via data-video-goto. -->
+                                 music; navigates to the video pages via data-video-goto.
+                                 Customize lives HERE, not in .header-actions above: that
+                                 container is the header-enrich widget an admin can hide, and
+                                 every user must be able to rearrange their own dashboard. -->
                             <div class="header-quick-nav">
+                                <button class="header-button dash-customize-btn" type="button" data-dash-customize="video"
+                                        aria-pressed="false" title="Rearrange and resize your dashboard cards">
+                                    <span class="hero-btn-icon">&#9881;</span>
+                                    <span class="hero-btn-label dash-customize-label">Customize</span>
+                                </button>
                                 <button class="header-button watchlist-button" type="button" data-video-goto="video-watchlist">
                                     <span class="hero-btn-icon">&#128065;</span>
                                     <span class="hero-btn-label">Watchlist</span>
@@ -2622,8 +2630,16 @@
                                 <span class="em-manage-btn-label">Manage Workers</span>
                             </button>
                         </div>
-                        <!-- Watchlist / Wishlist quick-nav (top-right corner) -->
+                        <!-- Watchlist / Wishlist quick-nav (top-right corner). Customize
+                             lives HERE, not in .header-actions above: that container is the
+                             header-enrich widget an admin can hide, and every user must be
+                             able to rearrange their own dashboard. -->
                         <div class="header-quick-nav">
+                            <button class="header-button dash-customize-btn" type="button" data-dash-customize="music"
+                                    aria-pressed="false" title="Rearrange and resize your dashboard cards">
+                                <span class="hero-btn-icon">&#9881;</span>
+                                <span class="hero-btn-label dash-customize-label">Customize</span>
+                            </button>
                             <button class="header-button watchlist-button" id="watchlist-button">
                                 <span class="hero-btn-icon">👁️</span>
                                 <span class="hero-btn-label">Watchlist</span>
@@ -8376,10 +8392,13 @@
                                             </div>
                                         </div>
                                         <div class="form-group">
-                                            <label>Completed Downloads Path — in SoulSync (optional):</label>
-                                            <input type="text" id="torrent-download-path" placeholder="leave blank for the shared-volume default">
-                                            <div class="setting-help-text">
-                                                Where <strong>SoulSync</strong> can read finished torrents — its own in-container path. Set this when your client saves to a category folder (e.g. a "Music" category at <code>/data/downloads/music</code>) that's mounted here at a different path. SoulSync finds the release by name under this folder. Blank = use the Soulseek download/transfer folders.
+                                            <label>Completed Downloads Paths — in SoulSync (optional):</label>
+                                            <div class="setting-help-text" style="margin-bottom: 8px;">
+                                                Where <strong>SoulSync</strong> can read finished torrents — its own in-container paths. Set these when your client saves somewhere that's mounted here at a different path. Add one row per location: most clients sort completed downloads into <em>category</em> folders (<code>/downloads/complete/Movies</code>, <code>…/TV-Shows</code>, <code>…/Anime</code>). You can also just name the parent (<code>/downloads/complete</code>) — SoulSync looks one level inside it too, so a category you add later still works. Blank = use the Soulseek download/transfer folders.
+                                            </div>
+                                            <div id="torrent-download-paths-list"></div>
+                                            <div class="form-actions" style="margin-top: 8px;">
+                                                <button class="test-button" type="button" onclick="addPathListRow('torrent-download-paths-list')">+ Add Path</button>
                                             </div>
                                         </div>
                                         <div class="form-group">
@@ -8491,10 +8510,13 @@
                                             </div>
                                         </div>
                                         <div class="form-group">
-                                            <label>Completed Downloads Path — in SoulSync (optional):</label>
-                                            <input type="text" id="usenet-download-path" placeholder="leave blank for the shared-volume default">
-                                            <div class="setting-help-text">
-                                                Where <strong>SoulSync</strong> can read finished NZB downloads — its own in-container path. Set this when SABnzbd/NZBGet writes that category to a folder (e.g. <code>/data/downloads/music</code>) mounted here at a different path. SoulSync finds the release by name under this folder. Blank = use the Soulseek download/transfer folders.
+                                            <label>Completed Downloads Paths — in SoulSync (optional):</label>
+                                            <div class="setting-help-text" style="margin-bottom: 8px;">
+                                                Where <strong>SoulSync</strong> can read finished NZB downloads — its own in-container paths. Set these when SABnzbd/NZBGet writes to a folder mounted here at a different path. Add one row per location: both sort completed downloads into <em>category</em> folders (<code>/downloads/complete/Movies</code>, <code>…/TV-Shows</code>). You can also just name the parent (<code>/downloads/complete</code>) — SoulSync looks one level inside it too. Blank = use the Soulseek download/transfer folders.
+                                            </div>
+                                            <div id="usenet-download-paths-list"></div>
+                                            <div class="form-actions" style="margin-top: 8px;">
+                                                <button class="test-button" type="button" onclick="addPathListRow('usenet-download-paths-list')">+ Add Path</button>
                                             </div>
                                         </div>
                                         <div class="form-group">
@@ -12096,6 +12118,9 @@
     <!-- Dashboard widget visibility registry — must load before any dashboard
          data layer, which gates its fetches on isWidgetVisible(). -->
     <script src="{{ url_for('static', filename='dashboard-widgets.js', v=static_v) }}"></script>
+    <!-- Per-user card order/width. MUST load after dashboard-widgets.js: it
+         skips cards that applyWidgetPolicy() has flagged as admin-hidden. -->
+    <script src="{{ url_for('static', filename='dashboard-layout.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='shared-helpers.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='media-player.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='settings.js', v=static_v) }}"></script>

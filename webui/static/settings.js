@@ -1583,8 +1583,7 @@ async function loadSettingsData() {
             _tcStall.value = (secs === undefined || secs === null) ? 10 : Math.round(Number(secs) / 60);
         }
         if (_tcStallAct) _tcStallAct.value = settings.download_source?.torrent_stall_action || 'abandon';
-        const _tcDlPath = document.getElementById('torrent-download-path');
-        if (_tcDlPath) _tcDlPath.value = settings.download_source?.torrent_download_path || '';
+        renderPathList('torrent-download-paths-list', settings.download_source?.torrent_download_path);
         const _ucType = document.getElementById('usenet-client-type');
         const _ucUrl = document.getElementById('usenet-client-url');
         const _ucKey = document.getElementById('usenet-client-api-key');
@@ -1597,8 +1596,7 @@ async function loadSettingsData() {
         if (_ucUser) _ucUser.value = settings.usenet_client?.username || '';
         if (_ucPass) _ucPass.value = settings.usenet_client?.password || '';
         if (_ucCat) _ucCat.value = settings.usenet_client?.category || 'soulsync';
-        const _ucDlPath = document.getElementById('usenet-download-path');
-        if (_ucDlPath) _ucDlPath.value = settings.download_source?.usenet_download_path || '';
+        renderPathList('usenet-download-paths-list', settings.download_source?.usenet_download_path);
         if (typeof updateUsenetClientUI === 'function') updateUsenetClientUI();
         // Sync ARL to connections tab field + bidirectional listeners
         const _connArl = document.getElementById('deezer-connection-arl');
@@ -3779,60 +3777,105 @@ async function toggleHydrabaseFromSettings() {
 }
 
 // ── Music Library Paths ──
-function renderMusicPaths(paths) {
-    const container = document.getElementById('music-paths-list');
-    if (!container) return;
-    if (!paths || paths.length === 0) {
-        container.innerHTML = '<div style="color: rgba(255,255,255,0.3); font-size: 0.85em; padding: 4px 0;">No paths configured. Click "Add Path" to add your music folder(s).</div>';
-        return;
-    }
-    container.innerHTML = paths.map((p, i) => `
-        <div class="form-group music-path-row" style="margin-bottom: 4px;">
-            <input type="text" class="music-path-input" value="${escapeHtml(p)}" placeholder="/music or C:\\Music" style="flex:1;">
-            <button class="test-button" onclick="_removeMusicPathRow(this)" style="padding: 8px 12px; color: #ef5350; border-color: rgba(239,83,80,0.3);">&times;</button>
-        </div>
-    `).join('');
-    // Attach auto-save to dynamically rendered inputs
-    container.querySelectorAll('.music-path-input').forEach(input => {
-        input.addEventListener('change', () => { if (typeof debouncedAutoSaveSettings === 'function') debouncedAutoSaveSettings(); });
+// ── Path list widget ────────────────────────────────────────────────────────
+// An add/remove list of folder paths. Used by the music library paths and by
+// the torrent/usenet "Completed Downloads Path" settings, which are lists
+// because a client sorting into category folders needs one entry per category.
+// Rows are keyed by their container id so the three instances don't collide.
+
+const PATH_LIST_CONFIGS = {
+    'music-paths-list': {
+        placeholder: '/music or C:\\Music',
+        empty: 'No paths configured. Click "Add Path" to add your music folder(s).',
+    },
+    'torrent-download-paths-list': {
+        placeholder: '/downloads/complete/Movies',
+        empty: 'No paths configured — falling back to the Soulseek download/transfer folders.',
+    },
+    'usenet-download-paths-list': {
+        placeholder: '/downloads/complete/Movies',
+        empty: 'No paths configured — falling back to the Soulseek download/transfer folders.',
+    },
+};
+
+// A value saved before these settings became lists is a bare string. Show it
+// as the first row rather than dropping it.
+function _asPathArray(value) {
+    if (Array.isArray(value)) return value;
+    if (typeof value === 'string' && value.trim()) return [value.trim()];
+    return [];
+}
+
+function _pathRowHtml(containerId, value) {
+    const cfg = PATH_LIST_CONFIGS[containerId] || {};
+    return `<input type="text" class="path-list-input" value="${escapeHtml(value || '')}" placeholder="${escapeHtml(cfg.placeholder || '')}" style="flex:1;">
+            <button class="test-button" onclick="_removePathListRow(this)" style="padding: 8px 12px; color: #ef5350; border-color: rgba(239,83,80,0.3);">&times;</button>`;
+}
+
+function _wirePathRowAutoSave(input) {
+    input.addEventListener('change', () => {
+        if (typeof debouncedAutoSaveSettings === 'function') debouncedAutoSaveSettings();
     });
 }
 
-function addMusicPathRow() {
-    const container = document.getElementById('music-paths-list');
+function renderPathList(containerId, paths) {
+    const container = document.getElementById(containerId);
     if (!container) return;
-    // Clear the "no paths" message if present
-    const placeholder = container.querySelector('div[style*="color: rgba"]');
-    if (placeholder && !container.querySelector('.music-path-row')) placeholder.remove();
+    const list = _asPathArray(paths);
+    const cfg = PATH_LIST_CONFIGS[containerId] || {};
+    if (list.length === 0) {
+        container.innerHTML = `<div class="path-list-empty" style="color: rgba(255,255,255,0.3); font-size: 0.85em; padding: 4px 0;">${escapeHtml(cfg.empty || 'No paths configured.')}</div>`;
+        return;
+    }
+    container.innerHTML = list.map(p => `
+        <div class="form-group path-list-row" style="margin-bottom: 4px;">
+            ${_pathRowHtml(containerId, p)}
+        </div>
+    `).join('');
+    container.querySelectorAll('.path-list-input').forEach(_wirePathRowAutoSave);
+}
+
+function addPathListRow(containerId) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    const placeholder = container.querySelector('.path-list-empty');
+    if (placeholder) placeholder.remove();
     const row = document.createElement('div');
-    row.className = 'form-group music-path-row';
+    row.className = 'form-group path-list-row';
     row.style.marginBottom = '4px';
-    row.innerHTML = `
-        <input type="text" class="music-path-input" value="" placeholder="/music or C:\\Music" style="flex:1;">
-        <button class="test-button" onclick="_removeMusicPathRow(this)" style="padding: 8px 12px; color: #ef5350; border-color: rgba(239,83,80,0.3);">&times;</button>
-    `;
+    row.innerHTML = _pathRowHtml(containerId, '');
     container.appendChild(row);
     const input = row.querySelector('input');
     input.focus();
-    // Auto-save when the user finishes typing a path
-    input.addEventListener('change', () => { if (typeof debouncedAutoSaveSettings === 'function') debouncedAutoSaveSettings(); });
+    _wirePathRowAutoSave(input);
 }
 
-function _removeMusicPathRow(btn) {
-    btn.closest('.music-path-row').remove();
-    // Auto-save after removing a path
+function _removePathListRow(btn) {
+    const container = btn.closest('div[id]');
+    btn.closest('.path-list-row').remove();
+    // Restore the empty-state message rather than leaving a bare "Add Path".
+    if (container && !container.querySelector('.path-list-row')) {
+        renderPathList(container.id, []);
+    }
     if (typeof debouncedAutoSaveSettings === 'function') debouncedAutoSaveSettings();
 }
 
-function collectMusicPaths() {
-    const inputs = document.querySelectorAll('.music-path-input');
+function collectPathList(containerId) {
+    const container = document.getElementById(containerId);
+    if (!container) return null;   // not rendered — caller omits the key
     const paths = [];
-    inputs.forEach(input => {
+    container.querySelectorAll('.path-list-input').forEach(input => {
         const val = input.value.trim();
         if (val) paths.push(val);
     });
     return paths;
 }
+
+// Music library paths — thin wrappers so the existing call sites and the
+// inline onclick in index.html keep working.
+function renderMusicPaths(paths) { renderPathList('music-paths-list', paths); }
+function addMusicPathRow() { addPathListRow('music-paths-list'); }
+function collectMusicPaths() { return collectPathList('music-paths-list') || []; }
 
 // ── Genre Whitelist ──
 let _genreWhitelistCache = [];
@@ -4770,9 +4813,15 @@ async function saveSettings(quiet = false) {
             })(),
             torrent_stall_action: document.getElementById('torrent-stall-action')?.value || 'abandon',
             // In-container path(s) where SoulSync reads finished torrent/usenet
-            // downloads (#857). Rendered in the torrent/usenet client sections.
-            torrent_download_path: document.getElementById('torrent-download-path')?.value || '',
-            usenet_download_path: document.getElementById('usenet-download-path')?.value || '',
+            // downloads (#857). Rendered in the torrent/usenet client sections
+            // as add/remove lists — clients sort into category folders, so one
+            // path is rarely enough. `null` (group not in the DOM) is stripped
+            // below so a partial form can't blank a saved list.
+            // `?? undefined` → JSON.stringify omits the key entirely, and
+            // /api/settings merges per key, so an unrendered group leaves the
+            // stored list untouched instead of blanking it.
+            torrent_download_path: collectPathList('torrent-download-paths-list') ?? undefined,
+            usenet_download_path: collectPathList('usenet-download-paths-list') ?? undefined,
         },
         tidal_download: {
             // quality derived from the global Quality Profile (ranked targets); allow_fallback always true

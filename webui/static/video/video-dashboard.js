@@ -414,6 +414,8 @@
     function onPageShown(e) {
         if (!e || e.detail !== DASHBOARD_ID) return;
         if (typeof applyWidgetPolicy === 'function') applyWidgetPolicy();
+        // Per-user card order/width — after the policy, whose hidden cards it skips.
+        if (typeof applyDashboardLayout === 'function') applyDashboardLayout('video');
         loadHealth();
         // One request feeding the stats, recent and library cards — always
         // worth making unless every one of them is hidden.

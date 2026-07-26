@@ -3484,13 +3484,11 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.3.2': [
-        { date: 'July 2026 · 1.3.2' },
-        { title: 'Your video Libraries now drive everything, not just downloads', desc: 'destination folders live in two places — each Library in Settings → Connections, and the flat Movies/TV boxes in Settings → Downloads. Downloads always honoured both. But the free-space health checks, the recycle bin, the "where did this file move to" resolver and the naming-repair job read ONLY the flat boxes. So the natural setup — set your paths per library, leave Downloads empty — silently meant no health checks, a recycle bin with nowhere to put anything (every delete permanent), and a naming job that skipped every single file. All four now read your Libraries. If you run two libraries of a kind, both are covered; a single flat box could only ever describe one.' },
-        { title: 'The Downloads folder boxes say what they are', desc: 'Movies and TV Shows there are labelled as fallbacks, because a Library\'s own Destination Folder wins for downloads into it. The YouTube box is called out separately — it is NOT a fallback, it is where followed-channel downloads always go, since Libraries cover movies and shows only.' },
-        { title: 'Standard users can\'t erase a purchase', desc: 'recording a purchase stays open to everyone; undoing one is now admin-only, on the server rather than by hiding a button. Both Unmark buttons go through the same call, so the per-track one is gone for standard profiles too — unmarking each track in turn was the same act as unmarking the album.' },
-        { title: 'The Interactive Help button can be hidden', desc: 'the floating ? is now a checkbox under Settings → Users → Standard User Interface, in a new "Both Sides" group since it floats over Music and Video alike.' },
-        { title: 'Earlier versions', desc: '1.3.1 added collapsible albums in Purchased. 1.3.0 extended the standard-user policy to the sidebar and split out Manage Workers. 1.2.0 let admins choose which dashboard cards standard users see. 1.1.0 brought the Purchased page and a settings clean-up. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
+    '1.4.0': [
+        { date: 'July 2026 · 1.4.0' },
+        { title: 'Make the dashboard yours', desc: 'hit Customize in the dashboard header to drag cards into the order you want and drag their right edge to make them wider or narrower. Everyone gets this — it\'s your own view, not a permission — and it applies to the Music and Video dashboards separately. Reset puts everything back. Your arrangement is remembered in the browser, and a card you widened on a desktop still lays out properly on a phone.' },
+        { title: 'More than one completed-downloads folder', desc: 'torrent and usenet clients sort finished downloads into category folders — downloads/complete/Movies, …/TV-Shows, …/Anime — but SoulSync could only be told about ONE folder and looked exactly one level inside it. So the release sat there finished and never got imported. You can now list as many folders as you like, and naming just the parent works too: SoulSync looks one level inside each one, so a category you add later still gets found.' },
+        { title: 'Earlier versions', desc: '1.3.2 made your video Libraries drive the health checks, recycle bin, moved-file resolver and naming-repair job instead of only the flat Downloads boxes — which had silently left all four inert on a per-library setup — relabelled those boxes as the fallbacks they are, restricted erasing a purchase to admins, and let the Interactive Help button be hidden. 1.3.1 added collapsible albums in Purchased. 1.3.0 extended the standard-user policy to the sidebar and split out Manage Workers. 1.2.0 let admins choose which dashboard cards standard users see. 1.1.0 brought the Purchased page and a settings clean-up. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
     ],
 };
 
@@ -3521,7 +3519,19 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.3.2: settings that describe what they actually do",
+        title: "1.4.0: a dashboard you arrange yourself",
+        description: "the dashboard's layout was baked into the markup — same order, same widths, for everyone. Now any user can drag their cards around and resize them. Plus: torrent and usenet completed-downloads folders accept more than one path, fixing imports that never happened because the client sorted downloads into category folders.",
+        features: [
+            "Customize (dashboard header): drag a card to reorder it, drag its right edge — or focus the handle and press ←/→ — to set it 1, 2 or 3 columns wide. Reset restores the shipped arrangement. Music and Video keep separate layouts, and it's saved per browser",
+            "available to EVERY user, not just admins — this is a personal view preference, not a permission. The admin's hide/show policy still applies on top: a card an admin has hidden can't be moved or resized because it isn't there",
+            "widths survive narrow screens properly: a card you widened on a desktop clamps to the row on a 2-column layout and goes full-width on a phone, instead of overflowing the grid",
+            "multiple completed-downloads paths (torrent AND usenet): clients sort finished downloads into category folders like /downloads/complete/Movies and …/TV-Shows, but only one folder could be configured and only one level was searched — so the release sat there finished and never imported. Add a row per folder, or just name the parent and let SoulSync look one level inside it, so a category you add later still resolves",
+            "the deeper search is still content-checked and exactly one level deep — it won't grab a same-named folder from the wrong category, and it won't crawl your whole download disk",
+        ],
+        usage_note: "Customize is in the top-right of each dashboard, next to Watchlist/Wishlist. The download paths are in Settings → Downloads, in the Torrent and Usenet client sections.",
+    },
+    {
+        title: "Earlier in 1.3.2 — settings that describe what they actually do",
         description: "video destination folders were configured in two places with no explanation of how they related — and four subsystems quietly read only one of them. Your Libraries are now the source of truth everywhere, the Downloads boxes say plainly that they're fallbacks, and undoing a purchase becomes an admin action.",
         features: [
             "your video Libraries drive everything now: free-space health checks, the recycle bin, the moved-file resolver and the naming-repair job all read the Destination Folder on each Library in Settings → Connections. They previously read ONLY the flat Movies/TV boxes under Downloads — so setting your paths per library and leaving Downloads blank meant no health checks, a recycle bin that couldn't recycle (every delete permanent) and a naming job that skipped every file",

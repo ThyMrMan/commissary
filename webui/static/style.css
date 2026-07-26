@@ -65471,6 +65471,50 @@ body.max-performance .dash-card::after {
 .dash-card--wide { grid-column: span 2; }
 .dash-card--full { grid-column: 1 / -1; }
 
+/* Per-user width (dashboard-layout.js). An ATTRIBUTE rather than an inline
+   style on purpose: the responsive rules below reset spans on narrow
+   viewports, and a media query cannot override an inline style. Declared
+   after the modifiers above and scoped through .dash-grid so it outranks
+   .dash-card--full for a card the user has resized. */
+.dash-grid .dash-card[data-span="1"] { grid-column: span 1; }
+.dash-grid .dash-card[data-span="2"] { grid-column: span 2; }
+.dash-grid .dash-card[data-span="3"] { grid-column: 1 / -1; }
+
+/* ── Layout edit mode ─────────────────────────────────────────────────── */
+.dash-edit-bar {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 14px; flex-wrap: wrap;
+    margin-bottom: 14px; padding: 10px 14px;
+    background: rgba(255,255,255,0.04);
+    border: 1px dashed rgba(255,255,255,0.22);
+    border-radius: 12px;
+}
+.dash-edit-bar__hint { color: rgba(255,255,255,0.55); font-size: 12.5px; }
+
+.dash-grid--editing .dash-card {
+    cursor: grab;
+    outline: 1px dashed rgba(255,255,255,0.28);
+    outline-offset: -3px;
+}
+.dash-grid--editing .dash-card:active { cursor: grabbing; }
+.dash-grid--editing .dash-card.dragging { opacity: 0.45; }
+.dash-grid--editing .dash-card.drag-over {
+    outline: 2px solid var(--accent-color, #1db954);
+    outline-offset: -3px;
+}
+
+.dash-card__resize-grip {
+    position: absolute; top: 0; right: 0; bottom: 0;
+    width: 12px; z-index: 3;
+    cursor: col-resize;
+    background: linear-gradient(to right, transparent, rgba(255,255,255,0.10));
+}
+.dash-card__resize-grip:hover,
+.dash-card__resize-grip:focus-visible {
+    background: linear-gradient(to right, transparent, var(--accent-color, #1db954));
+    outline: none;
+}
+
 /* Card head */
 .dash-card__head {
     position: relative;
@@ -67347,6 +67391,12 @@ body.max-performance .dash-card::after {
     .dash-card--full {
         grid-column: 1 / -1;
     }
+    /* Only two columns here, so a user-set 3-wide clamps to the full row
+       instead of overflowing the grid. */
+    .dash-grid .dash-card[data-span="2"],
+    .dash-grid .dash-card[data-span="3"] {
+        grid-column: 1 / -1;
+    }
     .dash-card {
         padding: 20px 22px;
     }
@@ -67434,8 +67484,16 @@ body.max-performance .dash-card::after {
         gap: 12px;
     }
     .dash-card--wide,
-    .dash-card--full {
+    .dash-card--full,
+    /* Single column — a user-set width has nothing to span, exactly as the
+       shipped modifiers above. Without this, resizing a card on a desktop
+       would silently break that user's phone layout. */
+    .dash-grid .dash-card[data-span] {
         grid-column: auto;
+    }
+    /* Dragging to reorder is fine on a phone; resizing is meaningless. */
+    .dash-card__resize-grip {
+        display: none;
     }
     .dash-card {
         padding: 16px 16px;

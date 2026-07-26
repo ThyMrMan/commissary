@@ -2987,6 +2987,9 @@ function initApp() {
     // renders into them. The policy is already loaded — initProfileSystem() is
     // awaited ahead of this call.
     applyWidgetPolicy();
+    // ...then this user's own card order/widths, which skip whatever the
+    // policy above just hid.
+    if (typeof initDashboardLayout === 'function') initDashboardLayout();
     // Initialize components
     initializeNavigation();
     initializeMobileNavigation();
@@ -3388,6 +3391,7 @@ async function loadPageData(pageId) {
         switch (pageId) {
             case 'dashboard':
                 applyWidgetPolicy();
+                if (typeof applyDashboardLayout === 'function') applyDashboardLayout('music');
                 await loadDashboardData();
                 if (isWidgetVisible('music.syncs')) loadDashboardSyncHistory();
                 break;
