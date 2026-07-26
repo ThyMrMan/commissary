@@ -26,7 +26,12 @@ def grab_movie(details: dict) -> dict:
     if not item["tmdb_id"] or not item["title"]:
         return {"success": False, "error": "movie is not TMDB-matched yet"}
     try:
+        from api.video import get_video_db
         from core.automation.handlers import video_process_wishlist as vpw
+        # multi-library #1105: this movie is already IN the library (that's
+        # why it's up for a repair grab) — route to its own Library instead
+        # of always the primary, same as the wishlist drain.
+        item["root_folder_id"] = get_video_db().root_folder_id_for_tmdb("movie", item["tmdb_id"])
         # _default_search returns (candidates, error): candidates is None when
         # the search never ran (slskd down/unconfigured), [] for a real miss.
         candidates, err = vpw._default_search(item, "movie")
@@ -37,7 +42,7 @@ def grab_movie(details: dict) -> dict:
             return {"success": False,
                     "error": "no release matched your quality profile — finding stays pending"}
         ok = vpw._default_enqueue(item, best, candidates, "movie",
-                                  vpw._default_target_dir("movie"))
+                                  vpw._item_target_dir(item, vpw._default_target_dir("movie")))
         if not ok:
             return {"success": False, "error": "slskd did not accept the download"}
         name = best.get("quality") or best.get("resolution") or "release"

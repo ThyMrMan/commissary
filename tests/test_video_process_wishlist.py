@@ -10,6 +10,9 @@ import json
 import pytest
 
 from core.automation.handlers.video_process_wishlist import (
+    _category_for_item,
+    _item_target_dir,
+    _root_folder_for_item,
     active_download_keys,
     annotate_upgrades,
     auto_video_process_wishlist,
@@ -90,6 +93,62 @@ def test_build_record_episode_shape():
                                              "air_date": "2008-02-10"}
 
 
+# ── multi-library #1105: per-item resolution helpers (pure, DB mocked) ────────
+
+def _mock_db(monkeypatch, root_folder):
+    import api.video
+
+    class _FakeDB:
+        def get_root_folder(self, rfid):
+            return root_folder if rfid == "the-id" else None
+
+    monkeypatch.setattr(api.video, "get_video_db", lambda: _FakeDB())
+
+
+def test_root_folder_for_item_none_without_a_root_folder_id(monkeypatch):
+    _mock_db(monkeypatch, {"path": "/anime", "category": "anime"})
+    assert _root_folder_for_item({"title": "no library yet"}) is None
+
+
+def test_root_folder_for_item_looks_up_the_stamped_id(monkeypatch):
+    _mock_db(monkeypatch, {"path": "/anime", "category": "anime"})
+    assert _root_folder_for_item({"root_folder_id": "the-id"}) == {"path": "/anime", "category": "anime"}
+
+
+def test_item_target_dir_prefers_its_own_library(monkeypatch):
+    _mock_db(monkeypatch, {"path": "/anime", "category": "anime"})
+    assert _item_target_dir({"root_folder_id": "the-id"}, "/tv-shows") == "/anime"
+
+
+def test_item_target_dir_falls_back_when_no_library(monkeypatch):
+    _mock_db(monkeypatch, {"path": "/anime", "category": "anime"})
+    assert _item_target_dir({"title": "no library"}, "/tv-shows") == "/tv-shows"
+
+
+def test_item_target_dir_falls_back_when_library_has_no_path_set(monkeypatch):
+    _mock_db(monkeypatch, {"path": "", "category": "anime"})
+    assert _item_target_dir({"root_folder_id": "the-id"}, "/tv-shows") == "/tv-shows"
+
+
+def test_category_for_item_prefers_its_own_library(monkeypatch):
+    _mock_db(monkeypatch, {"path": "/anime", "category": "anime"})
+    assert _category_for_item({"root_folder_id": "the-id"}, "show") == "anime"
+
+
+def test_category_for_item_falls_back_to_the_primary_when_no_library(monkeypatch):
+    monkeypatch.setattr("core.automation.handlers.video_process_wishlist._default_category",
+                        lambda mt: "primary-cat")
+    assert _category_for_item({"title": "no library"}, "show") == "primary-cat"
+
+
+def test_category_for_item_falls_back_when_library_category_is_blank(monkeypatch):
+    """A Library with no category set means 'inherit', not 'no category'."""
+    _mock_db(monkeypatch, {"path": "/anime", "category": "  "})
+    monkeypatch.setattr("core.automation.handlers.video_process_wishlist._default_category",
+                        lambda mt: "primary-cat")
+    assert _category_for_item({"root_folder_id": "the-id"}, "show") == "primary-cat"
+
+
 # ── handler ───────────────────────────────────────────────────────────────────
 def _run(items, *, active=None, root="/movies", media_type="movie", searches=None):
     enq = []
@@ -119,6 +178,31 @@ def test_grabs_each_wished_movie():
     assert res["status"] == "completed" and res["grabbed"] == 2 and res["searched"] == 2
     assert {e[0] for e in enq} == {("movie", "1"), ("movie", "2")}
     assert enq[0][2] == "/movies"
+
+
+def test_reported_bug_item_grabs_into_its_own_library_not_the_batch_primary(monkeypatch):
+    """THE reported bug: a show cataloged in the Anime library, watchlisted,
+    landed in the TV-Shows folder when auto-grabbed — because every item in
+    a drain batch shared the SAME resolved 'root', regardless of which
+    Library it actually belongs to. Two items in ONE batch, only one of them
+    filed under a Library, must land in two DIFFERENT target dirs."""
+    class _FakeDB:
+        def get_root_folder(self, rfid):
+            assert rfid == "anime-lib"
+            return {"path": "/media/anime", "category": "anime"}
+
+    import api.video
+    monkeypatch.setattr(api.video, "get_video_db", lambda: _FakeDB())
+
+    items = [
+        {"tmdb_id": 1, "title": "Filed under Anime", "year": "2020", "root_folder_id": "anime-lib"},
+        {"tmdb_id": 2, "title": "No library yet", "year": "2021"},
+    ]
+    res, enq, _, _ = _run(items, root="/tv-shows")
+    assert res["grabbed"] == 2
+    by_id = {e[0][1]: e[2] for e in enq}
+    assert by_id["1"] == "/media/anime"        # its OWN library, not the batch primary
+    assert by_id["2"] == "/tv-shows"           # no library of its own → the batch fallback
 
 
 def test_skips_items_already_downloading():
@@ -230,6 +314,86 @@ def test_movie_wishlist_annotates_owned(db):
     assert set(rows) == {1, 2}
     assert rows[1]["owned"] == 1 and rows[1]["owned_resolutions"] == "720p"
     assert rows[2]["owned"] == 0 and rows[2]["owned_resolutions"] is None
+
+
+def _add_library(db, *, path, kind="movie", category=None, server="plex"):
+    conn = db._get_connection()
+    cur = conn.execute(
+        "INSERT INTO root_folders (path, content_kind, server, category) VALUES (?,?,?,?)",
+        (str(path), kind, server, category))
+    rid = cur.lastrowid
+    conn.commit(); conn.close()
+    return rid
+
+
+# ── multi-library #1105: a title already filed under its own Library ──────────
+# (e.g. Anime) must carry that association through to an unattended grab,
+# instead of always resolving to the primary Library for the kind.
+
+def test_movie_wishlist_to_download_carries_its_own_root_folder_id(db):
+    anime = _add_library(db, path="/media/anime", category="anime")
+    movie_id = db.upsert_movie("plex", {"server_id": "m1", "tmdb_id": 1, "title": "Owned"})
+    conn = db._get_connection()
+    conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (anime, movie_id))
+    conn.commit(); conn.close()
+    db.add_movie_to_wishlist(1, "Owned", year="2020", status="wanted", library_id=movie_id)
+    row = db.movie_wishlist_to_download()[0]
+    assert row["library_id"] == movie_id
+    assert row["root_folder_id"] == anime
+
+
+def test_movie_wishlist_to_download_root_folder_id_is_none_when_unlinked(db):
+    db.add_movie_to_wishlist(1, "Never Owned", year="2020", status="wanted")
+    row = db.movie_wishlist_to_download()[0]
+    assert row["library_id"] is None
+    assert row["root_folder_id"] is None
+
+
+def test_episode_wishlist_to_download_carries_its_shows_root_folder_id(db):
+    anime = _add_library(db, path="/media/anime", kind="show", category="anime")
+    show_id = db.upsert_show_tree("plex", {"server_id": "s9", "tmdb_id": 9, "title": "Show"})
+    conn = db._get_connection()
+    conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (anime, show_id))
+    conn.commit(); conn.close()
+    db.add_episodes_to_wishlist(9, "Show",
+                                [{"season_number": 1, "episode_number": 1, "air_date": "2020-01-01"}],
+                                library_id=show_id)
+    row = db.episode_wishlist_to_download()[0]
+    assert row["library_id"] == show_id
+    assert row["root_folder_id"] == anime
+
+
+def test_wishlist_manual_search_items_carries_root_folder_id_both_scopes(db):
+    anime = _add_library(db, path="/media/anime", category="anime")
+    movie_id = db.upsert_movie("plex", {"server_id": "m1", "tmdb_id": 1, "title": "Owned"})
+    conn = db._get_connection()
+    conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (anime, movie_id))
+    conn.commit(); conn.close()
+    db.add_movie_to_wishlist(1, "Owned", year="2020", status="wanted", library_id=movie_id)
+    row = db.wishlist_manual_search_items("movie", 1)[0]
+    assert row["root_folder_id"] == anime
+
+    show_anime = _add_library(db, path="/media/anime-shows", kind="show", category="anime")
+    show_id = db.upsert_show_tree("plex", {"server_id": "s9", "tmdb_id": 9, "title": "Show"})
+    conn = db._get_connection()
+    conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (show_anime, show_id))
+    conn.commit(); conn.close()
+    db.add_episodes_to_wishlist(9, "Show",
+                                [{"season_number": 1, "episode_number": 1, "air_date": "2020-01-01"}],
+                                library_id=show_id)
+    row = db.wishlist_manual_search_items("show", 9)[0]
+    assert row["root_folder_id"] == show_anime
+
+
+def test_root_folder_id_for_tmdb(db):
+    anime = _add_library(db, path="/media/anime", category="anime")
+    movie_id = db.upsert_movie("plex", {"server_id": "m1", "tmdb_id": 1, "title": "Owned"})
+    conn = db._get_connection()
+    conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (anime, movie_id))
+    conn.commit(); conn.close()
+    assert db.root_folder_id_for_tmdb("movie", 1) == anime
+    assert db.root_folder_id_for_tmdb("movie", 999) is None       # not owned
+    assert db.root_folder_id_for_tmdb("show", 1) is None          # wrong kind's table
 
 
 def test_episode_wishlist_annotates_owned(db):

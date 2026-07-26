@@ -923,6 +923,34 @@ class VideoDatabase:
         finally:
             conn.close()
 
+    def root_folder_id_for_tmdb(self, kind: str, tmdb_id, server_source=None) -> int | None:
+        """The Library (root_folders.id) a TMDB title is already filed under,
+        if it's in the library at all — for callers that only have a bare
+        tmdb_id (no wishlist row to read library_id from), e.g. a repair-job
+        upgrade grab for an already-owned movie. None when the title isn't
+        owned, or is owned but not yet assigned to a Library."""
+        table = {"movie": "movies", "show": "shows"}.get(kind)
+        if not table or tmdb_id is None:
+            return None
+        try:
+            tmdb_id = int(tmdb_id)
+        except (TypeError, ValueError):
+            return None
+        conn = self._get_connection()
+        try:
+            if server_source:
+                row = conn.execute(
+                    f"SELECT root_folder_id FROM {table} WHERE tmdb_id=? AND server_source=? LIMIT 1",
+                    (tmdb_id, server_source)).fetchone()
+            else:
+                row = conn.execute(
+                    f"SELECT root_folder_id FROM {table} WHERE tmdb_id=? LIMIT 1", (tmdb_id,)).fetchone()
+            return row["root_folder_id"] if row else None
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
+
     def library_ids_for_tmdb(self, kind: str, tmdb_ids, server_source=None) -> dict:
         """{tmdb_id: library_row_id} for the owned subset of ``tmdb_ids`` on the
         active server. Batched (chunked IN) so a whole Discover rail costs one
@@ -5838,11 +5866,18 @@ class VideoDatabase:
         comma-joined) — the 'upgrade until cutoff' semantics: the drain skips
         owned items that already meet the cutoff and only accepts strictly
         better releases for the rest, which is what keeps the old
-        owned-re-download loop broken. Newest year first."""
+        owned-re-download loop broken. Newest year first.
+
+        ``root_folder_id`` is the Library the movie is ALREADY filed under
+        (via ``library_id``, when set) — so an unattended grab lands in the
+        SAME Library instead of always the primary one for the kind. NULL
+        when the movie isn't linked to a library row yet; the caller falls
+        back to the primary in that case."""
         conn = self._get_connection()
         try:
             return [dict(r) for r in conn.execute(
-                "SELECT w.tmdb_id, w.title, w.year, w.poster_url, "
+                "SELECT w.tmdb_id, w.title, w.year, w.poster_url, w.library_id, "
+                "(SELECT root_folder_id FROM movies WHERE id = w.library_id) AS root_folder_id, "
                 "EXISTS (SELECT 1 FROM movies m WHERE m.tmdb_id=w.tmdb_id AND m.has_file=1) "
                 "  AS owned, "
                 "(SELECT GROUP_CONCAT(f.resolution) FROM movies m "
@@ -5913,12 +5948,18 @@ class VideoDatabase:
         calendar), but the drain must not hunt for a release that can't exist yet — so this
         skips ``air_date`` in the future. OWNED episodes are included with the same
         ``owned``/``owned_resolutions`` annotation as movies (upgrade-until semantics; the
-        drain does the cutoff/strictly-better judging). Newest air date first."""
+        drain does the cutoff/strictly-better judging). Newest air date first.
+
+        ``root_folder_id`` is the show's OWN Library (via ``library_id``), so
+        a grab lands where the show already lives (e.g. Anime vs TV-Shows)
+        instead of always the primary TV Library. NULL when the show isn't
+        linked to a library row yet."""
         conn = self._get_connection()
         try:
             return [dict(r) for r in conn.execute(
                 "SELECT w.tmdb_id AS show_tmdb_id, w.title AS show_title, w.season_number, "
                 "w.episode_number, w.episode_title, w.air_date, w.poster_url, w.library_id, "
+                "(SELECT root_folder_id FROM shows WHERE id = w.library_id) AS root_folder_id, "
                 "EXISTS (SELECT 1 FROM episodes e JOIN shows s ON e.show_id = s.id "
                 "  WHERE s.tmdb_id = w.tmdb_id AND e.season_number = w.season_number "
                 "  AND e.episode_number = w.episode_number AND e.has_file = 1) AS owned, "
@@ -5957,7 +5998,8 @@ class VideoDatabase:
         try:
             if scope == "movie":
                 return [dict(r) for r in conn.execute(
-                    "SELECT w.tmdb_id, w.title, w.year, w.poster_url, "
+                    "SELECT w.tmdb_id, w.title, w.year, w.poster_url, w.library_id, "
+                    "(SELECT root_folder_id FROM movies WHERE id = w.library_id) AS root_folder_id, "
                     "EXISTS (SELECT 1 FROM movies m WHERE m.tmdb_id=w.tmdb_id AND m.has_file=1) "
                     "  AS owned, "
                     "(SELECT GROUP_CONCAT(f.resolution) FROM movies m "
@@ -5976,6 +6018,7 @@ class VideoDatabase:
             return [dict(r) for r in conn.execute(
                 "SELECT w.tmdb_id AS show_tmdb_id, w.title AS show_title, w.season_number, "
                 "w.episode_number, w.episode_title, w.air_date, w.poster_url, w.library_id, "
+                "(SELECT root_folder_id FROM shows WHERE id = w.library_id) AS root_folder_id, "
                 "EXISTS (SELECT 1 FROM episodes e JOIN shows s ON e.show_id = s.id "
                 "  WHERE s.tmdb_id = w.tmdb_id AND e.season_number = w.season_number "
                 "  AND e.episode_number = w.episode_number AND e.has_file = 1) AS owned, "

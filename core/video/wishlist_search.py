@@ -75,7 +75,10 @@ def _one(item: Dict[str, Any], media_type: str, target: str) -> bool:
             logger.info("manual search: no acceptable release for %s",
                         item.get("title") or item.get("show_title"))
             return False
-        return bool(vpw._default_enqueue(item, best, cands or [], media_type, target))
+        # multi-library #1105: land in the item's own Library when it has one,
+        # falling back to `target` (the primary) exactly as before otherwise.
+        item_target = vpw._item_target_dir(item, target)
+        return bool(vpw._default_enqueue(item, best, cands or [], media_type, item_target))
     except Exception:   # noqa: BLE001 - one item failing must not kill the batch
         logger.exception("manual wishlist search failed for %r",
                          item.get("title") or item.get("show_title"))

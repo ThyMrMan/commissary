@@ -182,7 +182,9 @@ def _rss_pass_inner(*, fetch, log) -> Dict[str, Any]:
                 log("RSS skip: %s — %s" % (_item_label(item, media_type),
                                            _skip_reason(cands, min_rank, item)))
                 continue
-            if vpw._default_enqueue(item, best, cands, media_type, target):
+            # multi-library #1105: land in the item's own Library when it has one.
+            item_target = vpw._item_target_dir(item, target)
+            if vpw._default_enqueue(item, best, cands, media_type, item_target):
                 grabbed += 1
                 active.add(vpw.item_key(item, media_type))
                 log("RSS grab: %s (%s)" % (best.get("title"), media_type))

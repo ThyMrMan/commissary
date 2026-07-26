@@ -268,11 +268,15 @@ def _default_active_keys(media_type: str) -> set:
 
 
 def _default_target_dir(media_type: str) -> str:
-    """The unattended-grab destination (wishlist drain, RSS instant-grab, repair
-    upgrades — nowhere to prompt a human): the PRIMARY configured Library for
-    this kind, falling back to the legacy scalar movies_path/tv_path for
-    installs with no Libraries configured yet. Thin wrapper around the shared
-    resolver so every unattended call site keeps working unmodified."""
+    """The FALLBACK unattended-grab destination when an item isn't already
+    filed under a specific Library (or the caller has no per-item info at
+    all, e.g. the batch-level pre-flight check): the PRIMARY configured
+    Library for this kind, falling back further to the legacy scalar
+    movies_path/tv_path for installs with no Libraries configured yet.
+    ``_item_target_dir`` is the actual per-item resolver — it prefers an
+    item's own Library and only reaches this when it has none. Thin wrapper
+    around the shared resolver so every unattended call site keeps working
+    unmodified."""
     from api.video import get_video_db
     from core.video.download_pipeline import resolve_download_root
     from core.video.sources import resolve_video_server
@@ -287,12 +291,11 @@ def _default_target_dir(media_type: str) -> str:
 
 
 def _default_category(media_type: str) -> Optional[str]:
-    """The torrent/usenet category for an unattended grab (multi-category,
-    P.4) — the PRIMARY configured Library's category for this kind, else None
-    (the client adapter falls back to the global torrent_client.category /
-    usenet_client.category setting). Mirrors ``_default_target_dir`` so an
-    unattended grab's destination folder and its category come from the SAME
-    Library."""
+    """The FALLBACK torrent/usenet category — the PRIMARY configured
+    Library's category for this kind, else None (the client adapter falls
+    back to the global torrent_client.category / usenet_client.category
+    setting). ``_category_for_item`` is the actual per-item resolver and
+    only reaches this when the item has no Library of its own."""
     from api.video import get_video_db
     from core.video.download_pipeline import resolve_torrent_category
     from core.video.sources import resolve_video_server
@@ -301,6 +304,43 @@ def _default_category(media_type: str) -> Optional[str]:
     server = resolve_video_server(db)
     primary = db.primary_root_folder(server, kind) if server else None
     return resolve_torrent_category(primary_root_folder=primary)
+
+
+def _root_folder_for_item(item: Dict[str, Any]) -> Optional[dict]:
+    """The specific Library an item is ALREADY filed under, if any —
+    ``root_folder_id`` is joined in by the wishlist queries (from the
+    show's/movie's own row via ``library_id``) or stamped on by a
+    tmdb_id-only caller (repair grabs). None when the item has no Library
+    yet, which callers treat as 'use the primary'."""
+    rfid = item.get("root_folder_id")
+    if not rfid:
+        return None
+    from api.video import get_video_db
+    return get_video_db().get_root_folder(rfid)
+
+
+def _item_target_dir(item: Dict[str, Any], fallback: str) -> str:
+    """Per-item grab destination (multi-library #1105): an item already
+    filed under a Library (an existing show/movie's ``root_folder_id``)
+    grabs into THAT Library — e.g. a show cataloged under Anime stays in
+    Anime instead of always landing in the primary TV Library. ``fallback``
+    is whatever the caller already resolved as the batch/primary default
+    (so a test-injected ``target_dir`` fake is respected exactly as before
+    for any item with no Library of its own)."""
+    root_folder = _root_folder_for_item(item)
+    if root_folder and root_folder.get("path"):
+        return root_folder["path"]
+    return fallback
+
+
+def _category_for_item(item: Dict[str, Any], media_type: str) -> Optional[str]:
+    """Per-item torrent/usenet category, mirroring ``_item_target_dir`` so a
+    grab's destination folder and its category always come from the SAME
+    Library."""
+    root_folder = _root_folder_for_item(item)
+    if root_folder and (root_folder.get("category") or "").strip():
+        return root_folder["category"].strip()
+    return _default_category(media_type)
 
 
 def _search_one_source(source: str, item: Dict[str, Any], media_type: str):
@@ -399,9 +439,10 @@ def _default_enqueue(item: Dict[str, Any], best: Dict[str, Any], candidates: Lis
             return False
     else:
         # torrent / usenet — hand off to the shared client; carry the returned ref into the row.
-        # Category comes from the SAME primary Library target_dir was resolved from (P.4).
+        # Category comes from the SAME Library target_dir was resolved from — the item's
+        # own Library when it has one, else the primary (multi-library #1105).
         from core.video.client_grab import grab
-        res = grab(source, best.get("download_url"), category=_default_category(media_type))
+        res = grab(source, best.get("download_url"), category=_category_for_item(item, media_type))
         if not res.get("ok"):
             logger.warning("video hybrid: %s grab refused for %s: %s", source, item.get("title"), res.get("error"))
             return False
@@ -524,7 +565,10 @@ def auto_video_process_wishlist(
             didnt_run = cands is None       # slskd not configured / errored / rate-limited
             cands = cands or []
             best = pick_best(cands, it.get("_min_rank") or 0)
-            ok = bool(best) and bool(enqueue(it, best, cands, media_type, root))
+            # multi-library #1105: an item already filed under its own Library
+            # (e.g. Anime) grabs there, not always into the batch's primary `root`.
+            item_target = _item_target_dir(it, root)
+            ok = bool(best) and bool(enqueue(it, best, cands, media_type, item_target))
             name = it.get('title') or it.get('show_title') or '?'
             if media_type == 'episode':
                 name = "%s S%02dE%02d" % (name, int(it.get('season_number') or 0),

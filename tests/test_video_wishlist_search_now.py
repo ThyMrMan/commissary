@@ -113,6 +113,31 @@ def test_search_now_runs_the_drain_seams_in_background(client, db, monkeypatch):
     assert _wait_for(lambda: ws._inflight == set()), f"bookkeeping never released: {ws._inflight}"
 
 
+def test_search_now_grabs_into_the_items_own_library(client, db, monkeypatch):
+    """multi-library #1105: manual 'Search now' shares the drain's
+    batch-hoisted-target seam — a movie already filed under a Library must
+    grab there, not into the primary target the fixture pins."""
+    from core.automation.handlers import video_process_wishlist as vpw
+    movie_id = db.upsert_movie("plex", {"server_id": "m1", "tmdb_id": 88, "title": "Grab Me"})
+    conn = db._get_connection()
+    cur = conn.execute(
+        "INSERT INTO root_folders (path, content_kind, server, category) VALUES (?,?,?,?)",
+        ("/media/anime", "movie", "plex", "anime"))
+    conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (cur.lastrowid, movie_id))
+    conn.commit(); conn.close()
+    db.add_movie_to_wishlist(88, "Grab Me", status="monitored", library_id=movie_id)
+    calls = []
+    monkeypatch.setattr(vpw, "_default_target_dir", lambda mt: "/media/movies")
+    monkeypatch.setattr(vpw, "_default_search",
+                        lambda it, mt: ([{"accepted": True, "resolution": "1080p",
+                                          "source": "soulseek", "title": it["title"]}], None))
+    monkeypatch.setattr(vpw, "_default_enqueue",
+                        lambda it, best, cands, mt, root: calls.append((it["tmdb_id"], mt, root)) or True)
+    r = client.post("/api/video/wishlist/search", json={"scope": "movie", "tmdb_id": 88})
+    assert r.get_json()["success"] is True
+    assert _wait_for(lambda: calls == [(88, "movie", "/media/anime")]), f"enqueue never ran: {calls}"
+
+
 def test_search_now_skips_items_already_downloading(client, db, monkeypatch):
     from core.automation.handlers import video_process_wishlist as vpw
     db.add_movie_to_wishlist(99, "Already Going")

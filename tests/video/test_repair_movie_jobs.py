@@ -218,6 +218,13 @@ def test_complete_scan_retires_findings_for_fixed_problems(db, worker):
 def test_grab_movie_contract(monkeypatch):
     from core.automation.handlers import video_process_wishlist as vpw
     from core.video.repair.grab import grab_movie
+    import api.video
+
+    class _FakeDB:
+        def root_folder_id_for_tmdb(self, kind, tmdb_id, server_source=None):
+            return None    # not filed under any Library → falls back to primary
+    monkeypatch.setattr(api.video, "get_video_db", lambda: _FakeDB())
+
     calls = {}
     monkeypatch.setattr(vpw, "_default_search",
                         lambda item, mt: ([{"accepted": True, "quality": "1080p",
@@ -237,6 +244,36 @@ def test_grab_movie_contract(monkeypatch):
     # Real search, nothing acceptable → stays pending.
     monkeypatch.setattr(vpw, "_default_search", lambda item, mt: ([], None))
     assert "quality profile" in grab_movie({"tmdb_id": 7, "title": "Film"})["error"]
+
+
+def test_grab_movie_routes_to_its_own_library(db, monkeypatch):
+    """multi-library #1105: an upgrade/broken-file fix for an already-owned
+    movie must re-grab into the SAME Library it's already filed under, not
+    always the primary — it's a repair, not a fresh acquisition."""
+    from core.automation.handlers import video_process_wishlist as vpw
+    from core.video.repair.grab import grab_movie
+    import api.video
+
+    movie_id = db.upsert_movie("plex", {"server_id": "m1", "tmdb_id": 7, "title": "Film"})
+    conn = db._get_connection()
+    cur = conn.execute(
+        "INSERT INTO root_folders (path, content_kind, server, category) VALUES (?,?,?,?)",
+        ("/media/anime", "movie", "plex", "anime"))
+    conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (cur.lastrowid, movie_id))
+    conn.commit(); conn.close()
+    monkeypatch.setattr(api.video, "get_video_db", lambda: db)
+
+    calls = {}
+    monkeypatch.setattr(vpw, "_default_search",
+                        lambda item, mt: ([{"accepted": True, "quality": "1080p",
+                                            "username": "u", "filename": "f",
+                                            "size_bytes": 1}], None))
+    monkeypatch.setattr(vpw, "_default_target_dir", lambda mt: "/primary-movies")
+    monkeypatch.setattr(vpw, "_default_enqueue",
+                        lambda item, best, cands, mt, tdir: calls.update(tdir=tdir) or True)
+    res = grab_movie({"tmdb_id": 7, "title": "Film"})
+    assert res["success"]
+    assert calls["tdir"] == "/media/anime"     # its OWN library, not the primary
 
 
 # ── Wishlist Audit ───────────────────────────────────────────────────────────
