@@ -71,14 +71,11 @@ KNOWN_CROSS_FILE_DUPES = {
     "loadDashboardData", # search.js, wishlist-tools.js
 }
 
-# Pre-existing same-file duplicates (two filter UIs reuse the same names).
-KNOWN_SAME_FILE_DUPES = {
-    "applyFiltersAndSort",
-    "calculateRelevanceScore",
-    "handleFilterClick",
-    "initializeFilters",
-    "resetFilters",
-}
+# Same-file duplicates that are tolerated. Empty on purpose: the five that
+# used to be listed here were one 160-line block pasted twice into
+# wishlist-tools.js, deleted upstream in c5a8bf24. Keeping the set empty means
+# the next accidental double-paste gets fixed rather than added to a list.
+KNOWN_SAME_FILE_DUPES = set()
 
 # ---------------------------------------------------------------------------
 # Helpers

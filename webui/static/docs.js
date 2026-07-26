@@ -1663,7 +1663,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="vid-switch">
                 <h3 class="docs-subsection-title">Switching Sides</h3>
-                <p class="docs-text">Use the <strong>side switcher</strong> in the sidebar to flip between the Music and Video apps. Each side has its own navigation, its own pages, and its own settings. A handful of pages are <strong>shared</strong> across both sides &mdash; <strong>Settings</strong>, <strong>Chat</strong>, <strong>Issues</strong>, and this <strong>Help &amp; Docs</strong> page &mdash; so you land on the same page no matter which side you were on.</p>
+                <p class="docs-text">Use the <strong>side switcher</strong> in the sidebar to flip between the Music and Video apps. Each side has its own navigation, its own pages, and its own settings. A handful of pages are <strong>shared</strong> across both sides &mdash; <strong>Settings</strong>, <strong>Issues</strong>, and this <strong>Help &amp; Docs</strong> page &mdash; so you land on the same page no matter which side you were on.</p>
                 ${docsImg('video-side-switch.jpg', 'Switching between the Music and Video sides')}
             </div>
             <div class="docs-subsection" id="vid-server">
