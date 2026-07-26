@@ -47,7 +47,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.4.0"
+_SOULSYNC_BASE_VERSION = "1.5.0"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -65,6 +65,13 @@ def _build_version_string():
     return _SOULSYNC_BASE_VERSION
 
 SOULSYNC_VERSION = _build_version_string()
+
+# Give Plex a stable identity BEFORE anything imports plexapi's submodules or
+# opens a connection. Without this, plexapi identifies us by MAC address and
+# hostname, both of which change on every Docker restart — so Plex mailed the
+# owner about a new "Linux" device each time the app rebooted.
+from core.plex_identity import apply_plex_identity
+apply_plex_identity(SOULSYNC_VERSION)
 
 # Dedicated source reuse logger — writes alongside app.log in the configured log directory
 import logging as _logging
@@ -941,7 +948,6 @@ VALID_WIDGET_IDS = {
     'music.header-enrich',
     'music.manage-workers',
     'music.nav-automations',
-    'music.nav-chat',
     'music.nav-tools',
     'video.recent',
     'video.stats',
@@ -952,7 +958,6 @@ VALID_WIDGET_IDS = {
     'video.header-enrich',
     'video.manage-workers',
     # No video.nav-automations: video Automations is already admin-only.
-    'video.nav-chat',
     'video.nav-tools',
     # App chrome — floats over both sides, so it belongs to neither.
     'shared.help-button',
@@ -40691,129 +40696,6 @@ def _emit_watchlist_count_loop():
         except Exception as e:
             logger.debug(f"Error emitting watchlist count: {e}")
 
-# Soulseek chat push (P3): watch the community room + PM unread state through
-# slskd and push deltas over the socket, so the nav badge and the bell react
-# without the chat page being open. First pass after boot only BASELINES the
-# room (no replaying history as "new"). Wholly idle-gated: zero slskd calls
-# while no browser is connected.
-_chat_push_state = {'room_key': None, 'pm_unread': -1, 'room': None}
-
-def _emit_chat_push_loop():
-    while not globals().get('IS_SHUTTING_DOWN', False):
-        socketio.sleep(6)
-        try:
-            if not _has_connected_clients():
-                continue
-            _slsk = download_orchestrator.client("soulseek") if download_orchestrator else None
-            if not _slsk or not _slsk.base_url:
-                continue
-            room = str(config_manager.get('soulseek.chat_room', 'SoulSync') or 'SoulSync')
-            if room != _chat_push_state['room']:
-                # room renamed (settings cog): re-baseline so the new room's
-                # history never replays as 'new' badge/notification spam
-                _chat_push_state['room'] = room
-                _chat_push_state['room_key'] = None
-            joined = run_async(_slsk.get_joined_rooms()) or []
-            if room not in joined:
-                # auto-join at startup / after an slskd restart (joins don't
-                # persist). chat_auto_join=false is the opt-out for users who
-                # don't want their account sitting in a public room — without
-                # it the loop would re-join them every 6s (un-leaveable). The
-                # chat PAGE still joins on open (an explicit user action).
-                if not config_manager.get('soulseek.chat_auto_join', True):
-                    room = None
-                elif not run_async(_slsk.join_room(room)):
-                    room = None
-            if not room:
-                msgs = []
-            else:
-                msgs = run_async(_slsk.get_room_messages(room)) or []
-            msgs.sort(key=lambda m: str(m.get('timestamp') or ''))
-            key = (str(msgs[-1].get('timestamp') or '') + ':' + str(len(msgs))) if msgs else ''
-            prev_key = _chat_push_state['room_key']
-            if prev_key is None:
-                _chat_push_state['room_key'] = key      # baseline, never replay history
-            elif key != prev_key:
-                prev_stamp = prev_key.rsplit(':', 1)[0]
-                fresh = [m for m in msgs if str(m.get('timestamp') or '') > prev_stamp]
-                _chat_push_state['room_key'] = key
-                if fresh:
-                    # live pushes carry the same DECODED view the API serves
-                    from core import chat_codec
-                    def _unwrap(m):
-                        dec = chat_codec.decode(m.get('message'))
-                        if dec is not None and chat_codec.reaction_of(dec):
-                            return None      # reaction carriers never render/badge
-                        out = {'username': m.get('username'),
-                               'message': dec['t'] if dec else m.get('message'),
-                               'timestamp': m.get('timestamp')}
-                        if dec:
-                            out['rich'] = True
-                            rep = chat_codec.reply_of(dec)
-                            if rep:
-                                out['reply'] = rep
-                        return out
-                    decoded = [x for x in (_unwrap(m) for m in fresh) if x]
-                    if decoded:      # a reaction-only tick still tracks PMs below
-                        try:
-                            get_database().add_chat_messages(room, decoded)
-                        except Exception:
-                            logger.debug("chat: loop archive write failed", exc_info=True)
-                        socketio.emit('chat:room_message', {
-                            'room': room,
-                            'messages': decoded[-20:],
-                        })
-            convos = run_async(_slsk.get_conversations()) or []
-            unread_users = [str(c.get('username') or '') for c in convos
-                            if c.get('hasUnAcknowledgedMessages')
-                            or (c.get('unAcknowledgedMessageCount') or 0) > 0]
-            unread = len([u for u in unread_users if u])
-            prev = _chat_push_state['pm_unread']
-            if unread != prev:
-                _chat_push_state['pm_unread'] = unread
-                socketio.emit('chat:unread', {
-                    'pms': unread,
-                    'users': [u for u in unread_users if u][:3],
-                    # 'grew' gates the toast: only a RISING count notifies (a read
-                    # clearing the flag must not), and never the boot baseline
-                    'grew': prev >= 0 and unread > prev,
-                })
-        except Exception:
-            logger.debug("chat push loop error", exc_info=True)
-
-# Anti-leech challenge auto-responder ("please type 'human' in this chat"):
-# NOT idle-gated — the whole point is answering at 3am with no browser open,
-# so blocked overnight grabs unblock themselves. One cheap conversations poll
-# per minute; the heavy lifting + guard rails live in core/chat_autoprove.py.
-def _chat_auto_prove_loop():
-    from core import chat_autoprove
-    state = {}
-    while not globals().get('IS_SHUTTING_DOWN', False):
-        socketio.sleep(60)
-        try:
-            if not config_manager.get('soulseek.chat_auto_prove', True):
-                continue
-            _slsk = download_orchestrator.client("soulseek") if download_orchestrator else None
-            if not _slsk or not _slsk.base_url:
-                continue
-            replies = chat_autoprove.scan_and_respond(_slsk, run_async, state=state)
-            for r in replies:
-                msg = "Auto-replied '%s' to %s's prove-you're-human challenge" % (
-                    r['token'], r['username'])
-                # observable both ways: durable bell history + a live toast
-                try:
-                    get_database().add_notifications([{'type': 'info', 'message': msg}],
-                                                     profile_id=1)
-                except Exception:
-                    logger.debug("autoprove: notification write failed", exc_info=True)
-                socketio.emit('dashboard:toast', {
-                    'icon': '🤖', 'title': 'Chat auto-reply',
-                    'subtitle': "answered %s's download challenge with '%s'" % (
-                        r['username'], r['token']),
-                })
-        except Exception:
-            logger.debug("chat auto-prove loop error", exc_info=True)
-
 def _emit_download_status_loop():
     """Background thread that pushes download batch status every 2 seconds to subscribed rooms.
     Skipped entirely while no client is connected — the transfer fetch below is a real
@@ -41213,18 +41095,6 @@ _configure_enrichment_api(
 )
 
 app.register_blueprint(_create_enrichment_blueprint())
-
-# Soulseek chat (rooms + PMs through slskd) — side-neutral, absolute /api/chat
-# paths, mounted OUTSIDE the video blueprint so music-only profiles reach it.
-from api.chat import configure as _configure_chat_api, create_blueprint as _create_chat_blueprint
-_configure_chat_api(
-    client_getter=lambda: download_orchestrator.client("soulseek"),
-    run_async=run_async,
-    config_get=lambda key, default=None: config_manager.get(key, default),
-    config_set=lambda key, value: config_manager.set(key, value),
-    db_getter=get_database,
-)
-app.register_blueprint(_create_chat_blueprint())
 
 # Record-label watchlist (search labels / browse a label's catalog / follow) —
 # purely additive, self-contained blueprint reading only watchlist_labels + the
@@ -41988,8 +41858,6 @@ def start_runtime_services():
         socketio.start_background_task(_emit_service_status_loop)
         socketio.start_background_task(_emit_watchlist_count_loop)
         socketio.start_background_task(_emit_download_status_loop)
-        socketio.start_background_task(_emit_chat_push_loop)
-        socketio.start_background_task(_chat_auto_prove_loop)
         # Server Activity — subscriber-gated live push (idle when no drawer open)
         socketio.start_background_task(_emit_server_activity_loop)
         # Phase 2: Dashboard pollers

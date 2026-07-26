@@ -2353,7 +2353,7 @@ const HELPER_TOURS = {
             { page: 'dashboard', selector: '.nav-section-label[data-section="find"]', title: 'Find', description: 'Discovery lives here — Search, Discover, and the Artist Map. Section headers collapse if you like a tidy sidebar.' },
             { page: 'dashboard', selector: '.nav-section-label[data-section="music"]', title: 'Music', description: 'Your collection: Library, Playlists & Sync, Downloads, and Import for files you already have.' },
             { page: 'dashboard', selector: '.nav-section-label[data-section="system"]', title: 'System', description: 'The machinery: Automations, Tools, Stats, Issues, and Settings.' },
-            { page: 'dashboard', selector: '.version-button', title: 'Version & Support', description: 'Click the version number for release notes — it glows when an update is available (green routine, yellow major, red critical). Support SoulSync lives right above it. That\'s the dashboard! 🎉' },
+            { page: 'dashboard', selector: '.version-button', title: 'Version', description: 'Click the version number for release notes — it glows when an update is available (green routine, yellow major, red critical). That\'s the dashboard! 🎉' },
         ]
     },
     'first-download': {
@@ -3484,11 +3484,12 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.4.0': [
-        { date: 'July 2026 · 1.4.0' },
-        { title: 'Make the dashboard yours', desc: 'hit Customize in the dashboard header to drag cards into the order you want and drag their right edge to make them wider or narrower. Everyone gets this — it\'s your own view, not a permission — and it applies to the Music and Video dashboards separately. Reset puts everything back. Your arrangement is remembered in the browser, and a card you widened on a desktop still lays out properly on a phone.' },
-        { title: 'More than one completed-downloads folder', desc: 'torrent and usenet clients sort finished downloads into category folders — downloads/complete/Movies, …/TV-Shows, …/Anime — but SoulSync could only be told about ONE folder and looked exactly one level inside it. So the release sat there finished and never got imported. You can now list as many folders as you like, and naming just the parent works too: SoulSync looks one level inside each one, so a category you add later still gets found.' },
-        { title: 'Earlier versions', desc: '1.3.2 made your video Libraries drive the health checks, recycle bin, moved-file resolver and naming-repair job instead of only the flat Downloads boxes — which had silently left all four inert on a per-library setup — relabelled those boxes as the fallbacks they are, restricted erasing a purchase to admins, and let the Interactive Help button be hidden. 1.3.1 added collapsible albums in Purchased. 1.3.0 extended the standard-user policy to the sidebar and split out Manage Workers. 1.2.0 let admins choose which dashboard cards standard users see. 1.1.0 brought the Purchased page and a settings clean-up. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
+    '1.5.0': [
+        { date: 'July 2026 · 1.5.0' },
+        { title: 'Chat is gone', desc: 'the Soulseek chat page — rooms, private messages and the message-this-user buttons on search results — has been removed, along with its stored message archive. Nothing else changes: search, downloads and transfers use the same Soulseek connection they always did.' },
+        { title: 'Support button removed', desc: 'the Support SoulSync button and its donation links belonged to the upstream project, so they\'re gone from the sidebar, the README and the Unraid template. The Docker image names in the install docs are untouched.' },
+        { title: 'Plex stops treating every restart as a new device', desc: 'each reboot made Plex email you about a new device with a generic numeric name, because SoulSync identified itself by MAC address and hostname — both of which Docker regenerates on every container start. SoulSync now keeps one stable identity and shows up as "SoulSync" in your Plex device list. Expect one last notification after this update, then quiet.' },
+        { title: 'Earlier versions', desc: '1.4.0 let every user drag and resize their own dashboard cards, and accepted more than one completed-downloads folder so category subfolders finally imported. 1.3.2 made your video Libraries drive the health checks, recycle bin, moved-file resolver and naming-repair job instead of only the flat Downloads boxes — which had silently left all four inert on a per-library setup — relabelled those boxes as the fallbacks they are, restricted erasing a purchase to admins, and let the Interactive Help button be hidden. 1.3.1 added collapsible albums in Purchased. 1.3.0 extended the standard-user policy to the sidebar and split out Manage Workers. 1.2.0 let admins choose which dashboard cards standard users see. 1.1.0 brought the Purchased page and a settings clean-up. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
     ],
 };
 
@@ -3519,7 +3520,19 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.4.0: a dashboard you arrange yourself",
+        title: "1.5.0: less to carry",
+        description: "the Soulseek chat feature and the upstream donation button are removed, and Plex now recognises SoulSync across restarts instead of announcing a new device every time the container starts.",
+        features: [
+            "chat removed completely: the rooms and private-message page, the nav entries on both the Music and Video sidebars, the \"message this user on Soulseek\" buttons on search results and uploader credits, and the stored message archive — the database sheds that table on upgrade",
+            "your Soulseek connection is unaffected. Search, browsing and transfers ride the same slskd link they always have; only the chat endpoints are gone",
+            "the Support SoulSync button and its donation links are removed from the sidebar, the README and the Unraid template. Docker image names in the install docs are untouched — those are pull commands, not donations",
+            "Plex device identity is now stable: SoulSync previously identified itself with the machine's MAC address and hostname, which Docker regenerates on every container start — so Plex saw a brand-new device after each reboot and mailed you about it, filling your device list with anonymous \"Linux\" entries. It now mints one identifier, keeps it in your config, and reports itself as \"SoulSync\"",
+            "expect one final new-device notification the first time you start this version — after that Plex recognises it",
+        ],
+        usage_note: "Nothing to configure. If you want to tidy up, the old anonymous Linux entries can be removed from plex.tv → Settings → Authorized Devices.",
+    },
+    {
+        title: "Earlier in 1.4.0 — a dashboard you arrange yourself",
         description: "the dashboard's layout was baked into the markup — same order, same widths, for everyone. Now any user can drag their cards around and resize them. Plus: torrent and usenet completed-downloads folders accept more than one path, fixing imports that never happened because the client sorted downloads into category folders.",
         features: [
             "Customize (dashboard header): drag a card to reorder it, drag its right edge — or focus the handle and press ←/→ — to set it 1, 2 or 3 columns wide. Reset restores the shipped arrangement. Music and Video keep separate layouts, and it's saved per browser",

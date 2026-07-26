@@ -52,8 +52,6 @@ Create `/boot/config/plugins/dockerMan/templates-user/soulsync.xml`:
   <PostArgs/>
   <CPUset/>
   <DateInstalled>1704067200</DateInstalled>
-  <DonateText>Support Development</DonateText>
-  <DonateLink>https://ko-fi.com/boulderbadgedad</DonateLink>
   <Requires>slskd container or standalone installation</Requires>
   <Config Name="WebUI Port" Target="8008" Default="8008" Mode="tcp" Description="Web interface port" Type="Port" Display="always" Required="true" Mask="false">8008</Config>
   <Config Name="Spotify OAuth Port" Target="8888" Default="8888" Mode="tcp" Description="Spotify OAuth callback port" Type="Port" Display="always" Required="true" Mask="false">8888</Config>

@@ -1,8 +1,8 @@
 """Record-label watchlist API — search labels, browse a label's catalog, and
 follow/unfollow a label so its new releases get wishlisted.
 
-Purely additive and self-contained (same standalone-blueprint pattern as
-api/chat.py): absolute /api/labels/* paths, no url_prefix, host deps injected
+Purely additive and self-contained (standalone-blueprint pattern):
+absolute /api/labels/* paths, no url_prefix, host deps injected
 via configure() to dodge circular imports with web_server. It reads only the
 new watchlist_labels table + the keyless MusicBrainz catalog layer
 (core/metadata/label_catalog) — it touches no existing route or table.

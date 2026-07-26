@@ -212,9 +212,9 @@ def test_nav_widgets_name_a_real_page():
     """A nav entry with no `page` couldn't block navigation, and one naming a
     page the server rejects would be unenforceable from the profile side."""
     pages = set(re.findall(r"page:\s*'([\w-]+)'", _WIDGETS_JS))
-    assert {'automations', 'chat', 'tools', 'video-chat', 'video-tools'} <= pages
+    assert {'automations', 'tools', 'video-tools'} <= pages
     # Every nav widget's selector must target the nav button for that page.
-    for page in ('chat', 'tools', 'automations'):
+    for page in ('tools', 'automations'):
         assert f'data-page="{page}"' in _WIDGETS_JS
 
 
@@ -225,8 +225,8 @@ def test_hidden_nav_blocks_navigation_not_just_the_link():
     start = init_js.index('function isPageAllowed')
     body = init_js[start:init_js.index('\nfunction ', start + 10)]
     assert 'isPageHiddenByPolicy' in body, (
-        "isPageAllowed ignores the widget policy — a hidden Chat/Tools page "
-        "would still load by typing its URL")
+        "isPageAllowed ignores the widget policy — a hidden Tools/Automations "
+        "page would still load by typing its URL")
 
 
 def test_nav_filter_loop_applies_the_policy_itself():

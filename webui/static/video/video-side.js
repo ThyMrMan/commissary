@@ -168,7 +168,6 @@
         { id: 'video-requests', label: 'Requests' },
         { id: 'video-calendar', label: 'Calendar' },
         { id: 'video-automations', label: 'Automations' },
-        { id: 'video-chat', label: 'Chat', shared: true },
         { id: 'video-tools', label: 'Tools' },
         { id: 'video-import', label: 'Import' },
         { id: 'video-settings', label: 'Settings' },
@@ -186,7 +185,7 @@
     // reveals the music page; we trigger its loader once shown. Help & Docs is the
     // same docs page as the music side (it'll host video + music docs together);
     // Settings is the shared, per-side-filtered settings page.
-    var SHARED_PAGES = { 'video-settings': 'settings', 'video-help': 'help', 'video-chat': 'chat' };
+    var SHARED_PAGES = { 'video-settings': 'settings', 'video-help': 'help' };
 
     function readSide() {
         try {

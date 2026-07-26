@@ -401,33 +401,9 @@ class MusicDatabase:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_notification_history_profile "
                            "ON notification_history (profile_id, id)")
 
-            # Soulseek chat archive (chatbic P2): slskd only holds room
-            # messages in memory since it joined — an slskd restart wipes the
-            # room. This is the durable copy (text stored DECODED + rich flag,
-            # decoding happens at ingest), fed by the push loop + page hydrate,
-            # deduped on the natural key, pruned per room. Rooms only — slskd
-            # already persists PM conversations itself.
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS chat_room_messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    room TEXT NOT NULL,
-                    username TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    rich INTEGER NOT NULL DEFAULT 0,
-                    timestamp TEXT NOT NULL,
-                    reply TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(room, username, timestamp, message) ON CONFLICT IGNORE
-                )
-            """)
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_room_messages_room "
-                           "ON chat_room_messages (room, timestamp)")
-            # the table shipped one commit before the reply column — live dbs
-            # already created it, so the column rides a tolerant ALTER
-            try:
-                cursor.execute("ALTER TABLE chat_room_messages ADD COLUMN reply TEXT")
-            except sqlite3.OperationalError:
-                pass    # already there
+            # The Soulseek chat feature was removed; shed its archive table
+            # so an upgraded database doesn't carry dead rows forever.
+            cursor.execute("DROP TABLE IF EXISTS chat_room_messages")
 
             # Watchlist table for storing artists to monitor for new releases
             cursor.execute("""
@@ -10468,102 +10444,6 @@ class MusicDatabase:
         except Exception as e:
             logger.error("Error journaling notifications: %s", e)
             return 0
-
-    _CHAT_ARCHIVE_KEEP = 5000     # per room — plenty of scrollback, bounded disk
-
-    def add_chat_messages(self, room: str, messages) -> int:
-        """Archive a batch of DECODED room messages ({username, message, rich,
-        timestamp}). Idempotent — the natural-key UNIQUE swallows replays from
-        the push loop + page hydrate both feeding the same slskd buffer.
-        Returns rows actually inserted."""
-        rows = []
-        for m in messages or []:
-            if not isinstance(m, dict):
-                continue
-            user = str(m.get('username') or '').strip()[:64]
-            msg = str(m.get('message') or '')[:4000]
-            ts = str(m.get('timestamp') or '').strip()[:40]
-            if not user or not msg or not ts:
-                continue
-            rep = m.get('reply')
-            rep_json = None
-            if isinstance(rep, dict) and rep.get('u'):
-                rep_json = json.dumps({'u': str(rep.get('u'))[:64],
-                                       'x': str(rep.get('x') or '')[:140]})
-            rows.append((str(room), user, msg, 1 if m.get('rich') else 0, ts, rep_json))
-        if not rows:
-            return 0
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                before = conn.total_changes
-                cursor.executemany(
-                    "INSERT INTO chat_room_messages (room, username, message, rich, timestamp, reply) "
-                    "VALUES (?, ?, ?, ?, ?, ?)", rows)
-                inserted = conn.total_changes - before
-                if inserted:
-                    cursor.execute(
-                        "DELETE FROM chat_room_messages WHERE room = ? AND id NOT IN "
-                        "(SELECT id FROM chat_room_messages WHERE room = ? "
-                        " ORDER BY timestamp DESC, id DESC LIMIT ?)",
-                        (str(room), str(room), self._CHAT_ARCHIVE_KEEP))
-                conn.commit()
-                return inserted
-        except Exception as e:
-            logger.error("Error archiving chat messages: %s", e)
-            return 0
-
-    def get_chat_messages(self, room: str, before: str = None, limit: int = 100) -> List[Dict[str, Any]]:
-        """A page of archived room messages, OLDEST-first within the page
-        (ready to render). ``before`` pages backwards: only messages strictly
-        older than that timestamp."""
-        try:
-            q = ("SELECT username, message, rich, timestamp, reply FROM chat_room_messages "
-                 "WHERE room = ?")
-            args: list = [str(room)]
-            if before:
-                q += " AND timestamp < ?"
-                args.append(str(before))
-            q += " ORDER BY timestamp DESC, id DESC LIMIT ?"
-            args.append(max(1, min(int(limit), 500)))
-            with self._get_connection() as conn:
-                rows = [dict(r) for r in conn.execute(q, args).fetchall()]
-            rows.reverse()
-            for r in rows:
-                r['rich'] = bool(r['rich'])
-                if r.get('reply'):
-                    try:
-                        r['reply'] = json.loads(r['reply'])
-                    except (ValueError, TypeError):
-                        r['reply'] = None
-                if not r.get('reply'):
-                    r.pop('reply', None)
-            return rows
-        except Exception as e:
-            logger.error("Error reading chat archive: %s", e)
-            return []
-
-    def search_chat_messages(self, room: str, query: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Archive search: messages in ``room`` whose text OR sender matches
-        ``query`` (case-insensitive substring), newest first."""
-        query = str(query or '').strip()
-        if not query:
-            return []
-        like = '%' + query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
-        try:
-            with self._get_connection() as conn:
-                rows = [dict(r) for r in conn.execute(
-                    "SELECT username, message, rich, timestamp, reply FROM chat_room_messages "
-                    "WHERE room = ? AND (message LIKE ? ESCAPE '\\' OR username LIKE ? ESCAPE '\\') "
-                    "ORDER BY timestamp DESC, id DESC LIMIT ?",
-                    (str(room), like, like, max(1, min(int(limit), 200)))).fetchall()]
-            for r in rows:
-                r['rich'] = bool(r['rich'])
-                r.pop('reply', None)   # search results render flat
-            return rows
-        except Exception as e:
-            logger.error("Error searching chat archive: %s", e)
-            return []
 
     def get_notification_history(self, profile_id: int = 1, type_filter: str = None,
                                  search: str = None, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:

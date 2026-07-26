@@ -53,7 +53,6 @@ const DASHBOARD_WIDGETS = [
 
     // --- Music sidebar: the System group ---------------------------------
     { id: 'music.nav-automations', side: 'music', kind: 'nav', page: 'automations', label: 'Automations', selector: '.nav-button[data-page="automations"]', global: true },
-    { id: 'music.nav-chat',        side: 'music', kind: 'nav', page: 'chat',        label: 'Chat',        selector: '.nav-button[data-page="chat"]',        global: true },
     { id: 'music.nav-tools',       side: 'music', kind: 'nav', page: 'tools',       label: 'Tools',       selector: '.nav-button[data-page="tools"]',       global: true },
 
     // --- Video dashboard -------------------------------------------------
@@ -71,7 +70,6 @@ const DASHBOARD_WIDGETS = [
     // --- Video sidebar: the System group ---------------------------------
     // No video.nav-automations: video Automations is ALREADY admin-only
     // (VIDEO_ADMIN_ONLY in init.js), so a checkbox for it would do nothing.
-    { id: 'video.nav-chat',  side: 'video', kind: 'nav', page: 'video-chat',  label: 'Chat',  selector: '.video-nav .nav-button[data-video-page="video-chat"]',  global: true },
     { id: 'video.nav-tools', side: 'video', kind: 'nav', page: 'video-tools', label: 'Tools', selector: '.video-nav .nav-button[data-video-page="video-tools"]', global: true },
 
     // --- App chrome (neither side — floats over both) ---------------------
