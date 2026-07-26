@@ -821,19 +821,26 @@ def resolve_reported_save_path(
     the classic arr-stack remote-path mismatch.
 
     Resolution order:
-      1. The reported path verbatim, if it's a readable directory here
-         (deployments that mirror the client's mount paths).
+      1. The reported path verbatim, if it's readable here — a directory
+         (deployments that mirror the client's mount paths), or a FILE:
+         a single-file torrent/nzb with no release folder around it, where
+         the client's ``content_path`` names the file itself.
       2. Explicit prefix mappings from ``download_source.usenet_path_mappings``
          — a list of ``{"from": "...", "to": "..."}`` (Sonarr/Radarr-style
          remote path mapping) for non-shared / oddly-mounted layouts.
-      3. Basename fallback: a same-named folder under a known SoulSync
-         download root. Zero-config for the standard shared-volume setup —
-         the album folder shows up under SoulSync's own ``./downloads``
+      3. Basename fallback: a same-named folder OR file under a known
+         SoulSync download root. Zero-config for the standard shared-volume
+         setup — the release shows up under SoulSync's own ``./downloads``
          mount with the same name the client reported.
 
+    A candidate that turns out to be a FILE (single-file release, no folder)
+    is accepted on existence alone — there's nothing to look "inside" the
+    way ``_contains_expected`` checks a directory, and matching on the full
+    reported basename is already as specific as a filename gets.
+
     Returns the best resolved path, or ``reported_path`` unchanged when
-    nothing better is found (so the caller's existing "no audio" error still
-    surfaces, with both paths logged).
+    nothing better is found (so the caller's existing "no audio"/"no video"
+    error still surfaces, with both paths logged).
     """
     if not reported_path:
         return reported_path
@@ -843,6 +850,12 @@ def resolve_reported_save_path(
     def _is_dir(candidate) -> bool:
         try:
             return Path(candidate).is_dir()
+        except OSError:
+            return False
+
+    def _is_file(candidate) -> bool:
+        try:
+            return Path(candidate).is_file()
         except OSError:
             return False
 
@@ -862,8 +875,12 @@ def resolve_reported_save_path(
             return False
 
     # 1. Reported path is directly readable — mounts already line up.
-    #    Verbatim acceptance requires the expected content when known.
-    if _is_dir(reported_path) and _contains_expected(reported_path):
+    #    A directory's verbatim acceptance requires the expected content
+    #    when known; a FILE has no "inside" to check, so existence is proof.
+    if _is_dir(reported_path):
+        if _contains_expected(reported_path):
+            return reported_path
+    elif _is_file(reported_path):
         return reported_path
 
     normalized = str(reported_path).replace('\\', '/')
@@ -884,7 +901,10 @@ def resolve_reported_save_path(
             if normalized == frm or normalized.startswith(frm + '/'):
                 rest = normalized[len(frm):].lstrip('/')
                 candidate = str(Path(to) / rest) if rest else to
-                if _is_dir(candidate) and _contains_expected(candidate):
+                if _is_dir(candidate):
+                    if _contains_expected(candidate):
+                        return candidate
+                elif _is_file(candidate):
                     return candidate
 
     roots = _candidate_download_roots(config_get)
@@ -895,7 +915,10 @@ def resolve_reported_save_path(
     if basename:
         for root in roots:
             candidate = Path(root) / basename
-            if _is_dir(candidate) and _contains_expected(candidate):
+            if _is_dir(candidate):
+                if _contains_expected(candidate):
+                    return str(candidate)
+            elif _is_file(candidate):
                 return str(candidate)
 
         # 3b. One level deeper. Clients sort finished downloads into CATEGORY
@@ -904,11 +927,17 @@ def resolve_reported_save_path(
         #     root's exact match above has been tried, so a precise hit never
         #     loses to a deeper guess, and still content-checked so a
         #     same-named folder in the wrong category can't be picked up.
-        #     One level only: these roots are whole download disks.
+        #     One level only: these roots are whole download disks. Applies to
+        #     a same-named FILE too — a single-file release with no folder of
+        #     its own, sitting directly in the category folder (a bare-file
+        #     movie/episode landing in '<root>/Movies/<name>.mkv').
         for root in roots:
             for sub in _subdirs_of(root):
                 candidate = sub / basename
-                if _is_dir(candidate) and _contains_expected(candidate):
+                if _is_dir(candidate):
+                    if _contains_expected(candidate):
+                        return str(candidate)
+                elif _is_file(candidate):
                     return str(candidate)
 
     # 4. The roots THEMSELVES. A torrent client reports its save DIRECTORY

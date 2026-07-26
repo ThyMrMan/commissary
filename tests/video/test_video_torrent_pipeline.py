@@ -65,6 +65,36 @@ def test_find_video_is_scoped_to_this_jobs_content(tmp_path):
     assert cd.find_video_file(str(folder)) == str(folder / "episode.mkv")
 
 
+def test_resolve_path_wiring_finds_a_bare_file_release(tmp_path, monkeypatch):
+    """End-to-end regression for the reported bug: a single-file movie
+    (a bluray remux with no per-release folder) lands directly in the
+    configured torrent category folder. process_client_download must
+    resolve it through the REAL resolve_reported_save_path wiring
+    (cd._resolve_path), not a stub — this pins client_download.py's own
+    production seam, not just the resolver in isolation."""
+    from config.settings import config_manager
+
+    movies = tmp_path / "complete" / "Movies"
+    movies.mkdir(parents=True)
+    name = "X-Men.Apocalypse.2016.2160p.UHD.BluRay.REMUX.HDR.HEVC.Atmos-EPSiLON.mkv"
+    (movies / name).write_bytes(b"")
+
+    monkeypatch.setattr(config_manager, "get",
+                        lambda key, default=None:
+                        str(movies) if key == 'download_source.torrent_download_path' else default)
+
+    status = _St(state="seeding", progress=1.0,
+                content_path=f"/data/torrents/complete/Movies/{name}")
+    upd = cd.process_client_download(
+        {"client_ref": "h1", "source": "torrent"},
+        get_status=lambda s, r: status,
+        resolve_path=cd._resolve_path,
+        find_video=cd.find_video_file,
+    )
+    assert upd["status"] == "completed"
+    assert upd["dest_path"] == str(movies / name)
+
+
 def test_client_forgot_job_is_missing_when_unplaced():
     upd = _proc({"client_ref": "h1", "source": "usenet"}, None, find=None)
     assert upd == {"_missing": True}

@@ -3484,13 +3484,10 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.6.0': [
-        { date: 'July 2026 · 1.6.0' },
-        { title: 'Your indexer keys stop leaking to the browser', desc: 'torrent and usenet search results carried the raw indexer download URL — API key and all — into the page, where it sat in DevTools and browser history, and the download endpoint accepted any URL handed back to it. Results now carry an opaque token that only the server can resolve, so nothing can talk SoulSync into forwarding an arbitrary URL to your download client.' },
-        { title: 'Downloads stop importing half-written files', desc: 'when your client reported a download finished, SoulSync could grab the staging folder while unpack and repair were still writing into it — importing a partial file as if it were complete. It now waits for the folder to actually stop changing. Video files also land in your library atomically and size-verified, which fixes the ones that played back skipping.' },
-        { title: 'Tagging and organising got a lot less destructive', desc: 'simple downloads no longer overwrite tags you already have (only blanks get filled), the reorganiser stops churning the casing of files it already organised, keeps your own album year instead of the source\'s, keeps featured-artist credits, and no longer stamps a bogus disc prefix on single-disc albums.' },
-        { title: 'Plex deep scans survive a slow library', desc: 'one slow page of a big or remote library used to hit a hard 15-second timeout and zero out the entire scan — reported as "zero artists". The timeout is now 30 seconds and configurable, and bulk fetches retry before giving up.' },
-        { title: 'Earlier versions', desc: '1.5.0 removed the Soulseek chat feature and the Support button, and gave Plex a stable device identity so it stops emailing about a new device on every restart. 1.4.0 let every user drag and resize their own dashboard cards, and accepted more than one completed-downloads folder so category subfolders finally imported. 1.3.2 made your video Libraries drive the health checks, recycle bin, moved-file resolver and naming-repair job. 1.3.1 added collapsible albums in Purchased. 1.3.0 extended the standard-user policy to the sidebar. 1.2.0 let admins choose which dashboard cards standard users see. 1.1.0 brought the Purchased page. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
+    '1.6.1': [
+        { date: 'July 2026 · 1.6.1' },
+        { title: 'Torrent/usenet downloads stuck at 100% now import', desc: 'a single-file release — a movie remux, a lone episode — landing directly in a category folder with no folder of its own around it was never found: every path check required a directory, so a bare video/audio file was rejected even when it sat exactly where it was supposed to. The download just sat at 100% forever with no error. Path resolution now accepts a matching file, not only a matching folder.' },
+        { title: 'Earlier versions', desc: '1.6.0 folded in 38 fixes from upstream SoulSync (through 3.1.8), led by a security fix for indexer URLs leaking to the browser. 1.5.0 removed the Soulseek chat feature and the Support button, and gave Plex a stable device identity so it stops emailing about a new device on every restart. 1.4.0 let every user drag and resize their own dashboard cards, and accepted more than one completed-downloads folder so category subfolders finally imported. 1.3.2 made your video Libraries drive the health checks, recycle bin, moved-file resolver and naming-repair job. 1.3.1 added collapsible albums in Purchased. 1.3.0 extended the standard-user policy to the sidebar. 1.2.0 let admins choose which dashboard cards standard users see. 1.1.0 brought the Purchased page. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
     ],
 };
 
@@ -3521,7 +3518,17 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.6.0: upstream's fixes, folded in",
+        title: "1.6.1: stuck downloads now finish",
+        description: "a torrent or usenet release that landed as a single file — a bluray remux, a lone episode — directly in a category folder, with no folder of its own, could sit at 100% forever and never import. No error, no log, just silence.",
+        features: [
+            "path resolution required a DIRECTORY at every step, so a release that was just one bare file (no folder wrapping it) never matched, even when it sat exactly at the configured Completed Downloads Path with the exact right name",
+            "it now accepts a matching FILE the same way it already accepted a matching folder — checked one level into category subfolders too, same as folders",
+            "affects both the torrent/usenet video pipeline and the equivalent music path; nothing to reconfigure",
+        ],
+        usage_note: "Downloads already stuck at 100% pick this up on their next poll (every few seconds) once you're on this version — no need to re-add them.",
+    },
+    {
+        title: "Earlier in 1.6.0 — upstream's fixes, folded in",
         description: "this fork branched from upstream SoulSync 3.1.5, which has since shipped three releases. 38 of their fixes are now here — a security fix, several that stop half-written downloads being imported, and a long tail of tagging and organising corrections. None of their chat work came with it.",
         features: [
             "SECURITY: torrent and usenet search results used to carry the raw indexer download URL — API key included — all the way into the browser, where it lived in DevTools and history, and the download endpoint would accept any URL sent back to it. Results now carry an opaque server-side token, so a client can no longer make SoulSync forward an arbitrary URL to SABnzbd, NZBGet or qBittorrent",

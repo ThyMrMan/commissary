@@ -508,6 +508,64 @@ def test_resolve_basename_fallback_against_download_root(tmp_path: Path) -> None
     assert resolved == str(tmp_path / "MyAlbum")
 
 
+def test_resolve_returns_a_readable_file_verbatim(tmp_path: Path) -> None:
+    """Single-file torrent/nzb, no release folder: the client's content_path
+    names the .mkv/.flac itself, not a directory. A file has no 'inside' to
+    check, so existence at the reported path is proof enough."""
+    movie = tmp_path / "X-Men.Apocalypse.2016.2160p.REMUX-EPSiLON.mkv"
+    movie.write_bytes(b"")
+    assert resolve_reported_save_path(str(movie), config_get=_cfg({})) == str(movie)
+
+
+def test_resolve_basename_fallback_matches_a_bare_file(tmp_path: Path) -> None:
+    """THE reported bug: a single-file release landing directly in a flat
+    category folder (no per-release subfolder) — the client reports its own
+    container's path, and the exact same filename sits under SoulSync's
+    configured torrent_download_path. Every existing basename check required
+    a DIRECTORY, so this exact-match candidate was rejected purely for being
+    a file, and the download stayed at 100% forever with no error."""
+    movies = tmp_path / "complete" / "Movies"
+    movies.mkdir(parents=True)
+    name = "X-Men.Apocalypse.2016.2160p.UHD.BluRay.REMUX.HDR.HEVC.Atmos-EPSiLON.mkv"
+    (movies / name).write_bytes(b"")
+
+    cfg = _cfg({'download_source.torrent_download_path': str(movies)})
+    resolved = resolve_reported_save_path(
+        f'/data/torrents/complete/Movies/{name}', config_get=cfg)
+    assert resolved == str(movies / name)
+
+
+def test_resolve_basename_fallback_prefers_a_directory_over_a_same_named_file(
+        tmp_path: Path) -> None:
+    """A directory candidate (content-checked) still wins over a file
+    candidate at another root when both exist — files are the fallback,
+    never a competing priority."""
+    name = "Release"
+    file_root = tmp_path / "flat"
+    dir_root = tmp_path / "foldered"
+    file_root.mkdir()
+    (file_root / name).write_bytes(b"")
+    (dir_root / name / "track.flac").parent.mkdir(parents=True)
+    cfg = _cfg({'soulseek.transfer_path': str(file_root),
+                'soulseek.download_path': str(dir_root)})
+    resolved = resolve_reported_save_path(f'/data/{name}', config_get=cfg)
+    assert resolved == str(dir_root / name)
+
+
+def test_resolve_one_level_deeper_matches_a_bare_file(tmp_path: Path) -> None:
+    """Same bare-file case, but the root only names the PARENT of the
+    category folder — exercises the one-level-deeper pass (3b), not the
+    exact-root pass (3)."""
+    movies = tmp_path / "complete" / "Movies"
+    movies.mkdir(parents=True)
+    name = "Some.Movie.2024.mkv"
+    (movies / name).write_bytes(b"")
+
+    cfg = _cfg({'download_source.torrent_download_path': [str(tmp_path / "complete")]})
+    resolved = resolve_reported_save_path(f'/downloads/{name}', config_get=cfg)
+    assert resolved == str(movies / name)
+
+
 def test_resolve_mapping_takes_priority_over_basename(tmp_path: Path) -> None:
     """An explicit mapping that resolves wins over the basename scan."""
     mapped_root = tmp_path / "mapped"
