@@ -3484,12 +3484,13 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.5.0': [
-        { date: 'July 2026 · 1.5.0' },
-        { title: 'Chat is gone', desc: 'the Soulseek chat page — rooms, private messages and the message-this-user buttons on search results — has been removed, along with its stored message archive. Nothing else changes: search, downloads and transfers use the same Soulseek connection they always did.' },
-        { title: 'Support button removed', desc: 'the Support SoulSync button and its donation links belonged to the upstream project, so they\'re gone from the sidebar, the README and the Unraid template. The Docker image names in the install docs are untouched.' },
-        { title: 'Plex stops treating every restart as a new device', desc: 'each reboot made Plex email you about a new device with a generic numeric name, because SoulSync identified itself by MAC address and hostname — both of which Docker regenerates on every container start. SoulSync now keeps one stable identity and shows up as "SoulSync" in your Plex device list. Expect one last notification after this update, then quiet.' },
-        { title: 'Earlier versions', desc: '1.4.0 let every user drag and resize their own dashboard cards, and accepted more than one completed-downloads folder so category subfolders finally imported. 1.3.2 made your video Libraries drive the health checks, recycle bin, moved-file resolver and naming-repair job instead of only the flat Downloads boxes — which had silently left all four inert on a per-library setup — relabelled those boxes as the fallbacks they are, restricted erasing a purchase to admins, and let the Interactive Help button be hidden. 1.3.1 added collapsible albums in Purchased. 1.3.0 extended the standard-user policy to the sidebar and split out Manage Workers. 1.2.0 let admins choose which dashboard cards standard users see. 1.1.0 brought the Purchased page and a settings clean-up. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
+    '1.6.0': [
+        { date: 'July 2026 · 1.6.0' },
+        { title: 'Your indexer keys stop leaking to the browser', desc: 'torrent and usenet search results carried the raw indexer download URL — API key and all — into the page, where it sat in DevTools and browser history, and the download endpoint accepted any URL handed back to it. Results now carry an opaque token that only the server can resolve, so nothing can talk SoulSync into forwarding an arbitrary URL to your download client.' },
+        { title: 'Downloads stop importing half-written files', desc: 'when your client reported a download finished, SoulSync could grab the staging folder while unpack and repair were still writing into it — importing a partial file as if it were complete. It now waits for the folder to actually stop changing. Video files also land in your library atomically and size-verified, which fixes the ones that played back skipping.' },
+        { title: 'Tagging and organising got a lot less destructive', desc: 'simple downloads no longer overwrite tags you already have (only blanks get filled), the reorganiser stops churning the casing of files it already organised, keeps your own album year instead of the source\'s, keeps featured-artist credits, and no longer stamps a bogus disc prefix on single-disc albums.' },
+        { title: 'Plex deep scans survive a slow library', desc: 'one slow page of a big or remote library used to hit a hard 15-second timeout and zero out the entire scan — reported as "zero artists". The timeout is now 30 seconds and configurable, and bulk fetches retry before giving up.' },
+        { title: 'Earlier versions', desc: '1.5.0 removed the Soulseek chat feature and the Support button, and gave Plex a stable device identity so it stops emailing about a new device on every restart. 1.4.0 let every user drag and resize their own dashboard cards, and accepted more than one completed-downloads folder so category subfolders finally imported. 1.3.2 made your video Libraries drive the health checks, recycle bin, moved-file resolver and naming-repair job. 1.3.1 added collapsible albums in Purchased. 1.3.0 extended the standard-user policy to the sidebar. 1.2.0 let admins choose which dashboard cards standard users see. 1.1.0 brought the Purchased page. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
     ],
 };
 
@@ -3520,7 +3521,20 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.5.0: less to carry",
+        title: "1.6.0: upstream's fixes, folded in",
+        description: "this fork branched from upstream SoulSync 3.1.5, which has since shipped three releases. 38 of their fixes are now here — a security fix, several that stop half-written downloads being imported, and a long tail of tagging and organising corrections. None of their chat work came with it.",
+        features: [
+            "SECURITY: torrent and usenet search results used to carry the raw indexer download URL — API key included — all the way into the browser, where it lived in DevTools and history, and the download endpoint would accept any URL sent back to it. Results now carry an opaque server-side token, so a client can no longer make SoulSync forward an arbitrary URL to SABnzbd, NZBGet or qBittorrent",
+            "half-written imports: a client reporting \"finished\" doesn't mean it has stopped writing — unpack and repair can still be working in the staging folder. SoulSync now waits for that folder to actually stop changing before importing, and video files land in the library atomically and size-verified (this is the cause of files that played back skipping)",
+            "tagging stopped overwriting you: simple downloads now only fill blank or placeholder tags instead of replacing real ones, and two rounds of false-positive retag warnings are gone",
+            "the reorganiser behaves: no more cosmetic casing churn on files it already organised, your own album year survives instead of being replaced by the source's, featured-artist credits stay in the title and filename, and single-disc albums stop getting a bogus disc prefix",
+            "Plex deep scans survive a slow library: one slow page used to hit a hard 15-second timeout and zero the whole scan, reported as \"zero artists\". Now 30 seconds, configurable, with retries on the bulk fetches",
+            "smaller ones: HiFi sources fail over on 429/403 instead of stalling, SABnzbd category handling matches what actually gets submitted, music videos file under the real artist rather than the uploader's channel, Discover caches its genre deep dives instead of re-fetching for 30 seconds on every click, and a 160-line block that had been pasted twice into the wishlist filters is gone",
+        ],
+        usage_note: "Nothing to configure. The Plex scan timeout and retry count are plex.request_timeout_seconds and plex.scan_retries if you ever need to raise them.",
+    },
+    {
+        title: "Earlier in 1.5.0 — less to carry",
         description: "the Soulseek chat feature and the upstream donation button are removed, and Plex now recognises SoulSync across restarts instead of announcing a new device every time the container starts.",
         features: [
             "chat removed completely: the rooms and private-message page, the nav entries on both the Music and Video sidebars, the \"message this user on Soulseek\" buttons on search results and uploader credits, and the stored message archive — the database sheds that table on upgrade",
