@@ -525,8 +525,13 @@ class ConfigManager:
                 # then finds the release by name under them. Empty = fall back
                 # to the soulseek download/transfer dirs (the shared-volume
                 # default). See core.download_plugins.album_bundle.resolve_reported_save_path.
-                "torrent_download_path": "",
-                "usenet_download_path": "",
+                # LISTS: a client sorting completed downloads into category
+                # folders needs one entry per category. A bare string (every
+                # config saved before this became a list) still works — see
+                # album_bundle._iter_paths. The resolver also looks ONE level
+                # inside each entry, so naming the parent folder is enough.
+                "torrent_download_path": [],
+                "usenet_download_path": [],
                 # Explicit remote→local prefix mappings for non-shared / oddly
                 # mounted layouts (Sonarr/Radarr "Remote Path Mapping" style):
                 # a list of {"from": "<client path>", "to": "<soulsync path>"}.

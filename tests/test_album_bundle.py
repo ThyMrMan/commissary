@@ -1150,3 +1150,130 @@ def test_poll_get_status_exception_treated_as_transient_miss() -> None:
     )
     assert result == '/recovered'
     assert 'failed' not in [c[0] for c in calls]
+
+
+# ---------------------------------------------------------------------------
+# Multiple completed-download paths + the category-subfolder layout.
+#
+# Torrent/usenet clients sort finished downloads into CATEGORY folders —
+# downloads/complete/Movies/<release>, .../TV-Shows/<release>. SoulSync could
+# only be told about one completed-downloads folder per protocol and looked
+# exactly one level under it, so the release at <root>/<category>/<release>
+# was never found and the import silently never happened.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_accepts_a_list_of_torrent_download_paths(tmp_path: Path) -> None:
+    """One entry per category folder — the reason these became lists."""
+    movies = tmp_path / "complete" / "Movies"
+    tv = tmp_path / "complete" / "TV-Shows"
+    for d in (movies, tv):
+        d.mkdir(parents=True)
+    (tv / "Some.Show.S01E01").mkdir()
+
+    cfg = _cfg({'download_source.torrent_download_path': [str(movies), str(tv)]})
+    resolved = resolve_reported_save_path(
+        '/downloads/complete/TV-Shows/Some.Show.S01E01', config_get=cfg)
+    assert resolved == str(tv / "Some.Show.S01E01")
+
+
+def test_resolve_still_accepts_a_bare_string_path(tmp_path: Path) -> None:
+    """Back-compat lock: every install configured before these became lists
+    has a string, and soulseek.download_path is a string forever. A list-only
+    reader would stringify it into one garbage root that never matches."""
+    (tmp_path / "MyAlbum").mkdir()
+    cfg = _cfg({'download_source.torrent_download_path': str(tmp_path)})
+    resolved = resolve_reported_save_path('/data/downloads/MyAlbum', config_get=cfg)
+    assert resolved == str(tmp_path / "MyAlbum")
+
+
+def test_resolve_finds_a_release_inside_a_category_subfolder(tmp_path: Path) -> None:
+    """THE reported bug: the root names the parent, the release sits one
+    level down under its category folder."""
+    release = tmp_path / "complete" / "Movies" / "Some.Movie.2024"
+    release.mkdir(parents=True)
+
+    cfg = _cfg({'download_source.torrent_download_path': [str(tmp_path / "complete")]})
+    resolved = resolve_reported_save_path(
+        '/data/downloads/complete/Movies/Some.Movie.2024', config_get=cfg)
+    assert resolved == str(release)
+
+
+def test_resolve_finds_the_category_folder_when_the_client_reports_its_save_dir(
+        tmp_path: Path) -> None:
+    """Torrent clients report the save DIRECTORY, not a per-release folder.
+    The release still lives under <root>/<category>/."""
+    category = tmp_path / "complete" / "Movies"
+    category.mkdir(parents=True)
+    (category / "Some.Movie.2024").mkdir()
+
+    cfg = _cfg({'download_source.torrent_download_path': [str(tmp_path / "complete")]})
+    resolved = resolve_reported_save_path(
+        '/downloads', config_get=cfg, expect_name='Some.Movie.2024')
+    assert resolved == str(category)
+
+
+def test_resolve_rejects_a_subfolder_that_lacks_the_expected_content(tmp_path: Path) -> None:
+    """The deeper search is still content-checked — a same-named folder in
+    the WRONG category must not be accepted."""
+    wrong = tmp_path / "complete" / "Movies" / "Some.Show.S01E01"
+    wrong.mkdir(parents=True)          # right name, no expected content inside
+    cfg = _cfg({'download_source.torrent_download_path': [str(tmp_path / "complete")]})
+
+    resolved = resolve_reported_save_path(
+        '/downloads/Some.Show.S01E01', config_get=cfg, expect_name='episode.mkv')
+    assert resolved == '/downloads/Some.Show.S01E01'    # unchanged = not resolved
+
+
+def test_resolve_prefers_an_exact_root_match_over_a_subfolder(tmp_path: Path) -> None:
+    """Exact <root>/<release> beats <root>/*/<release>, even when the exact
+    match is under a LATER root — every root's exact match is tried first."""
+    deep = tmp_path / "a" / "Movies" / "Release"
+    deep.mkdir(parents=True)
+    exact = tmp_path / "b" / "Release"
+    exact.mkdir(parents=True)
+
+    cfg = _cfg({'download_source.torrent_download_path': [
+        str(tmp_path / "a"), str(tmp_path / "b")]})
+    resolved = resolve_reported_save_path('/downloads/Release', config_get=cfg)
+    assert resolved == str(exact)
+
+
+def test_resolve_skips_junk_entries_in_a_path_list(tmp_path: Path) -> None:
+    """A hand-edited config shouldn't crash the resolver."""
+    (tmp_path / "MyAlbum").mkdir()
+    cfg = _cfg({'download_source.torrent_download_path': [
+        None, 42, "", "   ", {"nope": 1}, str(tmp_path)]})
+    resolved = resolve_reported_save_path('/data/downloads/MyAlbum', config_get=cfg)
+    assert resolved == str(tmp_path / "MyAlbum")
+
+
+def test_resolve_usenet_download_path_is_also_a_list(tmp_path: Path) -> None:
+    """Same treatment for usenet — SAB/NZBGet sort by category too."""
+    cat = tmp_path / "complete" / "music"
+    cat.mkdir(parents=True)
+    (cat / "MyAlbum").mkdir()
+
+    cfg = _cfg({'download_source.usenet_download_path': [str(tmp_path / "complete")]})
+    resolved = resolve_reported_save_path('/data/downloads/MyAlbum', config_get=cfg)
+    assert resolved == str(cat / "MyAlbum")
+
+
+def test_subfolder_scan_is_one_level_only(tmp_path: Path) -> None:
+    """These roots are whole download disks — a recursive walk would be a
+    performance trap. Two levels down must NOT resolve."""
+    buried = tmp_path / "complete" / "Movies" / "2024" / "Release"
+    buried.mkdir(parents=True)
+
+    cfg = _cfg({'download_source.torrent_download_path': [str(tmp_path / "complete")]})
+    resolved = resolve_reported_save_path('/downloads/Release', config_get=cfg)
+    assert resolved == '/downloads/Release'      # unchanged = not resolved
+
+
+def test_subfolder_scan_survives_an_unreadable_root(tmp_path: Path) -> None:
+    """A root that doesn't exist must degrade, not raise."""
+    cfg = _cfg({'download_source.torrent_download_path': [
+        str(tmp_path / "does-not-exist"), str(tmp_path)]})
+    (tmp_path / "MyAlbum").mkdir()
+    assert resolve_reported_save_path(
+        '/data/downloads/MyAlbum', config_get=cfg) == str(tmp_path / "MyAlbum")

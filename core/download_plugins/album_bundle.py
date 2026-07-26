@@ -600,6 +600,47 @@ def poll_album_download(
     return None
 
 
+def _iter_paths(value) -> list:
+    """One config value → zero or more roots.
+
+    ``download_source.torrent_download_path`` / ``usenet_download_path`` are
+    LISTS (a client sorting into category folders needs one entry per
+    category), while every other key here — and any config saved before that
+    change — is a bare string. Both are accepted forever.
+
+    Never ``str()`` a value that might be a list: that would stringify
+    ``['a', 'b']`` into one garbage root that silently never matches.
+    """
+    if isinstance(value, (list, tuple, set)):
+        return [p.strip() for p in value if isinstance(p, str) and p.strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+# Immediate subdirectories scanned per root when looking one level deeper.
+# These roots point at whole download disks; a cap keeps a mis-configured
+# root (say, / ) from turning every resolution into a directory crawl.
+_MAX_SUBDIRS_SCANNED = 100
+
+
+def _subdirs_of(root) -> list:
+    """Immediate subdirectories of ``root``, capped. Never recurses."""
+    out: list = []
+    try:
+        for entry in Path(root).iterdir():
+            try:
+                if entry.is_dir():
+                    out.append(entry)
+            except OSError:      # a broken symlink / permission hiccup
+                continue
+            if len(out) >= _MAX_SUBDIRS_SCANNED:
+                break
+    except OSError:              # root missing or unreadable — not our problem here
+        return []
+    return out
+
+
 def _candidate_download_roots(config_get: Callable[..., Any]) -> list:
     """Directories where THIS process can read finished downloads — used by
     ``resolve_reported_save_path`` for the basename fallback.
@@ -620,9 +661,7 @@ def _candidate_download_roots(config_get: Callable[..., Any]) -> list:
         'soulseek.download_path',
         'soulseek.transfer_path',
     ):
-        value = config_get(key, None)
-        if value:
-            roots.append(str(value))
+        roots.extend(_iter_paths(config_get(key, None)))
     seen: set = set()
     out: list = []
     for root in roots:
@@ -713,23 +752,44 @@ def resolve_reported_save_path(
                 if _is_dir(candidate) and _contains_expected(candidate):
                     return candidate
 
+    roots = _candidate_download_roots(config_get)
+
     # 3. Basename fallback under known download roots — covers the standard
     #    shared-volume layout with zero configuration.
     basename = Path(normalized).name
     if basename:
-        for root in _candidate_download_roots(config_get):
+        for root in roots:
             candidate = Path(root) / basename
             if _is_dir(candidate) and _contains_expected(candidate):
                 return str(candidate)
+
+        # 3b. One level deeper. Clients sort finished downloads into CATEGORY
+        #     folders — '<root>/complete/Movies/<release>' — so a root pointed
+        #     at the parent misses the release entirely. Runs only after every
+        #     root's exact match above has been tried, so a precise hit never
+        #     loses to a deeper guess, and still content-checked so a
+        #     same-named folder in the wrong category can't be picked up.
+        #     One level only: these roots are whole download disks.
+        for root in roots:
+            for sub in _subdirs_of(root):
+                candidate = sub / basename
+                if _is_dir(candidate) and _contains_expected(candidate):
+                    return str(candidate)
 
     # 4. The roots THEMSELVES. A torrent client reports its save DIRECTORY
     #    (e.g. '/downloads'), not a per-release folder — in the shared-mount
     #    setup the release lands as '<SoulSync download root>/<name>', so the
     #    right resolution of '/downloads' is simply our own configured root.
     if expect_name:
-        for root in _candidate_download_roots(config_get):
+        for root in roots:
             if _is_dir(root) and _contains_expected(root):
                 return str(root)
+        # 4b. ...and the same category-folder case: the client reported its
+        #     save dir, but the release sits under '<root>/<category>/'.
+        for root in roots:
+            for sub in _subdirs_of(root):
+                if _contains_expected(sub):
+                    return str(sub)
 
     # Nothing verifiably better — hand back the reported path unchanged so
     # the caller's "no audio found" error can name it honestly.
