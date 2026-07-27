@@ -100,7 +100,102 @@ def _failed_view(row):
     }
 
 
+def _browse_shortcuts(db) -> list:
+    """Sensible starting points for the folder browser, in the order a user is
+    likely to want them: where downloads land first, then the libraries. Only
+    folders that actually exist are offered — a shortcut to a path that isn't
+    mounted is worse than no shortcut. Deduped, first label wins."""
+    from config.settings import config_manager
+
+    out, seen = [], set()
+
+    def _add(label, path):
+        p = str(path or "").strip()
+        if not p:
+            return
+        key = os.path.normcase(os.path.abspath(p))
+        if key in seen or not os.path.isdir(p):
+            return
+        seen.add(key)
+        out.append({"label": label, "path": os.path.abspath(p)})
+
+    _add("Downloads", config_manager.get("soulseek.download_path", ""))
+    for i, p in enumerate(config_manager.get("soulseek.torrent_download_path", []) or []):
+        _add("Torrents" if i == 0 else "Torrents %d" % (i + 1), p)
+    for i, p in enumerate(config_manager.get("soulseek.usenet_download_path", []) or []):
+        _add("Usenet" if i == 0 else "Usenet %d" % (i + 1), p)
+    try:
+        for row in db.all_library_rows():
+            _add(str(row.get("label") or row.get("server_title") or "Library"), row.get("path"))
+    except Exception:   # noqa: BLE001 - a registry hiccup must not kill the browser
+        logger.exception("browse: could not read library rows for shortcuts")
+    return out
+
+
+# A big folder shouldn't ship 50k rows to the browser; the user navigates or types.
+_BROWSE_LIMIT = 1000
+
+
 def register_routes(bp):
+    @bp.route("/import/browse", methods=["GET"])
+    def video_import_browse():
+        """Walk the server's filesystem to pick a file, instead of typing its full
+        path. ``?path=`` lists that folder; with none, opens on the first existing
+        shortcut (normally the download folder) so the common case needs no typing.
+
+        Admin-only — it inherits the blueprint's ``/api/video/import`` prefix gate,
+        which is admin for every method. That matters: this enumerates directories
+        on the host.
+
+        Returns folders and VIDEO files only (the same ``is_video`` test the import
+        itself uses), so nothing offered here can be rejected on the next step."""
+        from . import get_video_db
+        from core.video.importer import is_video
+
+        db = get_video_db()
+        shortcuts = _browse_shortcuts(db)
+        raw = str(request.args.get("path") or "").strip()
+        path = os.path.abspath(raw) if raw else (shortcuts[0]["path"] if shortcuts else "")
+        if not path:
+            return jsonify({"success": True, "path": "", "parent": None,
+                            "dirs": [], "files": [], "shortcuts": [],
+                            "error": "No download or library folder is configured yet."})
+        if not os.path.isdir(path):
+            return jsonify({"success": False, "path": path, "shortcuts": shortcuts,
+                            "error": "That folder doesn't exist."}), 404
+
+        dirs, files = [], []
+        try:
+            with os.scandir(path) as it:
+                for e in it:
+                    if e.name.startswith("."):      # .git, .DS_Store, thumbnail caches…
+                        continue
+                    try:
+                        if e.is_dir():
+                            dirs.append({"name": e.name, "path": e.path})
+                        elif is_video(e.name):
+                            files.append({"name": e.name, "path": e.path,
+                                          "size": e.stat().st_size})
+                    except OSError:
+                        continue                    # a single unreadable entry is skipped
+        except PermissionError:
+            return jsonify({"success": False, "path": path, "shortcuts": shortcuts,
+                            "error": "No permission to read that folder."}), 403
+        except OSError:
+            logger.exception("browse failed for %s", path)
+            return jsonify({"success": False, "path": path, "shortcuts": shortcuts,
+                            "error": "Couldn't read that folder."}), 500
+
+        dirs.sort(key=lambda d: d["name"].lower())
+        files.sort(key=lambda f: f["name"].lower())
+        truncated = len(dirs) + len(files) > _BROWSE_LIMIT
+        parent = os.path.dirname(path.rstrip(os.sep)) or None
+        return jsonify({"success": True, "path": path,
+                        "parent": parent if parent and parent != path else None,
+                        "dirs": dirs[:_BROWSE_LIMIT],
+                        "files": files[:max(0, _BROWSE_LIMIT - len(dirs))],
+                        "shortcuts": shortcuts, "truncated": truncated})
+
     @bp.route("/import/failed", methods=["GET"])
     def video_import_failed():
         from . import get_video_db

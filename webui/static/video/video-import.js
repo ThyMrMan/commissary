@@ -191,6 +191,11 @@
                     '<input type="text" class="vimp-search-input" data-vimp-add-path ' +
                         'placeholder="/path/to/the/file.mkv" autocomplete="off" spellcheck="false">' +
                 '</div>' +
+                '<div class="vimp-browse" data-vimp-browse>' +
+                    '<div class="vimp-browse-shortcuts" data-vimp-shortcuts></div>' +
+                    '<div class="vimp-browse-crumb" data-vimp-crumb></div>' +
+                    '<div class="vimp-browse-list" data-vimp-list></div>' +
+                '</div>' +
                 '<div class="vimp-modal-foot">' +
                     '<button class="vimp-btn vimp-btn--ghost" type="button" data-vimp-add-close>Cancel</button>' +
                     '<button class="vimp-btn vimp-btn--place" type="button" data-vimp-add-confirm disabled>Add</button>' +
@@ -199,11 +204,103 @@
         document.body.appendChild(m);
     }
 
+    // ── folder browser ────────────────────────────────────────────────────────
+    // Typing a full path by hand was the only way in. The text field stays (it's
+    // still the fastest route for a pasted path) but it starts on the download
+    // folder and the list below walks the server's filesystem, so the usual case
+    // is a couple of clicks.
+    var _browse = { path: '', loading: false };
+
+    function browseTo(path) {
+        _browse.loading = true;
+        renderBrowse(null);
+        var q = path ? '?path=' + encodeURIComponent(path) : '';
+        fetch('/api/video/import/browse' + q, { headers: { Accept: 'application/json' } })
+            .then(function (r) { return r.json().catch(function () { return null; }); })
+            .then(function (d) {
+                _browse.loading = false;
+                if (!d) { renderBrowse({ error: 'Couldn’t read that folder.' }); return; }
+                if (d.path) _browse.path = d.path;
+                renderBrowse(d);
+            })
+            .catch(function () {
+                _browse.loading = false;
+                renderBrowse({ error: 'Couldn’t read that folder.' });
+            });
+    }
+
+    function renderBrowse(d) {
+        var sc = $('[data-vimp-shortcuts]'), crumb = $('[data-vimp-crumb]'), list = $('[data-vimp-list]');
+        if (!list) return;
+        if (_browse.loading) { list.innerHTML = '<div class="vimp-browse-msg">Loading…</div>'; return; }
+        if (!d) return;
+        if (sc && d.shortcuts) {
+            sc.innerHTML = (d.shortcuts || []).map(function (s) {
+                return '<button type="button" class="vimp-chip' +
+                    (s.path === _browse.path ? ' vimp-chip--on' : '') +
+                    '" data-vimp-go="' + esc(s.path) + '">' + esc(s.label) + '</button>';
+            }).join('');
+        }
+        if (crumb) crumb.textContent = d.path || '';
+        if (d.error) {
+            list.innerHTML = '<div class="vimp-browse-msg">' + esc(d.error) + '</div>';
+            return;
+        }
+        var rows = '';
+        if (d.parent) {
+            rows += '<button type="button" class="vimp-row vimp-row--dir" data-vimp-go="' +
+                esc(d.parent) + '"><span class="vimp-row-ic">↰</span>' +
+                '<span class="vimp-row-name">Parent folder</span></button>';
+        }
+        rows += (d.dirs || []).map(function (x) {
+            return '<button type="button" class="vimp-row vimp-row--dir" data-vimp-go="' + esc(x.path) + '">' +
+                '<span class="vimp-row-ic">📁</span><span class="vimp-row-name">' + esc(x.name) + '</span></button>';
+        }).join('');
+        rows += (d.files || []).map(function (x) {
+            return '<button type="button" class="vimp-row vimp-row--file" data-vimp-pick="' + esc(x.path) + '">' +
+                '<span class="vimp-row-ic">🎬</span><span class="vimp-row-name">' + esc(x.name) + '</span>' +
+                '<span class="vimp-row-size">' + fmtSize(x.size) + '</span></button>';
+        }).join('');
+        if (!rows) rows = '<div class="vimp-browse-msg">Nothing to import in this folder.</div>';
+        else if (d.truncated) {
+            rows += '<div class="vimp-browse-msg">Too many entries to show them all — ' +
+                'open a subfolder or type the path above.</div>';
+        }
+        list.innerHTML = rows;
+    }
+
+    function fmtSize(n) {
+        if (!n && n !== 0) return '';
+        var u = ['B', 'KB', 'MB', 'GB', 'TB'], i = 0;
+        while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+        return (i > 1 ? n.toFixed(1) : Math.round(n)) + ' ' + u[i];
+    }
+
+    function pickBrowsedFile(path) {
+        var input = $('[data-vimp-add-path]');
+        if (input) input.value = path;
+        syncAddConfirm();
+        var list = $('[data-vimp-list]');
+        if (list) {
+            var on = list.querySelector('.vimp-row--on');
+            if (on) on.classList.remove('vimp-row--on');
+            var me = list.querySelector('[data-vimp-pick="' + (window.CSS && CSS.escape ? CSS.escape(path) : path) + '"]');
+            if (me) me.classList.add('vimp-row--on');
+        }
+    }
+
+    function syncAddConfirm() {
+        var input = $('[data-vimp-add-path]'), btn = $('[data-vimp-add-confirm]');
+        if (btn) btn.disabled = !(input && input.value.trim());
+    }
+
     function openAddFile() {
         ensureAddModal();
         var input = $('[data-vimp-add-path]');
         if (input) { input.value = ''; input.focus(); }
         var btn = $('[data-vimp-add-confirm]'); if (btn) { btn.disabled = true; btn.textContent = 'Add'; }
+        _browse = { path: '', loading: false };
+        browseTo('');   // no path → the backend opens on the first configured download folder
     }
 
     function closeAddFile() {
@@ -556,6 +653,10 @@
             if (e.target.closest('[data-vimp-add-modal]')) {
                 if (e.target.closest('[data-vimp-add-close]')) { closeAddFile(); return; }
                 if (e.target.closest('[data-vimp-add-confirm]')) { submitAddFile(); return; }
+                var go = e.target.closest('[data-vimp-go]');
+                if (go) { browseTo(go.getAttribute('data-vimp-go')); return; }
+                var pick = e.target.closest('[data-vimp-pick]');
+                if (pick) { pickBrowsedFile(pick.getAttribute('data-vimp-pick')); return; }
             }
         });
         // 'change' too — a <select> (the Library picker) is not covered by 'input'
@@ -565,10 +666,7 @@
         });
         document.addEventListener('input', function (e) {
             if (state.resolve && e.target.closest('[data-vimp-modal]')) onModalInput(e);
-            if (e.target.matches('[data-vimp-add-path]')) {
-                var btn = $('[data-vimp-add-confirm]');
-                if (btn) btn.disabled = !e.target.value.trim();
-            }
+            if (e.target.matches('[data-vimp-add-path]')) syncAddConfirm();
         });
         document.addEventListener('keydown', function (e) {
             if (e.key === 'Enter' && e.target.matches('[data-vimp-add-path]') && e.target.value.trim()) submitAddFile();
