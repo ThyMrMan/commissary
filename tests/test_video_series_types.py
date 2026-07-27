@@ -88,7 +88,7 @@ def test_gate_anime_absolute_number_is_an_episode_identity():
     assert ok["accepted"]
     miss = _eval("[SubsPlease] One Piece - 1072 (1080p)",
                  want_season=20, want_episode=45, want_absolute=1071)
-    assert not miss["accepted"] and "Not a single episode" in miss["rejected"]
+    assert not miss["accepted"] and "No episode number" in miss["rejected"]
     # without want_absolute nothing changes for standard shows
     std = _eval("[SubsPlease] One Piece - 1071 (1080p)", want_season=20, want_episode=45)
     assert not std["accepted"]

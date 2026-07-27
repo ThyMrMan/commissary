@@ -4,7 +4,7 @@ Two structural gaps that threw away real episodes:
 
 1. DAILY SERIES — late night / soaps / House Hunters release by AIR DATE
    ('The.Daily.Show.2026.07.08...'), not SxxExx. Those parsed with no episode
-   marker and died as 'Not a single episode'. Now: the parser extracts the date,
+   marker and died as 'no episode number in the release name'. Now: the parser extracts the date,
    a date match IS the episode identity (even over a numbering mismatch), and
    the retry ladder tries date-form queries after the SxxExx forms.
 
@@ -51,7 +51,7 @@ def test_date_named_release_rejected_on_wrong_date_or_no_wanted_date():
     parsed = parse_release("The.Daily.Show.2026.07.09.Guest.1080p.WEB.h264")
     v = evaluate_release(parsed, _PROFILE, scope="episode", want_season=31, want_episode=85,
                          want_title="The Daily Show", want_date="2026-07-08")
-    assert v["accepted"] is False and "Not a single episode" in v["rejected"]
+    assert v["accepted"] is False and "No episode number" in v["rejected"]
     # without a wanted date the old behavior stands (no SxxExx -> not an episode)
     v2 = evaluate_release(parsed, _PROFILE, scope="episode", want_season=31, want_episode=85,
                           want_title="The Daily Show")

@@ -145,15 +145,7 @@ def _want_titles(db, body, title=None):
         "movie", "movies", "film", "films") else "show"
     if str((body or {}).get("scope") or "").lower() in ("episode", "season", "series", "show"):
         kind = "show"
-    tmdb_id = None
-    media_id, source = (body or {}).get("media_id"), str((body or {}).get("media_source") or "").lower()
-    if source == "tmdb":
-        tmdb_id = media_id
-    elif media_id is not None:
-        try:
-            tmdb_id = db.tmdb_id_for_library_row(kind, media_id)
-        except Exception:   # noqa: BLE001 - a matching assist must never break a search
-            tmdb_id = None
+    tmdb_id = _tmdb_id_from(db, body)
     if not tmdb_id:
         return out or primary
     try:
@@ -164,6 +156,60 @@ def _want_titles(db, body, title=None):
     except Exception:   # noqa: BLE001
         logger.debug("alias lookup failed for %s %s", kind, tmdb_id, exc_info=True)
     return out or primary
+
+
+def _tmdb_id_from(db, body):
+    """The tmdb id behind a search/grab payload — media_id is a tmdb id when
+    media_source says 'tmdb', otherwise a movies/shows row id."""
+    media_id, source = (body or {}).get("media_id"), str((body or {}).get("media_source") or "").lower()
+    if not media_id:
+        return None
+    if source == "tmdb":
+        return media_id
+    kind = "movie" if str((body or {}).get("kind") or "").lower() in (
+        "movie", "movies", "film", "films") else "show"
+    try:
+        return db.tmdb_id_for_library_row(kind, media_id)
+    except Exception:   # noqa: BLE001
+        return None
+
+
+def _episode_hints(db, body, season=None, episode=None):
+    """``(want_date, want_absolute)`` for an episode search — the two ways a
+    release can identify an episode WITHOUT carrying SxxExx.
+
+    Releases named by air date (daily shows: 'The.Daily.Show.2026.07.08') or by
+    ABSOLUTE number (fansub anime: '[SubsPlease] Show - 03') parse to
+    ``episode=None``, and the scope check then has nothing to match on and
+    rejects them. The unattended paths have always supplied both from
+    ``search_context``; the interactive search supplied neither, so searching by
+    hand for an anime episode always failed while the hourly drain grabbed it
+    fine.
+
+    Deliberately NOT gated on ``series_type`` the way ``search_context`` is.
+    Both hints are accept-only — ``has_absolute_episode`` documents that a miss
+    means 'not proven', never a rejection — so computing them for every show is
+    safe, and it removes the dependency on a show being correctly tagged as
+    anime, which is itself a common way for this to go wrong."""
+    body = body or {}
+    scope = str(body.get("scope") or "").lower()
+    if scope and scope not in ("episode",):
+        return None, None
+    s = body.get("season") if season is None else season
+    e = body.get("episode") if episode is None else episode
+    tmdb_id = _tmdb_id_from(db, body)
+    if not tmdb_id or s is None or e is None:
+        return None, None
+    want_date = want_absolute = None
+    try:
+        want_date = db.episode_air_date(tmdb_id, s, e)
+    except Exception:   # noqa: BLE001 - a matching assist must never break a search
+        logger.debug("air-date hint failed for %s S%sE%s", tmdb_id, s, e, exc_info=True)
+    try:
+        want_absolute = db.episode_absolute_number(tmdb_id, s, e)
+    except Exception:   # noqa: BLE001
+        logger.debug("absolute hint failed for %s S%sE%s", tmdb_id, s, e, exc_info=True)
+    return want_date, want_absolute
 
 
 def _parse_text(hit) -> str:
@@ -816,8 +862,11 @@ def register_routes(bp):
             raw = mock_search(scope, title, year=body.get("year"), season=want_season,
                               episode=want_episode, season_end=season_end, source=source)
         preferred = _preferred_indexer_ids_for_root_folder(get_video_db(), _root_folder_id_for_grab(get_video_db(), body))
+        _ep_hints = _episode_hints(get_video_db(), body, want_season, want_episode)
         return jsonify({"scope": scope, "live": live,
-                        "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=_want_titles(get_video_db(), body), preferred_indexer_ids=preferred)})
+                        "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=_want_titles(get_video_db(), body),
+                                                 want_date=_ep_hints[0], want_absolute=_ep_hints[1],
+                                                 preferred_indexer_ids=preferred)})
 
     @bp.route("/downloads/search/start", methods=["POST"])
     def video_downloads_search_start():
@@ -831,6 +880,8 @@ def register_routes(bp):
         title = body.get("title") or ""
         source = str(body.get("source") or "").lower()
         want_season, want_episode, season_end = _search_ints(body)
+        # Air date / absolute number, for releases that carry no SxxExx.
+        _ep_hints = _episode_hints(get_video_db(), body, want_season, want_episode)
 
         if source == "soulseek":
             from core.video.slskd_search import (
@@ -858,12 +909,15 @@ def register_routes(bp):
                 return jsonify({"error": "Prowlarr: " + str(pres["error"])})
             preferred = _preferred_indexer_ids_for_root_folder(get_video_db(), _root_folder_id_for_grab(get_video_db(), body))
             return jsonify({"id": None, "live": True, "complete": True,
-                            "results": _evaluate_hits(pres["hits"], profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=_want_titles(get_video_db(), body), preferred_indexer_ids=preferred)})
+                            "results": _evaluate_hits(pres["hits"], profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=_want_titles(get_video_db(), body),
+                                                 want_date=_ep_hints[0], want_absolute=_ep_hints[1],
+                                                 preferred_indexer_ids=preferred)})
         # remaining mock sources (e.g. youtube placeholder) resolve in one shot
         raw = mock_search(scope, title, year=body.get("year"), season=want_season,
                           episode=want_episode, season_end=season_end, source=source)
         return jsonify({"id": None, "live": False, "complete": True,
-                        "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=_want_titles(get_video_db(), body))})
+                        "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=_want_titles(get_video_db(), body),
+                                                 want_date=_ep_hints[0], want_absolute=_ep_hints[1])})
 
     @bp.route("/downloads/search/poll", methods=["GET"])
     def video_downloads_search_poll():
@@ -877,11 +931,13 @@ def register_routes(bp):
         if not sid:
             return jsonify({"results": [], "live": True, "total_files": 0})
         profile, _pid = _profile_for_request(get_video_db(), request.args)
+        _poll_hints = _episode_hints(get_video_db(), request.args, want_season, want_episode)
         polled = poll_search(sid)
         return jsonify({"live": True, "total_files": polled["total_files"],
                         "results": _evaluate_hits(polled["hits"], profile, scope, want_season, want_episode, want_year=request.args.get("year"),
                                                  want_title=_want_titles(get_video_db(), request.args,
-                                                                         request.args.get("title")))})
+                                                                         request.args.get("title")),
+                                                 want_date=_poll_hints[0], want_absolute=_poll_hints[1])})
 
     @bp.route("/downloads/grab", methods=["POST"])
     def video_downloads_grab():

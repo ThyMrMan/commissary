@@ -183,7 +183,13 @@ def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_tit
                 from core.video.release_parse import has_absolute_episode
                 if has_absolute_episode(parsed.get("title"), want_absolute):
                     return None, None
-            return None, "Not a single episode"
+            # NOT "this is a pack" — the parser found no episode number at all.
+            # The old wording ("Not a single episode") described a conclusion the
+            # code never reached, and sent people off checking whether the file
+            # was a season pack when the real answer is that nothing in the name
+            # said which episode it is (fansub absolute numbering, a date-named
+            # daily, or just an unparseable name).
+            return None, "No episode number in the release name"
         if want_season is not None and season != want_season:
             # A date match trumps a numbering mismatch — scene season numbering for
             # dailies rarely agrees with TMDB's, but the air date is unambiguous.

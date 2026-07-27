@@ -6731,6 +6731,30 @@ class VideoDatabase:
         finally:
             conn.close()
 
+    def episode_air_date(self, show_tmdb_id, season_number, episode_number):
+        """One episode's air date (ISO), or None when it isn't in the library.
+
+        Daily series are released by DATE rather than SxxExx ('The.Daily.Show.
+        2026.07.08'), so this is the only thing that identifies such a release —
+        the sibling of ``episode_absolute_number`` for the other naming
+        convention the scope check understands."""
+        try:
+            s, e = int(season_number), int(episode_number)
+        except (TypeError, ValueError):
+            return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT air_date FROM episodes "
+                "WHERE show_id = (SELECT id FROM shows WHERE tmdb_id=? ORDER BY id LIMIT 1) "
+                "AND season_number=? AND episode_number=? LIMIT 1",
+                (int(show_tmdb_id), s, e)).fetchone()
+            return (str(row["air_date"])[:10] or None) if row and row["air_date"] else None
+        except (sqlite3.Error, TypeError, ValueError):
+            return None
+        finally:
+            conn.close()
+
     def episode_absolute_number(self, show_tmdb_id, season_number, episode_number):
         """The episode's ABSOLUTE number (anime numbering, P8): its 1-based position
         in the show's aired order, specials (season 0) excluded. None when the show
