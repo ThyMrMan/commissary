@@ -376,6 +376,13 @@ _COLUMN_MIGRATIONS = [
     # follow that predates the column — and every admin follow — stays live; a
     # follow from a profile without download rights is written as 0 and every
     # acquisition path skips it until approved.
+    # User-supplied "also known as" titles, newline-separated. A matching aid only:
+    # the release-title gate accepts a release named by any of these. Exists because
+    # TMDB's alias coverage is patchy for anime — a show whose fansub releases use a
+    # translation of the original title has no automatic bridge to its TMDB name.
+    # Never pushed to Plex/Jellyfin; this is SoulSync-local.
+    ("shows", "aka_titles", "TEXT"),
+    ("movies", "aka_titles", "TEXT"),
     ("video_watchlist", "approved", "INTEGER NOT NULL DEFAULT 1"),
     ("video_watchlist", "requested_by", "INTEGER"),
     ("video_watchlist", "requested_by_name", "TEXT"),
@@ -1040,6 +1047,79 @@ class VideoDatabase:
             return None
         finally:
             conn.close()
+
+    @staticmethod
+    def _split_akas(raw) -> list:
+        """Stored newline-separated AKAs → a clean deduped list (case-insensitive,
+        order preserved). Also tolerates commas, since that's what people type."""
+        out, seen = [], set()
+        for part in str(raw or "").replace(",", "\n").split("\n"):
+            t = part.strip()
+            if t and t.lower() not in seen:
+                seen.add(t.lower())
+                out.append(t)
+        return out
+
+    def set_aka_titles(self, kind: str, item_id, titles) -> list | None:
+        """Replace a title's user AKA list. ``titles`` may be a list or a raw
+        newline/comma string. Returns the stored list, or None for an unknown row."""
+        table = {"movie": "movies", "show": "shows"}.get(kind)
+        if not table or item_id is None:
+            return None
+        if isinstance(titles, (list, tuple)):
+            titles = "\n".join(str(t or "") for t in titles)
+        clean = self._split_akas(titles)
+        conn = self._get_connection()
+        try:
+            cur = conn.execute(f"UPDATE {table} SET aka_titles=? WHERE id=?",
+                               ("\n".join(clean) or None, int(item_id)))
+            conn.commit()
+            return clean if cur.rowcount else None
+        except (sqlite3.Error, TypeError, ValueError):
+            logger.exception("set_aka_titles failed (%s %s)", kind, item_id)
+            return None
+        finally:
+            conn.close()
+
+    def aka_titles(self, kind: str, item_id) -> list:
+        """One title's user AKAs by library row id."""
+        table = {"movie": "movies", "show": "shows"}.get(kind)
+        if not table or item_id is None:
+            return []
+        conn = self._get_connection()
+        try:
+            row = conn.execute(f"SELECT aka_titles FROM {table} WHERE id=?",
+                               (int(item_id),)).fetchone()
+            return self._split_akas(row["aka_titles"]) if row else []
+        except (sqlite3.Error, TypeError, ValueError):
+            return []
+        finally:
+            conn.close()
+
+    def aka_titles_for_tmdb(self, kind: str, tmdb_id) -> list:
+        """User AKAs keyed by TMDB id — what the alias resolvers hold.
+
+        Unions across every row for that tmdb_id: the same show mirrored on two
+        servers is two rows, and an AKA typed on one of them must still count."""
+        table = {"movie": "movies", "show": "shows"}.get(kind)
+        if not table or tmdb_id is None:
+            return []
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                f"SELECT aka_titles FROM {table} WHERE tmdb_id=? AND aka_titles IS NOT NULL",
+                (int(tmdb_id),)).fetchall()
+        except (sqlite3.Error, TypeError, ValueError):
+            return []
+        finally:
+            conn.close()
+        out, seen = [], set()
+        for r in rows:
+            for t in self._split_akas(r["aka_titles"]):
+                if t.lower() not in seen:
+                    seen.add(t.lower())
+                    out.append(t)
+        return out
 
     def tmdb_id_for_library_row(self, kind: str, row_id):
         """The tmdb_id of a movies/shows ROW — the inverse of
@@ -4872,6 +4952,7 @@ class VideoDatabase:
             "wikidata_url": show["wikidata_url"],
             "genres": genres, "cast": credits["cast"], "crew": credits["crew"],
             "tmdb_id": show["tmdb_id"], "tvdb_id": show["tvdb_id"], "imdb_id": show["imdb_id"],
+            "aka_titles": self._split_akas(show["aka_titles"]),
             # The Library this show is filed under, so a grab/import started from the
             # detail page routes to ITS folder and category instead of defaulting to
             # the primary Library for the kind (an Anime show landing under TV Shows).
@@ -7987,6 +8068,7 @@ class VideoDatabase:
             "wikidata_url": m["wikidata_url"],
             "cast": credits["cast"], "crew": credits["crew"],
             "tmdb_id": m["tmdb_id"], "imdb_id": m["imdb_id"],
+            "aka_titles": self._split_akas(m["aka_titles"]),
             # See show_detail — the Library this movie is filed under, so a grab
             # started from the detail page routes to ITS folder and category.
             "root_folder_id": m["root_folder_id"],

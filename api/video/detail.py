@@ -50,6 +50,28 @@ def register_routes(bp):
             return jsonify({"error": res.get("error", "not found")}), 404
         return jsonify(res)
 
+    @bp.route("/detail/<kind>/<int:item_id>/aka", methods=["PUT"])
+    def video_set_aka_titles(kind, item_id):
+        """Replace a title's user "also known as" list. Body: {titles: [...] | "a\\nb"}.
+
+        A SoulSync-LOCAL matching aid, deliberately not part of /metadata: that
+        endpoint pushes edits to Plex/Jellyfin and locks the field there, which
+        would be wrong for something the media server has no concept of. These
+        titles only widen what the release-title gate accepts.
+
+        Exists because TMDB's alias coverage is patchy — most visibly for anime,
+        where fansub groups release under a translation of the original title
+        while TMDB lists a different localised name, leaving no automatic bridge
+        between the two."""
+        from . import get_video_db
+        if kind not in ("movie", "show"):
+            return jsonify({"error": "bad kind"}), 400
+        body = request.get_json(silent=True) or {}
+        stored = get_video_db().set_aka_titles(kind, item_id, body.get("titles"))
+        if stored is None:
+            return jsonify({"error": "unknown item"}), 404
+        return jsonify({"ok": True, "aka_titles": stored})
+
     @bp.route("/detail/<kind>/<int:item_id>/lock", methods=["POST"])
     def video_field_lock(kind, item_id):
         """Lock or release one field. Releasing hands it back to the server:

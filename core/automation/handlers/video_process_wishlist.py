@@ -136,18 +136,28 @@ def active_download_keys(active: Iterable[Dict[str, Any]]) -> set:
 
 
 def _acceptable_titles(primary: Any, kind: str, tmdb_id: Any) -> List[str]:
-    """[primary title, *TMDB alternative titles] — deduped, primary first. The alias
-    set the release-title gate matches against (so a release named by a known aka still
-    matches). Best-effort: just the primary when TMDB is unavailable."""
+    """[primary title, *user AKAs, *TMDB alternative titles] — deduped, primary first.
+    The alias set the release-title gate matches against (so a release named by a known
+    aka still matches). Best-effort: just the primary when nothing else is available.
+
+    User AKAs come FIRST after the primary because they're the deliberate override:
+    someone typed them precisely because TMDB's own aliases didn't cover the release
+    naming they were seeing."""
+    user_akas: List[str] = []
     aliases: List[str] = []
     if tmdb_id:
         try:
+            from api.video import get_video_db
+            user_akas = get_video_db().aka_titles_for_tmdb(kind, tmdb_id) or []
+        except Exception:   # noqa: BLE001 - a matching assist must never break a grab
+            user_akas = []
+        try:
             from core.video.enrichment.engine import get_video_enrichment_engine
             aliases = get_video_enrichment_engine().alt_titles_for(kind, tmdb_id) or []
-        except Exception:   # noqa: BLE001 - a matching assist must never break a grab
+        except Exception:   # noqa: BLE001
             aliases = []
     out, seen = [], set()
-    for t in [primary, *aliases]:
+    for t in [primary, *user_akas, *aliases]:
         t = str(t or "").strip()
         if t and t.lower() not in seen:
             seen.add(t.lower())

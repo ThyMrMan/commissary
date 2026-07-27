@@ -148,6 +148,14 @@ def _want_titles(db, body, title=None):
     tmdb_id = _tmdb_id_from(db, body)
     if not tmdb_id:
         return out or primary
+    # User AKAs first — they're the deliberate override, typed precisely because
+    # TMDB's own aliases didn't cover the release naming being seen.
+    try:
+        for a in (db.aka_titles_for_tmdb(kind, tmdb_id) or []):
+            if a and a not in out:
+                out.append(a)
+    except Exception:   # noqa: BLE001 - a matching assist must never break a search
+        logger.debug("aka lookup failed for %s %s", kind, tmdb_id, exc_info=True)
     try:
         from core.video.enrichment.engine import get_video_enrichment_engine
         for a in (get_video_enrichment_engine().alt_titles_for(kind, tmdb_id) or []):

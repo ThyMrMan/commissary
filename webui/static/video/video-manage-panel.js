@@ -61,6 +61,9 @@
             '.vmg-sect{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.07em;' +
                 'color:rgba(255,255,255,.42);margin:6px 0 -8px;}' +
             '.vmg-field{display:flex;flex-direction:column;gap:6px;min-width:0;}' +
+            '.vmg-aka{resize:vertical;min-height:52px;line-height:1.4;}' +
+            '.vmg-hint{font-size:11.5px;line-height:1.4;color:rgba(255,255,255,.42);}' +
+            '.vmg-field [data-vmg-aka-save]{align-self:flex-start;}' +
             '.vmg-label{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:700;color:rgba(255,255,255,.6);}' +
             '.vmg-row2{display:grid;grid-template-columns:1fr 1fr;gap:12px;}' +
             '.vmg-input,.vmg-area{width:100%;box-sizing:border-box;padding:10px 12px;border-radius:10px;font-size:13.5px;' +
@@ -236,6 +239,19 @@
                             '</option>';
                     }).join('') + '</select></div>'
                 : '') +
+            // Also known as (matching aid): extra titles the release-title gate will
+            // accept for this title. TMDB's alias coverage is patchy — most visibly
+            // for anime, where fansub groups release under a translation of the
+            // original title while TMDB lists a different localised name. Local only;
+            // never pushed to Plex/Jellyfin.
+            '<div class="vmg-field"><label>Also known as</label>' +
+                '<textarea class="vmg-input vmg-aka" data-vmg-aka rows="2" ' +
+                    'placeholder="One title per line — releases named this way will match"' +
+                    '>' + esc((d.aka_titles || []).join('\n')) + '</textarea>' +
+                '<div class="vmg-hint">Used only for matching downloads. Add the name ' +
+                    'releases actually use if it differs from the one shown here.</div>' +
+                '<button class="vmg-btn-ghost" type="button" data-vmg-aka-save>Save titles</button>' +
+            '</div>' +
             '<div class="vmg-sect">Matches</div>' +
             '<div class="vmg-matches" data-vmg-matches>' +
                 '<div class="vmg-msearch-hint">Loading matches…</div>' +
@@ -552,6 +568,27 @@
             .catch(function () { toast('Couldn’t update the series type', 'error'); });
     }
 
+    function saveAkaTitles(btn) {
+        var box = document.querySelector('[data-vmg-aka]');
+        if (!box) return;
+        btn.disabled = true;
+        fetch('/api/video/detail/' + state.kind + '/' + state.id + '/aka', {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ titles: box.value }) })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+                btn.disabled = false;
+                if (!d || !d.ok) { toast('Couldn’t save those titles', 'error'); return; }
+                // Echo back what was actually stored (deduped, blanks dropped) so the
+                // box shows the truth rather than what was typed.
+                box.value = (d.aka_titles || []).join('\n');
+                toast(d.aka_titles.length
+                    ? 'Saved — releases using ' + (d.aka_titles.length === 1 ? 'that name' : 'those names') + ' will match'
+                    : 'Cleared — only the title above will match', 'success');
+            })
+            .catch(function () { btn.disabled = false; toast('Couldn’t save those titles', 'error'); });
+    }
+
     function setQualityProfile(sel) {
         var pid = parseInt(sel.value, 10) || 0;
         fetch('/api/video/detail/' + state.kind + '/' + state.id + '/quality-profile', {
@@ -671,6 +708,8 @@
                 applyMatch('imdb', iv, 'IMDb id set — ratings will refresh');
                 return;
             }
+            var akaBtn = e.target.closest('[data-vmg-aka-save]');
+            if (akaBtn) { saveAkaTitles(akaBtn); return; }
             var tw = e.target.closest('[data-vmg-watched]');
             if (tw) { toggle('watched', tw); return; }
             var tm = e.target.closest('[data-vmg-monitored]');
