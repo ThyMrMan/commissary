@@ -27,6 +27,40 @@ def _req_width():
     return max(48, min(1600, w))
 
 
+def _serve_cached(url, params=None):
+    """Serve an upstream image through the on-disk image cache, or None to let
+    the caller fall back to streaming it live.
+
+    Every artwork request used to make a fresh blocking call to Plex/TMDB. With
+    gunicorn on one worker and eight threads, a grid of posters on a cold browser
+    cache could occupy the whole pool and stall unrelated API requests behind it.
+    ``core.image_cache`` (already used by the music side) stores the bytes on
+    disk, dedupes concurrent requests for the same key with a per-key lock, and
+    serves a stale copy if the refresh fails — so a Plex restart mid-scroll shows
+    art instead of holes.
+
+    Returns None rather than raising on any cache problem: artwork must never be
+    the reason a page errors."""
+    try:
+        from urllib.parse import urlencode
+
+        from flask import send_file
+
+        from core.image_cache import get_image_cache
+        full = url + (("&" if "?" in url else "?") + urlencode(params) if params else "")
+        cached = get_image_cache().get_url(full)
+        resp = send_file(str(cached.path), mimetype=cached.mime_type, conditional=True)
+        # A real validator, so a repeat view is a 304 instead of a re-download.
+        # The old code sent max-age alone, which meant every image was refetched
+        # in full the moment the browser's copy aged out.
+        resp.headers["Cache-Control"] = "public, max-age=604800"
+        resp.headers["ETag"] = '"vimg-%s"' % cached.key[:32]
+        return resp
+    except Exception as e:      # noqa: BLE001 - fall back to the live stream
+        logger.debug("image cache miss-through for %s: %s", url, e)
+        return None
+
+
 def _tmdb_resize(url, w, backdrop):
     """Rewrite a TMDB image URL's size segment (/t/p/<size>/...) to a bucket near
     ``w`` so episode stills load small. Best-effort — unchanged if it doesn't match."""
@@ -52,6 +86,9 @@ def register_routes(bp):
             if path.startswith("http://") or path.startswith("https://"):
                 if w and "image.tmdb.org" in path:
                     path = _tmdb_resize(path, w, backdrop)
+                hit = _serve_cached(path)
+                if hit is not None:
+                    return hit
                 upstream = requests.get(path, timeout=15, stream=True)
                 if upstream.status_code != 200:
                     abort(404)
@@ -95,6 +132,11 @@ def register_routes(bp):
             else:
                 abort(404)
 
+            hit = _serve_cached(url, params)
+            if hit is None and fallback:
+                hit = _serve_cached(fallback, params)
+            if hit is not None:
+                return hit
             upstream = requests.get(url, params=params, timeout=15, stream=True)
             if upstream.status_code != 200 and fallback:
                 upstream = requests.get(fallback, params=params, timeout=15, stream=True)

@@ -3,6 +3,7 @@ _DIRECT_RUN = (__name__ == '__main__')
 import os
 import json
 import asyncio
+import gzip
 import requests
 import socket
 import subprocess
@@ -47,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.6.8"
+_SOULSYNC_BASE_VERSION = "1.6.9"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -672,6 +673,93 @@ def _set_profile_context():
             logger.debug("profile session validate: %s", e)
 
     g.profile_id = pid
+
+
+# Content types worth compressing. Images, video, fonts and archives are already
+# compressed — gzipping them burns CPU to make them very slightly bigger.
+_COMPRESSIBLE_TYPES = (
+    'text/', 'application/javascript', 'text/javascript', 'application/json',
+    'application/manifest+json', 'image/svg+xml', 'application/xml', 'text/xml',
+)
+# Below this, the gzip header costs more than the saving and adds latency.
+_COMPRESS_MIN_BYTES = 1024
+# Ceiling on buffering a passthrough (static-file) body into memory to compress
+# it. The largest text asset here is style.css at ~1.9 MB.
+_COMPRESS_MAX_BYTES = 8 * 1024 * 1024
+
+
+@app.after_request
+def _compress_response(response):
+    """gzip text responses when the client asks for it.
+
+    Nothing was compressed before this: index.html shipped 1.02 MB raw and
+    style.css 1.94 MB. Measured over the whole static tree, gzip -6 takes
+    10.44 MB down to 2.13 MB (4.9x), which is the single biggest reduction in
+    bytes-on-the-wire available here.
+
+    What it will NOT touch, and why each one matters:
+      * `text/event-stream` — SSE responses are open-ended generators. Reading
+        the body to compress it would block until the stream ends, i.e. forever.
+      * any other streamed response of unknown length (the artwork proxy hands
+        back `Response(iter_content(...))`) — buffering it would defeat the
+        streaming and hold the whole image in memory.
+      * 206 partial content — range requests must keep their byte offsets.
+      * anything already carrying Content-Encoding, and non-2xx bodies.
+
+    Static files ARE `direct_passthrough` (Flask's file wrapper) but have a known
+    Content-Length and a real file behind them, so they're safe to materialise
+    below a ceiling — and they're the bulk of the payload, so skipping them would
+    have missed most of the win.
+    """
+    try:
+        if response.headers.get('Content-Encoding'):
+            return response
+        if response.status_code < 200 or response.status_code >= 300:
+            return response
+        if response.status_code == 206:
+            return response
+        ctype = (response.headers.get('Content-Type') or '').split(';', 1)[0].strip().lower()
+        if ctype == 'text/event-stream':
+            return response
+        if not ctype.startswith(_COMPRESSIBLE_TYPES):
+            return response
+        # Vary regardless of whether we compress THIS response: the same URL can
+        # be served both ways depending on the request, and a shared cache must
+        # key on it either way.
+        response.headers.add('Vary', 'Accept-Encoding')
+        if 'gzip' not in (request.headers.get('Accept-Encoding') or '').lower():
+            return response
+
+        if response.direct_passthrough:
+            try:
+                declared = int(response.headers.get('Content-Length') or 0)
+            except (TypeError, ValueError):
+                declared = 0
+            if declared <= 0 or declared > _COMPRESS_MAX_BYTES:
+                return response
+            # Safe to read now: known length, backed by a file on disk. Werkzeug
+            # refuses get_data() while passthrough is on, so clear it first.
+            response.direct_passthrough = False
+        elif response.is_streamed:
+            return response
+
+        data = response.get_data()
+        if len(data) < _COMPRESS_MIN_BYTES:
+            return response
+        packed = gzip.compress(data, 6)
+        if len(packed) >= len(data):        # incompressible — keep the original
+            return response
+        response.set_data(packed)
+        response.headers['Content-Encoding'] = 'gzip'
+        response.headers['Content-Length'] = str(len(packed))
+        # A weak ETag survives the transformation; a strong one would now be a
+        # lie, since the bytes no longer match what the strong tag identified.
+        etag = response.headers.get('ETag')
+        if etag and not etag.startswith('W/'):
+            response.headers['ETag'] = 'W/' + etag
+    except Exception as e:      # noqa: BLE001 - never let compression break a response
+        logger.debug("response compression skipped: %s", e)
+    return response
 
 
 @app.after_request
@@ -2537,7 +2625,14 @@ from core.connection_detect import run_detection
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    """The SPA shell. It's ~1 MB of markup and was being re-downloaded in full on
+    every visit — no validator, no cache directive. An ETag over the rendered
+    body turns a repeat visit into a 304, and `no-cache` (revalidate, don't skip)
+    keeps a deploy visible immediately."""
+    resp = app.make_response(render_template('index.html'))
+    resp.headers['Cache-Control'] = 'no-cache'
+    resp.add_etag()
+    return resp.make_conditional(request)
 
 
 @app.route('/sw.js')
