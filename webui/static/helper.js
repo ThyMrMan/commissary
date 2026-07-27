@@ -3484,11 +3484,14 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.7.1': [
-        { date: 'July 2026 · 1.7.1' },
+    '1.7.2': [
+        { date: 'July 2026 · 1.7.2' },
+        { title: 'The login screen is properly quiet now', desc: 'finishing what 1.7.1 started. The page had still been sending about seventeen requests the moment it loaded, for parts of SoulSync you are not signed in to yet. It now sends two — the only two the sign-in screen actually needs. Everything else waits until you are in.' },
+        { title: 'Nothing waits longer than it should', desc: 'if SoulSync cannot work out whether you are signed in, it stops waiting after ten seconds and carries on as before. Installs without "Require login" are unaffected either way.' },
+        { title: 'Also in 1.7.1 and 1.7.0', desc: 'if you are coming from 1.6.x you are getting all of these at once. The security items at the bottom are worth reading before putting SoulSync on a public address.' },
         { title: 'Sign in with Plex works again on the login screen', desc: 'with "Require login" turned on, pressing Sign in with Plex appeared to do nothing. It was actually working the whole time — the panel showing your plex.tv code was being hidden by the lock screen, so the code never appeared. It shows now.' },
         { title: 'A much quieter login screen', desc: 'the sign-in page had been quietly firing off dozens of requests a minute to parts of SoulSync you are not signed in to yet, all of them refused. It now waits until you are signed in.' },
-        { title: 'Also in 1.7.0 — the security release', desc: 'if you are coming from 1.6.x you are getting these at the same time. They are worth reading before putting SoulSync on a public address.' },
+        { title: 'From 1.7.0 — the security release', desc: 'the items below are the security work, kept here so an upgrade from 1.6.x does not skip past them.' },
         { title: 'Requests from other websites are now refused', desc: 'while you were signed in, any other site you happened to visit could quietly make your browser send commands to SoulSync as you. Those are now rejected. Nothing changes for normal use — it is your own tabs and your own apps that are unaffected — and there is a switch in Settings → Security if you ever need it off.' },
         { title: 'A way in without signing in has been closed', desc: 'a first-run shortcut could hand out an API key without asking who you were, even with "Require login" turned on. It now needs an admin who is actually signed in. If you use the API, create keys in Settings → API keys as normal.' },
         { title: 'SoulSync no longer fetches images from anywhere it is told', desc: 'the artwork fetcher had a check that let everything through, so it could be pointed at devices on your home network. It now only reaches your own media servers and public artwork sites. Plex and Jellyfin artwork behind a LAN address keeps working.' },
@@ -3525,7 +3528,17 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.7.1: the login screen behaves itself",
+        title: "1.7.2: the rest of the login-screen noise",
+        description: "1.7.1 stopped the repeating background polling on the sign-in screen. This finishes the job — the one-off burst every module fires the instant the page loads.",
+        features: [
+            "about fifteen modules each fetch something once at boot — the video dashboard, libraries, scan status, issue and watchlist counts, YouTube channels, search sources. None of them can know yet whether you are signed in, because that answer only arrives with the first reply from the server, so with Require login on they all went out and were all refused. They now wait for that answer",
+            "they WAIT rather than fail. That distinction is the whole point: on an install without Require login, auth is briefly unknown too, so failing fast would have made those same requests give up and paint an empty state that never refills. Deferring means an ordinary install sees no change at all — verified, twenty-five requests, all returning real data",
+            "if the answer never comes, the wait ends after ten seconds and everything proceeds as it used to. A bug in this cannot leave SoulSync unable to talk to itself",
+            "measured on the sign-in screen: seventeen requests before, two after — and those two are the ones the screen genuinely needs",
+        ],
+    },
+    {
+        title: "Earlier in 1.7.1 — the login screen behaves itself",
         description: "two follow-ups to 1.7.0, both on the sign-in screen, both reported from real use.",
         features: [
             "\"Sign in with Plex\" looked dead once Require login was on. It was never broken — the request went out, Plex returned a real code, and the panel showing that code was hidden by the lock screen's own blanking rule. The panel is now excepted from it, like the other two lock screens",

@@ -5801,6 +5801,10 @@ function updateOverlayTask(data) {
 // Pull current state on demand (panel open / page load) so we're accurate even if
 // a socket event was missed or a job was already running before we connected.
 function _seedOverlayTask() {
+    // Locked (login / PIN screen): auth-gated, and these seed on page load —
+    // after auth-hold.js has already released, so the class check is what
+    // catches them. Resumes on unlock.
+    if (document.body.classList.contains('app-locked')) return;
     fetch('/api/video/overlays/apply/status')
         .then(r => r.ok ? r.json() : null)
         .then(s => { if (s) updateOverlayTask(s); })
@@ -5858,6 +5862,10 @@ function updateCollectionArtTask(data) {
 }
 
 function _seedCollectionArtTask() {
+    // Locked (login / PIN screen): auth-gated, and these seed on page load —
+    // after auth-hold.js has already released, so the class check is what
+    // catches them. Resumes on unlock.
+    if (document.body.classList.contains('app-locked')) return;
     fetch('/api/video/collections/posters/regenerate/status')
         .then(r => r.ok ? r.json() : null)
         .then(s => { if (s) updateCollectionArtTask(s); })
@@ -5908,6 +5916,10 @@ function updateVideoBulkTask(data) {
 }
 
 function _seedVideoBulkTask() {
+    // Locked (login / PIN screen): auth-gated, and these seed on page load —
+    // after auth-hold.js has already released, so the class check is what
+    // catches them. Resumes on unlock.
+    if (document.body.classList.contains('app-locked')) return;
     fetch('/api/video/bulk/status')
         .then(r => r.ok ? r.json() : null)
         .then(s => { if (s) updateVideoBulkTask(s); })
@@ -5959,6 +5971,10 @@ function updateCollectionSyncTask(data) {
 }
 
 function _seedCollectionSyncTask() {
+    // Locked (login / PIN screen): auth-gated, and these seed on page load —
+    // after auth-hold.js has already released, so the class check is what
+    // catches them. Resumes on unlock.
+    if (document.body.classList.contains('app-locked')) return;
     fetch('/api/video/collections/sync/status')
         .then(r => r.ok ? r.json() : null)
         .then(s => { if (s) updateCollectionSyncTask(s); })

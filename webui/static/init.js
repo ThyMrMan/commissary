@@ -667,6 +667,12 @@ async function initProfileSystem() {
     } catch (e) {
         console.error('Profile init error:', e);
         return true; // Fall through to normal init
+    } finally {
+        // Release auth-hold.js no matter which branch we took. settle() is
+        // idempotent and first-call-wins, so a lock screen that already settled
+        // TRUE above keeps that verdict; every other path — including the catch —
+        // settles false and the parked boot fetches go out for real.
+        if (window.__soulsyncAuthSettled) window.__soulsyncAuthSettled(false);
     }
 }
 
@@ -675,6 +681,9 @@ async function initProfileSystem() {
 function showLoginScreen() {
     const overlay = document.getElementById('login-overlay');
     if (!overlay) return;
+    // Definitive "we are locked" — releases auth-hold.js so the boot fetches it
+    // parked resolve to a 401 locally instead of going out and being refused.
+    if (window.__soulsyncAuthSettled) window.__soulsyncAuthSettled(true);
     // Hide the entire app while locked, so removing the overlay (Safari "Hide
     // Distracting Items", devtools) reveals nothing — not even the empty chrome.
     // initApp() reveals it again on a successful sign-in (#852).
@@ -871,6 +880,8 @@ async function submitRecoveryReset() {
 function showLaunchPinScreen() {
     const overlay = document.getElementById('launch-pin-overlay');
     if (!overlay) return;
+    // Same as showLoginScreen — the PIN gate refuses the same endpoints.
+    if (window.__soulsyncAuthSettled) window.__soulsyncAuthSettled(true);
     // Hide the whole app while locked — bypassing the overlay reveals nothing (#852).
     document.body.classList.add('app-locked');
     overlay.style.display = 'flex';
