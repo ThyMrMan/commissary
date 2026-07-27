@@ -538,6 +538,20 @@ body[data-side="video"] .dashboard-header-sweep {
     gap: 6px;
     margin: 4px 0 8px 44px;
 }
+/* Preferred trackers: pick real indexers by name. The value on the wire is
+   still comma-separated Prowlarr ids — which is exactly what nobody could
+   look up, hence the picker. */
+.library-tracker-picker { display: flex; flex-wrap: wrap; gap: 6px; }
+.library-tracker { display: inline-flex; align-items: center; gap: 7px; padding: 5px 10px;
+    border-radius: 999px; cursor: pointer; font-size: 12.5px; font-weight: 600;
+    color: rgba(255, 255, 255, 0.72);
+    background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.12); }
+.library-tracker:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+.library-tracker--on { background: rgba(var(--accent-rgb), 0.2);
+    border-color: rgba(var(--accent-rgb), 0.5); color: #fff; }
+.library-tracker input { margin: 0; }
+.library-tracker em { font-style: normal; font-size: 11px; color: rgba(255, 255, 255, 0.4); }
+.library-tracker-empty { font-size: 12px; color: rgba(255, 255, 255, 0.45); }
 /* Phones: the centered no-wrap row (3 selects + Select) overflowed BOTH edges
    — wrap it into a tidy 2-up grid instead. */
 @media (max-width: 640px) {

@@ -76,6 +76,9 @@ def create_video_blueprint() -> Blueprint:
                    "/api/video/repair",
                    "/api/video/server-config", "/api/video/jellyfin",
                    "/api/video/organization", "/api/video/downloads/slskd",
+                   # the indexer inventory is Settings-class data (and indexer
+                   # URLs leaking to the browser was a real bug once)
+                   "/api/video/downloads/indexers",
                    "/api/video/enrichment/config", "/api/video/enrichment/priority",
                    "/api/video/notifications",   # P11: GETs return webhook URLs/bot tokens
                    "/api/video/backups")         # P10: restore/download the whole database

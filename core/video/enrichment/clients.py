@@ -497,7 +497,33 @@ class TMDBClient:
             if t and k not in seen:
                 seen.add(k)
                 out.append(t)
+        # TMDB's ORIGINAL title is not in /alternative_titles, but it's what fansub
+        # groups usually romanise from — an anime whose TMDB display name is a
+        # localised rewrite ("Oh Boy, Was I Wrong About Her") is released under the
+        # original instead, and without this the alias set can't bridge them.
+        for extra in self._original_titles(kind, tmdb_id):
+            k = extra.lower()
+            if k not in seen:
+                seen.add(k)
+                out.append(extra)
         return out[:30]
+
+    def _original_titles(self, kind, tmdb_id) -> list:
+        """The title(s) on the detail record that aren't the localised display name:
+        ``original_title``/``original_name``, plus the English ``name`` when TMDB is
+        serving a translated one. Best-effort — never raises."""
+        import requests
+        path = "/movie/" if kind == "movie" else "/tv/"
+        try:
+            r = requests.get(self.BASE + path + str(tmdb_id),
+                             params={"api_key": self.api_key}, timeout=12)
+            r.raise_for_status()
+            d = r.json() or {}
+        except Exception:
+            logger.debug("original-title fetch failed for %s %s", kind, tmdb_id, exc_info=True)
+            return []
+        vals = [d.get("original_title"), d.get("original_name"), d.get("title"), d.get("name")]
+        return [s for s in (str(v or "").strip() for v in vals) if s]
 
     def season_episodes(self, tv_id, season_number):
         """Episode-level data for one season (still/overview/rating) — the show

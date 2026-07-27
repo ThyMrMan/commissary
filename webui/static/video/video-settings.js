@@ -228,17 +228,84 @@
         categoryInput.setAttribute('data-lib-category', '');
         fields.appendChild(categoryInput);
 
+        // Preferred trackers. This is stored as comma-separated Prowlarr indexer
+        // IDS, but the app never showed anyone what those ids were — so the field
+        // used to be a bare text box asking for a number you had no way to look
+        // up, and _norm_indexer_ids silently dropped anything non-numeric. Typing
+        // a tracker's NAME therefore saved as blank, which read as "it doesn't
+        // save". The value is still ids on the wire; the picker just supplies them.
         var indexerIdsInput = document.createElement('input');
         indexerIdsInput.type = 'text';
-        indexerIdsInput.placeholder = 'Preferred trackers (indexer IDs, e.g. 1,3 — blank = no preference)';
-        indexerIdsInput.title = 'Prowlarr indexer id(s) that rank higher for grabs into this library — a soft nudge, not a search filter.';
+        indexerIdsInput.placeholder = 'Preferred trackers (blank = no preference)';
+        indexerIdsInput.title = 'Prowlarr indexer(s) that rank higher for grabs into this library — a soft nudge, not a search filter.';
         indexerIdsInput.value = (configured && configured.preferred_indexer_ids) || '';
         indexerIdsInput.setAttribute('data-lib-indexer-ids', '');
         fields.appendChild(indexerIdsInput);
 
+        var trackerBox = document.createElement('div');
+        trackerBox.className = 'library-tracker-picker';
+        trackerBox.setAttribute('data-lib-trackers', '');
+        fields.appendChild(trackerBox);
+        renderTrackerPicker(trackerBox, indexerIdsInput);
+
         row.appendChild(fields);
         box.addEventListener('change', function () { fields.style.display = box.checked ? '' : 'none'; });
         return row;
+    }
+
+    // Prowlarr's indexer list, fetched once per page and shared by every Library
+    // row's picker. null = not fetched yet, [] = Prowlarr unconfigured/unreachable.
+    var _indexers = null;
+    var _indexersPromise = null;   // in-flight dedupe: every Library row asks at once
+
+    function loadIndexers() {
+        if (_indexers !== null) return Promise.resolve(_indexers);
+        if (_indexersPromise) return _indexersPromise;
+        _indexersPromise = fetch('/api/video/downloads/indexers', { headers: { Accept: 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) { _indexers = (d && d.indexers) || []; return _indexers; })
+            .catch(function () { _indexers = []; return _indexers; });
+        return _indexersPromise;
+    }
+
+    function _selectedIds(input) {
+        return String(input.value || '').split(',')
+            .map(function (s) { return s.trim(); })
+            .filter(function (s) { return s; });
+    }
+
+    function renderTrackerPicker(box, input) {
+        loadIndexers().then(function (list) {
+            if (!box.isConnected) return;
+            if (!list.length) {
+                // No Prowlarr, or it couldn't be reached. Keep the text field
+                // usable rather than hiding the setting entirely.
+                box.innerHTML = '<div class="library-tracker-empty">Connect Prowlarr to pick trackers ' +
+                    'by name. Until then this field takes indexer IDs.</div>';
+                input.placeholder = 'Preferred trackers (indexer IDs, e.g. 1,3 — blank = no preference)';
+                return;
+            }
+            // The picker owns the value from here, so the raw id box is redundant.
+            input.type = 'hidden';
+            var sel = _selectedIds(input);
+            box.innerHTML = list.map(function (ix) {
+                var on = sel.indexOf(String(ix.id)) !== -1;
+                return '<label class="library-tracker' + (on ? ' library-tracker--on' : '') + '">' +
+                    '<input type="checkbox" data-lib-tracker="' + ix.id + '"' + (on ? ' checked' : '') + '>' +
+                    '<span>' + esc(ix.name) + '</span>' +
+                    '<em>' + esc(ix.protocol || '') + (ix.enable ? '' : ' · disabled') + '</em></label>';
+            }).join('');
+            box.addEventListener('change', function (e) {
+                var cb = e.target.closest('[data-lib-tracker]');
+                if (!cb) return;
+                var picked = [];
+                box.querySelectorAll('[data-lib-tracker]').forEach(function (c) {
+                    if (c.checked) picked.push(c.getAttribute('data-lib-tracker'));
+                });
+                input.value = picked.join(',');
+                cb.closest('.library-tracker').classList.toggle('library-tracker--on', cb.checked);
+            });
+        });
     }
 
     function fill(group, items, configured) {

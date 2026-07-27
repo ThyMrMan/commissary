@@ -127,6 +127,45 @@ def _root_folder_id_for_grab(db, body) -> int | str | None:
     return db.root_folder_id_for_library_row(kind, media_id)
 
 
+def _want_titles(db, body, title=None):
+    """The title(s) a manual search should accept, primary first.
+
+    The unattended paths (wishlist drain, RSS sync, the monitor's requery) have
+    always gated on ``ctx['titles']`` — the primary title PLUS its TMDB aliases —
+    but the interactive search passed a bare ``body['title']``, so a release named
+    by any AKA was rejected as a wrong title only when a human searched for it.
+    That is the wrong way round: the manual path is where a user is watching and
+    expects it to work.
+
+    Falls back to just the primary title whenever the tmdb id can't be resolved or
+    TMDB isn't configured — never fewer titles than before."""
+    primary = title if title is not None else (body or {}).get("title")
+    out = [primary] if primary else []
+    kind = "movie" if str((body or {}).get("kind") or "").lower() in (
+        "movie", "movies", "film", "films") else "show"
+    if str((body or {}).get("scope") or "").lower() in ("episode", "season", "series", "show"):
+        kind = "show"
+    tmdb_id = None
+    media_id, source = (body or {}).get("media_id"), str((body or {}).get("media_source") or "").lower()
+    if source == "tmdb":
+        tmdb_id = media_id
+    elif media_id is not None:
+        try:
+            tmdb_id = db.tmdb_id_for_library_row(kind, media_id)
+        except Exception:   # noqa: BLE001 - a matching assist must never break a search
+            tmdb_id = None
+    if not tmdb_id:
+        return out or primary
+    try:
+        from core.video.enrichment.engine import get_video_enrichment_engine
+        for a in (get_video_enrichment_engine().alt_titles_for(kind, tmdb_id) or []):
+            if a and a not in out:
+                out.append(a)
+    except Exception:   # noqa: BLE001
+        logger.debug("alias lookup failed for %s %s", kind, tmdb_id, exc_info=True)
+    return out or primary
+
+
 def _parse_text(hit) -> str:
     """What the release parser should read for a hit. Soulseek hits are grouped by
     FOLDER — the folder title carries the show/release name, but on library-style
@@ -413,6 +452,23 @@ def register_routes(bp):
         """The release blocklist — exact remote files that will never be re-picked."""
         from . import get_video_db
         return jsonify({"success": True, "items": get_video_db().list_video_blocklist()})
+
+    @bp.route("/downloads/indexers", methods=["GET"])
+    def video_downloads_indexers():
+        """The configured Prowlarr indexers, so the Preferred-Trackers setting can
+        offer a pick-list instead of demanding numeric ids the app never showed.
+
+        Identity fields only — never the indexer URL or API key. Admin-gated via
+        the blueprint's prefix list, matching the other indexer/credential
+        surfaces. An unconfigured or unreachable Prowlarr returns an empty list
+        with ``configured`` false, which the UI falls back on rather than
+        pretending there are no trackers."""
+        from core.video.prowlarr_search import is_configured, list_indexers
+        try:
+            return jsonify({"configured": is_configured(), "indexers": list_indexers()})
+        except Exception:
+            logger.exception("failed to list prowlarr indexers")
+            return jsonify({"configured": False, "indexers": []})
 
     @bp.route("/downloads/blocklist", methods=["POST"])
     def video_downloads_blocklist_add():
@@ -761,7 +817,7 @@ def register_routes(bp):
                               episode=want_episode, season_end=season_end, source=source)
         preferred = _preferred_indexer_ids_for_root_folder(get_video_db(), _root_folder_id_for_grab(get_video_db(), body))
         return jsonify({"scope": scope, "live": live,
-                        "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=body.get("title"), preferred_indexer_ids=preferred)})
+                        "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=_want_titles(get_video_db(), body), preferred_indexer_ids=preferred)})
 
     @bp.route("/downloads/search/start", methods=["POST"])
     def video_downloads_search_start():
@@ -802,12 +858,12 @@ def register_routes(bp):
                 return jsonify({"error": "Prowlarr: " + str(pres["error"])})
             preferred = _preferred_indexer_ids_for_root_folder(get_video_db(), _root_folder_id_for_grab(get_video_db(), body))
             return jsonify({"id": None, "live": True, "complete": True,
-                            "results": _evaluate_hits(pres["hits"], profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=body.get("title"), preferred_indexer_ids=preferred)})
+                            "results": _evaluate_hits(pres["hits"], profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=_want_titles(get_video_db(), body), preferred_indexer_ids=preferred)})
         # remaining mock sources (e.g. youtube placeholder) resolve in one shot
         raw = mock_search(scope, title, year=body.get("year"), season=want_season,
                           episode=want_episode, season_end=season_end, source=source)
         return jsonify({"id": None, "live": False, "complete": True,
-                        "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=body.get("title"))})
+                        "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=_want_titles(get_video_db(), body))})
 
     @bp.route("/downloads/search/poll", methods=["GET"])
     def video_downloads_search_poll():
@@ -823,7 +879,9 @@ def register_routes(bp):
         profile, _pid = _profile_for_request(get_video_db(), request.args)
         polled = poll_search(sid)
         return jsonify({"live": True, "total_files": polled["total_files"],
-                        "results": _evaluate_hits(polled["hits"], profile, scope, want_season, want_episode, want_year=request.args.get("year"), want_title=request.args.get("title"))})
+                        "results": _evaluate_hits(polled["hits"], profile, scope, want_season, want_episode, want_year=request.args.get("year"),
+                                                 want_title=_want_titles(get_video_db(), request.args,
+                                                                         request.args.get("title")))})
 
     @bp.route("/downloads/grab", methods=["POST"])
     def video_downloads_grab():

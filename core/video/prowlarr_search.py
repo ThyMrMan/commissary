@@ -53,6 +53,28 @@ def is_configured() -> bool:
         return False
 
 
+def list_indexers() -> List[dict]:
+    """The configured indexers as ``{id, name, protocol, enable, privacy}``.
+
+    Deliberately NOT the raw Prowlarr payload: that carries each indexer's URL
+    and API key, and leaking indexer URLs to the browser was a real security bug
+    once already. Only the identity fields a picker needs cross the boundary.
+
+    Exists because the per-Library "Preferred trackers" setting stores numeric
+    Prowlarr ids, and nothing in the app ever showed the user what those ids
+    were — so the field asked for something it gave you no way to find out."""
+    try:
+        c = _client()
+        if not c.is_configured():
+            return []
+        return [{"id": ix.id, "name": ix.name, "protocol": ix.protocol,
+                 "enable": bool(ix.enable), "privacy": ix.privacy}
+                for ix in c._get_indexers_sync()]
+    except Exception:   # noqa: BLE001 - an unreachable Prowlarr just means no picker
+        logger.warning("could not list Prowlarr indexers", exc_info=True)
+        return []
+
+
 def _indexer_ids() -> List[int]:
     """The optional Prowlarr indexer allowlist (shared ``prowlarr.indexer_ids``)."""
     from config.settings import config_manager

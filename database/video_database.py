@@ -1041,6 +1041,27 @@ class VideoDatabase:
         finally:
             conn.close()
 
+    def tmdb_id_for_library_row(self, kind: str, row_id):
+        """The tmdb_id of a movies/shows ROW — the inverse of
+        ``root_folder_id_for_library_row``'s lookup, for callers holding a library
+        row id that need the TMDB identity (e.g. to fetch a title's alias set)."""
+        table = {"movie": "movies", "show": "shows"}.get(kind)
+        if not table or row_id is None:
+            return None
+        try:
+            row_id = int(row_id)
+        except (TypeError, ValueError):
+            return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                f"SELECT tmdb_id FROM {table} WHERE id=? LIMIT 1", (row_id,)).fetchone()
+            return row["tmdb_id"] if row else None
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
+
     def library_ids_for_tmdb(self, kind: str, tmdb_ids, server_source=None) -> dict:
         """{tmdb_id: library_row_id} for the owned subset of ``tmdb_ids`` on the
         active server. Batched (chunked IN) so a whole Discover rail costs one
