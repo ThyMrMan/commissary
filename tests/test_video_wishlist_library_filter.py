@@ -9,6 +9,7 @@ from their standard TV library had no way to see just its wishlist.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -158,3 +159,85 @@ def test_libraries_come_from_the_configured_registry_so_members_see_them():
     assert "d.configured" in body
     assert "d.movies" not in body and "d.tv" not in body
     assert "root_folder_id" in _WSH_JS
+
+
+# ---------------------------------------------------------------------------
+# Per-Library tab badges (a new Library showed no count at all)
+# ---------------------------------------------------------------------------
+
+def test_wishlist_counts_break_down_per_library(db):
+    """Each Library's badge counts the SAME unit its kind tab does — movies for
+    a movie Library, DISTINCT shows (not episodes) for a show Library — so the
+    two are directly comparable."""
+    anime = _add_library(db, path="/media/anime", kind="show")
+    tv = _add_library(db, path="/media/tv", kind="show")
+    movies = _add_library(db, path="/media/movies", kind="movie")
+
+    mid = db.upsert_movie("plex", {"server_id": "m1", "tmdb_id": 1, "title": "A Film"})
+    sid = db.upsert_show_tree("plex", {"server_id": "s1", "tmdb_id": 9, "title": "Anime Show"})
+    conn = db._get_connection()
+    conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (movies, mid))
+    conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (anime, sid))
+    conn.commit(); conn.close()
+
+    db.add_movie_to_wishlist(1, "A Film", year=2020, library_id=mid)
+    db.add_episodes_to_wishlist(9, "Anime Show",
+                                [{"season_number": 1, "episode_number": 1},
+                                 {"season_number": 1, "episode_number": 2}], library_id=sid)
+
+    by_lib = db.wishlist_counts()["by_library"]
+    assert by_lib[movies] == 1
+    assert by_lib[anime] == 1     # ONE show, not two episodes — matches the TV tab's unit
+    assert by_lib[tv] == 0        # an empty Library still reports a number, not nothing
+
+
+def test_wishlist_count_badges_agree_with_the_filtered_list(db):
+    """The badge and the list it labels must never disagree — both scope
+    through library_id the same way."""
+    anime = _add_library(db, path="/media/anime", kind="movie")
+    mid = db.upsert_movie("plex", {"server_id": "m1", "tmdb_id": 1, "title": "Anime Film"})
+    conn = db._get_connection()
+    conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (anime, mid))
+    conn.commit(); conn.close()
+    db.add_movie_to_wishlist(1, "Anime Film", year=2020, library_id=mid)
+    db.add_movie_to_wishlist(2, "Unlinked Film", year=2020)   # no library_id
+
+    assert db.wishlist_counts()["by_library"][anime] == 1
+    assert len(db.query_wishlist("movie", root_folder_id=anime)["items"]) == 1
+
+
+def test_counts_endpoint_exposes_by_library(db):
+    import api.video as videoapi
+    videoapi._video_db = db
+    try:
+        lib = _add_library(db, path="/media/anime", kind="movie")
+        app = Flask(__name__)
+        app.register_blueprint(videoapi.create_video_blueprint(), url_prefix="/api/video")
+        out = app.test_client().get("/api/video/wishlist/counts").get_json()
+        assert str(lib) in {str(k) for k in out["by_library"]}
+    finally:
+        videoapi._video_db = None
+
+
+def test_kind_tab_is_relabelled_when_its_libraries_are_listed_beside_it():
+    """A Library called 'Movies' sitting under a tab called 'Movies' reads as a
+    duplicate entry — the kind tab says it's the union instead."""
+    body = _func(_WSH_JS, "renderLibraryTabs")
+    assert "KIND_ALL_LABEL" in body
+    assert "'All Movies'" in _WSH_JS and "'All TV'" in _WSH_JS
+
+
+def test_library_tabs_carry_a_count_badge():
+    body = _func(_WSH_JS, "renderLibraryTabs")
+    assert "data-vwsh-count-lib" in body
+    assert "vwsh-tab-n" in body
+    counts = _func(_WSH_JS, "setCounts")
+    assert "by_library" in counts
+    assert "data-vwsh-count-lib" in counts
+
+
+def test_youtube_gets_no_per_library_tabs_in_the_wishlist():
+    """loadYoutube() has no root_folder_id filter, so a per-Library YouTube tab
+    would silently show the unfiltered list."""
+    m = re.search(r"var LIB_KEY = \{[^}]*\}", _WSH_JS)
+    assert m and "youtube" not in m.group(0)

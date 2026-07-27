@@ -346,13 +346,16 @@
                 (value === '' ? ' class="em-global-auto"' : '') + '>' + esc(label) + '</button>';
         };
         var movieLibs = withId(libs.movies), tvLibs = withId(libs.tv);
-        var html = tab('movie', 'Movies');
+        // A kind tab standing next to its own Libraries says it's the union:
+        // a Library named 'Movies' under a tab named 'Movies' just reads as a
+        // duplicate, as does 'Shows' beside a 'TV Shows' Library.
+        var html = tab('movie', movieLibs.length > 1 ? 'All Movies' : 'Movies');
         if (movieLibs.length > 1) {
             movieLibs.forEach(function (l) {
                 html += tab('movie:' + l.id, (l.label || l.server_title || 'Library'));
             });
         }
-        html += tab('show', 'Shows');
+        html += tab('show', tvLibs.length > 1 ? 'All Shows' : 'Shows');
         if (tvLibs.length > 1) {
             tvLibs.forEach(function (l) {
                 html += tab('show:' + l.id, (l.label || l.server_title || 'Library'));

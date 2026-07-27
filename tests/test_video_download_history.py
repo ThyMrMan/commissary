@@ -59,7 +59,10 @@ def test_history_tabs_classify_real_episode_and_youtube_kinds(db):
     db.record_download_history(_episode(id=2, kind="episode"))
     db.record_download_history(_youtube(id=3))
 
-    assert db.download_history_counts() == {"movie": 1, "show": 1, "youtube": 1, "total": 3}
+    counts = db.download_history_counts()
+    assert {k: counts[k] for k in ("movie", "show", "youtube", "total")} == {
+        "movie": 1, "show": 1, "youtube": 1, "total": 3}
+    assert counts["by_library"] == {}      # no Libraries configured in this test
 
     def kinds(tab):
         return sorted(r["kind"] for r in db.query_download_history(kind=tab)["items"])
@@ -207,7 +210,8 @@ def test_counts_only_count_completed(db):
     db.record_download_history(_movie(id=3, status="failed", dest_path=None,
                                       error="no release found"))
     c = db.download_history_counts()
-    assert c == {"movie": 1, "show": 0, "youtube": 0, "total": 1}   # the failed one isn't counted
+    assert {k: c[k] for k in ("movie", "show", "youtube", "total")} == {
+        "movie": 1, "show": 0, "youtube": 0, "total": 1}   # the failed one isn't counted
 
 
 def test_latest_completed_download_is_the_probe_target(db):
@@ -228,3 +232,50 @@ def test_newest_first_ordering_in_the_feed(db):
                                       completed_at="2026-06-01 00:00:00"))
     titles = [i["title"] for i in db.query_download_history()["items"]]
     assert titles == ["New", "Old"]
+
+
+# ── per-Library tab badges (a new Library showed no count at all) ─────────────
+
+def test_history_counts_break_down_per_library(db, tmp_path):
+    anime = _add_library(db, path=str(tmp_path / "Anime"), kind="show")
+    tv = _add_library(db, path=str(tmp_path / "TV"), kind="show")
+    db.record_download_history(_episode(
+        id=1, title="Anime Show", dest_path=str(tmp_path / "Anime" / "Anime Show" / "s01e01.mkv")))
+    db.record_download_history(_episode(
+        id=2, title="Other Show", dest_path=str(tmp_path / "TV" / "Other Show" / "s01e01.mkv")))
+    by_lib = db.download_history_counts()["by_library"]
+    assert by_lib[anime] == 1
+    assert by_lib[tv] == 1
+
+
+def test_history_count_badges_agree_with_the_filtered_list(db, tmp_path):
+    """Badge and list share _history_library_clause, so they can't disagree."""
+    anime = _add_library(db, path=str(tmp_path / "Anime"), kind="show")
+    db.record_download_history(_episode(
+        id=1, title="Anime Show", dest_path=str(tmp_path / "Anime" / "Anime Show" / "s01e01.mkv")))
+    db.record_download_history(_movie(id=2, title="Elsewhere", dest_path="/somewhere/else/x.mkv"))
+    assert db.download_history_counts()["by_library"][anime] == 1
+    assert len(db.query_download_history(root_folder_id=anime)["items"]) == 1
+
+
+def test_history_counts_for_a_library_with_no_path_are_zero_not_everything(db, tmp_path):
+    """An unset Library path must match nothing — the same guard the filter has,
+    so a blank path can't make a badge claim the whole history."""
+    blank = _add_library(db, path="", kind="show")
+    db.record_download_history(_movie(id=1, title="Anything", dest_path="/x/y.mkv"))
+    assert db.download_history_counts()["by_library"][blank] == 0
+
+
+def test_kind_tab_is_relabelled_when_its_libraries_are_listed_beside_it():
+    body = _func("renderLibraryTabs")
+    assert "KIND_ALL_LABEL" in body
+    assert "'All Movies'" in _VDH_JS and "'All TV'" in _VDH_JS
+
+
+def test_library_tabs_carry_a_count_badge():
+    body = _func("renderLibraryTabs")
+    assert "data-vdh-c-lib" in body
+    assert "vdh-tab-n" in body
+    counts = _func("setCounts")
+    assert "by_library" in counts
+    assert "data-vdh-c-lib" in counts

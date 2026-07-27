@@ -440,11 +440,19 @@
     // clobbering the other (the bug: badge shows the right number, then 'switches' to the
     // TV-only count). The endpoint /wishlist/counts is the single source of truth for the
     // grand total, so the setters just (re)sync the nav badge from it.
+    var _lastCounts = null;
     function setCounts(counts) {
+        if (counts) _lastCounts = counts;   // replayed when library tabs render later
         state.counts = { movie: (counts && counts.movie) || 0, show: (counts && counts.show) || 0,
                          episode: (counts && counts.episode) || 0 };
         var cm = $('[data-vwsh-count-movie]'); if (cm) cm.textContent = state.counts.movie;
         var cs = $('[data-vwsh-count-show]'); if (cs) cs.textContent = state.counts.show;
+        var byLib = (counts && counts.by_library) || {};
+        var libEls = document.querySelectorAll('[data-vwsh-count-lib]');
+        for (var i = 0; i < libEls.length; i++) {
+            var id = libEls[i].getAttribute('data-vwsh-count-lib');
+            libEls[i].textContent = byLib[id] != null ? byLib[id] : 0;
+        }
         refreshBadge();                                   // authoritative grand total
         updateSub();
         updateClearBtn();
@@ -666,15 +674,25 @@
     }
 
     // Per-Library filters live IN the tab strip, right after the kind tab they
-    // belong to ('Movies | TV | Anime | YouTube') — 'Movies'/'TV' alone can't
-    // distinguish a standard library from a separate Anime one of the same
-    // kind. Only rendered for a kind with more than one Library configured
-    // (with one, the kind tab already IS that Library).
+    // belong to ('All Movies | Movies | Anime Films | All TV | TV Shows |
+    // Anime | YouTube') — 'Movies'/'TV' alone can't distinguish a standard
+    // library from a separate Anime one of the same kind. Only rendered for a
+    // kind with more than one Library configured (with one, the kind tab
+    // already IS that Library).
     //
     // Reads d.configured (the Library REGISTRY every profile can see), not
     // d.movies/d.tv — those are the live server-section DISCOVERY list, which
     // is admin-only and carries no root_folder id to filter by.
-    var LIB_KEY = { movie: 'movies', show: 'tv', youtube: 'youtube' };
+    // Movies/TV only — deliberately NOT youtube. The YouTube tab is served by
+    // loadYoutube(), which has no root_folder_id filter at all (the YouTube
+    // wishlist isn't linked to a Library the way TMDB titles are), so a
+    // per-Library YouTube tab would silently show the unfiltered list.
+    var LIB_KEY = { movie: 'movies', show: 'tv' };
+    // A kind tab sitting next to its own Libraries needs to say it's the
+    // union, not repeat a Library's name: a Library called 'Movies' under a
+    // tab called 'Movies' just reads as a duplicate.
+    var KIND_ALL_LABEL = { movie: 'All Movies', show: 'All TV' };
+    var _libsByKind = {};
     var libsLoaded = false;
     function loadLibraries() {
         if (libsLoaded) return;
@@ -692,9 +710,12 @@
         for (var i = 0; i < old.length; i++) old[i].remove();
         Object.keys(LIB_KEY).forEach(function (kind) {
             var libs = configured[LIB_KEY[kind]] || [];
-            if (libs.length < 2) return;
             var anchor = strip.querySelector('[data-vwsh-tab="' + kind + '"]');
             if (!anchor) return;
+            _libsByKind[kind] = libs.length > 1 ? libs : [];
+            if (libs.length < 2) return;
+            var kindLabel = anchor.childNodes[0];   // the text node before the count badge
+            if (kindLabel && kindLabel.nodeType === 3) kindLabel.nodeValue = KIND_ALL_LABEL[kind] + ' ';
             libs.forEach(function (l) {
                 var b = document.createElement('button');
                 b.className = 'vwsh-tab vwsh-tab--lib';
@@ -702,11 +723,19 @@
                 b.setAttribute('role', 'tab');
                 b.setAttribute('data-vwsh-tab', kind + ':' + l.id);
                 b.setAttribute('data-vwsh-lib-tab', '');
-                b.textContent = l.label || l.server_title || 'Library';
+                b.appendChild(document.createTextNode((l.label || l.server_title || 'Library') + ' '));
+                var n = document.createElement('span');
+                n.className = 'vwsh-tab-n';
+                n.setAttribute('data-vwsh-count-lib', l.id);
+                n.textContent = '0';
+                b.appendChild(n);
                 anchor.parentNode.insertBefore(b, anchor.nextSibling);
                 anchor = b;   // keep this kind's libraries in their configured order
             });
         });
+        // Paint badges for tabs that appeared after the last load. Only with
+        // real counts in hand — replaying a null would zero the kind badges.
+        if (_lastCounts) setCounts(_lastCounts);
     }
 
     // Empty the whole current tab (movies / TV / YouTube), after a confirm.

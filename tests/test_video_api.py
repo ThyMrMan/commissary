@@ -1072,7 +1072,12 @@ def test_watchlist_endpoint_paginates_and_searches(tmp_path):
 def test_wishlist_add_movie_then_list(tmp_path):
     client, _ = _make_client(tmp_path)
     r = client.post("/api/video/wishlist/add", json={"movie": {"tmdb_id": 603, "title": "The Matrix", "year": 1999}})
-    assert r.get_json() == {"success": True, "added": 1, "counts": {"movie": 1, "show": 0, "episode": 0, "total": 1}}
+    out = r.get_json()
+    assert out["success"] is True and out["added"] == 1
+    # counts also carries by_library (per-Library tab badges) — assert the
+    # kind buckets rather than the whole dict so adding one can't break this.
+    assert {k: out["counts"][k] for k in ("movie", "show", "episode", "total")} == {
+        "movie": 1, "show": 0, "episode": 0, "total": 1}
     lst = client.get("/api/video/wishlist?kind=movie").get_json()
     assert lst["success"] and lst["items"][0]["tmdb_id"] == 603 and lst["counts"]["movie"] == 1
 

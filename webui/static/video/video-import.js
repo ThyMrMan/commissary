@@ -377,11 +377,18 @@
     // Normalise a /api/video/search result into the picker's shape; keep only the
     // kind we're resolving (movies for 'movie', shows for 'episode'). Owned titles
     // (library_id present) are flagged so they can float to the top.
+    //
+    // `kind` FIRST: /api/video/search returns {kind:'movie'|'show'|'person', ...}
+    // (see clients.py's search()) — it has no media_type, no type and no
+    // first_air_date, so the old chain fell all the way through to its 'movie'
+    // default for every row and shows could never appear under the Episode tab.
+    // The other names are kept as a tolerant fallback for raw-TMDB shapes.
     function normResults(raw, kind) {
         var want = kind === 'episode' ? ['tv', 'show'] : ['movie'];
         var out = [];
         (raw || []).forEach(function (it) {
-            var mt = String(it.media_type || it.type || (it.first_air_date ? 'tv' : 'movie')).toLowerCase();
+            var mt = String(it.kind || it.media_type || it.type ||
+                            (it.first_air_date ? 'tv' : 'movie')).toLowerCase();
             if (want.indexOf(mt) === -1) return;
             var date = it.year || it.release_date || it.first_air_date || '';
             out.push({

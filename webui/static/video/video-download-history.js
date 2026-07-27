@@ -185,6 +185,10 @@
     // is admin-only and carries no root_folder id to filter by.
     var libsLoaded = false;
     var LIB_KEY = { movie: 'movies', show: 'tv', youtube: 'youtube' };
+    // A kind tab sitting next to its own Libraries needs to say it's the
+    // union, not repeat a Library's name: a Library called 'Movies' under a
+    // tab called 'Movies' just reads as a duplicate.
+    var KIND_ALL_LABEL = { movie: 'All Movies', show: 'All TV', youtube: 'All YouTube' };
     function loadLibraries() {
         if (libsLoaded) return;
         libsLoaded = true;
@@ -204,17 +208,27 @@
             if (libs.length < 2) return;   // one library IS the kind tab — nothing to split
             var anchor = strip.querySelector('[data-vdh-tab="' + kind + '"]');
             if (!anchor) return;
+            var kindLabel = anchor.childNodes[0];   // the text node before the count badge
+            if (kindLabel && kindLabel.nodeType === 3) kindLabel.nodeValue = KIND_ALL_LABEL[kind] + ' ';
             libs.forEach(function (l) {
                 var b = document.createElement('button');
                 b.className = 'vdh-tab vdh-tab--lib';
                 b.type = 'button';
                 b.setAttribute('data-vdh-tab', kind + ':' + l.id);
                 b.setAttribute('data-vdh-lib-tab', '');
-                b.textContent = l.label || l.server_title || 'Library';
+                b.appendChild(document.createTextNode((l.label || l.server_title || 'Library') + ' '));
+                var n = document.createElement('span');
+                n.className = 'vdh-tab-n';
+                n.setAttribute('data-vdh-c-lib', l.id);
+                n.textContent = '0';
+                b.appendChild(n);
                 anchor.parentNode.insertBefore(b, anchor.nextSibling);
                 anchor = b;   // keep this kind's libraries in their configured order
             });
         });
+        // Paint badges for tabs that appeared after the last load. Only with
+        // real counts in hand — replaying a null would zero the kind badges.
+        if (_lastCounts) setCounts(_lastCounts);
     }
 
     function setTab(tab) {
@@ -305,7 +319,9 @@
         body.innerHTML = html;
     }
 
+    var _lastCounts = null;
     function setCounts(c) {
+        if (c) _lastCounts = c;   // replayed when library tabs render later
         state.counts = c || state.counts;
         var q = function (s) { return el.querySelector(s); };
         q('[data-vdh-c-all]').textContent = state.counts.total || 0;
@@ -313,6 +329,12 @@
         q('[data-vdh-c-show]').textContent = state.counts.show || 0;
         var yc = q('[data-vdh-c-youtube]');
         if (yc) yc.textContent = state.counts.youtube || 0;
+        var byLib = state.counts.by_library || {};
+        var libEls = el.querySelectorAll('[data-vdh-c-lib]');
+        for (var i = 0; i < libEls.length; i++) {
+            var id = libEls[i].getAttribute('data-vdh-c-lib');
+            libEls[i].textContent = byLib[id] != null ? byLib[id] : 0;
+        }
         var sub = q('[data-vdh-sub]');
         sub.textContent = (state.counts.total || 0) + ' grab' + (state.counts.total === 1 ? '' : 's') +
             ' · ' + (state.counts.movie || 0) + ' movies · ' + (state.counts.show || 0) + ' episodes · '

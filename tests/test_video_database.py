@@ -1334,7 +1334,8 @@ def test_wishlist_episodes_group_into_show_tree(db):
     assert [s["season_number"] for s in show["seasons"]] == [1, 2]
     assert [e["episode_number"] for e in show["seasons"][0]["episodes"]] == [1, 2]
     counts = db.wishlist_counts()
-    assert counts == {"movie": 0, "show": 1, "episode": 3, "total": 3}
+    assert {k: counts[k] for k in ("movie", "show", "episode", "total")} == {
+        "movie": 0, "show": 1, "episode": 3, "total": 3}
 
 
 def test_wishlist_remove_scopes(db):
@@ -1562,7 +1563,9 @@ def test_youtube_rows_do_not_disturb_tmdb_counts(db):
     db.add_videos_to_wishlist({"youtube_id": "UCx", "title": "Chan"},
                               [{"youtube_id": "x1", "title": "X1"}])
     # existing shapes unchanged
-    assert db.wishlist_counts() == {"movie": 1, "show": 1, "episode": 1, "total": 2}
+    _c = db.wishlist_counts()
+    assert {k: _c[k] for k in ("movie", "show", "episode", "total")} == {
+        "movie": 1, "show": 1, "episode": 1, "total": 2}
     assert db.watchlist_counts() == {"show": 1, "person": 0, "studio": 0, "total": 1}
     # youtube counts live on their own surface
     assert db.youtube_wishlist_counts() == {"channel": 1, "video": 1}

@@ -380,6 +380,22 @@ def _norm_indexer_ids(raw) -> str | None:
     return ",".join(ids) if ids else None
 
 
+def _history_library_clause(root) -> tuple:
+    """(sql, args) scoping video_download_history to one configured Library.
+
+    History rows predate root_folder_id and were never tied to a Library the
+    way movies/shows rows are, so the Library's ``dest_path`` prefix is the
+    only join key available. Shared by the paged query and the tab-badge
+    counts so a badge can never disagree with the list it labels.
+    """
+    root_path = str((root or {}).get("path") or "").strip()
+    if not root_path:
+        return ("0", [])   # unknown/unset Library path → match nothing, not everything
+    norm = root_path.replace("\\", "/").rstrip("/") + "/"
+    return ("REPLACE(COALESCE(dest_path, ''), '\\', '/') LIKE ? ESCAPE '\\' COLLATE NOCASE",
+            [norm.replace("%", "\\%").replace("_", "\\_") + "%"])
+
+
 def _subtitle_langs_list(raw) -> list:
     """Parse the stored OpenSubtitles ``subtitle_langs`` JSON array into a list of
     language codes for the detail payload. Returns [] for null/garbage so the UI
@@ -2336,14 +2352,9 @@ class VideoDatabase:
         if outcome:
             where.append("outcome = ?"); args.append(outcome)
         if root_folder_id:
-            root = self.get_root_folder(root_folder_id)
-            root_path = str((root or {}).get("path") or "").strip()
-            if root_path:
-                norm = root_path.replace("\\", "/").rstrip("/") + "/"
-                where.append("REPLACE(COALESCE(dest_path, ''), '\\', '/') LIKE ? ESCAPE '\\' COLLATE NOCASE")
-                args.append(norm.replace("%", "\\%").replace("_", "\\_") + "%")
-            else:
-                where.append("0")   # unknown/unset Library path → match nothing, not everything
+            clause = _history_library_clause(self.get_root_folder(root_folder_id))
+            where.append(clause[0])
+            args += clause[1]
         s = (search or "").strip()
         if s:
             where.append("(title LIKE ? OR release_title LIKE ?) COLLATE NOCASE")
@@ -2373,22 +2384,32 @@ class VideoDatabase:
             conn.close()
 
     def download_history_counts(self) -> dict:
-        """{movie, show(=TV: episodes + show/season packs), youtube, total} of completed
-        grabs (for the modal tabs/badge). Classifies by kind+source so episodes (kind=
-        'episode') land under TV and YouTube (source='youtube') gets its own bucket —
-        the old version counted only kind='movie'/'show', so TV + YouTube vanished."""
+        """{movie, show(=TV: episodes + show/season packs), youtube, total,
+        by_library: {<root_folder_id>: n}} of completed grabs (for the modal
+        tabs/badges). Classifies by kind+source so episodes (kind='episode')
+        land under TV and YouTube (source='youtube') gets its own bucket —
+        the old version counted only kind='movie'/'show', so TV + YouTube
+        vanished. ``by_library`` uses the same dest_path prefix rule the
+        per-Library filter does (see ``_history_library_clause``)."""
         conn = self._get_connection()
         try:
             _yt = "(COALESCE(source,'') = 'youtube' OR kind = 'youtube')"
+            _base = "WHERE outcome='completed' AND cleared_at IS NULL"
             row = conn.execute(
                 "SELECT "
                 "SUM(CASE WHEN " + _yt + " THEN 1 ELSE 0 END) AS yt, "
                 "SUM(CASE WHEN kind = 'movie' AND NOT " + _yt + " THEN 1 ELSE 0 END) AS mv, "
                 "SUM(CASE WHEN kind <> 'movie' AND NOT " + _yt + " THEN 1 ELSE 0 END) AS tv, "
-                "COUNT(*) AS total FROM video_download_history "
-                "WHERE outcome='completed' AND cleared_at IS NULL").fetchone()
+                "COUNT(*) AS total FROM video_download_history " + _base).fetchone()
+            by_library = {}
+            for r in self.all_library_rows():
+                sql, args = _history_library_clause(r)
+                by_library[r["id"]] = conn.execute(
+                    "SELECT COUNT(*) c FROM video_download_history " + _base + " AND " + sql,
+                    args).fetchone()["c"]
             return {"movie": row["mv"] or 0, "show": row["tv"] or 0,
-                    "youtube": row["yt"] or 0, "total": row["total"] or 0}
+                    "youtube": row["yt"] or 0, "total": row["total"] or 0,
+                    "by_library": by_library}
         finally:
             conn.close()
 
@@ -6221,13 +6242,34 @@ class VideoDatabase:
             conn.close()
 
     def wishlist_counts(self) -> dict:
-        """{'movie': n, 'show': n, 'episode': n, 'total': movies+episodes}."""
+        """{'movie': n, 'show': n, 'episode': n, 'total': movies+episodes,
+        'by_library': {<root_folder_id>: n}}.
+
+        ``by_library`` feeds the badge on each per-Library tab, counting the
+        SAME unit its kind tab does — movies for a movie Library, distinct
+        shows (not episodes) for a show Library — so a Library's badge is
+        directly comparable to the 'All' badge above it. Scoped through
+        ``library_id`` exactly like ``query_wishlist``'s root_folder_id
+        filter, so the badge can never disagree with the list it labels.
+        """
         conn = self._get_connection()
         try:
             movie = conn.execute("SELECT COUNT(*) c FROM video_wishlist WHERE kind='movie'").fetchone()["c"]
             episode = conn.execute("SELECT COUNT(*) c FROM video_wishlist WHERE kind='episode'").fetchone()["c"]
             shows = conn.execute("SELECT COUNT(DISTINCT tmdb_id) c FROM video_wishlist WHERE kind='episode'").fetchone()["c"]
-            return {"movie": movie, "show": shows, "episode": episode, "total": movie + episode}
+            by_library = {}
+            for r in self.all_library_rows():
+                if r.get("content_kind") == "movie":
+                    sql = ("SELECT COUNT(*) c FROM video_wishlist WHERE kind='movie' AND "
+                           "library_id IN (SELECT id FROM movies WHERE root_folder_id = ?)")
+                elif r.get("content_kind") == "show":
+                    sql = ("SELECT COUNT(DISTINCT tmdb_id) c FROM video_wishlist WHERE kind='episode' AND "
+                           "library_id IN (SELECT id FROM shows WHERE root_folder_id = ?)")
+                else:
+                    continue
+                by_library[r["id"]] = conn.execute(sql, (r["id"],)).fetchone()["c"]
+            return {"movie": movie, "show": shows, "episode": episode,
+                    "total": movie + episode, "by_library": by_library}
         finally:
             conn.close()
 

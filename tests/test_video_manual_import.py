@@ -245,3 +245,27 @@ def test_failed_view_carries_drawer_facts(env):
     os.remove(env["src"])
     it2 = env["client"].get("/api/video/import/failed").get_json()["items"][0]
     assert it2["file_exists"] is False and it2["file_size"] is None
+
+
+# ── the Place dialog's identity picker reads the right kind field ─────────────
+
+def test_search_results_carry_kind_not_media_type():
+    """/api/video/search returns {kind:'movie'|'show'|'person'} — no media_type,
+    no type, no first_air_date. The picker's normResults() must key off `kind`;
+    reading the others made every row fall through to the 'movie' default, so a
+    show could never appear under the Episode tab."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "core" / "video" / "enrichment"
+           / "clients.py").read_text(encoding="utf-8")
+    body = src[src.index("    def search(self, query):"):]
+    body = body[:body.index("\n    def ", 10)]
+    assert '"kind": "movie"' in body and '"kind": "show"' in body
+    assert '"media_type"' not in body.split("out.append")[1]   # not on the OUTPUT rows
+
+    js = (Path(__file__).resolve().parent.parent / "webui" / "static" / "video"
+          / "video-import.js").read_text(encoding="utf-8")
+    norm = js[js.index("function normResults("):]
+    norm = norm[:norm.index("\n    function ", 10)]
+    assert "it.kind ||" in norm                       # kind is consulted FIRST
+    assert norm.index("it.kind") < norm.index("it.media_type")
+    assert "'show'" in norm                           # and 'show' is an accepted episode kind
