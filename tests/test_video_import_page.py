@@ -91,3 +91,41 @@ def test_drawer_offers_delete_file_with_destructive_confirm():
     assert "delete_file: !!del" in _JS
     assert "destructive: true" in _JS               # SoulSync confirm modal, red button
     assert ".vimp-btn--danger" in _CSS
+
+
+# ── Place dialog: pick which Library the file lands in ───────────────────────
+# The dialog had only Movie/Episode tabs, so the backend always fell back to the
+# PRIMARY Library for the kind — a show from a separate Anime library had no way
+# to reach it.
+
+def _func(name: str) -> str:
+    i = _JS.index("function " + name + "(")
+    nxt = _JS.find("\n    function ", i + 1)
+    return _JS[i:nxt if nxt != -1 else len(_JS)]
+
+
+def test_place_dialog_has_a_library_picker():
+    assert "data-vimp-lib-row" in _JS and "data-vimp-lib" in _JS
+    assert ".vimp-lib" in _CSS
+    assert "function renderLibraryPicker(" in _JS
+
+
+def test_library_picker_reads_the_configured_registry():
+    """d.configured is the Library registry (ids + labels); d.movies/d.tv are the
+    admin-only server-section discovery list, which carries neither."""
+    body = _func("loadLibraries")
+    assert "/api/video/libraries" in body
+    assert "d.configured" in body
+    assert "d.movies" not in body and "d.tv" not in body
+
+
+def test_library_picker_follows_the_kind_tab():
+    body = _func("renderLibraryPicker")
+    assert "LIB_KEY[r.kind]" in body
+    assert "libs.length < 2" in body            # one Library is not a choice
+    assert "renderLibraryPicker()" in _func("renderModal")
+
+
+def test_place_sends_the_chosen_library():
+    body = _func("place")
+    assert "root_folder_id: r.rootFolderId || null" in body

@@ -117,8 +117,44 @@ def test_api_passes_root_folder_id_through(db):
 # Frontend contracts
 # ---------------------------------------------------------------------------
 
-def test_js_and_html_wire_the_library_filter():
-    assert "data-vwsh-lib" in _INDEX
-    assert "data-vwsh-lib" in _WSH_JS
+def _func(src: str, name: str) -> str:
+    i = src.index("function " + name + "(")
+    nxt = src.find("\n    function ", i + 1)
+    return src[i:nxt if nxt != -1 else len(src)]
+
+
+def test_library_filter_lives_in_the_tab_strip_not_a_dropdown():
+    """The filter sits next to the existing Movies/TV/YouTube tabs. The old
+    standalone <select> in the toolbar is gone from the markup entirely."""
+    assert "data-vwsh-lib" not in _INDEX
+    body = _func(_WSH_JS, "renderLibraryTabs")
+    assert "vwsh-tabs" in body
+    assert "data-vwsh-lib-tab" in body
+    assert "vwsh-tab--lib" in body
+
+
+def test_a_library_tab_encodes_its_kind_and_root_folder_id():
+    body = _func(_WSH_JS, "renderLibraryTabs")
+    assert "kind + ':' + l.id" in body
+    set_tab = _func(_WSH_JS, "setTab")
+    assert "split(':')" in set_tab
+    assert "state.rootFolderId = parts.length > 1 ? parts[1] : ''" in set_tab
+
+
+def test_library_tabs_are_click_delegated():
+    """They're injected after wire() runs, so per-button listeners would miss
+    them — the strip itself must carry the handler."""
+    body = _func(_WSH_JS, "wire")
+    assert ".vwsh-tabs" in body
+    assert "closest('[data-vwsh-tab]')" in body
+
+
+def test_libraries_come_from_the_configured_registry_so_members_see_them():
+    """d.configured is readable by every profile; d.movies/d.tv are the
+    admin-only server-section discovery list (empty for members, and carrying
+    no root_folder id to filter by) — which is why this only worked for admins."""
+    body = _func(_WSH_JS, "loadLibraries")
+    assert "/api/video/libraries" in body
+    assert "d.configured" in body
+    assert "d.movies" not in body and "d.tv" not in body
     assert "root_folder_id" in _WSH_JS
-    assert "/api/video/libraries" in _WSH_JS

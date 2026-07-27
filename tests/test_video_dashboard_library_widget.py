@@ -1,10 +1,11 @@
-"""Video dashboard Library widget: shows more than just Movies/Shows totals.
+"""Video dashboard Library widget: per-Library tiles REPLACE the totals.
 
-The fixed tiles summed EVERY configured Library of a kind into one number, so
-a second Library of the same kind (e.g. a separate Anime library) had no way
-to show its own count. dashboard_stats() now carries a `by_library` breakdown
-(tested in tests/test_video_database.py); this file pins the frontend wiring
-that renders it as extra tiles in the existing widget.
+The fixed Movies/Shows/Disk Size tiles summed EVERY configured Library of a
+kind into one number, which is meaningless once an Anime library sits beside
+a standard TV one. dashboard_stats() carries a `by_library` breakdown with
+each Library's own count AND its own disk size (tested in
+tests/test_video_database.py); this file pins the frontend wiring that renders
+it — including hiding the aggregates it supersedes.
 """
 
 from __future__ import annotations
@@ -53,3 +54,23 @@ def test_extra_tiles_reuse_the_shared_stat_tile_markup():
     assert "library-status-stat" in body
     assert "library-status-stat-value" in body
     assert "library-status-stat-label" in body
+
+
+def test_each_tile_shows_that_librarys_own_disk_size():
+    """The single 'Disk Size' aggregate summed every Library; each tile now
+    carries its own bytes instead."""
+    body = _func("renderLibraryTiles")
+    assert "lib.size_bytes" in body
+    assert "formatBytes(lib.size_bytes)" in body
+
+
+def test_aggregate_tiles_are_hidden_once_libraries_are_configured():
+    """Movies / Shows / Disk Size sum across Libraries — they must give way to
+    the per-Library tiles, and stay only as the no-Library-configured fallback
+    (so a fresh install still sees something)."""
+    assert "data-video-lib-agg" in _INDEX
+    # exactly the three aggregate tiles, not Episodes (a true library-wide total)
+    assert _INDEX.count("data-video-lib-agg") == 3
+    body = _func("renderLibraryTiles")
+    assert "data-video-lib-agg" in body
+    assert "hidden = libs.length > 0" in body

@@ -237,14 +237,16 @@ def _rank(pool: List[Dict[str, Any]], item: Dict[str, Any], media_type: str) -> 
     accepted candidate with its protocol as the grab source."""
     from api.video import get_video_db
     from api.video.downloads import _evaluate_hits
-    from core.automation.handlers.video_process_wishlist import search_context
+    from core.automation.handlers.video_process_wishlist import (
+        _preferred_indexer_ids_for_item, search_context)
     from core.video.quality_profile import load_for_item
     ctx = search_context(item, media_type)
     cands = _evaluate_hits(pool, load_for_item(get_video_db(), item), ctx["scope"],
                            ctx.get("season"), ctx.get("episode"),
                            want_year=ctx.get("year"),
                            want_title=ctx.get("titles") or ctx.get("title"),
-                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"))
+                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"),
+                           preferred_indexer_ids=_preferred_indexer_ids_for_item(item))
     for c in cands:
         c["source"] = "usenet" if str(c.get("protocol") or "") == "usenet" else "torrent"
     # Full ranked list, not just accepted: rejected candidates ride along into

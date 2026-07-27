@@ -363,7 +363,21 @@ _COLUMN_MIGRATIONS = [
     # Per-library torrent-client category/label (e.g. Movies -> "movies", Anime ->
     # "anime") — NULL inherits the global torrent_client.category setting.
     ("root_folders", "category", "TEXT"),
+    # Per-library preferred tracker(s) — comma-separated Prowlarr indexer ids
+    # (same format as the global prowlarr.indexer_ids allowlist). A hit from
+    # one of these indexers ranks higher for titles in this Library; NULL/blank
+    # means no preference (every allowed indexer ranks equally, as today).
+    ("root_folders", "preferred_indexer_ids", "TEXT"),
 ]
+
+
+def _norm_indexer_ids(raw) -> str | None:
+    """A comma-separated Prowlarr indexer id list → a clean digits-only comma
+    string, or None when empty/all-garbage. Same tolerant parsing as the
+    global prowlarr.indexer_ids allowlist (core/video/prowlarr_search.py's
+    _indexer_ids) — non-digit tokens are just dropped, never an error."""
+    ids = [p.strip() for p in str(raw or "").split(",") if p.strip().isdigit()]
+    return ",".join(ids) if ids else None
 
 
 def _subtitle_langs_list(raw) -> list:
@@ -2605,15 +2619,15 @@ class VideoDatabase:
         """Every configured library for this server, full detail (for the
         Settings editor + the Library page's tab bar).
         {"movies": [...], "tv": [...]} — each entry:
-        {id, server_title, label, path, sort_order, category}."""
+        {id, server_title, label, path, sort_order, category, preferred_indexer_ids}."""
         conn = self._get_connection()
         try:
             self._migrate_legacy_libraries(conn, server)
             out = {}
             for ui_kind, content_kind in self._LIB_KIND.items():
                 rows = conn.execute(
-                    "SELECT id, server_title, label, path, sort_order, category FROM root_folders "
-                    "WHERE server=? AND content_kind=? ORDER BY sort_order, id",
+                    "SELECT id, server_title, label, path, sort_order, category, preferred_indexer_ids "
+                    "FROM root_folders WHERE server=? AND content_kind=? ORDER BY sort_order, id",
                     (server, content_kind)).fetchall()
                 out[ui_kind] = [dict(r) for r in rows]
             return out
@@ -2628,14 +2642,18 @@ class VideoDatabase:
 
     def save_libraries(self, server: str, movies, tv, youtube=None) -> dict:
         """Replace this server's Libraries with the given lists (each entry:
-        {id?, server_title, label, path, category}). Missing ids are deleted
-        (their movies/shows rows fall back to unassigned); others are upserted
-        in list order, which becomes sort_order (index 0 = primary). Returns
-        the new list_libraries(server) shape. ``youtube`` entries are manually
-        named (no server-side discovery — YouTube isn't scanned from a Plex/
-        Jellyfin section), but stored the same way as movies/tv. ``category``
-        is the torrent-client category/label new grabs into this library
-        carry; blank/omitted inherits the global torrent_client.category."""
+        {id?, server_title, label, path, category, preferred_indexer_ids}).
+        Missing ids are deleted (their movies/shows rows fall back to
+        unassigned); others are upserted in list order, which becomes
+        sort_order (index 0 = primary). Returns the new list_libraries(server)
+        shape. ``youtube`` entries are manually named (no server-side
+        discovery — YouTube isn't scanned from a Plex/Jellyfin section), but
+        stored the same way as movies/tv. ``category`` is the torrent-client
+        category/label new grabs into this library carry; blank/omitted
+        inherits the global torrent_client.category. ``preferred_indexer_ids``
+        is a comma-separated list of Prowlarr indexer ids (same format as the
+        global prowlarr.indexer_ids allowlist) that rank higher for titles in
+        this library; blank/omitted means no preference."""
         entries_by_kind = {"movies": movies, "tv": tv, "youtube": youtube}
         conn = self._get_connection()
         try:
@@ -2650,18 +2668,20 @@ class VideoDatabase:
                     label = str(e.get("label") or "").strip() or None
                     path = str(e.get("path") or "").strip()
                     category = str(e.get("category") or "").strip() or None
+                    preferred_indexer_ids = _norm_indexer_ids(e.get("preferred_indexer_ids"))
                     eid = e.get("id")
                     if eid:
                         conn.execute(
-                            "UPDATE root_folders SET server_title=?, label=?, path=?, sort_order=?, category=? "
-                            "WHERE id=? AND server=? AND content_kind=?",
-                            (title, label, path, i, category, int(eid), server, content_kind))
+                            "UPDATE root_folders SET server_title=?, label=?, path=?, sort_order=?, category=?, "
+                            "preferred_indexer_ids=? WHERE id=? AND server=? AND content_kind=?",
+                            (title, label, path, i, category, preferred_indexer_ids,
+                             int(eid), server, content_kind))
                         keep_ids.add(int(eid))
                     else:
                         cur = conn.execute(
-                            "INSERT INTO root_folders (path, content_kind, server, server_title, label, sort_order, category) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (path, content_kind, server, title, label, i, category))
+                            "INSERT INTO root_folders (path, content_kind, server, server_title, label, "
+                            "sort_order, category, preferred_indexer_ids) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (path, content_kind, server, title, label, i, category, preferred_indexer_ids))
                         keep_ids.add(cur.lastrowid)
                 existing_ids = {r[0] for r in conn.execute(
                     "SELECT id FROM root_folders WHERE server=? AND content_kind=?",
@@ -2738,8 +2758,8 @@ class VideoDatabase:
         server): an install that never opened the Libraries editor simply has
         no rows, and its callers fall through to the legacy scalars.
         """
-        sql = ("SELECT id, path, content_kind, server, server_title, label, sort_order, category "
-               "FROM root_folders")
+        sql = ("SELECT id, path, content_kind, server, server_title, label, sort_order, category, "
+               "preferred_indexer_ids FROM root_folders")
         params = ()
         if kind:
             content_kind = {"movie": "movie", "movies": "movie", "show": "show",
@@ -2765,8 +2785,8 @@ class VideoDatabase:
         conn = self._get_connection()
         try:
             row = conn.execute(
-                "SELECT id, path, content_kind, server, server_title, label, sort_order, category "
-                "FROM root_folders WHERE id=?", (int(root_folder_id),)).fetchone()
+                "SELECT id, path, content_kind, server, server_title, label, sort_order, category, "
+                "preferred_indexer_ids FROM root_folders WHERE id=?", (int(root_folder_id),)).fetchone()
             return dict(row) if row else None
         except (TypeError, ValueError):
             return None
@@ -2857,25 +2877,39 @@ class VideoDatabase:
             def scalar(sql: str, params=()):
                 return conn.execute(sql, params).fetchone()[0]
 
-            # Per-Library breakdown — the fixed movies/shows totals above sum EVERY
-            # configured Library of that kind into one number, so a second Library
-            # (an Anime library alongside the standard one, say) had no way to show
-            # its own count. Only surfaced for a kind that actually has more than
-            # one configured Library — a single-library install (the common case)
-            # gets nothing extra here.
+            # Per-Library breakdown — the fixed movies/shows/size totals above sum
+            # EVERY configured Library of that kind into one number, so a second
+            # Library (an Anime library alongside the standard one, say) had no way
+            # to show its own count or its own share of the disk. Every configured
+            # movie/show Library gets an entry; the dashboard renders these INSTEAD
+            # of the aggregate tiles and only falls back to them when this is empty
+            # (no Libraries configured yet).
             lib_rows = [r for r in self.all_library_rows() if r.get("content_kind") in ("movie", "show")]
             movie_libs = [r for r in lib_rows if r["content_kind"] == "movie"]
             show_libs = [r for r in lib_rows if r["content_kind"] == "show"]
             by_library = []
-            for r in ((movie_libs if len(movie_libs) > 1 else []) +
-                      (show_libs if len(show_libs) > 1 else [])):
-                tbl = "movies" if r["content_kind"] == "movie" else "shows"
+            for r in movie_libs + show_libs:
+                is_movie = r["content_kind"] == "movie"
+                tbl = "movies" if is_movie else "shows"
                 where = "root_folder_id=?" + (" AND server_source=?" if server_source else "")
                 params = (r["id"],) + (sv if server_source else ())
+                # Movie files hang off the movie row; episode files hang off the
+                # show's episodes — one hop further for a show Library.
+                if is_movie:
+                    size_sub = f"SELECT id FROM movies WHERE {where}"
+                    size_q = ("SELECT COALESCE(SUM(size_bytes), 0) FROM media_files "
+                              f"WHERE movie_id IN ({size_sub})")
+                else:
+                    size_sub = (f"SELECT e.id FROM episodes e JOIN shows s ON s.id=e.show_id "
+                                f"WHERE s.root_folder_id=?"
+                                + (" AND s.server_source=?" if server_source else ""))
+                    size_q = ("SELECT COALESCE(SUM(size_bytes), 0) FROM media_files "
+                              f"WHERE episode_id IN ({size_sub})")
                 by_library.append({
                     "id": r["id"], "kind": r["content_kind"],
                     "label": r.get("label") or r.get("server_title") or "Library",
                     "count": scalar(f"SELECT COUNT(*) FROM {tbl} WHERE {where}", params),
+                    "size_bytes": scalar(size_q, params),
                 })
 
             return {

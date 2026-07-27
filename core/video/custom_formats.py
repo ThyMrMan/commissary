@@ -62,8 +62,13 @@ def normalize_format(raw: Any) -> Optional[Dict[str, Any]]:
     except (TypeError, ValueError):
         score = 0
     fid = raw.get("id")
+    # A UI-facing tag only — matching/scoring never reads it. 'group' marks a
+    # format the Preferred Groups quick-add generated, so that panel can find
+    # its own entries in the same list without a separate table.
+    kind = str(raw.get("kind") or "custom").strip() or "custom"
     return {"id": int(fid) if isinstance(fid, (int, float)) and int(fid) >= 1 else None,
-            "name": name[:80], "include": include, "exclude": exclude, "score": score}
+            "name": name[:80], "include": include, "exclude": exclude, "score": score,
+            "kind": kind}
 
 
 def load_formats(db) -> List[Dict[str, Any]]:

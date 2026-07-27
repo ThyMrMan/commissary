@@ -134,10 +134,39 @@ def test_api_passes_root_folder_id_through(tmp_path):
         videoapi._video_db = None
 
 
-def test_js_wires_the_library_filter():
-    assert "data-vdh-lib" in _VDH_JS
-    assert "root_folder_id" in _VDH_JS
-    assert "/api/video/libraries" in _VDH_JS
+def _func(name: str) -> str:
+    i = _VDH_JS.index("function " + name + "(")
+    nxt = _VDH_JS.find("\n    function ", i + 1)
+    return _VDH_JS[i:nxt if nxt != -1 else len(_VDH_JS)]
+
+
+def test_library_filter_lives_in_the_tab_strip_not_a_dropdown():
+    """The filter sits next to the existing All/Movies/TV/YouTube tabs. The old
+    standalone <select> is gone from the toolbar."""
+    assert "vdh-lib-select" not in _VDH_JS
+    body = _func("renderLibraryTabs")
+    assert ".vdh-tabs" in body
+    assert "data-vdh-lib-tab" in body
+    assert "kind + ':' + l.id" in body
+
+
+def test_a_library_tab_splits_into_kind_plus_root_folder_id():
+    set_tab = _func("setTab")
+    assert "state.rootFolderId = parts.length > 1 ? parts[1] : ''" in set_tab
+    # the kind sent to the API is the bare kind, never 'show:3'
+    load = _func("load")
+    assert "params.set('kind', String(state.tab).split(':')[0])" in load
+    assert "root_folder_id" in load
+
+
+def test_libraries_come_from_the_configured_registry_so_members_see_them():
+    """d.configured is readable by every profile; d.movies/d.tv are the
+    admin-only server-section discovery list (empty for members, and carrying
+    no root_folder id to filter by) — which is why this only worked for admins."""
+    body = _func("loadLibraries")
+    assert "/api/video/libraries" in body
+    assert "d.configured" in body
+    assert "d.movies" not in body and "d.tv" not in body
 
 
 def test_records_a_completed_movie_with_parsed_quality(db):

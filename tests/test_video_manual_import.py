@@ -126,6 +126,69 @@ def test_added_file_places_the_same_way_and_never_deletes_the_users_original(env
     assert stray.exists()          # the user's own file — copy mode must not reclaim it
 
 
+# ── /import/add guesses the kind; /place honours a chosen Library ─────────────
+# Everything added by hand used to be filed as kind='movie', so the Place dialog
+# opened on the Movie tab and — with no Library picker at all — an episode from a
+# separate Anime library landed in the primary MOVIE destination.
+
+@pytest.mark.parametrize("name, scope", [
+    ("Severance.S02E03.1080p.WEB.x264.mkv", "episode"),
+    ("Some.Show.Season.2.1080p.mkv", "episode"),
+    ("[SubsPlease] Digimon Beatbreak - 40 [1080p][AAC].mkv", "episode"),   # fansub absolute numbering
+    ("The.Matrix.1999.1080p.BluRay.x265.mkv", "movie"),
+    ("Blade Runner 2049 (2017) 2160p.mkv", "movie"),
+])
+def test_add_guesses_movie_vs_episode_from_the_filename(env, tmp_path, name, scope):
+    f = tmp_path / name
+    f.write_bytes(b"q" * 1024)
+    r = env["client"].post("/api/video/import/add", json={"path": str(f)}).get_json()
+    item = next(i for i in env["client"].get("/api/video/import/failed").get_json()["items"]
+                if i["id"] == r["id"])
+    assert item["scope"] == scope
+    assert item["kind"] == ("show" if scope == "episode" else "movie")
+
+
+def test_fansub_absolute_numbering_keeps_the_episode_but_leaves_season_blank(env, tmp_path):
+    """'[SubsPlease] Show - 40' carries no season at all — guessing one would be
+    a lie, so the user still fills it in; only the TAB is pre-picked."""
+    f = tmp_path / "[Erai-raws] Some Anime - 12 [1080p][Multiple Subtitle].mkv"
+    f.write_bytes(b"q" * 1024)
+    r = env["client"].post("/api/video/import/add", json={"path": str(f)}).get_json()
+    item = next(i for i in env["client"].get("/api/video/import/failed").get_json()["items"]
+                if i["id"] == r["id"])
+    assert item["scope"] == "episode"
+    assert item["episode"] == 12
+    assert item["season"] is None
+
+
+def test_place_files_into_the_chosen_library_not_the_primary(env, tmp_path):
+    """The reported failure: a show belonging to a separate Anime library was
+    placed into the primary destination because nothing could say otherwise."""
+    db = env["db"]
+    anime = tmp_path / "Anime"
+    anime.mkdir()
+    standard = tmp_path / "TVStandard"
+    standard.mkdir()
+    conn = db._get_connection()
+    conn.execute("INSERT INTO root_folders (path, content_kind, server, sort_order) VALUES (?,?,?,?)",
+                 (str(standard), "show", "plex", 0))
+    conn.execute("INSERT INTO root_folders (path, content_kind, server, sort_order) VALUES (?,?,?,?)",
+                 (str(anime), "show", "plex", 1))
+    anime_id = conn.execute("SELECT id FROM root_folders WHERE path=?", (str(anime),)).fetchone()[0]
+    conn.commit(); conn.close()
+
+    f = tmp_path / "Anime.Show.S01E05.1080p.WEB.x264.mkv"
+    f.write_bytes(b"a" * 4096)
+    added = env["client"].post("/api/video/import/add", json={"path": str(f)}).get_json()
+    r = env["client"].post("/api/video/import/%d/place" % added["id"],
+                           json={"scope": "episode", "title": "Anime Show", "year": 2024,
+                                 "season": 1, "episode": 5,
+                                 "root_folder_id": anime_id}).get_json()
+    assert r["success"] and r["status"] == "completed"
+    assert any(anime.rglob("*.mkv"))          # landed in the Anime library
+    assert not any(standard.rglob("*.mkv"))   # NOT the primary show library
+
+
 def test_media_ids_resolves_tmdb_and_library_regrabs():
     from core.video.download_monitor import _media_ids
     # grabbed straight from TMDB → media_id is the tmdb id

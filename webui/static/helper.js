@@ -3484,10 +3484,14 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.6.1': [
-        { date: 'July 2026 · 1.6.1' },
-        { title: 'Torrent/usenet downloads stuck at 100% now import', desc: 'a single-file release — a movie remux, a lone episode — landing directly in a category folder with no folder of its own around it was never found: every path check required a directory, so a bare video/audio file was rejected even when it sat exactly where it was supposed to. The download just sat at 100% forever with no error. Path resolution now accepts a matching file, not only a matching folder.' },
-        { title: 'Earlier versions', desc: '1.6.0 folded in 38 fixes from upstream SoulSync (through 3.1.8), led by a security fix for indexer URLs leaking to the browser. 1.5.0 removed the Soulseek chat feature and the Support button, and gave Plex a stable device identity so it stops emailing about a new device on every restart. 1.4.0 let every user drag and resize their own dashboard cards, and accepted more than one completed-downloads folder so category subfolders finally imported. 1.3.2 made your video Libraries drive the health checks, recycle bin, moved-file resolver and naming-repair job. 1.3.1 added collapsible albums in Purchased. 1.3.0 extended the standard-user policy to the sidebar. 1.2.0 let admins choose which dashboard cards standard users see. 1.1.0 brought the Purchased page. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
+    '1.6.4': [
+        { date: 'July 2026 · 1.6.4' },
+        { title: 'Prefer a release group, and a tracker per Library', desc: 'Settings → Downloads → Quality gains Preferred Groups: type a group name and releases from it rank higher. Each Library also gets its own Preferred Trackers field, so an Anime library can favour one indexer while TV favours another. Both are soft nudges applied to every acquisition path (wishlist drain, RSS, manual search) — never search filters, so a Library whose preferred tracker has nothing this time still gets results.' },
+        { title: 'Library filters moved into the tab strips', desc: 'the Wishlist and Download History per-Library filters were dropdowns that rendered blank and only ever worked for admins. They are now tabs sitting beside Movies/TV/YouTube, and every profile sees them.' },
+        { title: 'Enrichment Workers tab strip fixed', desc: 'every per-Library tab rendered as the word "Library" and clicking one selected several at once — they all shared an identical value. Real names now, one selection per click.' },
+        { title: 'Dashboard Library widget shows each Library separately', desc: 'the Movies, Shows and Disk Size tiles added every Library of a kind together, which stops meaning anything once Anime sits beside TV. Each configured Library now gets its own tile with its own count and its own disk usage.' },
+        { title: 'Manual import lands in the right Library', desc: 'a file added by hand was always filed as a movie, so the Place dialog opened on the wrong tab and episodes went to the movie destination. The kind is now read from the filename — including fansub naming like "[SubsPlease] Show - 40" that carries no season at all — and the dialog lets you pick which Library it lands in.' },
+        { title: 'Earlier versions', desc: '1.6.3 added manual import for any on-disk file (no failed download needed first), fixed fansub-style anime releases being rejected as title mismatches, made grab failures show the real reason instead of a generic toast, and root-caused dashboard customisation being completely dead on the Video side. 1.6.2 made unattended grabs respect each title\'s own Library instead of always routing to the primary one. 1.6.1 fixed torrent/usenet downloads stuck at 100% when the release was a single bare file. 1.6.0 folded in 38 fixes from upstream SoulSync (through 3.1.8), led by a security fix for indexer URLs leaking to the browser. 1.5.0 removed the Soulseek chat feature and the Support button, and gave Plex a stable device identity. 1.4.0 let every user drag and resize their own dashboard cards, and accepted more than one completed-downloads folder. 1.3.2 made your video Libraries drive the health checks, recycle bin, moved-file resolver and naming-repair job. 1.3.1 added collapsible albums in Purchased. 1.3.0 extended the standard-user policy to the sidebar. 1.2.0 let admins choose which dashboard cards standard users see. 1.1.0 brought the Purchased page. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
     ],
 };
 
@@ -3518,7 +3522,45 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.6.1: stuck downloads now finish",
+        title: "1.6.4: pick your groups, your trackers, your Libraries",
+        description: "two new download preferences, plus a sweep through the multi-library surfaces added in 1.6.3 — several of which turned out to be reading the wrong list entirely, which is why they showed blank options and only ever worked for admins.",
+        features: [
+            "Preferred Groups (Settings → Downloads → Quality): type a release group — FLUX, NTb — and releases from it score higher. It creates a normal Custom Format under the hood, so you can open the table below and fine-tune the score or swap in a regex whenever you want",
+            "Preferred Trackers, per Library: each Library gets its own field, so an Anime library can favour one indexer while standard TV favours another. Both preferences are SOFT — Prowlarr still searches every indexer you allow, a preferred hit just ranks higher, so a Library whose favourite tracker has nothing this week never comes up empty",
+            "they apply everywhere a release gets picked: the hourly wishlist drain, RSS instant-grab and the manual search modal all rank through the same code, so what you see in the modal is what the automation would have chosen",
+            "Wishlist and Download History: the per-Library filter is now a TAB next to Movies/TV/YouTube instead of a dropdown, and it works for every profile. Both were reading the live server-section list — admin-only, and carrying no Library id — instead of your configured Libraries, so they rendered blank entries that filtered nothing",
+            "Enrichment Workers: the per-Library tabs all displayed as the word \"Library\" and clicking one lit up several at once, because they shared one identical value. Same root cause, same fix",
+            "the Library dashboard widget stops adding your Libraries together: Movies, Shows and Disk Size were single totals spanning every Library of that kind. Each Library now gets its own tile with its own count and its own disk usage",
+            "manual import files to the right place: a file you added by hand was always recorded as a movie, so the Place dialog opened on the Movie tab and an episode landed in the movie destination. It now reads the kind from the filename — including fansub naming like \"[SubsPlease] Show - 40\", which carries no season anywhere — and the dialog lets you choose which Library it lands in",
+        ],
+        usage_note: "Preferred Groups is in Settings → Downloads → Quality, just above Custom Formats. Preferred Trackers is on each Library in Settings → Connections → Libraries, and takes Prowlarr indexer IDs (e.g. 1,3) — leave it blank for no preference.",
+    },
+    {
+        title: "Earlier in 1.6.3 — import anything, filter by Library, and a dashboard that finally responds",
+        description: "manual import no longer needs SoulSync to have failed a download first, two bugs surfaced while chasing a failed grab got fixed, and dashboard customisation on the Video side turned out to have never worked at all.",
+        features: [
+            "Add file… on the Import page queues ANY video file on disk for placement — one moved in by hand, or left over from another tool — through the same place/dismiss queue, with no prior download needed",
+            "fixed a real risk that surfaced alongside it: after a copy-mode import, SoulSync reclaimed (deleted) the source file. A file you added yourself is your own copy, not a download client's temp file — placing it now never deletes your original",
+            "fansub anime releases stopped being rejected: '[SubsPlease] Title - 40 [1080p]' was thrown out as a title mismatch because the group tag and the glued-on episode number leaked into the parsed title. Scoped narrowly to bracket-tagged releases, so ordinary names that legitimately end in a number — 'Moana 2' — are untouched",
+            "grab failures say why: every one of the four video download helpers threw away the backend's error message on a failed request, so every cause produced the same blank \"Grab failed\" toast",
+            "Download History, Wishlist and the Library page gained per-Library filtering, and shows gained an Airing / Ended / Upcoming filter",
+            "dashboard customisation was dead on the Video side — dragging and resizing did nothing. The video stylesheet pinned every card to a fixed CSS order, which always beats the DOM reordering the drag actually performs; the move was being saved, just never shown. The markup now carries the intended layout and the conflicting CSS is gone",
+        ],
+        usage_note: "Import is in the Video sidebar; the Add file… button takes a full path to the file. Customize is in the top-right of the dashboard.",
+    },
+    {
+        title: "Earlier in 1.6.2 — unattended grabs respect your Libraries",
+        description: "automatic downloads always routed to the primary Library for the kind, ignoring which Library the title was actually filed under. So an Anime show already sitting in your Anime library had its new episodes dropped into standard TV.",
+        features: [
+            "all four unattended paths are covered: the wishlist drain, RSS instant-grab, \"Search now\", and repair-job upgrades",
+            "the cause was that unattended grabs resolved ONE destination for a whole batch and reused it for every item. The interactive Get flow already did this correctly — this brings the automation up to the same standard",
+            "the torrent-client category follows the same rule, so a grab's destination folder and its category always come from the same Library",
+            "titles not yet assigned to any Library still fall back to the primary one, exactly as before",
+        ],
+        usage_note: "Nothing to configure — it reads the Library each title is already filed under.",
+    },
+    {
+        title: "Earlier in 1.6.1 — stuck downloads now finish",
         description: "a torrent or usenet release that landed as a single file — a bluray remux, a lone episode — directly in a category folder, with no folder of its own, could sit at 100% forever and never import. No error, no log, just silence.",
         features: [
             "path resolution required a DIRECTORY at every step, so a release that was just one bare file (no folder wrapping it) never matched, even when it sat exactly at the configured Completed Downloads Path with the exact right name",

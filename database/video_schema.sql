@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS root_folders (
     label        TEXT,             -- display override for tabs/UI; NULL falls back to server_title
     sort_order   INTEGER NOT NULL DEFAULT 0,   -- tab order; lowest = "primary" (default grab destination)
     category     TEXT,             -- per-library torrent-client category/label; NULL inherits the global default
+    preferred_indexer_ids TEXT,    -- comma-separated Prowlarr indexer ids ranked higher for this library; NULL = no preference
     created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

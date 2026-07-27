@@ -66,14 +66,29 @@ def test_render_global_tabs_builds_per_library_buttons():
     assert "'movie:' +" in body and "'show:' +" in body
     # only offered when there's more than one Library for that kind — a single
     # -library install shouldn't see a redundant duplicate of the plain tab
-    assert "libs.movies.length > 1" in body
-    assert "libs.tv.length > 1" in body
+    assert "movieLibs.length > 1" in body
+    assert "tvLibs.length > 1" in body
 
 
-def test_libraries_are_loaded_from_the_shared_endpoint():
+def test_render_global_tabs_drops_entries_with_no_id():
+    """Every button's data-em-priority must be distinct. An id-less entry would
+    render as 'movie:undefined' for all of them, so a single click matched —
+    and highlighted — several tabs at once."""
+    body = _func("renderGlobalTabs")
+    assert "l.id != null" in body
+
+
+def test_libraries_are_loaded_from_the_configured_registry():
+    """d.configured is the Library registry (ids + labels, visible to every
+    profile). d.movies/d.tv are the live server-section DISCOVERY list: no ids,
+    no labels, and empty for non-admins — reading those made every tab render
+    as 'Library'."""
     assert "function loadLibraries(" in _JS
     body = _func("loadLibraries")
     assert "/api/video/libraries" in body
+    assert "d.configured" in body
+    code = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("//"))
+    assert "d.movies" not in code and "d.tv" not in code
     assert "renderGlobalTabs()" in body
     # fetched once opening the modal, alongside the existing priority load
     open_body = _func("open")

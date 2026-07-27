@@ -2437,6 +2437,14 @@ body[data-side="video"] #soulsync-toggle { display: none; }
 .vq-fmt-del:hover { background: rgba(239, 68, 68, 0.8); color: #fff; border-color: transparent; }
 @media (max-width: 900px) { .vq-fmt-row { grid-template-columns: 1fr 1fr; } }
 
+/* Preferred Groups quick-add — a simple name + remove row, not the 6-column
+   Custom Formats grid (reusing .vq-fmt-row's grid-template would misalign
+   the delete button since this row only has two children). */
+.vq-group-row { display: flex; align-items: center; justify-content: space-between;
+    gap: 8px; padding: 6px 10px; border-radius: 9px; background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.08); margin-bottom: 6px; }
+.vq-group-name { font-size: 12.5px; color: #fff; }
+
 /* YouTube Libraries editor rows — manual name + destination folder (no
    server-side discovery, so no checkbox column like the Movies/TV rows). */
 .yt-library-row { display: grid; grid-template-columns: 1fr 1.6fr 30px; gap: 8px;
@@ -3547,6 +3555,12 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
     padding: 1px 6px; border-radius: 999px; background: rgba(255, 255, 255, 0.08); color: rgba(255, 255, 255, 0.6);
     transition: background 0.2s ease, color 0.2s ease; }
 .vwsh-tab--on .vwsh-tab-n { background: rgba(var(--vd-accent-rgb), 0.25); color: #fff; }
+/* Per-Library tabs sit inside the same strip as the kind tabs; the dashed left
+   edge reads them as a subdivision of the kind tab they follow, not peers. */
+.vwsh-tabs { flex-wrap: wrap; row-gap: 8px; }
+.vwsh-tab--lib { border-left: 2px dashed rgba(255, 255, 255, 0.18); font-weight: 600;
+    max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; }
+.vwsh-tab--lib.vwsh-tab--on { border-left-color: rgba(var(--vd-accent-rgb), 0.6); }
 
 .vwsh-toolbar { padding: 18px 40px 0; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .vwsh-body { padding: 26px 40px 0; }
@@ -4987,6 +5001,11 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
 .vimp-ep-field input { padding: 8px 11px; border-radius: 9px; font-size: 13px; color: #fff;
     background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.14); width: 90px; }
 .vimp-ep-field--wide input { width: 100%; }
+/* Destination Library picker — same field language as the season/episode row. */
+.vimp-lib { display: flex; padding: 12px 20px 0; }
+.vimp-lib[hidden] { display: none; }
+.vimp-ep-field select { padding: 8px 11px; border-radius: 9px; font-size: 13px; color: #fff; width: 100%;
+    background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.14); cursor: pointer; }
 .vimp-modal-foot { display: flex; justify-content: flex-end; gap: 10px; padding: 14px 20px 18px; border-top: 1px solid rgba(255, 255, 255, 0.06); margin-top: 8px; }
 
 /* ── Download History modal (.vdh-*) — permanent timeline of every grab ───── */
@@ -5032,10 +5051,12 @@ body.vdh-locked { overflow: hidden; }
 .vdh-tab-n { font-size: 10.5px; font-weight: 800; min-width: 16px; text-align: center; padding: 1px 5px;
     border-radius: 999px; background: rgba(255, 255, 255, 0.08); color: rgba(255, 255, 255, 0.6); }
 .vdh-tab--on .vdh-tab-n { background: rgba(var(--accent-rgb), 0.28); color: #fff; }
-.vdh-lib-select { flex: 0 0 auto; height: 38px; padding: 0 12px; border-radius: 11px; cursor: pointer;
-    background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); color: rgba(255, 255, 255, 0.85);
-    font-size: 12.5px; font-weight: 700; max-width: 180px; }
-.vdh-lib-select[hidden] { display: none; }
+/* Per-Library tabs sit inside the same strip as the kind tabs; the dashed left
+   edge reads them as a subdivision of the kind tab they follow, not peers. */
+.vdh-tabs { flex-wrap: wrap; row-gap: 8px; }
+.vdh-tab--lib { border-left: 2px dashed rgba(255, 255, 255, 0.18); font-weight: 600;
+    max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; }
+.vdh-tab--lib.vdh-tab--on { border-left-color: rgba(var(--accent-rgb), 0.6); }
 .vdh-search { position: relative; display: flex; align-items: center; gap: 9px; margin-left: auto; height: 38px;
     flex: 1; min-width: 180px; max-width: 320px; padding: 0 13px; box-sizing: border-box;
     background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 11px;

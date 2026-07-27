@@ -70,7 +70,6 @@
                         '<button class="vdh-tab" type="button" data-vdh-tab="show">TV <span class="vdh-tab-n" data-vdh-c-show>0</span></button>' +
                         '<button class="vdh-tab" type="button" data-vdh-tab="youtube">YouTube <span class="vdh-tab-n" data-vdh-c-youtube>0</span></button>' +
                     '</div>' +
-                    '<select class="vdh-lib-select" data-vdh-lib hidden title="Library"></select>' +
                     '<div class="vdh-search">' +
                         '<svg class="vdh-search-ic" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>' +
                         '<input type="text" class="vdh-search-input" data-vdh-search placeholder="Search history…" autocomplete="off" spellcheck="false">' +
@@ -172,42 +171,57 @@
                 state.search = si.value.trim(); state.page = 1; load(false);
             }, 250);
         });
-        var libSel = el.querySelector('[data-vdh-lib]');
-        if (libSel) libSel.addEventListener('change', function () {
-            state.rootFolderId = libSel.value || ''; state.page = 1; load(false);
-        });
         return el;
     }
 
-    // Every configured Library (movies + tv + youtube) flattened into one filter —
-    // 'TV' alone doesn't distinguish a standard TV library from a separate Anime
-    // one, so this is the only way to see just one Library's grabs. Hidden
-    // entirely when there's 0 or 1 Library configured (nothing to filter by).
+    // Per-Library filters live IN the tab strip, right after the kind tab they
+    // belong to ('Movies | Anime Films | TV | Anime | YouTube') — 'TV' alone
+    // can't distinguish a standard TV library from a separate Anime one. Each
+    // library tab is encoded '<kind>:<root_folder_id>' so the strip stays a
+    // single mutually-exclusive choice, same as before.
+    //
+    // Reads d.configured (the Library REGISTRY every profile can see), not
+    // d.movies/d.tv — those are the live server-section DISCOVERY list, which
+    // is admin-only and carries no root_folder id to filter by.
     var libsLoaded = false;
+    var LIB_KEY = { movie: 'movies', show: 'tv', youtube: 'youtube' };
     function loadLibraries() {
         if (libsLoaded) return;
         libsLoaded = true;
         fetch('/api/video/libraries', { headers: { Accept: 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) {
-                if (!d) return;
-                var all = [].concat(
-                    (d.movies || []).map(function (l) { return { id: l.id, label: 'Movies: ' + (l.label || l.server_title || '') }; }),
-                    (d.tv || []).map(function (l) { return { id: l.id, label: 'TV: ' + (l.label || l.server_title || '') }; }),
-                    (d.youtube || []).map(function (l) { return { id: l.id, label: 'YouTube: ' + (l.label || l.server_title || '') }; }));
-                var sel = el.querySelector('[data-vdh-lib]');
-                if (!sel || all.length < 2) return;
-                sel.innerHTML = '<option value="">All Libraries</option>' + all.map(function (l) {
-                    return '<option value="' + esc(l.id) + '">' + esc(l.label) + '</option>';
-                }).join('');
-                sel.hidden = false;
-            })
+            .then(function (d) { renderLibraryTabs((d && d.configured) || {}); })
             .catch(function () {});
+    }
+
+    function renderLibraryTabs(configured) {
+        var strip = el.querySelector('.vdh-tabs');
+        if (!strip) return;
+        var old = strip.querySelectorAll('[data-vdh-lib-tab]');
+        for (var i = 0; i < old.length; i++) old[i].remove();
+        Object.keys(LIB_KEY).forEach(function (kind) {
+            var libs = configured[LIB_KEY[kind]] || [];
+            if (libs.length < 2) return;   // one library IS the kind tab — nothing to split
+            var anchor = strip.querySelector('[data-vdh-tab="' + kind + '"]');
+            if (!anchor) return;
+            libs.forEach(function (l) {
+                var b = document.createElement('button');
+                b.className = 'vdh-tab vdh-tab--lib';
+                b.type = 'button';
+                b.setAttribute('data-vdh-tab', kind + ':' + l.id);
+                b.setAttribute('data-vdh-lib-tab', '');
+                b.textContent = l.label || l.server_title || 'Library';
+                anchor.parentNode.insertBefore(b, anchor.nextSibling);
+                anchor = b;   // keep this kind's libraries in their configured order
+            });
+        });
     }
 
     function setTab(tab) {
         if (tab === state.tab) return;
         state.tab = tab; state.page = 1;
+        var parts = String(tab).split(':');
+        state.rootFolderId = parts.length > 1 ? parts[1] : '';
         var tabs = el.querySelectorAll('[data-vdh-tab]');
         for (var i = 0; i < tabs.length; i++)
             tabs[i].classList.toggle('vdh-tab--on', tabs[i].getAttribute('data-vdh-tab') === tab);
@@ -318,7 +332,7 @@
         var body = el.querySelector('[data-vdh-body]');
         if (!append) body.classList.add('vdh-body--loading');
         var params = new URLSearchParams({ page: state.page, limit: LIMIT, search: state.search });
-        if (state.tab !== 'all') params.set('kind', state.tab);
+        if (state.tab !== 'all') params.set('kind', String(state.tab).split(':')[0]);
         if (state.rootFolderId) params.set('root_folder_id', state.rootFolderId);
         fetch('/api/video/downloads/history?' + params.toString(), { headers: { Accept: 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })

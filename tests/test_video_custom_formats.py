@@ -77,6 +77,22 @@ def test_scores_sum_with_per_profile_overrides():
 # Store
 # ---------------------------------------------------------------------------
 
+def test_kind_tag_round_trips_and_defaults_to_custom(db):
+    plain = cf.save_format(db, {"name": "X", "include": ["x"], "score": 5})
+    assert plain["kind"] == "custom"          # untagged formats default to 'custom'
+    group = cf.save_format(db, {"name": "Prefer FLUX", "include": ["FLUX"], "score": 50, "kind": "group"})
+    assert group["kind"] == "group"
+    rows = {r["id"]: r for r in cf.load_formats(db)}
+    assert rows[plain["id"]]["kind"] == "custom" and rows[group["id"]]["kind"] == "group"
+
+
+def test_kind_tag_never_affects_matching_or_scoring():
+    fmts = [{"id": 1, "name": "A", "include": ["web"], "exclude": [], "score": 10, "kind": "group"},
+            {"id": 2, "name": "B", "include": ["hdr"], "exclude": [], "score": 5, "kind": "custom"}]
+    total, names = cf.format_score("Movie WEB HDR", fmts, {})
+    assert total == 15 and names == ["A", "B"]
+
+
 def test_store_crud_and_validation(db):
     assert cf.save_format(db, {"name": "", "include": ["x"]}) is None          # needs a name
     assert cf.save_format(db, {"name": "X", "include": []}) is None            # needs a term
@@ -150,9 +166,43 @@ def test_formats_api_crud(client):
     assert client.delete("/api/video/downloads/quality/formats/9").status_code == 404
 
 
+def test_formats_api_accepts_and_returns_the_group_tag(client):
+    created = client.post("/api/video/downloads/quality/formats",
+                          json={"name": "Prefer NTb", "include": ["NTb"], "score": 50,
+                                "kind": "group"}).get_json()
+    assert created["success"] and created["kind"] == "group"
+    listed = client.get("/api/video/downloads/quality/formats").get_json()["formats"]
+    assert listed[0]["kind"] == "group"
+
+
 def test_settings_ui_has_the_formats_editor():
     assert 'id="vq-format-rows"' in _INDEX and "data-vq-format-add" in _INDEX
     assert 'id="vq-min-format-score"' in _INDEX
     assert "QUALITY_URL + '/formats'" in _SETTINGS_JS
     assert "format_scores" in _SETTINGS_JS       # per-profile override column
     assert "renderFormats()" in _SETTINGS_JS
+
+
+# ---------------------------------------------------------------------------
+# Preferred Groups (thin quick-add over Custom Formats)
+# ---------------------------------------------------------------------------
+
+def test_settings_ui_has_the_preferred_groups_quick_add():
+    assert 'id="vq-group-rows"' in _INDEX
+    assert 'id="vq-group-add-input"' in _INDEX
+    assert "data-vq-group-add" in _INDEX
+    assert "function renderPreferredGroups(" in _SETTINGS_JS
+    assert "function wireGroups(" in _SETTINGS_JS
+    # generates a normal custom format tagged kind:'group', reusing the SAME
+    # endpoint rather than a new one
+    assert "kind: 'group'" in _SETTINGS_JS
+    assert "QUALITY_URL + '/formats'" in _SETTINGS_JS
+
+
+def test_preferred_groups_panel_reuses_the_same_formats_list():
+    """The compact panel must filter _vqFormats, not fetch its own copy —
+    otherwise it and the full Custom Formats table could drift out of sync."""
+    body = _SETTINGS_JS[_SETTINGS_JS.index("function renderPreferredGroups("):]
+    body = body[:body.index("\n    function ", 10)]
+    assert "_vqFormats.filter" in body
+    assert "kind === 'group'" in body

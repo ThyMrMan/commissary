@@ -228,6 +228,14 @@
         categoryInput.setAttribute('data-lib-category', '');
         fields.appendChild(categoryInput);
 
+        var indexerIdsInput = document.createElement('input');
+        indexerIdsInput.type = 'text';
+        indexerIdsInput.placeholder = 'Preferred trackers (indexer IDs, e.g. 1,3 — blank = no preference)';
+        indexerIdsInput.title = 'Prowlarr indexer id(s) that rank higher for grabs into this library — a soft nudge, not a search filter.';
+        indexerIdsInput.value = (configured && configured.preferred_indexer_ids) || '';
+        indexerIdsInput.setAttribute('data-lib-indexer-ids', '');
+        fields.appendChild(indexerIdsInput);
+
         row.appendChild(fields);
         box.addEventListener('change', function () { fields.style.display = box.checked ? '' : 'none'; });
         return row;
@@ -262,12 +270,14 @@
             var labelInput = row.querySelector('[data-lib-label]');
             var pathInput = row.querySelector('[data-lib-path]');
             var categoryInput = row.querySelector('[data-lib-category]');
+            var indexerIdsInput = row.querySelector('[data-lib-indexer-ids]');
             out.push({
                 id: row.dataset.libId ? parseInt(row.dataset.libId, 10) : null,
                 server_title: row.dataset.serverTitle,
                 label: labelInput ? labelInput.value.trim() : '',
                 path: pathInput ? pathInput.value.trim() : '',
-                category: categoryInput ? categoryInput.value.trim() : ''
+                category: categoryInput ? categoryInput.value.trim() : '',
+                preferred_indexer_ids: indexerIdsInput ? indexerIdsInput.value.trim() : ''
             });
         }
         return out;
@@ -853,7 +863,9 @@
                 if (!d) return;
                 _vqFormats = d.formats || [];
                 renderFormats();
+                renderPreferredGroups();
                 wireFormats();
+                wireGroups();
             })
             .catch(function () { /* ignore */ });
     }
@@ -864,7 +876,7 @@
         var overrides = (_videoQuality && _videoQuality.format_scores) || {};
         host.innerHTML = _vqFormats.map(function (f) {
             var ov = overrides[String(f.id)];
-            return '<div class="vq-fmt-row" data-vq-fmt="' + f.id + '">' +
+            return '<div class="vq-fmt-row" data-vq-fmt="' + f.id + '" data-vq-fmt-kind="' + escA(f.kind || 'custom') + '">' +
                 '<input class="vq-fmt-in" data-vq-fmt-f="name" value="' + escA(f.name) + '" placeholder="Name">' +
                 '<input class="vq-fmt-in" data-vq-fmt-f="include" value="' + escA((f.include || []).join(', ')) + '" placeholder="match: term, /regex/">' +
                 '<input class="vq-fmt-in" data-vq-fmt-f="exclude" value="' + escA((f.exclude || []).join(', ')) + '" placeholder="never: term, /regex/">' +
@@ -884,7 +896,69 @@
         var split = function (s) { return s.split(',').map(function (x) { return x.trim(); }).filter(Boolean); };
         return { id: parseInt(row.getAttribute('data-vq-fmt'), 10),
                  name: val('name'), include: split(val('include')), exclude: split(val('exclude')),
-                 score: parseInt(val('score'), 10) || 0 };
+                 score: parseInt(val('score'), 10) || 0, kind: row.getAttribute('data-vq-fmt-kind') || 'custom' };
+    }
+
+    // ── preferred groups (thin quick-add over custom formats) ────────────────
+    // A 'group' format is a normal custom format tagged kind:'group' — this
+    // panel just filters the SAME _vqFormats list, so add/remove here and
+    // editing the row in the full Custom Formats table below stay in sync.
+    function renderPreferredGroups() {
+        var host = document.getElementById('vq-group-rows');
+        if (!host) return;
+        var groups = _vqFormats.filter(function (f) { return f.kind === 'group'; });
+        host.innerHTML = groups.map(function (f) {
+            return '<div class="vq-fmt-row vq-group-row" data-vq-group="' + f.id + '">' +
+                '<span class="vq-group-name">' + escA((f.include || [])[0] || f.name) + '</span>' +
+                '<button class="vq-fmt-del" type="button" data-vq-group-del="' + f.id + '" title="Remove">✕</button>' +
+                '</div>';
+        }).join('') || '<div class="settings-hint" style="padding:6px 0;">No preferred groups yet.</div>';
+    }
+
+    function wireGroups() {
+        var addBtn = document.querySelector('[data-vq-group-add]');
+        if (addBtn && !addBtn._vqWired) {
+            addBtn._vqWired = true;
+            var doAdd = function () {
+                var input = document.getElementById('vq-group-add-input');
+                var name = input ? input.value.trim() : '';
+                if (!name) return;
+                fetch(QUALITY_URL + '/formats', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: 'Prefer ' + name, include: [name], exclude: [], score: 50, kind: 'group' })
+                }).then(function (r) { return r.ok ? r.json() : null; })
+                  .then(function (res) {
+                      if (!res || !res.success) { toast('Couldn’t add that group', 'error'); return; }
+                      _vqFormats.push({ id: res.id, name: res.name, include: res.include, exclude: res.exclude,
+                                        score: res.score, kind: res.kind });
+                      if (input) input.value = '';
+                      renderPreferredGroups();
+                      renderFormats();
+                  })
+                  .catch(function () { toast('Couldn’t add that group', 'error'); });
+            };
+            addBtn.addEventListener('click', doAdd);
+            var input = document.getElementById('vq-group-add-input');
+            if (input) input.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); doAdd(); } });
+        }
+        var groupHost = document.getElementById('vq-group-rows');
+        if (groupHost && !groupHost._vqWired) {
+            groupHost._vqWired = true;
+            groupHost.addEventListener('click', function (e) {
+                var del = e.target.closest('[data-vq-group-del]');
+                if (!del) return;
+                var fid = del.getAttribute('data-vq-group-del');
+                fetch(QUALITY_URL + '/formats/' + fid, { method: 'DELETE' })
+                    .then(function (r) { return r.ok ? r.json() : null; })
+                    .then(function (res) {
+                        if (!res || !res.success) throw new Error();
+                        _vqFormats = _vqFormats.filter(function (f) { return String(f.id) !== fid; });
+                        renderPreferredGroups();
+                        renderFormats();
+                    })
+                    .catch(function () { toast('Couldn’t remove that group', 'error'); });
+            });
+        }
     }
 
     function wireFormats() {
@@ -912,8 +986,12 @@
               .then(function (res) {
                   if (!res || !res.success) { toast('A format needs a name and at least one term', 'error'); return; }
                   for (var i = 0; i < _vqFormats.length; i++) {
-                      if (_vqFormats[i].id === res.id) { _vqFormats[i] = { id: res.id, name: res.name, include: res.include, exclude: res.exclude, score: res.score }; }
+                      if (_vqFormats[i].id === res.id) {
+                          _vqFormats[i] = { id: res.id, name: res.name, include: res.include, exclude: res.exclude,
+                                            score: res.score, kind: res.kind };
+                      }
                   }
+                  renderPreferredGroups();
               })
               .catch(function () { toast('Couldn’t save the format', 'error'); });
         });
@@ -927,6 +1005,7 @@
                     if (!res || !res.success) throw new Error();
                     _vqFormats = _vqFormats.filter(function (f) { return String(f.id) !== fid; });
                     renderFormats();
+                    renderPreferredGroups();
                 })
                 .catch(function () { toast('Couldn’t delete the format', 'error'); });
         });
@@ -940,7 +1019,8 @@
                 }).then(function (r) { return r.ok ? r.json() : null; })
                   .then(function (res) {
                       if (!res || !res.success) throw new Error();
-                      _vqFormats.push({ id: res.id, name: res.name, include: res.include, exclude: res.exclude, score: res.score });
+                      _vqFormats.push({ id: res.id, name: res.name, include: res.include, exclude: res.exclude,
+                                        score: res.score, kind: res.kind });
                       renderFormats();
                   })
                   .catch(function () { toast('Couldn’t add a format', 'error'); });

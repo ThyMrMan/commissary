@@ -12,6 +12,7 @@ import pytest
 from core.automation.handlers.video_process_wishlist import (
     _category_for_item,
     _item_target_dir,
+    _preferred_indexer_ids_for_item,
     _root_folder_for_item,
     active_download_keys,
     annotate_upgrades,
@@ -147,6 +148,35 @@ def test_category_for_item_falls_back_when_library_category_is_blank(monkeypatch
     monkeypatch.setattr("core.automation.handlers.video_process_wishlist._default_category",
                         lambda mt: "primary-cat")
     assert _category_for_item({"root_folder_id": "the-id"}, "show") == "primary-cat"
+
+
+def test_preferred_indexer_ids_parses_the_libraries_comma_list(monkeypatch):
+    _mock_db(monkeypatch, {"path": "/anime", "category": "anime", "preferred_indexer_ids": "1, 3"})
+    assert _preferred_indexer_ids_for_item({"root_folder_id": "the-id"}) == {1, 3}
+
+
+def test_preferred_indexer_ids_empty_when_no_library(monkeypatch):
+    _mock_db(monkeypatch, {"path": "/anime", "category": "anime", "preferred_indexer_ids": "1"})
+    assert _preferred_indexer_ids_for_item({"title": "no library"}) == set()
+
+
+def test_preferred_indexer_ids_empty_when_library_has_none_set(monkeypatch):
+    _mock_db(monkeypatch, {"path": "/anime", "category": "anime"})   # no preferred_indexer_ids key
+    assert _preferred_indexer_ids_for_item({"root_folder_id": "the-id"}) == set()
+
+
+def test_preferred_indexer_ids_drops_garbage_tokens(monkeypatch):
+    _mock_db(monkeypatch, {"path": "/anime", "preferred_indexer_ids": "2, bogus, 9,"})
+    assert _preferred_indexer_ids_for_item({"root_folder_id": "the-id"}) == {2, 9}
+
+
+def test_preferred_indexer_ids_does_not_fall_back_to_the_primary_library(monkeypatch):
+    """Unlike _item_target_dir/_category_for_item, an unlinked item gets NO
+    tracker preference — inheriting one from an unrelated 'primary' library
+    would be a surprising default for a soft ranking nudge."""
+    monkeypatch.setattr("core.automation.handlers.video_process_wishlist._default_category",
+                        lambda mt: "primary-cat")
+    assert _preferred_indexer_ids_for_item({"title": "no library"}) == set()
 
 
 # ── handler ───────────────────────────────────────────────────────────────────

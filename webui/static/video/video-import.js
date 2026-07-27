@@ -241,9 +241,10 @@
             kind: (item.scope === 'episode' || item.kind === 'show') ? 'episode' : 'movie',
             query: item.title || basename(item.file) || '',
             results: [], picked: null, season: item.season || '', episode: item.episode || '',
-            searching: false,
+            searching: false, rootFolderId: '',
         };
         ensureModal();
+        loadLibraries();
         renderModal();
         runSearch();
         var input = $('[data-vimp-q]');
@@ -279,6 +280,10 @@
                     '<input type="text" class="vimp-search-input" data-vimp-q placeholder="Search your library &amp; TMDB&hellip;" autocomplete="off" spellcheck="false">' +
                 '</div>' +
                 '<div class="vimp-results" data-vimp-results></div>' +
+                '<div class="vimp-lib" data-vimp-lib-row hidden>' +
+                    '<label class="vimp-ep-field vimp-ep-field--wide">Library ' +
+                        '<select data-vimp-lib></select></label>' +
+                '</div>' +
                 '<div class="vimp-ep" data-vimp-ep hidden>' +
                     '<label class="vimp-ep-field">Season <input type="number" min="0" data-vimp-season></label>' +
                     '<label class="vimp-ep-field">Episode <input type="number" min="0" data-vimp-episode></label>' +
@@ -292,6 +297,38 @@
         document.body.appendChild(m);
     }
 
+    // Which Library the placed file lands in. Without this the backend fell
+    // back to the PRIMARY Library for the kind, so an Anime episode was filed
+    // into the standard TV (or, when the kind was guessed wrong, Movies) root
+    // with no way to say otherwise. Reads d.configured — the registry every
+    // profile can see — not the admin-only d.movies/d.tv discovery list.
+    var LIB_KEY = { movie: 'movies', episode: 'tv' };
+    var _libs = null;
+    function loadLibraries() {
+        if (_libs) { renderLibraryPicker(); return; }
+        fetch('/api/video/libraries', { headers: { Accept: 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) { _libs = (d && d.configured) || {}; renderLibraryPicker(); })
+            .catch(function () { _libs = {}; renderLibraryPicker(); });
+    }
+
+    function renderLibraryPicker() {
+        var r = state.resolve, row = $('[data-vimp-lib-row]'), sel = $('[data-vimp-lib]');
+        if (!r || !row || !sel) return;
+        var libs = (_libs || {})[LIB_KEY[r.kind]] || [];
+        // One Library for this kind is not a choice — the backend's primary
+        // fallback already lands there.
+        if (libs.length < 2) { row.hidden = true; r.rootFolderId = ''; return; }
+        if (!libs.some(function (l) { return String(l.id) === String(r.rootFolderId); }))
+            r.rootFolderId = String(libs[0].id);   // lowest sort_order = the primary
+        sel.innerHTML = libs.map(function (l) {
+            return '<option value="' + esc(l.id) + '"' +
+                (String(l.id) === String(r.rootFolderId) ? ' selected' : '') + '>' +
+                esc(l.label || l.server_title || 'Library') + '</option>';
+        }).join('');
+        row.hidden = false;
+    }
+
     function renderModal() {
         var r = state.resolve;
         if (!r) return;
@@ -300,6 +337,7 @@
         var tabs = document.querySelectorAll('[data-vimp-kind]');
         for (var i = 0; i < tabs.length; i++)
             tabs[i].classList.toggle('vimp-kindtab--on', tabs[i].getAttribute('data-vimp-kind') === r.kind);
+        renderLibraryPicker();
         var ep = $('[data-vimp-ep]');
         if (ep) ep.hidden = !(r.kind === 'episode' && r.picked);
         var sEl = $('[data-vimp-season]'); if (sEl && r.season !== '') sEl.value = r.season;
@@ -381,6 +419,7 @@
         var body = {
             scope: r.kind, media_id: r.picked.media_id,
             title: r.picked.title, year: r.picked.year ? parseInt(r.picked.year, 10) : null,
+            root_folder_id: r.rootFolderId || null,
         };
         if (r.kind === 'episode') {
             body.season = parseInt(r.season, 10);
@@ -480,6 +519,7 @@
         }
         if (e.target.matches('[data-vimp-season]')) { r.season = e.target.value; updateConfirm(); return; }
         if (e.target.matches('[data-vimp-episode]')) { r.episode = e.target.value; updateConfirm(); return; }
+        if (e.target.matches('[data-vimp-lib]')) { r.rootFolderId = e.target.value || ''; return; }
     }
 
     function startPoll() {
@@ -510,6 +550,11 @@
                 if (e.target.closest('[data-vimp-add-close]')) { closeAddFile(); return; }
                 if (e.target.closest('[data-vimp-add-confirm]')) { submitAddFile(); return; }
             }
+        });
+        // 'change' too — a <select> (the Library picker) is not covered by 'input'
+        // in every browser this ships to.
+        document.addEventListener('change', function (e) {
+            if (state.resolve && e.target.closest('[data-vimp-modal]')) onModalInput(e);
         });
         document.addEventListener('input', function (e) {
             if (state.resolve && e.target.closest('[data-vimp-modal]')) onModalInput(e);

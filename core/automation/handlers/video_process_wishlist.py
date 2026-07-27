@@ -343,6 +343,24 @@ def _category_for_item(item: Dict[str, Any], media_type: str) -> Optional[str]:
     return _default_category(media_type)
 
 
+def _preferred_indexer_ids_for_item(item: Dict[str, Any]) -> set:
+    """The item's own Library's preferred tracker(s), if any — a SOFT ranking
+    signal (see ``_evaluate_hits``' ``preferred_indexer_ids``), never a search
+    filter. An item with no Library yet (root_folder_id unset) has no
+    preference — this deliberately does NOT fall back to the primary
+    Library's preference the way ``_item_target_dir``/``_category_for_item``
+    fall back for destination/category, since a tracker nudge inherited from
+    an unrelated 'primary' Library would be a surprising default."""
+    root_folder = _root_folder_for_item(item)
+    raw = (root_folder or {}).get("preferred_indexer_ids") or ""
+    out = set()
+    for p in str(raw).split(","):
+        p = p.strip()
+        if p.isdigit():
+            out.add(int(p))
+    return out
+
+
 def _search_one_source(source: str, item: Dict[str, Any], media_type: str):
     """Search ONE source → (ranked candidates tagged with source, error). soulseek via slskd,
     torrent/usenet via Prowlarr. Returns (None, error) when the search couldn't run."""
@@ -378,7 +396,8 @@ def _search_one_source(source: str, item: Dict[str, Any], media_type: str):
     cands = _evaluate_hits(hits, profile, ctx["scope"], ctx.get("season"), ctx.get("episode"),
                            want_year=ctx.get("year"),
                            want_title=ctx.get("titles") or ctx.get("title"),
-                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"))
+                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"),
+                           preferred_indexer_ids=_preferred_indexer_ids_for_item(item))
     for c in cands:
         c["source"] = source
     return cands, None

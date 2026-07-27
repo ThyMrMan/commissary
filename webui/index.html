@@ -873,8 +873,15 @@
                                                 </button>
                                             </div>
                                         </div>
+                                        <!-- The Movies/Shows/Disk Size tiles below are AGGREGATES — they
+                                             sum every configured Library of a kind into one number, which
+                                             is wrong once a second Library of that kind exists (Anime
+                                             alongside TV). video-dashboard.js hides them and renders one
+                                             tile per Library (count + its own disk size) whenever the
+                                             stats payload carries a by_library breakdown; they stay as
+                                             the fallback for an install with no Libraries configured. -->
                                         <div class="library-status-stats" data-video-lib-stats>
-                                            <div class="library-status-stat">
+                                            <div class="library-status-stat" data-video-lib-agg>
                                                 <div class="library-status-stat-icon">
                                                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/></svg>
                                                 </div>
@@ -883,7 +890,7 @@
                                                     <span class="library-status-stat-label">Movies</span>
                                                 </div>
                                             </div>
-                                            <div class="library-status-stat">
+                                            <div class="library-status-stat" data-video-lib-agg>
                                                 <div class="library-status-stat-icon">
                                                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="15" rx="2"/><polyline points="17 2 12 7 7 2"/></svg>
                                                 </div>
@@ -901,7 +908,7 @@
                                                     <span class="library-status-stat-label">Episodes</span>
                                                 </div>
                                             </div>
-                                            <div class="library-status-stat">
+                                            <div class="library-status-stat" data-video-lib-agg>
                                                 <div class="library-status-stat-icon">
                                                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
                                                 </div>
@@ -1529,9 +1536,6 @@
                                 <option value="oldest">Oldest first</option>
                                 <option value="wanted">Most wanted</option>
                                 <option value="title">A&ndash;Z</option>
-                            </select>
-                            <select class="vwsh-sort" data-vwsh-lib aria-label="Library" hidden>
-                                <option value="">All Libraries</option>
                             </select>
                             <button class="vwsh-failing-filter" type="button" data-vwsh-failing hidden
                                     title="Show only items that keep failing to download — the fix-it hub: auto search, manual search or remove each one">
@@ -7332,6 +7336,22 @@
                                             <input type="range" id="vq-episode-size" class="vq-slider" min="0" max="200" step="1" value="0">
                                         </div>
                                     </div>
+                                </div>
+                            </div>
+                            <!-- Preferred Groups: a friendlier quick-add for the single most common
+                                 Custom Format use case (boost a trusted release group) — generates a
+                                 normal Custom Format under the hood, tagged kind:'group' so this panel
+                                 can find its own entries in the same list. -->
+                            <div class="settings-group" data-stg="quality" data-video-only>
+                                <h3>Preferred Groups</h3>
+                                <div class="setting-help-text">
+                                    Always favor a specific release/upload group (e.g. <code>FLUX</code>, <code>NTb</code>) when picking among otherwise similar releases.
+                                    Adds a Custom Format below with a +50 score — for regex or a custom score, edit it there directly.
+                                </div>
+                                <div id="vq-group-rows"></div>
+                                <div class="form-group" style="display:flex; gap:8px; align-items:center;">
+                                    <input type="text" id="vq-group-add-input" placeholder="Group name, e.g. FLUX" style="max-width:220px;">
+                                    <button class="test-button" type="button" data-vq-group-add>+ Add</button>
                                 </div>
                             </div>
                             <!-- Custom Formats (arr-parity P3): scored release-name matchers -->

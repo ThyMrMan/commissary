@@ -403,6 +403,12 @@
     // results trickle in over ~30s, so a single short wait misses them).
     function searchInto(container, resultsEl, params, triggerRows, onDone) {
         if (!resultsEl) return;
+        // Per-Library tracker preference (multi-library torrent preferences):
+        // the library picker's current choice, same value already sent on the
+        // grab payload — sent one step earlier so ranking itself reflects it,
+        // not just where the file lands after a grab.
+        var rfid = pickedRootFolderId(container);
+        if (rfid) params.root_folder_id = rfid;
         triggerRows = (triggerRows || []).filter(Boolean);
         if (resultsEl._poll) { clearTimeout(resultsEl._poll); resultsEl._poll = null; }
         resultsEl._rows = null;   // drop any prior search's rows so Auto can't grab a stale hit

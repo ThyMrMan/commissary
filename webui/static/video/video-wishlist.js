@@ -649,42 +649,64 @@
             .catch(function () { /* best-effort */ });
     }
 
+    // A tab is either a bare kind ('movie') or a Library within a kind
+    // ('show:3') — see renderLibraryTabs.
     function setTab(tab) {
-        if (tab !== 'movie' && tab !== 'show' && tab !== 'youtube') return;
-        state.tab = tab; state.page = 1; state.search = '';
-        state.rootFolderId = '';
+        var parts = String(tab).split(':');
+        var kind = parts[0];
+        if (kind !== 'movie' && kind !== 'show' && kind !== 'youtube') return;
+        state.tab = kind; state.page = 1; state.search = '';
+        state.rootFolderId = parts.length > 1 ? parts[1] : '';
         var si = $('[data-vwsh-search]'); if (si) si.value = '';
         var tabs = document.querySelectorAll('[data-vwsh-tab]');
         for (var i = 0; i < tabs.length; i++)
             tabs[i].classList.toggle('vwsh-tab--on', tabs[i].getAttribute('data-vwsh-tab') === tab);
         updateClearBtn();
-        loadLibraries();
         load();
     }
 
-    // Filter by a specific configured Library (e.g. a separate Anime library) —
-    // 'Movies'/'TV' alone doesn't distinguish libraries of the same kind. Hidden
-    // entirely when there's 0 or 1 Library configured for the active tab's kind,
-    // and not offered at all on the YouTube tab (no library concept there).
-    var _libsFor = null;
+    // Per-Library filters live IN the tab strip, right after the kind tab they
+    // belong to ('Movies | TV | Anime | YouTube') — 'Movies'/'TV' alone can't
+    // distinguish a standard library from a separate Anime one of the same
+    // kind. Only rendered for a kind with more than one Library configured
+    // (with one, the kind tab already IS that Library).
+    //
+    // Reads d.configured (the Library REGISTRY every profile can see), not
+    // d.movies/d.tv — those are the live server-section DISCOVERY list, which
+    // is admin-only and carries no root_folder id to filter by.
+    var LIB_KEY = { movie: 'movies', show: 'tv', youtube: 'youtube' };
+    var libsLoaded = false;
     function loadLibraries() {
-        var sel = $('[data-vwsh-lib]');
-        if (!sel) return;
-        if (state.tab === 'youtube') { sel.hidden = true; return; }
-        if (_libsFor === state.tab) return;
+        if (libsLoaded) return;
+        libsLoaded = true;
         fetch('/api/video/libraries', { headers: { Accept: 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) {
-                if (!d || state.tab === 'youtube') return;
-                var list = (state.tab === 'show' ? d.tv : d.movies) || [];
-                _libsFor = state.tab;
-                if (list.length < 2) { sel.hidden = true; return; }
-                sel.innerHTML = '<option value="">All Libraries</option>' + list.map(function (l) {
-                    return '<option value="' + esc(l.id) + '">' + esc(l.label || l.server_title || '') + '</option>';
-                }).join('');
-                sel.hidden = false;
-            })
+            .then(function (d) { renderLibraryTabs((d && d.configured) || {}); })
             .catch(function () {});
+    }
+
+    function renderLibraryTabs(configured) {
+        var strip = document.querySelector('[data-video-subpage="video-wishlist"] .vwsh-tabs');
+        if (!strip) return;
+        var old = strip.querySelectorAll('[data-vwsh-lib-tab]');
+        for (var i = 0; i < old.length; i++) old[i].remove();
+        Object.keys(LIB_KEY).forEach(function (kind) {
+            var libs = configured[LIB_KEY[kind]] || [];
+            if (libs.length < 2) return;
+            var anchor = strip.querySelector('[data-vwsh-tab="' + kind + '"]');
+            if (!anchor) return;
+            libs.forEach(function (l) {
+                var b = document.createElement('button');
+                b.className = 'vwsh-tab vwsh-tab--lib';
+                b.type = 'button';
+                b.setAttribute('role', 'tab');
+                b.setAttribute('data-vwsh-tab', kind + ':' + l.id);
+                b.setAttribute('data-vwsh-lib-tab', '');
+                b.textContent = l.label || l.server_title || 'Library';
+                anchor.parentNode.insertBefore(b, anchor.nextSibling);
+                anchor = b;   // keep this kind's libraries in their configured order
+            });
+        });
     }
 
     // Empty the whole current tab (movies / TV / YouTube), after a confirm.
@@ -836,10 +858,12 @@
     }
 
     function wire() {
-        var tabs = document.querySelectorAll('[data-vwsh-tab]');
-        for (var i = 0; i < tabs.length; i++) (function (b) {
-            b.addEventListener('click', function () { setTab(b.getAttribute('data-vwsh-tab')); });
-        })(tabs[i]);
+        // Delegated: the per-Library tabs are injected after wire() runs.
+        var strip = document.querySelector('[data-video-subpage="video-wishlist"] .vwsh-tabs');
+        if (strip) strip.addEventListener('click', function (e) {
+            var b = e.target.closest('[data-vwsh-tab]');
+            if (b) setTab(b.getAttribute('data-vwsh-tab'));
+        });
         var grid = $('[data-vwsh-grid]'); if (grid) grid.addEventListener('click', onGridClick);
         var search = $('[data-vwsh-search]');
         if (search) search.addEventListener('input', function () {
@@ -848,10 +872,6 @@
         });
         var sortSel = $('[data-vwsh-sort]');
         if (sortSel) sortSel.addEventListener('change', function () { state.sort = sortSel.value; state.page = 1; load(); });
-        var libSel = $('[data-vwsh-lib]');
-        if (libSel) libSel.addEventListener('change', function () {
-            state.rootFolderId = libSel.value || ''; state.page = 1; load();
-        });
         var failBtn = $('[data-vwsh-failing]');
         if (failBtn) failBtn.addEventListener('click', function () {
             state.failingOnly = !state.failingOnly;

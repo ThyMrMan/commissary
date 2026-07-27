@@ -170,8 +170,13 @@
     }
     function loadLibraries() {
         if (state.libraries) return Promise.resolve();
+        // d.configured is the Library REGISTRY (has ids + labels); d.movies/d.tv
+        // are the live server-section DISCOVERY list, which carries neither —
+        // reading those made every tab render as 'Library' with the same
+        // 'show:undefined' value, so one click lit them all up.
         return getJSON('/api/video/libraries').then(function (d) {
-            state.libraries = d ? { movies: d.movies || [], tv: d.tv || [] } : { movies: [], tv: [] };
+            var c = (d && d.configured) || {};
+            state.libraries = { movies: c.movies || [], tv: c.tv || [] };
             renderGlobalTabs();
         }).catch(function () { state.libraries = { movies: [], tv: [] }; });
     }
@@ -330,19 +335,26 @@
         var host = byId('vem-global-tabs');
         if (!host) return;
         var libs = state.libraries || { movies: [], tv: [] };
+        // An entry with no id can't address a Library — dropping it keeps every
+        // tab's data-em-priority distinct (identical values would all match
+        // state.priority at once and appear selected together).
+        var withId = function (list) {
+            return (list || []).filter(function (l) { return l && l.id != null; });
+        };
         var tab = function (value, label) {
             return '<button data-em-priority="' + esc(value) + '"' +
                 (value === '' ? ' class="em-global-auto"' : '') + '>' + esc(label) + '</button>';
         };
+        var movieLibs = withId(libs.movies), tvLibs = withId(libs.tv);
         var html = tab('movie', 'Movies');
-        if (libs.movies.length > 1) {
-            libs.movies.forEach(function (l) {
+        if (movieLibs.length > 1) {
+            movieLibs.forEach(function (l) {
                 html += tab('movie:' + l.id, (l.label || l.server_title || 'Library'));
             });
         }
         html += tab('show', 'Shows');
-        if (libs.tv.length > 1) {
-            libs.tv.forEach(function (l) {
+        if (tvLibs.length > 1) {
+            tvLibs.forEach(function (l) {
                 html += tab('show:' + l.id, (l.label || l.server_title || 'Library'));
             });
         }

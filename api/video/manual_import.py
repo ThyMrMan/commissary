@@ -33,6 +33,28 @@ logger = get_logger("video_api.manual_import")
 _KIND_FOR_SCOPE = {"movie": "movie", "episode": "show"}
 
 
+def _guess_scope(name: str) -> dict:
+    """Movie or episode, guessed from a bare filename — {scope, season, episode}.
+
+    A manually added file used to be filed as a movie unconditionally, so the
+    Place dialog opened on the Movie tab and an episode landed in a movie
+    Library. Two shapes count as an episode: the SxxExx/Season-N forms
+    ``parse_release`` already understands, and the fansub absolute-numbering
+    convention (``[SubsPlease] Show - 40 [1080p]``), which carries no season
+    at all — those get ``season: None`` so the user still fills it in, but at
+    least open on the right tab.
+    """
+    from core.video.release_parse import fansub_absolute_episode, parse_release
+    stem = os.path.splitext(str(name or ""))[0]
+    p = parse_release(stem)
+    if p.get("episode") is not None or p.get("season") is not None:
+        return {"scope": "episode", "season": p.get("season"), "episode": p.get("episode")}
+    absolute = fansub_absolute_episode(stem)
+    if absolute is not None:
+        return {"scope": "episode", "season": None, "episode": absolute}
+    return {"scope": "movie", "season": None, "episode": None}
+
+
 def _ctx(row):
     try:
         c = json.loads(row.get("search_ctx") or "{}")
@@ -112,10 +134,12 @@ def register_routes(bp):
         except OSError:
             size_bytes = None
         name = os.path.basename(path)
+        guess = _guess_scope(name)
         dl_id = db.add_video_download({
-            "kind": "movie", "title": name, "release_title": name, "source": "manual",
+            "kind": _KIND_FOR_SCOPE[guess["scope"]], "title": name, "release_title": name,
+            "source": "manual",
             "filename": name, "size_bytes": size_bytes, "status": "downloading",
-            "candidates": "[]", "search_ctx": "{}", "tried_queries": "[]",
+            "candidates": "[]", "search_ctx": json.dumps(guess), "tried_queries": "[]",
             "tried_files": "[]", "attempts": 0,
         })
         db.update_video_download(dl_id, status="import_failed",
@@ -145,9 +169,10 @@ def register_routes(bp):
         if scope not in ("movie", "episode"):
             return jsonify({"success": False, "error": "Choose a movie or an episode."}), 400
 
-        # No picker on this low-traffic admin tool (P.4 scope) — the shared
-        # resolver falls back to the primary configured Library for the kind,
-        # then the legacy scalar path, same as an unattended grab.
+        # The Place dialog sends the chosen Library as root_folder_id; with none
+        # (or an unknown one) the shared resolver falls back to the primary
+        # configured Library for the kind, then the legacy scalar path, same as
+        # an unattended grab.
         override = {
             "scope": scope,
             "title": body.get("title"),

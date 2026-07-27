@@ -199,6 +199,25 @@ def extract_title(release_name: Any) -> str:
     return _spaces(t[:cut])
 
 
+def fansub_absolute_episode(release_name: Any):
+    """The absolute episode number of a fansub-style release, or None.
+
+    The convention is a leading group tag plus a bare number glued on with a
+    dash — '[SubsPlease] Digimon Beatbreak - 40 [1080p]'. There's no SxxExx and
+    no season anywhere, so ``parse_release`` reports neither; this is the only
+    signal that such a file is an EPISODE at all. Requiring the group tag keeps
+    it off ordinary movie names, whose trailing '-GRP' carries no digits."""
+    t = str(release_name or "")
+    tagless = _LEADING_GROUP_TAG.sub("", t, count=1)
+    if tagless == t:
+        return None
+    m = _TRAILING_EP_NUM.search(tagless)
+    if not m:
+        return None
+    digits = "".join(ch for ch in m.group(0) if ch.isdigit())
+    return int(digits) if digits else None
+
+
 def has_absolute_episode(release_name: Any, absolute: Any) -> bool:
     """True when the release carries this ABSOLUTE episode number as a standalone
     token in its title region — anime naming ('[SubsPlease] One Piece - 1071

@@ -208,9 +208,10 @@ def test_dashboard_stats_counts_content_and_downloads(db):
     assert s["watchlist"] == 1 and s["wishlist"] == 0
 
 
-def test_dashboard_stats_by_library_only_appears_with_more_than_one_library_per_kind(db):
-    # a single configured movie library + single show library → no breakdown at all,
-    # same as an install with no Libraries configured (nothing extra to show)
+def test_dashboard_stats_breaks_out_every_configured_library(db):
+    """EVERY configured movie/show Library gets an entry — the dashboard renders
+    these INSTEAD of the aggregate Movies/Shows tiles, so a single-library
+    install must still get its one entry (there'd be nothing to show otherwise)."""
     solo_movie = _add_root_folder(db, path="/media/movies", kind="movie", label="Movies")
     solo_show = _add_root_folder(db, path="/media/tv", kind="show", label="TV")
     mid = db.upsert_movie("plex", {"server_id": "m1", "title": "A"})
@@ -219,18 +220,43 @@ def test_dashboard_stats_by_library_only_appears_with_more_than_one_library_per_
         conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (solo_movie, mid))
         conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (solo_show, sid))
         conn.commit()
-    assert db.dashboard_stats()["library"]["by_library"] == []
+    assert {e["label"]: e["count"] for e in db.dashboard_stats()["library"]["by_library"]} \
+        == {"Movies": 1, "TV": 1}
 
-    # a SECOND show library (Anime) → now shows break out per-library; movies still don't
     anime = _add_root_folder(db, path="/media/anime", kind="show", label="Anime")
     aid = db.upsert_show_tree("plex", {"server_id": "s2", "title": "Anime Show"})
     with db.connect() as conn:
         conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (anime, aid))
         conn.commit()
     by_lib = db.dashboard_stats()["library"]["by_library"]
-    labels = {e["label"]: e["count"] for e in by_lib}
-    assert labels == {"TV": 1, "Anime": 1}
-    assert all(e["kind"] == "show" for e in by_lib)   # movies untouched — still solo
+    assert {e["label"]: e["count"] for e in by_lib} == {"Movies": 1, "TV": 1, "Anime": 1}
+    assert {e["label"]: e["kind"] for e in by_lib} \
+        == {"Movies": "movie", "TV": "show", "Anime": "show"}
+
+
+def test_dashboard_stats_by_library_carries_each_librarys_own_disk_size(db):
+    """The single aggregate size_bytes summed every Library; each entry now
+    carries only ITS OWN bytes — movie files hang off the movie row, episode
+    files off the show's episodes."""
+    movies = _add_root_folder(db, path="/media/movies", kind="movie", label="Movies")
+    anime = _add_root_folder(db, path="/media/anime", kind="show", label="Anime")
+    tv = _add_root_folder(db, path="/media/tv", kind="show", label="TV")
+    mid = db.upsert_movie("plex", {"server_id": "m1", "title": "A"})
+    aid = db.upsert_show_tree("plex", {"server_id": "s1", "title": "Anime Show"})
+    with db.connect() as conn:
+        conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (movies, mid))
+        conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (anime, aid))
+        conn.execute("INSERT INTO media_files(movie_id,relative_path,size_bytes) VALUES (?,'m.mkv',700)",
+                     (mid,))
+        conn.execute("INSERT INTO seasons(id,show_id,season_number) VALUES (1,?,1)", (aid,))
+        conn.execute("INSERT INTO episodes(id,show_id,season_id,season_number,episode_number) "
+                     "VALUES (1,?,1,1,1)", (aid,))
+        conn.execute("INSERT INTO media_files(episode_id,relative_path,size_bytes) VALUES (1,'e.mkv',300)")
+        conn.commit()
+    sizes = {e["label"]: e["size_bytes"] for e in db.dashboard_stats()["library"]["by_library"]}
+    assert sizes == {"Movies": 700, "Anime": 300, "TV": 0}
+    assert db.dashboard_stats()["library"]["size_bytes"] == 1000   # aggregate unchanged
+    assert tv   # the empty Library still gets an entry, not omitted
 
 
 def test_dashboard_stats_by_library_scoped_to_server_source(db):
@@ -324,6 +350,32 @@ def test_library_category_roundtrips_and_defaults_to_none(db):
     saved2 = db.save_libraries(
         "plex", [{"id": mid, "server_title": "Movies", "path": "/m1", "category": ""}], [])
     assert saved2["movies"][0]["category"] is None
+
+
+def test_library_preferred_indexer_ids_roundtrip_and_default_to_none(db):
+    # Per-library preferred tracker(s) — e.g. Anime -> tracker A, TV -> tracker B.
+    saved = db.save_libraries(
+        "plex",
+        [{"server_title": "Movies", "path": "/m1", "preferred_indexer_ids": "1, 3"},
+         {"server_title": "Anime Movies", "path": "/m2"}],   # unset -> no preference
+        [{"server_title": "TV Shows", "path": "/tv", "preferred_indexer_ids": "7"}])
+    assert saved["movies"][0]["preferred_indexer_ids"] == "1,3"
+    assert saved["movies"][1]["preferred_indexer_ids"] is None
+    assert saved["tv"][0]["preferred_indexer_ids"] == "7"
+
+    mid = saved["movies"][0]["id"]
+    assert db.get_root_folder(mid)["preferred_indexer_ids"] == "1,3"
+
+    # Garbage/non-digit tokens are dropped, not stored verbatim.
+    saved2 = db.save_libraries(
+        "plex", [{"id": mid, "server_title": "Movies", "path": "/m1",
+                  "preferred_indexer_ids": "2, bogus, 9,"}], [])
+    assert saved2["movies"][0]["preferred_indexer_ids"] == "2,9"
+
+    # Re-saving with a blank value clears it back to "no preference".
+    saved3 = db.save_libraries(
+        "plex", [{"id": mid, "server_title": "Movies", "path": "/m1", "preferred_indexer_ids": ""}], [])
+    assert saved3["movies"][0]["preferred_indexer_ids"] is None
 
 
 def test_library_selection_legacy_plain_string(db):

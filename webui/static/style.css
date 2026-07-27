@@ -63441,6 +63441,21 @@ body.max-performance #page-particles-canvas {
     color: rgba(255, 255, 255, 0.3);
     text-transform: uppercase;
     letter-spacing: 0.8px;
+    /* A Library's own name can be long ('Anime Movies (4K)') where the fixed
+       labels were one word — clip rather than push the tile grid wider. */
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Per-Library tiles carry that Library's own disk size under its name (the
+   single aggregate "Disk Size" tile they replaced summed every Library). */
+.library-status-stat-sub {
+    font-size: 10px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.42);
+    letter-spacing: 0.2px;
+    white-space: nowrap;
 }
 
 .library-status-progress {

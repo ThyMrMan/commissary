@@ -82,14 +82,13 @@
         }
     }
 
-    // Extra tiles for configured Libraries beyond the base Movies/Shows pair
-    // (e.g. a separate Anime library) — the fixed tiles only ever summed
-    // EVERY movie/show into one total, so a second library of the same kind
-    // had no way to show its own count. Only sent by the backend when a kind
-    // actually has more than one configured Library, so the common single-
-    // library case renders nothing extra here. Appended into the SAME grid
-    // as the fixed tiles (.library-status-stats is `repeat(4, 1fr)` and
-    // wraps automatically, so no layout change is needed for extra tiles).
+    // One tile per configured Library, each with ITS OWN count and disk size.
+    // These REPLACE the fixed Movies/Shows/Disk Size tiles (tagged
+    // data-video-lib-agg in the markup), which summed every Library of a kind
+    // into one number — meaningless once an Anime library sits alongside TV.
+    // The aggregates stay visible only while no Library is configured, so a
+    // fresh install still sees something. Appended into the SAME grid as the
+    // fixed tiles (.library-status-stats is `repeat(4, 1fr)` and wraps).
     var LIB_TILE_ICON = {
         movie: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/></svg>',
         show: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="15" rx="2"/><polyline points="17 2 12 7 7 2"/></svg>',
@@ -99,16 +98,23 @@
         if (!host) return;
         var existing = host.querySelectorAll('[data-video-lib-tile]');
         for (var i = 0; i < existing.length; i++) existing[i].remove();
-        (byLibrary || []).forEach(function (lib) {
+        var libs = byLibrary || [];
+        var aggs = host.querySelectorAll('[data-video-lib-agg]');
+        for (var j = 0; j < aggs.length; j++) aggs[j].hidden = libs.length > 0;
+        libs.forEach(function (lib) {
             var el = document.createElement('div');
             el.className = 'library-status-stat';
             el.setAttribute('data-video-lib-tile', '');
+            var kindWord = lib.kind === 'show' ? 'shows' : 'movies';
             el.innerHTML =
                 '<div class="library-status-stat-icon">' + (LIB_TILE_ICON[lib.kind] || LIB_TILE_ICON.movie) + '</div>' +
                 '<div class="library-status-stat-text">' +
                     '<span class="library-status-stat-value">' + (lib.count != null ? lib.count : 0) + '</span>' +
                     '<span class="library-status-stat-label">' + _esc(lib.label || 'Library') + '</span>' +
+                    '<span class="library-status-stat-sub">' + formatBytes(lib.size_bytes) + '</span>' +
                 '</div>';
+            el.title = _esc(lib.label || 'Library') + ' — ' + (lib.count != null ? lib.count : 0) +
+                ' ' + kindWord + ' · ' + formatBytes(lib.size_bytes) + ' on disk';
             host.appendChild(el);
         });
     }

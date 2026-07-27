@@ -173,3 +173,15 @@ def test_evaluate_release_without_want_title_keeps_old_behavior():
     parsed = parse_release("The.Cloverfield.Paradox.2018.1080p.WEBRip.x265-PS")
     v = evaluate_release(parsed, _PROFILE, scope="movie", want_year=2017)
     assert v["accepted"] is True     # only the year gate ran (2018 within 2017..2018)
+
+
+def test_fansub_absolute_episode_is_extractable_on_its_own():
+    """The manual-import queue needs the same signal to tell a fansub EPISODE
+    apart from a movie — there's no SxxExx and no season anywhere in the name."""
+    from core.video.release_parse import fansub_absolute_episode
+    assert fansub_absolute_episode("[SubsPlease] DIGIMON BEATBREAK - 40 [1080p][AAC]") == 40
+    assert fansub_absolute_episode("[Erai-raws] Some Anime - 1071 [1080p]") == 1071
+    # no leading group tag → not the fansub convention, whatever the trailing dash
+    assert fansub_absolute_episode("The.Matrix.1999.1080p.BluRay.x265-GRP") is None
+    assert fansub_absolute_episode("Moana 2 2024 1080p WEBRip") is None
+    assert fansub_absolute_episode("") is None
