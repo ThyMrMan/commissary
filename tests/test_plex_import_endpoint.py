@@ -82,7 +82,8 @@ def test_import_creates_profiles_with_shared_defaults(client, monkeypatch):
     new_id = body['imported'][0]['profile_id']
     created = db.get_profile(new_id)
     assert created['plex_account_id'] == 31
-    assert created['allowed_sides'] == 'music' and created['can_download'] is False and created['is_admin'] is False
+    # video access is read-only-ish: follows land pending, downloads stay off
+    assert created['allowed_sides'] == 'both' and created['can_download'] is False and created['is_admin'] is False
     assert created['avatar_url'] == 'http://thumb'
 
 

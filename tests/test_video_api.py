@@ -111,9 +111,34 @@ def test_download_actions_require_can_download(tmp_path):
     c = _client_as(tmp_path, is_admin=True, can_download=False)
     for url in ["/api/video/downloads/grab", "/api/video/downloads/grab-pack",
                 "/api/video/downloads/retry", "/api/video/youtube/download",
-                "/api/video/wishlist/add", "/api/video/watchlist/add"]:
+                "/api/video/wishlist/add",
+                # destructive siblings — reachable since Plex profiles gained
+                # video access, so they need the same gate
+                "/api/video/downloads/cancel", "/api/video/downloads/history/clear",
+                "/api/video/wishlist/remove", "/api/video/wishlist/clear",
+                # approving a pending follow IS acquisition
+                "/api/video/watchlist/approve"]:
         r = c.post(url, json={})
         assert r.status_code == 403, "POST %s must require can_download" % url
+
+
+def test_watchlist_add_is_allowed_without_can_download_but_lands_pending(tmp_path):
+    """The one deliberate exception to the gate above. A download-disabled
+    profile MAY follow a show — that's the point of the approval queue — but the
+    row is filed approved=0 and acquires nothing until an admin approves it.
+    is_admin is irrelevant here: can_download alone decides, so a
+    download-disabled admin can't self-approve past their own gate either."""
+    c = _client_as(tmp_path, is_admin=True, can_download=False)
+    r = c.post("/api/video/watchlist/add",
+               json={"kind": "show", "tmdb_id": 4242, "title": "Asked For", "monitor": "all"})
+    body = r.get_json()
+    assert r.status_code == 200 and body["success"] is True
+    assert body["pending"] is True and body["wished"] == 0
+
+    from api.video import get_video_db
+    db = get_video_db()
+    assert db.pending_watchlist_count() == 1
+    assert db.wishlist_counts()["episode"] == 0     # monitor='all' expanded nothing
 
 
 def test_blueprint_exposes_dashboard_route():

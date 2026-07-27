@@ -202,7 +202,9 @@ def build_detail_blob(detail: Optional[Dict[str, Any]], credit: Dict[str, Any],
 # ── production seams ──────────────────────────────────────────────────────────
 def _default_fetch_people() -> List[Dict[str, Any]]:
     from api.video import get_video_db
-    return get_video_db().list_watchlist('person')
+    # approved_only: a follow a member filed but no admin has approved yet must
+    # not be scanned into wishlist writes.
+    return get_video_db().list_watchlist('person', approved_only=True)
 
 
 def _default_fetch_credits(tmdb_id: Any) -> List[Dict[str, Any]]:

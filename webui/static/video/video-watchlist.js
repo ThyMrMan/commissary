@@ -83,6 +83,27 @@
         return '<span class="vwlp-pill">' + esc(status) + '</span>';
     }
 
+    function isAdmin() {
+        return !(typeof currentProfile !== 'undefined' && currentProfile && !currentProfile.is_admin);
+    }
+
+    // A follow filed by a profile without download rights sits approved=0: it's on
+    // the list so the requester can see it, but nothing acquires it until an admin
+    // approves. Admins get the Approve/Decline pair inline on the card.
+    function pendingChrome(it, kind) {
+        if (it.approved !== false) return { badge: '', actions: '' };
+        var who = it.requested_by_name ? ' · asked by ' + esc(it.requested_by_name) : '';
+        var badge = '<span class="vwlp-pending-badge" title="Waiting for an admin to approve' +
+            (it.requested_by_name ? ' — requested by ' + esc(it.requested_by_name) : '') + '">' +
+            '⏳ Awaiting approval' + (isAdmin() ? who : '') + '</span>';
+        if (!isAdmin()) return { badge: badge, actions: '' };
+        var d = 'data-vwlp-kind="' + esc(kind) + '" data-vwlp-tmdb="' + esc(it.tmdb_id) + '"';
+        return { badge: badge, actions:
+            '<div class="vwlp-pending-actions">' +
+            '<button type="button" class="vwlp-approve" ' + d + '>Approve</button>' +
+            '<button type="button" class="vwlp-deny" ' + d + '>Decline</button></div>' };
+    }
+
     function cardHTML(it, kind) {
         // SPA open target: library shows open by library id ('library' source);
         // people + un-owned shows open by tmdb id ('tmdb').
@@ -110,11 +131,13 @@
               'background:rgba(0,0,0,.55);color:#fff;font-size:15px;line-height:1;cursor:pointer;display:flex;' +
               'align-items:center;justify-content:center;backdrop-filter:blur(4px);">&#9881;</button>'
             : '';
-        return '<a class="vwlp-card' + (kind === 'person' ? ' vwlp-card--person' : '') + '" href="' + href + '" ' +
+        var pend = pendingChrome(it, kind);
+        return '<a class="vwlp-card' + (kind === 'person' ? ' vwlp-card--person' : '') +
+            (it.approved === false ? ' vwlp-card--pending' : '') + '" href="' + href + '" ' +
             'data-vwlp-open="' + kind + '" data-vwlp-source="' + source + '" data-vwlp-openid="' + esc(openId) + '">' +
             '<div class="vwlp-card-art">' + art + '<div class="vwlp-card-scrim"></div>' + pill + cog + btn + '</div>' +
             '<div class="vwlp-card-info"><span class="vwlp-card-title" title="' + esc(it.title) + '">' +
-            esc(it.title) + '</span>' + meta + '</div></a>';
+            esc(it.title) + '</span>' + meta + pend.badge + pend.actions + '</div></a>';
     }
 
     function updateNavBadge(counts) {
@@ -493,6 +516,37 @@
     // FULL page reload). The eye button's capture-phase handler already stops its
     // own clicks from reaching here. Mirrors video-library.js.
     function onGridClick(e) {
+        // Approve / Decline a pending follow. These sit inside the card's <a>,
+        // so both handlers must stop the navigation before doing anything.
+        var appr = e.target.closest('.vwlp-approve, .vwlp-deny');
+        if (appr) {
+            e.preventDefault(); e.stopPropagation();
+            if (appr.disabled) return;
+            var deny = appr.classList.contains('vwlp-deny');
+            appr.disabled = true;
+            appr.textContent = deny ? 'Declining…' : 'Approving…';
+            fetch('/api/video/watchlist/' + (deny ? 'deny' : 'approve'), {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ kind: appr.getAttribute('data-vwlp-kind'),
+                                       tmdb_id: parseInt(appr.getAttribute('data-vwlp-tmdb'), 10) })
+            }).then(function (r) { return r.json().catch(function () { return null; }); })
+              .then(function (d) {
+                  if (d && d.success) {
+                      if (typeof toast === 'function') {
+                          toast(deny ? 'Request declined'
+                                     : 'Approved' + (d.wished ? ' — wishlisted ' + d.wished + ' episode'
+                                                                + (d.wished === 1 ? '' : 's') : ''),
+                                'success');
+                      }
+                      load();
+                  } else {
+                      appr.disabled = false;
+                      appr.textContent = deny ? 'Decline' : 'Approve';
+                      if (typeof toast === 'function') toast((d && d.error) || 'Failed', 'error');
+                  }
+              });
+            return;
+        }
         var pcog = e.target.closest('[data-vwlp-psettings]');
         if (pcog) {
             e.preventDefault(); e.stopPropagation();

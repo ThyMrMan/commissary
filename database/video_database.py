@@ -372,6 +372,14 @@ _COLUMN_MIGRATIONS = [
     # NULL falls back to the owned movies/shows row's Library (via library_id),
     # then to the primary — so existing rows keep their current behavior.
     ("video_wishlist", "root_folder_id", "INTEGER"),
+    # Watchlist approval gate (see schema.sql). approved defaults to 1 so every
+    # follow that predates the column — and every admin follow — stays live; a
+    # follow from a profile without download rights is written as 0 and every
+    # acquisition path skips it until approved.
+    ("video_watchlist", "approved", "INTEGER NOT NULL DEFAULT 1"),
+    ("video_watchlist", "requested_by", "INTEGER"),
+    ("video_watchlist", "requested_by_name", "TEXT"),
+    ("video_watchlist", "monitor", "TEXT"),
 ]
 
 
@@ -504,6 +512,10 @@ class VideoDatabase:
         # Index on movies.tmdb_collection_id — a migration-added column, so it must be
         # created AFTER _ensure_columns (the schema executescript runs before the ALTERs).
         "CREATE INDEX IF NOT EXISTS idx_movies_collection ON movies(tmdb_collection_id)",
+        # video_watchlist.approved is migration-added too — the pending-approval
+        # queue reads it on every watchlist render and nav-badge poll.
+        "CREATE INDEX IF NOT EXISTS idx_video_watchlist_approved "
+        "ON video_watchlist(approved) WHERE approved = 0",
         # Recently-Added ranks shows by their newest episode's add-date — MAX(added_at)
         # per show over a 200k-episode table, so index it.
         "CREATE INDEX IF NOT EXISTS idx_episodes_show_added ON episodes(show_id, added_at)",
@@ -3520,8 +3532,13 @@ class VideoDatabase:
             # of shows whose status backfill never landed — Cops, Dutton Ranch, …)
             active = ("(s.status IS NULL OR TRIM(s.status)='' OR LOWER(s.status) "
                       "NOT IN ('ended','canceled','cancelled','completed'))")
+            # approved=1 on the explicit-follow arm: a follow still awaiting admin
+            # approval must not feed the auto-wishlist airing job. The default arm
+            # (airing library shows) is unaffected — those are already-owned shows,
+            # not something a member just asked for.
             wl_where = (
-                " AND (s.tmdb_id IN (SELECT tmdb_id FROM video_watchlist WHERE kind='show' AND state='follow')"
+                " AND (s.tmdb_id IN (SELECT tmdb_id FROM video_watchlist "
+                "                    WHERE kind='show' AND state='follow' AND approved=1)"
                 " OR (" + active + " AND s.tmdb_id NOT IN "
                 "(SELECT tmdb_id FROM video_watchlist WHERE kind='show' AND state='mute')))")
         conn = self._get_connection()
@@ -5703,10 +5720,19 @@ class VideoDatabase:
                         "AND LOWER(status) NOT IN ('ended', 'canceled', 'cancelled', 'completed')")
 
     def add_to_watchlist(self, kind: str, tmdb_id: int, title: str,
-                         poster_url: str | None = None, library_id: int | None = None) -> bool:
+                         poster_url: str | None = None, library_id: int | None = None,
+                         approved: bool = True, requested_by=None,
+                         requested_by_name=None, monitor=None) -> bool:
         """Explicitly follow a show/person/studio (state='follow'). Idempotent upsert on
         (kind, tmdb_id) — re-adding refreshes title/poster/library_id and clears
-        any 'mute' tombstone. Returns True on success."""
+        any 'mute' tombstone. Returns True on success.
+
+        ``approved=False`` files the follow as awaiting admin approval: it appears
+        on the watchlist right away but no acquisition path acts on it. The upsert
+        deliberately uses MAX() on approved, so a later pending re-add can never
+        DOWNGRADE a follow an admin already approved (nor can a member revoke one
+        by re-adding it). requested_by/name and monitor are recorded only when the
+        row is created pending, and are cleared on approval."""
         if kind not in ("show", "person", "studio") or not tmdb_id or not title:
             return False
         conn = self._get_connection()
@@ -5714,13 +5740,20 @@ class VideoDatabase:
             was = conn.execute("SELECT state FROM video_watchlist WHERE kind=? AND tmdb_id=?",
                                (kind, int(tmdb_id))).fetchone()
             conn.execute(
-                """INSERT INTO video_watchlist (kind, tmdb_id, title, poster_url, library_id, state)
-                   VALUES (?, ?, ?, ?, ?, 'follow')
+                """INSERT INTO video_watchlist (kind, tmdb_id, title, poster_url, library_id, state,
+                                                approved, requested_by, requested_by_name, monitor)
+                   VALUES (?, ?, ?, ?, ?, 'follow', ?, ?, ?, ?)
                    ON CONFLICT(kind, tmdb_id) DO UPDATE SET
                        state='follow', title=excluded.title,
                        poster_url=COALESCE(excluded.poster_url, video_watchlist.poster_url),
-                       library_id=COALESCE(excluded.library_id, video_watchlist.library_id)""",
-                (kind, int(tmdb_id), title, poster_url, library_id))
+                       library_id=COALESCE(excluded.library_id, video_watchlist.library_id),
+                       approved=MAX(video_watchlist.approved, excluded.approved),
+                       requested_by=COALESCE(video_watchlist.requested_by, excluded.requested_by),
+                       requested_by_name=COALESCE(video_watchlist.requested_by_name,
+                                                  excluded.requested_by_name),
+                       monitor=COALESCE(video_watchlist.monitor, excluded.monitor)""",
+                (kind, int(tmdb_id), title, poster_url, library_id, 1 if approved else 0,
+                 requested_by, requested_by_name, monitor))
             conn.commit()
             # A refresh-upsert of an existing follow is not a new follow.
             if not (was and was["state"] == "follow"):
@@ -5729,6 +5762,77 @@ class VideoDatabase:
         except Exception:
             logger.exception("add_to_watchlist failed (%s %s)", kind, tmdb_id)
             return False
+        finally:
+            conn.close()
+
+    def approve_watchlist_entry(self, kind: str, tmdb_id: int) -> dict | None:
+        """Approve a pending follow so acquisition can act on it. Returns the row
+        as it was BEFORE the flip (carrying the requester's ``monitor`` choice, so
+        the caller can expand the back catalog they asked for), or None when the
+        entry is unknown or already approved — which makes double-approval a
+        no-op rather than a second round of wishlist writes."""
+        if kind not in ("show", "person", "studio") or not tmdb_id:
+            return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT * FROM video_watchlist WHERE kind=? AND tmdb_id=? AND approved=0",
+                (kind, int(tmdb_id))).fetchone()
+            if not row:
+                return None
+            conn.execute("UPDATE video_watchlist SET approved=1 WHERE id=?", (row["id"],))
+            conn.commit()
+            return dict(row)
+        except Exception:
+            logger.exception("approve_watchlist_entry failed (%s %s)", kind, tmdb_id)
+            return None
+        finally:
+            conn.close()
+
+    def pending_watchlist_entries(self, requested_by=None) -> list[dict]:
+        """Follows awaiting approval, newest first. ``requested_by`` scopes to one
+        profile's own asks (what a member is allowed to see)."""
+        sql = ("SELECT id, kind, tmdb_id, title, poster_url, library_id, monitor, "
+               "requested_by, requested_by_name, date_added "
+               "FROM video_watchlist WHERE approved=0 AND state='follow'")
+        args: list = []
+        if requested_by is not None:
+            sql += " AND requested_by=?"
+            args.append(int(requested_by))
+        sql += " ORDER BY date_added DESC, id DESC"
+        conn = self._get_connection()
+        try:
+            return [dict(r) for r in conn.execute(sql, args)]
+        finally:
+            conn.close()
+
+    def pending_watchlist_count(self, requested_by=None) -> int:
+        """How many follows are awaiting approval — the nav badge."""
+        sql = "SELECT COUNT(*) c FROM video_watchlist WHERE approved=0 AND state='follow'"
+        args: list = []
+        if requested_by is not None:
+            sql += " AND requested_by=?"
+            args.append(int(requested_by))
+        conn = self._get_connection()
+        try:
+            return conn.execute(sql, args).fetchone()["c"]
+        except Exception:
+            return 0
+        finally:
+            conn.close()
+
+    def watchlist_entry_requester(self, kind: str, tmdb_id: int):
+        """(approved, requested_by) for one follow, or None when there's no row —
+        so an endpoint can tell an admin's live follow from a member's own pending
+        ask before allowing a removal."""
+        if kind not in ("show", "person", "studio") or not tmdb_id:
+            return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT approved, requested_by FROM video_watchlist WHERE kind=? AND tmdb_id=?",
+                (kind, int(tmdb_id))).fetchone()
+            return (row["approved"], row["requested_by"]) if row else None
         finally:
             conn.close()
 
@@ -5798,16 +5902,27 @@ class VideoDatabase:
     _EPS_COLS = ("(SELECT COUNT(*) FROM episodes e WHERE e.show_id=s.id) AS episode_count, "
                  "(SELECT COUNT(*) FROM episodes e WHERE e.show_id=s.id AND e.has_file=1) AS owned_count")
 
-    def _effective_shows(self, conn, server_source) -> list[dict]:
+    def _effective_shows(self, conn, server_source, approved_only: bool = False) -> list[dict]:
         """Explicit show follows ∪ actively-airing library shows (not muted),
-        each carrying status + owned/total episode counts for the card chrome."""
+        each carrying status + owned/total episode counts for the card chrome.
+
+        Pending follows are INCLUDED by default and carry ``approved``/requester
+        fields — the watchlist page shows them so the requester can see their own
+        ask. ``approved_only`` is for acquisition callers, which must not act on
+        an entry an admin hasn't cleared. The default arm (airing library shows)
+        is always approved: those are already-owned shows, not requests."""
         out, seen = [], set()
+        wl_where = " AND w.approved=1" if approved_only else ""
         for r in conn.execute(
                 "SELECT w.tmdb_id, w.title, w.poster_url, w.library_id, w.date_added, s.status, "
+                "w.approved, w.requested_by, w.requested_by_name, w.monitor, "
                 + self._EPS_COLS +
                 " FROM video_watchlist w LEFT JOIN shows s ON s.id = w.library_id "
-                "WHERE w.kind='show' AND w.state='follow' ORDER BY w.date_added DESC, w.id DESC"):
-            d = dict(r); d["kind"] = "show"; out.append(d); seen.add(r["tmdb_id"])
+                "WHERE w.kind='show' AND w.state='follow'" + wl_where +
+                " ORDER BY w.date_added DESC, w.id DESC"):
+            d = dict(r); d["kind"] = "show"
+            d["approved"] = bool(d.get("approved", 1))
+            out.append(d); seen.add(r["tmdb_id"])
         muted = {r["tmdb_id"] for r in conn.execute(
             "SELECT tmdb_id FROM video_watchlist WHERE kind='show' AND state='mute'")}
         sql = ("SELECT s.tmdb_id, s.title, s.id AS library_id, s.status, " + self._EPS_COLS +
@@ -5828,26 +5943,36 @@ class VideoDatabase:
                         "date_added": None, "auto": True})
         return out
 
-    def list_watchlist(self, kind: str | None = None, server_source=None) -> list[dict]:
+    def list_watchlist(self, kind: str | None = None, server_source=None,
+                       approved_only: bool = False) -> list[dict]:
         """Effective watchlist. Shows include the airing-library default; people and
-        studios are explicit follows only."""
+        studios are explicit follows only.
+
+        ``approved_only=True`` drops follows still awaiting admin approval — what
+        the people/studio scan handlers pass, since each row they see becomes
+        wishlist writes. The watchlist PAGE leaves it False so a requester can see
+        their own pending ask, flagged by the ``approved`` field on each row."""
+        gate = " AND approved=1" if approved_only else ""
+        cols = ("SELECT tmdb_id, title, poster_url, library_id, date_added, lookback_years, "
+                "approved, requested_by, requested_by_name, monitor ")
         conn = self._get_connection()
         try:
             people = []
             if kind in (None, "person"):
                 for r in conn.execute(
-                        "SELECT tmdb_id, title, poster_url, library_id, date_added, lookback_years "
-                        "FROM video_watchlist WHERE kind='person' AND state='follow' "
-                        "ORDER BY date_added DESC, id DESC"):
-                    d = dict(r); d["kind"] = "person"; people.append(d)
+                        cols + "FROM video_watchlist WHERE kind='person' AND state='follow'"
+                        + gate + " ORDER BY date_added DESC, id DESC"):
+                    d = dict(r); d["kind"] = "person"
+                    d["approved"] = bool(d.get("approved", 1)); people.append(d)
             studios = []
             if kind in (None, "studio"):
                 for r in conn.execute(
-                        "SELECT tmdb_id, title, poster_url, library_id, date_added, lookback_years "
-                        "FROM video_watchlist WHERE kind='studio' AND state='follow' "
-                        "ORDER BY date_added DESC, id DESC"):
-                    d = dict(r); d["kind"] = "studio"; studios.append(d)
-            shows = self._effective_shows(conn, server_source) if kind in (None, "show") else []
+                        cols + "FROM video_watchlist WHERE kind='studio' AND state='follow'"
+                        + gate + " ORDER BY date_added DESC, id DESC"):
+                    d = dict(r); d["kind"] = "studio"
+                    d["approved"] = bool(d.get("approved", 1)); studios.append(d)
+            shows = (self._effective_shows(conn, server_source, approved_only=approved_only)
+                     if kind in (None, "show") else [])
             if kind == "person":
                 return people
             if kind == "studio":

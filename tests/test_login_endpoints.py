@@ -237,7 +237,7 @@ def test_plex_signin_auto_provisions_authorized_new_account(client, monkeypatch)
     new_id = body['profile']['id']
     created = db.get_profile(new_id)
     assert created['plex_account_id'] == 202
-    assert created['allowed_sides'] == 'music' and created['can_download'] is False and created['is_admin'] is False
+    assert created['allowed_sides'] == 'both' and created['can_download'] is False and created['is_admin'] is False
     with client.session_transaction() as sess:
         assert sess['profile_id'] == new_id
 

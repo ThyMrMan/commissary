@@ -138,7 +138,8 @@ def build_detail_blob(detail: Optional[Dict[str, Any]], film: Dict[str, Any],
 # ── production seams ──────────────────────────────────────────────────────────
 def _default_fetch_studios() -> List[Dict[str, Any]]:
     from api.video import get_video_db
-    return get_video_db().list_watchlist('studio')
+    # approved_only: see the people scan — an unapproved follow acquires nothing.
+    return get_video_db().list_watchlist('studio', approved_only=True)
 
 
 def _default_fetch_films(company_id: Any) -> List[Dict[str, Any]]:

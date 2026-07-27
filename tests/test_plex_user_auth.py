@@ -100,10 +100,18 @@ def test_has_server_access_false_for_non_numeric_id():
 # ── PLEX_PROFILE_DEFAULTS ───────────────────────────────────────────────────
 
 def test_plex_profile_defaults_are_restrictive():
-    """Bulk-imported / auto-provisioned profiles start music-only, downloads
-    off, non-admin — stricter than the shipped manual-create default
-    (can_download defaults True there) since these weren't individually
-    vetted by the admin."""
+    """Bulk-imported / auto-provisioned profiles start non-admin with downloads
+    OFF — stricter than the shipped manual-create default (can_download defaults
+    True there) since these weren't individually vetted by the admin.
+
+    allowed_sides is 'both' so a new Plex user can browse the video side and
+    follow a show. That is not a download right: can_download=False keeps every
+    acquisition and destructive endpoint gated, and a follow from such a profile
+    is filed video_watchlist.approved=0, acquiring nothing until an admin
+    approves it. can_download is the security boundary here, not allowed_sides."""
     assert pua.PLEX_PROFILE_DEFAULTS == {
-        'allowed_sides': 'music', 'can_download': False, 'is_admin': False,
+        'allowed_sides': 'both', 'can_download': False, 'is_admin': False,
     }
+    # The part that must never loosen without a deliberate decision.
+    assert pua.PLEX_PROFILE_DEFAULTS['can_download'] is False
+    assert pua.PLEX_PROFILE_DEFAULTS['is_admin'] is False

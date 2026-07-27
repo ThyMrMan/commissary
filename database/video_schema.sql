@@ -499,9 +499,24 @@ CREATE TABLE IF NOT EXISTS video_watchlist (
     -- airing library show), so the default must not re-add it. Library shows
     -- that are still airing are watched by default WITHOUT a row here.
     state       TEXT NOT NULL DEFAULT 'follow',
+    -- Approval gate. A follow added by a profile WITHOUT download rights lands
+    -- approved=0: it shows on the watchlist immediately (so the requester can
+    -- see it) but every ACQUISITION path skips it until an admin approves.
+    -- Defaults to 1 so admin follows, and every row that predates this column,
+    -- stay live.
+    approved         INTEGER NOT NULL DEFAULT 1,
+    requested_by     INTEGER,          -- profile id that asked for it (NULL = admin/legacy)
+    requested_by_name TEXT,            -- display name, captured at request time
+    -- The monitor policy the requester chose. Held rather than applied, so
+    -- approval can expand the back catalog they actually asked for instead of
+    -- silently downgrading everyone to 'future'.
+    monitor          TEXT,
     date_added  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(kind, tmdb_id)
 );
+-- NOTE: the index on `approved` lives in VideoDatabase._POST_INDEXES, not here —
+-- this file's executescript runs BEFORE the additive ALTERs, so indexing a
+-- migration-added column here fails with "no such column" on any upgraded DB.
 CREATE INDEX IF NOT EXISTS idx_video_watchlist_kind ON video_watchlist(kind);
 
 -- WISHLIST (curated 'get this') — atomic units are MOVIES and EPISODES. Adding a

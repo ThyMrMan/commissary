@@ -104,10 +104,25 @@ def create_video_blueprint() -> Blueprint:
         if admin and not is_admin:
             return jsonify({"error": "Admin only."}), 403
 
+        # /watchlist/add is deliberately ABSENT here: a profile without download
+        # rights may follow a show, but the follow is filed awaiting approval
+        # (video_watchlist.approved=0) and no acquisition path acts on it until an
+        # admin clears it. The endpoint itself stamps approved from can_download,
+        # so relaxing the gate here cannot start a download.
         if writing and not getattr(g, "can_download", True) and _p(
+                # '/downloads/grab' also covers '/downloads/grab-pack' by prefix
                 "/api/video/downloads/grab", "/api/video/downloads/retry",
                 "/api/video/youtube/download", "/api/video/wishlist/add",
-                "/api/video/watchlist/add", "/api/video/youtube/wishlist/add"):
+                "/api/video/youtube/wishlist/add",
+                # approving IS acquisition — admin-only, checked in the route too
+                "/api/video/watchlist/approve",
+                # Destructive siblings of the above. These were unreachable while
+                # every non-download profile was music-only; now that a Plex sign-in
+                # gets video access by default, an un-gated one would let a member
+                # cancel the admin's downloads or empty the shared wishlist.
+                "/api/video/downloads/cancel", "/api/video/downloads/history",
+                "/api/video/wishlist/remove", "/api/video/wishlist/clear",
+                "/api/video/youtube/wishlist/remove"):
             return jsonify({"error": "Downloads are disabled for this profile."}), 403
 
     from .dashboard import register_routes as reg_dashboard

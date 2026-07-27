@@ -8,13 +8,32 @@ phase. Reads/writes only video_library.db via the shared VideoDatabase.
 
 from __future__ import annotations
 
-from flask import jsonify, request
+from flask import g, jsonify, request
 
 from utils.logging_config import get_logger
 
 logger = get_logger("video_api.watchlist")
 
 _KINDS = ("show", "person", "studio")
+
+
+def _me():
+    return int(getattr(g, "profile_id", 1) or 1)
+
+
+def _is_admin():
+    return bool(getattr(g, "is_admin", _me() == 1))
+
+
+def _may_acquire():
+    """Whether this profile's follows take effect immediately, or land pending.
+
+    Keyed on can_download ALONE, deliberately not on is_admin. The blueprint's
+    permission gate treats the two as orthogonal — a download-disabled admin is
+    still refused /downloads/grab — so letting is_admin alone approve here would
+    have handed that same admin a way around their own gate, since an approved
+    follow expands straight into wishlist writes."""
+    return bool(getattr(g, "can_download", True))
 
 
 def _server():
@@ -72,7 +91,13 @@ def register_routes(bp):
         """Add a show/person. Body: {kind, tmdb_id, title, poster_url?, library_id?,
         monitor?}. ``monitor`` (shows only; arr-parity P2) picks what to wish at
         follow time: future (default) | all | first_season | latest_season | pilot —
-        back-catalog expansion is best-effort, the follow itself always lands."""
+        back-catalog expansion is best-effort, the follow itself always lands.
+
+        A profile WITHOUT download rights may follow, but the row is filed
+        ``approved=0``: it appears on the watchlist right away and no acquisition
+        path acts on it until an admin approves. Their chosen ``monitor`` is
+        stored rather than expanded, so approving later wishes what they actually
+        asked for instead of silently downgrading them to 'future'."""
         from . import get_video_db
         body = request.get_json(silent=True) or {}
         kind = body.get("kind")
@@ -82,14 +107,23 @@ def register_routes(bp):
             return jsonify({"success": False, "error": "kind, tmdb_id and title are required"}), 400
         try:
             db = get_video_db()
+            approved = _may_acquire()
+            monitor = str(body.get("monitor") or "future").lower()
             ok = db.add_to_watchlist(
                 kind, int(tmdb_id), title,
                 poster_url=body.get("poster_url") or None,
-                library_id=body.get("library_id") or None)
+                library_id=body.get("library_id") or None,
+                approved=approved,
+                requested_by=None if approved else _me(),
+                requested_by_name=None if approved else getattr(g, "profile_name", None),
+                monitor=None if approved else monitor)
             if not ok:
                 return jsonify({"success": False, "error": "Could not add to watchlist"}), 400
+            if not approved:
+                return jsonify({"success": True, "watched": True, "wished": 0,
+                                "pending": True,
+                                "message": "Added — waiting for an admin to approve it."})
             wished = 0
-            monitor = str(body.get("monitor") or "future").lower()
             if kind == "show" and monitor != "future":
                 try:
                     from datetime import date
@@ -112,7 +146,12 @@ def register_routes(bp):
 
     @bp.route("/watchlist/remove", methods=["POST"])
     def video_watchlist_remove():
-        """Remove a show/person. Body: {kind, tmdb_id}."""
+        """Remove a show/person. Body: {kind, tmdb_id}.
+
+        A profile that can't acquire may only withdraw its OWN pending follow —
+        it must not be able to un-follow the shared, admin-approved watchlist.
+        (Before Plex profiles were given video access this endpoint was
+        unreachable for them, so nothing guarded it.)"""
         from . import get_video_db
         body = request.get_json(silent=True) or {}
         kind = body.get("kind")
@@ -120,10 +159,98 @@ def register_routes(bp):
         if kind not in _KINDS or not tmdb_id:
             return jsonify({"success": False, "error": "kind and tmdb_id are required"}), 400
         try:
-            removed = get_video_db().remove_from_watchlist(kind, int(tmdb_id))
+            db = get_video_db()
+            if not _may_acquire():
+                owner = db.watchlist_entry_requester(kind, int(tmdb_id))
+                if not owner or owner[0] or owner[1] != _me():
+                    return jsonify({"success": False,
+                                    "error": "You can only withdraw your own pending requests."}), 403
+            removed = db.remove_from_watchlist(kind, int(tmdb_id))
             return jsonify({"success": True, "watched": False, "removed": removed})
         except Exception:
             logger.exception("Failed to remove from video watchlist")
+            return jsonify({"success": False, "error": "Failed"}), 500
+
+    @bp.route("/watchlist/pending", methods=["GET"])
+    def video_watchlist_pending():
+        """Follows awaiting approval — all of them for an admin, a member's own
+        otherwise. ``count`` feeds the nav badge."""
+        from . import get_video_db
+        try:
+            db = get_video_db()
+            scope = None if _is_admin() else _me()
+            return jsonify({"success": True,
+                            "pending": db.pending_watchlist_entries(requested_by=scope),
+                            "count": db.pending_watchlist_count(requested_by=scope)})
+        except Exception:
+            logger.exception("Failed to list pending watchlist entries")
+            return jsonify({"success": False, "pending": [], "count": 0}), 500
+
+    @bp.route("/watchlist/approve", methods=["POST"])
+    def video_watchlist_approve():
+        """Admin approves a pending follow — acquisition starts here. Body:
+        {kind, tmdb_id}. The requester's stored monitor policy is expanded now
+        (it was deliberately NOT expanded at follow time), so approving gives
+        them the back catalog they asked for."""
+        from . import get_video_db
+        if not _is_admin():
+            return jsonify({"success": False, "error": "Admin only."}), 403
+        body = request.get_json(silent=True) or {}
+        kind = body.get("kind")
+        tmdb_id = body.get("tmdb_id")
+        if kind not in _KINDS or not tmdb_id:
+            return jsonify({"success": False, "error": "kind and tmdb_id are required"}), 400
+        try:
+            db = get_video_db()
+            row = db.approve_watchlist_entry(kind, int(tmdb_id))
+            if row is None:
+                return jsonify({"success": False,
+                                "error": "Unknown entry, or already approved."}), 404
+            wished = 0
+            monitor = str(row.get("monitor") or "future").lower()
+            if kind == "show" and monitor != "future":
+                try:
+                    from datetime import date
+
+                    from core.video.enrichment.engine import get_video_enrichment_engine
+                    from core.video.monitor_policy import episodes_for_policy
+                    eps = episodes_for_policy(get_video_enrichment_engine(), int(tmdb_id),
+                                              monitor, date.today().isoformat())
+                    if eps:
+                        wished = db.add_episodes_to_wishlist(
+                            int(tmdb_id), row.get("title") or "", eps,
+                            poster_url=row.get("poster_url") or None,
+                            library_id=row.get("library_id") or None)
+                except Exception:   # noqa: BLE001 - the approval itself must still stand
+                    logger.exception("approve: monitor policy expansion failed for %s", tmdb_id)
+            return jsonify({"success": True, "approved": True, "wished": wished})
+        except Exception:
+            logger.exception("Failed to approve watchlist entry")
+            return jsonify({"success": False, "error": "Failed"}), 500
+
+    @bp.route("/watchlist/deny", methods=["POST"])
+    def video_watchlist_deny():
+        """Admin rejects a pending follow. Body: {kind, tmdb_id}. Removes it the
+        same way an un-follow does (a 'mute' tombstone), so the airing-library
+        default can't quietly re-add it."""
+        from . import get_video_db
+        if not _is_admin():
+            return jsonify({"success": False, "error": "Admin only."}), 403
+        body = request.get_json(silent=True) or {}
+        kind = body.get("kind")
+        tmdb_id = body.get("tmdb_id")
+        if kind not in _KINDS or not tmdb_id:
+            return jsonify({"success": False, "error": "kind and tmdb_id are required"}), 400
+        try:
+            db = get_video_db()
+            owner = db.watchlist_entry_requester(kind, int(tmdb_id))
+            if not owner or owner[0]:
+                return jsonify({"success": False,
+                                "error": "Unknown entry, or already approved."}), 404
+            db.remove_from_watchlist(kind, int(tmdb_id))
+            return jsonify({"success": True, "denied": True})
+        except Exception:
+            logger.exception("Failed to deny watchlist entry")
             return jsonify({"success": False, "error": "Failed"}), 500
 
     @bp.route("/watchlist/person/<int:tmdb_id>/settings", methods=["GET"])

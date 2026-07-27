@@ -2862,6 +2862,19 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
 .vwlp-pill--ended { background: rgba(255, 255, 255, 0.1); color: rgba(255, 255, 255, 0.6); }
 .vwlp-card-meta { display: block; font-size: 11.5px; font-weight: 600; color: rgba(255, 255, 255, 0.45); margin-top: 3px; }
 
+/* Follows awaiting admin approval — visibly on the list, visibly not active yet. */
+.vwlp-card--pending .vwlp-card-art { opacity: 0.62; }
+.vwlp-pending-badge { display: block; margin-top: 4px; font-size: 11px; font-weight: 700;
+    line-height: 1.35; color: #f0b429; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vwlp-pending-actions { display: flex; gap: 6px; margin-top: 6px; }
+.vwlp-pending-actions button { flex: 1; height: 26px; padding: 0 8px; border: none; border-radius: 8px;
+    font-family: inherit; font-size: 11.5px; font-weight: 700; cursor: pointer; }
+.vwlp-pending-actions button:disabled { opacity: 0.6; cursor: default; }
+.vwlp-approve { background: #1db954; color: #fff; }
+.vwlp-approve:hover:not(:disabled) { background: #1ed760; }
+.vwlp-deny { background: rgba(255, 255, 255, 0.1); color: rgba(255, 255, 255, 0.82); }
+.vwlp-deny:hover:not(:disabled) { background: rgba(255, 255, 255, 0.16); }
+
 .vwlp-sort { height: 42px; padding: 0 36px 0 14px; box-sizing: border-box; border-radius: 12px;
     background-color: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1);
     color: rgba(255, 255, 255, 0.88); font-size: 13.5px; font-weight: 600; font-family: inherit;

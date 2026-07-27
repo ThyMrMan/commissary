@@ -22,8 +22,13 @@ logger = get_logger(__name__)
 # these are bulk-added friends/Home members the admin didn't individually
 # vet, so downloads start OFF and they can be loosened per-profile afterward
 # in Manage Profiles.
+# Defaults for a profile auto-created on first Sign in with Plex. 'both' gives a
+# new user the video side read-only: they can browse, and they can follow a show —
+# but can_download=False means that follow is filed awaiting admin approval
+# (video_watchlist.approved=0) and nothing is acquired until an admin clears it.
+# Every download-triggering and destructive endpoint stays behind can_download.
 PLEX_PROFILE_DEFAULTS: Dict[str, Any] = {
-    'allowed_sides': 'music',
+    'allowed_sides': 'both',
     'can_download': False,
     'is_admin': False,
 }
