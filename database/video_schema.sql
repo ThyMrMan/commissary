@@ -524,6 +524,11 @@ CREATE TABLE IF NOT EXISTS video_wishlist (
     air_date       TEXT,                     -- episode air date | video published_at (video rows)
     status         TEXT NOT NULL DEFAULT 'wanted',  -- wanted|searching|downloading|downloaded|failed
     library_id     INTEGER,                  -- owned movies.id/shows.id when re-downloading
+    -- The Library this item should be filed into. Only library_id used to carry
+    -- that (indirectly, via movies/shows.root_folder_id), which left a NOT-yet-owned
+    -- title with no Library at all — so a new Anime show always drained into the
+    -- primary TV Library. NULL falls back to the owned row's Library, then primary.
+    root_folder_id INTEGER,
     server_source  TEXT,                     -- server context that added it (informational)
     -- generic source bridge (mirrors video_watchlist). For 'video' rows:
     -- source='youtube', source_id=video youtube id, parent_source_id=channel youtube id.

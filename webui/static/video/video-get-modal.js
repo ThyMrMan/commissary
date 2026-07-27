@@ -88,13 +88,15 @@
             // Shows get a wider modal + a season/episode picker (not the movie layout).
             VideoDownload.render(content, { kind: 'show', id: o.id, source: o.source || 'library',
                 detail: (modalState && modalState._detail) || null, tvId: (modalState && modalState._tvId) || null,
-                poster: (modalState && modalState.poster) || null });
+                poster: (modalState && modalState.poster) || null,
+                rootFolderId: (modalState && modalState._detail && modalState._detail.root_folder_id) || null });
             ov.classList.add('vgm-mode-dl-show');
         } else {
             var file = (modalState && modalState.kind === 'movie' && modalState.owned) ? (modalState.file || null) : null;
             VideoDownload.render(content, { kind: o.kind, id: o.id, source: o.source || 'library', isYt: false, file: file,
                 title: (modalState && modalState.title) || o.title || '', year: (modalState && modalState.year) || null,
-                poster: (modalState && modalState.poster) || null });
+                poster: (modalState && modalState.poster) || null,
+                rootFolderId: (modalState && modalState.rootFolderId) || null });
         }
         setDownloadMode(ov, true);
         dl.hidden = false;
@@ -608,6 +610,7 @@
         } else {
             modalState = { kind: 'movie', owned: !!d.owned, tmdbId: d.tmdb_id, title: d.title,
                 year: d.year || null, poster: pUrl || null, libraryId: libId,
+                rootFolderId: d.root_folder_id || null,   // preselects the Library picker
                 file: d.file || null };   // owned → re-download; file feeds the download verdict
             renderOwned(d);
         }

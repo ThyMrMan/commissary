@@ -62,7 +62,7 @@
             '<select class="vdl-library-select" data-vdl-library></select>' +
         '</div>';
     }
-    function loadLibraryPicker(container, kind) {
+    function loadLibraryPicker(container, kind, rootFolderId) {
         var wrap = container.querySelector('[data-vdl-library-wrap]');
         var sel = container.querySelector('[data-vdl-library]');
         if (!wrap || !sel) return;
@@ -70,8 +70,15 @@
             if (!container.isConnected || !d) return;
             var cfg = (d.configured || {})[kind === 'show' ? 'tv' : 'movies'] || [];
             if (cfg.length < 2) { wrap.hidden = true; return; }   // nothing to choose
+            // Preselect the Library this title is ALREADY filed under. Without it the
+            // browser selects option 0 — which list_libraries orders as the lowest
+            // sort_order, i.e. the primary — and pickedRootFolderId then stamps that
+            // onto the grab EXPLICITLY, overriding the backend's own fallback. An
+            // Anime show would silently download into the main TV Library.
+            var want = rootFolderId == null ? null : String(rootFolderId);
             sel.innerHTML = cfg.map(function (c) {
-                return '<option value="' + c.id + '">' + esc(c.label || c.server_title) + '</option>';
+                var on = want !== null && String(c.id) === want ? ' selected' : '';
+                return '<option value="' + c.id + '"' + on + '>' + esc(c.label || c.server_title) + '</option>';
             }).join('');
             wrap.hidden = false;
         });
@@ -226,7 +233,7 @@
                 if (container.isConnected) renderSources(container, sourcesFromConfig(c));
             });
             if (opts.file) renderOwned(container, opts.file);
-            loadLibraryPicker(container, 'movie');
+            loadLibraryPicker(container, 'movie', opts.rootFolderId);
         }
         // Resume tracking: if this title already has a download in flight (e.g. the
         // user grabbed it, closed the modal, and re-opened), show a live banner.
@@ -761,7 +768,7 @@
             container.addEventListener('change', onShowChange);
         }
         getJSON('/api/video/downloads/quality').then(function (p) { if (container.isConnected && p) renderTarget(container, p, false); });
-        loadLibraryPicker(container, 'show');
+        loadLibraryPicker(container, 'show', opts.rootFolderId);
         getJSON('/api/video/downloads/config').then(function (c) {
             if (!container.isConnected) return;
             st.sources = sourcesFromConfig(c);

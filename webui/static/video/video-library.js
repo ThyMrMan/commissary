@@ -267,7 +267,13 @@
         var sel = $('[data-video-lib-genre]');
         if (!sel || cardKind() === 'channel' || sel._for === state.tab) return;
         var tab = state.tab;
-        fetch('/api/video/library/genres?kind=' + activeLib().kind, { headers: { 'Accept': 'application/json' } })
+        // Scope the facet to the SAME Library the listing is showing, or the Anime
+        // tab offers every genre in the whole TV collection and picking one can
+        // come back empty.
+        var lib = activeLib();
+        var q = '/api/video/library/genres?kind=' + lib.kind +
+            (lib.rootFolderId ? '&root_folder_id=' + encodeURIComponent(lib.rootFolderId) : '');
+        fetch(q, { headers: { 'Accept': 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {
                 if (!d || state.tab !== tab) return;
@@ -286,12 +292,17 @@
     // that a page reload picking it up is fine.
     function loadResolutions() {
         var sel = $('[data-video-lib-res]');
-        if (!sel || sel._loaded) return;
-        fetch('/api/video/library/resolutions', { headers: { 'Accept': 'application/json' } })
+        // Keyed by TAB, not a one-shot _loaded flag — the set of resolutions is
+        // per-Library now, so switching tabs has to refetch.
+        if (!sel || sel._for === state.tab) return;
+        var tab = state.tab, lib = activeLib();
+        fetch('/api/video/library/resolutions' +
+              (lib.rootFolderId ? '?root_folder_id=' + encodeURIComponent(lib.rootFolderId) : ''),
+              { headers: { 'Accept': 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {
-                if (!d) return;
-                sel._loaded = true;
+                if (!d || state.tab !== tab) return;
+                sel._for = tab;
                 sel.innerHTML = '<option value="">Any Quality</option>' +
                     (d.resolutions || []).map(function (x) {
                         return '<option value="' + esc(x) + '"' +

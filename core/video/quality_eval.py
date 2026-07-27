@@ -153,8 +153,12 @@ def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_tit
     if want_title:
         from core.video.release_parse import extract_title, titles_match
         if not titles_match(parsed.get("title"), want_title):
+            # want_title may be a whole alias set — render it readably rather than
+            # letting a list repr ("wanted ['A', 'B']") reach the user.
+            wanted = (want_title if isinstance(want_title, str)
+                      else " / ".join(str(t) for t in want_title if t))
             return None, "Wrong title (%s — wanted %s)" % (
-                extract_title(parsed.get("title")) or "?", want_title)
+                extract_title(parsed.get("title")) or "?", wanted)
     season, episode = parsed.get("season"), parsed.get("episode")
     if scope == "movie":
         if season is not None:

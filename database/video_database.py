@@ -368,6 +368,10 @@ _COLUMN_MIGRATIONS = [
     # one of these indexers ranks higher for titles in this Library; NULL/blank
     # means no preference (every allowed indexer ranks equally, as today).
     ("root_folders", "preferred_indexer_ids", "TEXT"),
+    # The Library a wishlist item is destined for, chosen when it was added.
+    # NULL falls back to the owned movies/shows row's Library (via library_id),
+    # then to the primary — so existing rows keep their current behavior.
+    ("video_wishlist", "root_folder_id", "INTEGER"),
 ]
 
 
@@ -995,6 +999,30 @@ class VideoDatabase:
             else:
                 row = conn.execute(
                     f"SELECT root_folder_id FROM {table} WHERE tmdb_id=? LIMIT 1", (tmdb_id,)).fetchone()
+            return row["root_folder_id"] if row else None
+        except sqlite3.Error:
+            return None
+        finally:
+            conn.close()
+
+    def root_folder_id_for_library_row(self, kind: str, row_id) -> int | None:
+        """The Library (root_folders.id) a movies/shows ROW is filed under.
+
+        The sibling of ``root_folder_id_for_tmdb`` for callers holding a library
+        row id rather than a tmdb_id — the two ids a grab payload can carry
+        (``media_source`` says which). None when the row is unknown or not yet
+        assigned to a Library."""
+        table = {"movie": "movies", "show": "shows"}.get(kind)
+        if not table or row_id is None:
+            return None
+        try:
+            row_id = int(row_id)
+        except (TypeError, ValueError):
+            return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                f"SELECT root_folder_id FROM {table} WHERE id=? LIMIT 1", (row_id,)).fetchone()
             return row["root_folder_id"] if row else None
         except sqlite3.Error:
             return None
@@ -2666,7 +2694,10 @@ class VideoDatabase:
         {id?, server_title, label, path, category, preferred_indexer_ids}).
         Missing ids are deleted (their movies/shows rows fall back to
         unassigned); others are upserted in list order, which becomes
-        sort_order (index 0 = primary). Returns the new list_libraries(server)
+        sort_order (index 0 = primary). Passing None for a kind leaves that
+        kind's rows untouched — only an explicitly supplied list prunes, so a
+        caller that manages movies+tv can't delete the YouTube roots it never
+        knew about. Returns the new list_libraries(server)
         shape. ``youtube`` entries are manually named (no server-side
         discovery — YouTube isn't scanned from a Plex/Jellyfin section), but
         stored the same way as movies/tv. ``category`` is the torrent-client
@@ -2679,7 +2710,15 @@ class VideoDatabase:
         conn = self._get_connection()
         try:
             for ui_kind, content_kind in self._LIB_KIND.items():
-                entries = entries_by_kind.get(ui_kind) or []
+                entries = entries_by_kind.get(ui_kind)
+                # None means "this caller didn't manage this kind" — leave its rows
+                # alone. Only an explicitly supplied (possibly empty) list may prune.
+                # The Libraries settings page posts movies+tv and omits youtube, so
+                # folding None into [] here deleted every YouTube root on every save,
+                # silently dropping it from health checks, recycle and path re-rooting
+                # (all_library_rows is kind-agnostic and does read those rows).
+                if entries is None:
+                    continue
                 keep_ids = set()
                 for i, e in enumerate(entries):
                     e = e or {}
@@ -4795,6 +4834,10 @@ class VideoDatabase:
             "wikidata_url": show["wikidata_url"],
             "genres": genres, "cast": credits["cast"], "crew": credits["crew"],
             "tmdb_id": show["tmdb_id"], "tvdb_id": show["tvdb_id"], "imdb_id": show["imdb_id"],
+            # The Library this show is filed under, so a grab/import started from the
+            # detail page routes to ITS folder and category instead of defaulting to
+            # the primary Library for the kind (an Anime show landing under TV Shows).
+            "root_folder_id": show["root_folder_id"],
             "has_poster": bool(show["poster_url"]), "has_backdrop": bool(show["backdrop_url"]),
             "logo": show["logo_url"],
             "subtitle_langs": _subtitle_langs_list(show["subtitle_langs"]),
@@ -5890,7 +5933,7 @@ class VideoDatabase:
     # are just bulk add/remove operations over those rows.
     def add_movie_to_wishlist(self, tmdb_id, title, *, year=None, poster_url=None,
                               library_id=None, server_source=None, status='wanted',
-                              detail_json=None) -> bool:
+                              detail_json=None, root_folder_id=None) -> bool:
         """Wish for a movie. Idempotent upsert on its tmdb id.
 
         ``status`` lets the watchlist-people scan add an UPCOMING (unreleased) movie as
@@ -5918,17 +5961,19 @@ class VideoDatabase:
                 "SELECT 1 FROM video_wishlist WHERE kind='movie' AND tmdb_id=?",
                 (int(tmdb_id),)).fetchone()
             conn.execute(
-                """INSERT INTO video_wishlist (kind, tmdb_id, title, poster_url, year, library_id, server_source, status, detail_json)
-                   VALUES ('movie', ?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO video_wishlist (kind, tmdb_id, title, poster_url, year, library_id, server_source, status, detail_json, root_folder_id)
+                   VALUES ('movie', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(tmdb_id) WHERE kind='movie' DO UPDATE SET
                        title=excluded.title,
                        poster_url=COALESCE(excluded.poster_url, video_wishlist.poster_url),
                        year=COALESCE(excluded.year, video_wishlist.year),
                        library_id=COALESCE(excluded.library_id, video_wishlist.library_id),
+                       root_folder_id=COALESCE(excluded.root_folder_id, video_wishlist.root_folder_id),
                        detail_json=COALESCE(excluded.detail_json, video_wishlist.detail_json),
                        status=CASE WHEN video_wishlist.status='monitored' AND excluded.status='wanted'
                                    THEN 'wanted' ELSE video_wishlist.status END""",
-                (int(tmdb_id), title, poster_url, year, library_id, server_source, status, detail_json))
+                (int(tmdb_id), title, poster_url, year, library_id, server_source, status,
+                 detail_json, root_folder_id))
             conn.commit()
             if not existed:   # a refresh-upsert is not a new wish
                 _publish_video_event("video_wishlist_item_added",
@@ -5987,7 +6032,8 @@ class VideoDatabase:
         try:
             return [dict(r) for r in conn.execute(
                 "SELECT w.tmdb_id, w.title, w.year, w.poster_url, w.library_id, "
-                "(SELECT root_folder_id FROM movies WHERE id = w.library_id) AS root_folder_id, "
+                "COALESCE(w.root_folder_id, (SELECT root_folder_id FROM movies WHERE id = w.library_id)) "
+                "AS root_folder_id, "
                 "EXISTS (SELECT 1 FROM movies m WHERE m.tmdb_id=w.tmdb_id AND m.has_file=1) "
                 "  AS owned, "
                 "(SELECT GROUP_CONCAT(f.resolution) FROM movies m "
@@ -6069,7 +6115,8 @@ class VideoDatabase:
             return [dict(r) for r in conn.execute(
                 "SELECT w.tmdb_id AS show_tmdb_id, w.title AS show_title, w.season_number, "
                 "w.episode_number, w.episode_title, w.air_date, w.poster_url, w.library_id, "
-                "(SELECT root_folder_id FROM shows WHERE id = w.library_id) AS root_folder_id, "
+                "COALESCE(w.root_folder_id, (SELECT root_folder_id FROM shows WHERE id = w.library_id)) "
+                "AS root_folder_id, "
                 "EXISTS (SELECT 1 FROM episodes e JOIN shows s ON e.show_id = s.id "
                 "  WHERE s.tmdb_id = w.tmdb_id AND e.season_number = w.season_number "
                 "  AND e.episode_number = w.episode_number AND e.has_file = 1) AS owned, "
@@ -6109,7 +6156,8 @@ class VideoDatabase:
             if scope == "movie":
                 return [dict(r) for r in conn.execute(
                     "SELECT w.tmdb_id, w.title, w.year, w.poster_url, w.library_id, "
-                    "(SELECT root_folder_id FROM movies WHERE id = w.library_id) AS root_folder_id, "
+                    "COALESCE(w.root_folder_id, (SELECT root_folder_id FROM movies WHERE id = w.library_id)) "
+                "AS root_folder_id, "
                     "EXISTS (SELECT 1 FROM movies m WHERE m.tmdb_id=w.tmdb_id AND m.has_file=1) "
                     "  AS owned, "
                     "(SELECT GROUP_CONCAT(f.resolution) FROM movies m "
@@ -6128,7 +6176,8 @@ class VideoDatabase:
             return [dict(r) for r in conn.execute(
                 "SELECT w.tmdb_id AS show_tmdb_id, w.title AS show_title, w.season_number, "
                 "w.episode_number, w.episode_title, w.air_date, w.poster_url, w.library_id, "
-                "(SELECT root_folder_id FROM shows WHERE id = w.library_id) AS root_folder_id, "
+                "COALESCE(w.root_folder_id, (SELECT root_folder_id FROM shows WHERE id = w.library_id)) "
+                "AS root_folder_id, "
                 "EXISTS (SELECT 1 FROM episodes e JOIN shows s ON e.show_id = s.id "
                 "  WHERE s.tmdb_id = w.tmdb_id AND e.season_number = w.season_number "
                 "  AND e.episode_number = w.episode_number AND e.has_file = 1) AS owned, "
@@ -6147,7 +6196,8 @@ class VideoDatabase:
             conn.close()
 
     def add_episodes_to_wishlist(self, show_tmdb_id, show_title, episodes, *,
-                                 poster_url=None, library_id=None, server_source=None) -> int:
+                                 poster_url=None, library_id=None, server_source=None,
+                                 root_folder_id=None) -> int:
         """Wish for one or more episodes of a show (the show's tmdb id keys them).
         ``episodes`` = [{season_number, episode_number, title?, air_date?}, …].
         Idempotent per (show, season, episode). Returns the count written."""
@@ -6167,8 +6217,8 @@ class VideoDatabase:
                     """INSERT INTO video_wishlist
                            (kind, tmdb_id, title, poster_url, season_number, episode_number,
                             episode_title, still_url, episode_overview, season_poster_url,
-                            air_date, library_id, server_source)
-                       VALUES ('episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            air_date, library_id, server_source, root_folder_id)
+                       VALUES ('episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(tmdb_id, season_number, episode_number) WHERE kind='episode' DO UPDATE SET
                            title=excluded.title,
                            poster_url=COALESCE(excluded.poster_url, video_wishlist.poster_url),
@@ -6177,10 +6227,11 @@ class VideoDatabase:
                            episode_overview=COALESCE(excluded.episode_overview, video_wishlist.episode_overview),
                            season_poster_url=COALESCE(excluded.season_poster_url, video_wishlist.season_poster_url),
                            air_date=COALESCE(excluded.air_date, video_wishlist.air_date),
-                           library_id=COALESCE(excluded.library_id, video_wishlist.library_id)""",
+                           library_id=COALESCE(excluded.library_id, video_wishlist.library_id),
+                           root_folder_id=COALESCE(excluded.root_folder_id, video_wishlist.root_folder_id)""",
                     (int(show_tmdb_id), show_title, poster_url, int(sn), int(en),
                      e.get("title"), e.get("still_url"), e.get("overview"), e.get("season_poster_url"),
-                     e.get("air_date"), library_id, server_source))
+                     e.get("air_date"), library_id, server_source, root_folder_id))
                 n += 1
             new_rows = conn.execute(
                 "SELECT COUNT(*) FROM video_wishlist WHERE kind='episode' AND tmdb_id=?",
@@ -6261,10 +6312,10 @@ class VideoDatabase:
             for r in self.all_library_rows():
                 if r.get("content_kind") == "movie":
                     sql = ("SELECT COUNT(*) c FROM video_wishlist WHERE kind='movie' AND "
-                           "library_id IN (SELECT id FROM movies WHERE root_folder_id = ?)")
+                           "COALESCE(root_folder_id, (SELECT root_folder_id FROM movies WHERE id = library_id)) = ?")
                 elif r.get("content_kind") == "show":
                     sql = ("SELECT COUNT(DISTINCT tmdb_id) c FROM video_wishlist WHERE kind='episode' AND "
-                           "library_id IN (SELECT id FROM shows WHERE root_folder_id = ?)")
+                           "COALESCE(root_folder_id, (SELECT root_folder_id FROM shows WHERE id = library_id)) = ?")
                 else:
                     continue
                 by_library[r["id"]] = conn.execute(sql, (r["id"],)).fetchone()["c"]
@@ -6325,7 +6376,7 @@ class VideoDatabase:
                 if s:
                     where.append("title LIKE ? COLLATE NOCASE"); args.append("%" + s + "%")
                 if root_folder_id:
-                    where.append("library_id IN (SELECT id FROM movies WHERE root_folder_id = ?)")
+                    where.append("COALESCE(root_folder_id, (SELECT root_folder_id FROM movies WHERE id = library_id)) = ?")
                     args.append(root_folder_id)
                 wsql = " WHERE " + " AND ".join(where)
                 order = {"title": "title COLLATE NOCASE", "oldest": "date_added ASC, id ASC",
@@ -6346,7 +6397,7 @@ class VideoDatabase:
                 if s:
                     where.append("title LIKE ? COLLATE NOCASE"); args.append("%" + s + "%")
                 if root_folder_id:
-                    where.append("library_id IN (SELECT id FROM shows WHERE root_folder_id = ?)")
+                    where.append("COALESCE(root_folder_id, (SELECT root_folder_id FROM shows WHERE id = library_id)) = ?")
                     args.append(root_folder_id)
                 wsql = " WHERE " + " AND ".join(where)
                 total = conn.execute(
@@ -7766,6 +7817,9 @@ class VideoDatabase:
             "wikidata_url": m["wikidata_url"],
             "cast": credits["cast"], "crew": credits["crew"],
             "tmdb_id": m["tmdb_id"], "imdb_id": m["imdb_id"],
+            # See show_detail — the Library this movie is filed under, so a grab
+            # started from the detail page routes to ITS folder and category.
+            "root_folder_id": m["root_folder_id"],
             "has_poster": bool(m["poster_url"]), "has_backdrop": bool(m["backdrop_url"]),
             "logo": m["logo_url"],
             "subtitle_langs": _subtitle_langs_list(m["subtitle_langs"]),
@@ -7928,19 +7982,27 @@ class VideoDatabase:
         finally:
             conn.close()
 
-    def library_genres(self, kind: str, server_source=None) -> list:
+    def library_genres(self, kind: str, server_source=None, root_folder_id=None) -> list:
         """Distinct genre names in use for movies/shows — feeds the library page's
-        genre filter dropdown (only genres that would actually match something)."""
+        genre filter dropdown (only genres that would actually match something).
+        ``root_folder_id`` scopes it to one Library, matching ``query_library``'s
+        own filter — without it the Anime tab offers every genre in the whole TV
+        collection and picking one can return nothing."""
         is_shows = kind == "shows"
         jt, fk = ("show_genres", "show_id") if is_shows else ("movie_genres", "movie_id")
         tbl, alias = ("shows", "s") if is_shows else ("movies", "m")
         sql = (f"SELECT DISTINCT g.name FROM genres g "
                f"JOIN {jt} xg ON xg.genre_id=g.id "
                f"JOIN {tbl} {alias} ON {alias}.id=xg.{fk}")
-        params = []
+        where, params = [], []
         if server_source:
-            sql += f" WHERE {alias}.server_source = ?"
+            where.append(f"{alias}.server_source = ?")
             params.append(server_source)
+        if root_folder_id:
+            where.append(f"{alias}.root_folder_id = ?")
+            params.append(root_folder_id)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY g.name COLLATE NOCASE"
         conn = self._get_connection()
         try:
@@ -7948,9 +8010,10 @@ class VideoDatabase:
         finally:
             conn.close()
 
-    def library_resolutions(self, server_source=None) -> list:
+    def library_resolutions(self, server_source=None, root_folder_id=None) -> list:
         """Distinct file resolutions in the movie library (best first) — feeds
-        the library page's resolution filter dropdown."""
+        the library page's resolution filter dropdown. ``root_folder_id`` scopes
+        it to one Library (see ``library_genres``)."""
         from core.video.quality_eval import resolution_rank
         sql = ("SELECT DISTINCT mf.resolution FROM media_files mf "
                "JOIN movies m ON m.id=mf.movie_id "
@@ -7959,6 +8022,9 @@ class VideoDatabase:
         if server_source:
             sql += " AND m.server_source = ?"
             params.append(server_source)
+        if root_folder_id:
+            sql += " AND m.root_folder_id = ?"
+            params.append(root_folder_id)
         conn = self._get_connection()
         try:
             vals = [r[0] for r in conn.execute(sql, params)]

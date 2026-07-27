@@ -170,10 +170,35 @@ _EDITION_TOKENS = frozenset({
     "cut", "edition", "theatrical", "special", "imax", "final", "ultimate", "definitive",
 })
 
+# ── Colon subtitles ───────────────────────────────────────────────────────────
+# A release often carries a work's FULL official title while TMDB stores only the
+# part before the colon ('The Frontier Lord Begins with Zero Subjects: Tales of Blue
+# Dias and the Onikin Alna' vs 'The Frontier Lord Begins with Zero Subjects') — common
+# for light-novel adaptations. normalize_title folds ':' to a space, so by comparison
+# time the one signal that the tail was a SUBTITLE and not a different show is already
+# gone; the head has to be offered as a candidate before that happens.
+#
+# Splitting on the colon is deliberately narrower than prefix matching. A sequel or
+# disambiguating marker always sits LEFT of any colon, so it is never dropped: 'Moana 2'
+# keeps its '2', and 'The Cloverfield Paradox' has no colon at all and so yields no
+# extra candidate. Two further guards close the one class this DOES open — franchise
+# installments whose distinguishing part sits right of the colon:
+_SUBTITLE_MIN_WORDS = 3          # 'Dune', 'Alien', 'Star Trek', 'The Hunger Games' → too short to split
+# ...and an explicit installment marker, for long franchise names that clear the floor.
+_INSTALLMENT_TAIL = re.compile(
+    r"^\s*(?:part|chapter|chap|vol|volume|book|episode|ep|season|series|act|"
+    r"the\s+(?:first|second|third|fourth|fifth|final|last))\b", re.I)
+
 
 def _spaces(s: Any) -> str:
-    """Separators (dots/underscores/dashes) → spaces, whitespace collapsed."""
-    return re.sub(r"\s+", " ", re.sub(r"[._\-]+", " ", str(s or ""))).strip()
+    """Separators (dots/underscores/dashes/brackets) → spaces, whitespace collapsed.
+
+    Brackets count as separators because a cut at a quality token lands INSIDE the
+    bracket that introduces it ('... - 04 [Web]' cuts before 'Web', keeping the '['),
+    and that orphan leaks into the user-facing 'Wrong title (…' message. Matching is
+    unaffected either way — ``normalize_title`` already folds every non-alphanumeric
+    to a space — so this is purely about what the rejection reason reads like."""
+    return re.sub(r"\s+", " ", re.sub(r"[._\-\[\]()]+", " ", str(s or ""))).strip()
 
 
 def extract_title(release_name: Any) -> str:
@@ -260,6 +285,28 @@ def acceptable_titles(want_title: Any) -> set:
     return {n for n in (normalize_title(x) for x in items) if n}
 
 
+def _title_variants(raw_title: Any, normalized: str) -> list:
+    """The normalized titles a RELEASE's extracted title may legitimately be known
+    by — itself, plus the part before each colon when the tail reads as a subtitle.
+
+    Only ever applied to the release side. Applying it to the wanted side would add
+    'mission' as an acceptable title for 'Mission: Impossible - Fallout' and let any
+    'Mission: …' release satisfy a search for the unrelated film 'Mission'."""
+    out = [normalized]
+    raw = str(raw_title or "")
+    if ":" not in raw:
+        return out
+    parts = raw.split(":")
+    for i in range(1, len(parts)):
+        head = normalize_title(":".join(parts[:i]))
+        tail = ":".join(parts[i:])
+        if (head and head not in out
+                and len(head.split()) >= _SUBTITLE_MIN_WORDS
+                and not _INSTALLMENT_TAIL.match(tail)):
+            out.append(head)
+    return out
+
+
 def titles_match(release_name: Any, want_title: Any) -> bool:
     """True when a release's parsed title matches ANY acceptable title (primary +
     aliases). Exact after normalization, tolerating only trailing edition words
@@ -279,7 +326,11 @@ def titles_match(release_name: Any, want_title: Any) -> bool:
     Every candidate that HAS such a tag gets a second try with the tag and the
     glued-on episode number stripped; candidates without one are untouched, so
     ordinary scene names (including ones that legitimately end in a number, like
-    'Moana 2') can't be affected."""
+    'Moana 2') can't be affected.
+
+    Each candidate is finally tried both whole and colon-split (see
+    ``_title_variants``), because a release often carries the full official title
+    where TMDB stores only the part before the colon."""
     wants = acceptable_titles(want_title)
     if not wants:
         return True
@@ -297,19 +348,21 @@ def titles_match(release_name: Any, want_title: Any) -> bool:
     cands += [c for c in fansub_cands if c not in cands]
     saw_any = False
     for cand in cands:
-        got = normalize_title(extract_title(cand))
-        if not got:
+        head = extract_title(cand)
+        norm = normalize_title(head)
+        if not norm:
             continue
         saw_any = True
-        for want in wants:
-            if got == want:
-                return True
-            if got.replace(" ", "") == want.replace(" ", ""):
-                return True                              # '90DayFiance' == '90 day fiance'
-            if got.startswith(want + " "):
-                rest = got[len(want):].split()
-                if rest and all(tok in _EDITION_TOKENS for tok in rest):
+        for got in _title_variants(head, norm):
+            for want in wants:
+                if got == want:
                     return True
+                if got.replace(" ", "") == want.replace(" ", ""):
+                    return True                          # '90DayFiance' == '90 day fiance'
+                if got.startswith(want + " "):
+                    rest = got[len(want):].split()
+                    if rest and all(tok in _EDITION_TOKENS for tok in rest):
+                        return True
     return not saw_any
 
 

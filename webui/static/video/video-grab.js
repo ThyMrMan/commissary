@@ -11,9 +11,9 @@
  * endpoints. Kept separate for now so wiring the detail page can't regress the
  * working modal — a later cleanup could fold the modal onto this core.
  *
- *   VideoGrab.episode({ title, source, season, episode, mediaId, mediaSource, year, poster })
+ *   VideoGrab.episode({ title, source, season, episode, mediaId, mediaSource, year, poster, rootFolderId })
  *       → Promise<{ ok:boolean, id?:string, error?:string }>
- *   VideoGrab.season({ title, source, season, episodes:[num...], mediaId, mediaSource, year, poster }, onEp)
+ *   VideoGrab.season({ title, source, season, episodes:[num...], mediaId, mediaSource, year, poster, rootFolderId }, onEp)
  *       // onEp(episodeNumber, 'searching' | 'grabbing' | 'none') fired per episode
  *       → Promise<{ grabbed:number, total:number }>
  *   VideoGrab.wishlistEpisodes(show, episodes) → Promise<boolean>
@@ -91,8 +91,14 @@
     function episode(opts) {
         opts = opts || {};
         var src = opts.source || 'soulseek';
+        // rootFolderId rides along so the grab lands in the show's OWN Library
+        // (an Anime show keeps its anime folder/category instead of falling back
+        // to the primary TV Library) and so the search gets that Library's
+        // preferred trackers. The backend re-derives it from mediaId when absent,
+        // so an older caller that omits it still routes correctly.
         var params = { scope: 'episode', title: opts.title, season: opts.season,
-            episode: opts.episode, source: src };
+            episode: opts.episode, source: src, root_folder_id: opts.rootFolderId || null,
+            media_id: opts.mediaId, media_source: opts.mediaSource };
         return runSearch(params).then(function (rows) {
             var best = bestRow(rows);
             if (!best) return { ok: false, error: 'no release found' };
@@ -100,6 +106,7 @@
                 kind: 'show', title: opts.title, release_title: best.title,
                 source: src, size_bytes: best.size_bytes, quality_label: best.quality_label,
                 media_id: opts.mediaId, media_source: opts.mediaSource, year: opts.year, poster_url: opts.poster,
+                root_folder_id: opts.rootFolderId || null,
                 search_ctx: { scope: 'episode', title: opts.title, year: opts.year,
                     season: opts.season, episode: opts.episode }
             };
@@ -138,7 +145,8 @@
                 active++;
                 if (onEp) onEp(en, 'searching');
                 episode({ title: opts.title, source: opts.source, season: opts.season, episode: en,
-                    mediaId: opts.mediaId, mediaSource: opts.mediaSource, year: opts.year, poster: opts.poster })
+                    mediaId: opts.mediaId, mediaSource: opts.mediaSource, year: opts.year, poster: opts.poster,
+                    rootFolderId: opts.rootFolderId })
                     .then(function (r) {
                         active--;
                         if (r.ok) { grabbed++; if (onEp) onEp(en, 'grabbing'); }

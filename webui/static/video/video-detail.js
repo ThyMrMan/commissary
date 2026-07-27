@@ -2695,7 +2695,7 @@
         // instead of the placeholder TV orb. Same resolver the wishlist writes use.
         return { title: data.title, source: src, season: selectedSeason, episode: en,
             mediaId: (data.source !== 'tmdb' ? data.id : null), mediaSource: data.source, year: data.year,
-            poster: _showPoster() };
+            poster: _showPoster(), rootFolderId: data.root_folder_id };
     }
     // Optimistic per-episode state for the search phase — the grab has no row in
     // /downloads/active yet. The live tracker takes over once it appears.
@@ -2815,7 +2815,7 @@
             return VideoGrab.season({ title: data.title, source: src, season: selectedSeason,
                 episodes: missing.map(function (e) { return e.episode_number; }),
                 mediaId: (data.source !== 'tmdb' ? data.id : null), mediaSource: data.source, year: data.year,
-                poster: _showPoster() },
+                poster: _showPoster(), rootFolderId: data.root_folder_id },
                 function (en, state) { _setEpSynthetic(en, state); });
         }).then(function (res) {
             btn.disabled = false; _btnLabel(btn, 'Grab season'); startDlTracking();

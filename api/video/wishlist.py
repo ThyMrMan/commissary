@@ -175,9 +175,14 @@ def register_routes(bp):
     @bp.route("/wishlist/add", methods=["POST"])
     def video_wishlist_add():
         """Add a movie or a set of a show's episodes. Body is one of:
-            {"movie": {tmdb_id, title, year?, poster_url?, library_id?}}
-            {"show": {tmdb_id, title, poster_url?, library_id?},
-             "episodes": [{season_number, episode_number, title?, air_date?}, …]}"""
+            {"movie": {tmdb_id, title, year?, poster_url?, library_id?, root_folder_id?}}
+            {"show": {tmdb_id, title, poster_url?, library_id?, root_folder_id?},
+             "episodes": [{season_number, episode_number, title?, air_date?}, …]}
+
+        ``root_folder_id`` is the Library the item should be filed into. Omitted,
+        it's inferred from the title's existing library row when it has one, and
+        finally falls back to the primary Library at drain time — so a NOT-yet-owned
+        Anime show no longer has to land in the standard TV Library."""
         from . import get_video_db
         body = request.get_json(silent=True) or {}
         srv = _server()
@@ -188,7 +193,9 @@ def register_routes(bp):
                 ok = db.add_movie_to_wishlist(
                     int(movie["tmdb_id"]), movie["title"].strip(), year=movie.get("year"),
                     poster_url=movie.get("poster_url") or None,
-                    library_id=movie.get("library_id") or None, server_source=srv)
+                    library_id=movie.get("library_id") or None, server_source=srv,
+                    root_folder_id=(movie.get("root_folder_id")
+                                    or db.root_folder_id_for_tmdb("movie", movie["tmdb_id"])))
                 return jsonify({"success": ok, "added": 1 if ok else 0, "counts": db.wishlist_counts()})
 
             show = body.get("show")
@@ -197,7 +204,9 @@ def register_routes(bp):
                 n = db.add_episodes_to_wishlist(
                     int(show["tmdb_id"]), show["title"].strip(), episodes,
                     poster_url=show.get("poster_url") or None,
-                    library_id=show.get("library_id") or None, server_source=srv)
+                    library_id=show.get("library_id") or None, server_source=srv,
+                    root_folder_id=(show.get("root_folder_id")
+                                    or db.root_folder_id_for_tmdb("show", show["tmdb_id"])))
                 return jsonify({"success": n > 0, "added": n, "counts": db.wishlist_counts()})
 
             return jsonify({"success": False, "error": "movie or show+episodes required"}), 400

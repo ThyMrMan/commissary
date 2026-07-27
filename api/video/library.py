@@ -13,6 +13,15 @@ from utils.logging_config import get_logger
 logger = get_logger("video_api.library")
 
 
+def _arg_root_folder_id():
+    """The ?root_folder_id= filter as an int, or None when absent/unparseable —
+    so the filter dropdowns scope to the same Library tab the listing does."""
+    try:
+        return int(request.args.get("root_folder_id") or 0) or None
+    except (TypeError, ValueError):
+        return None
+
+
 def register_routes(bp):
     @bp.route("/library", methods=["GET"])
     def video_library():
@@ -73,7 +82,8 @@ def register_routes(bp):
         from core.video.sources import resolve_video_server
         try:
             return jsonify({"resolutions": get_video_db().library_resolutions(
-                server_source=resolve_video_server())})
+                server_source=resolve_video_server(),
+                root_folder_id=_arg_root_folder_id())})
         except Exception:
             logger.exception("Failed to list library resolutions")
             return jsonify({"resolutions": []})
@@ -86,7 +96,8 @@ def register_routes(bp):
         from core.video.sources import resolve_video_server
         try:
             return jsonify({"genres": get_video_db().library_genres(
-                request.args.get("kind", "movies"), server_source=resolve_video_server())})
+                request.args.get("kind", "movies"), server_source=resolve_video_server(),
+                root_folder_id=_arg_root_folder_id())})
         except Exception:
             logger.exception("Failed to list library genres")
             return jsonify({"genres": []})

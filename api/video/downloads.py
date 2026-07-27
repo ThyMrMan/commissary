@@ -99,6 +99,34 @@ def _resolve_category(db, kind: str, root_folder_id) -> str | None:
     return resolve_torrent_category(root_folder=root_folder, primary_root_folder=primary)
 
 
+def _root_folder_id_for_grab(db, body) -> int | str | None:
+    """The Library a manual grab belongs to.
+
+    An explicit pick from the Library dropdown always wins. With none — the
+    dropdown hides itself when there's only one Library for the kind, and the
+    inline ⬇ buttons on the detail page never render one — fall back to the
+    Library the title is ALREADY filed under. This is the manual twin of
+    ``video_process_wishlist._root_folder_for_item``, which reads root_folder_id
+    straight off the wishlist row; here the payload's media_id/media_source pair
+    is the equivalent handle (same convention as ``download_monitor``: a 'tmdb'
+    media_source means media_id is a tmdb_id, anything else a library row id).
+
+    Returns None only when the title is unknown or unassigned, which leaves the
+    caller's existing primary-Library fallback in charge — unchanged behavior
+    for installs with a single Library per kind."""
+    explicit = (body or {}).get("root_folder_id")
+    if explicit:
+        return explicit
+    kind = "movie" if str((body or {}).get("kind") or "").lower() in (
+        "movie", "movies", "film", "films") else "show"
+    media_id = (body or {}).get("media_id")
+    if not media_id:
+        return None
+    if str((body or {}).get("media_source") or "").lower() == "tmdb":
+        return db.root_folder_id_for_tmdb(kind, media_id)
+    return db.root_folder_id_for_library_row(kind, media_id)
+
+
 def _parse_text(hit) -> str:
     """What the release parser should read for a hit. Soulseek hits are grouped by
     FOLDER — the folder title carries the show/release name, but on library-style
@@ -731,7 +759,7 @@ def register_routes(bp):
         else:
             raw = mock_search(scope, title, year=body.get("year"), season=want_season,
                               episode=want_episode, season_end=season_end, source=source)
-        preferred = _preferred_indexer_ids_for_root_folder(get_video_db(), body.get("root_folder_id"))
+        preferred = _preferred_indexer_ids_for_root_folder(get_video_db(), _root_folder_id_for_grab(get_video_db(), body))
         return jsonify({"scope": scope, "live": live,
                         "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=body.get("title"), preferred_indexer_ids=preferred)})
 
@@ -772,7 +800,7 @@ def register_routes(bp):
                 return jsonify({"error": "Prowlarr isn't configured — set its URL + key on Settings → Downloads."})
             if pres.get("error"):
                 return jsonify({"error": "Prowlarr: " + str(pres["error"])})
-            preferred = _preferred_indexer_ids_for_root_folder(get_video_db(), body.get("root_folder_id"))
+            preferred = _preferred_indexer_ids_for_root_folder(get_video_db(), _root_folder_id_for_grab(get_video_db(), body))
             return jsonify({"id": None, "live": True, "complete": True,
                             "results": _evaluate_hits(pres["hits"], profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=body.get("title"), preferred_indexer_ids=preferred)})
         # remaining mock sources (e.g. youtube placeholder) resolve in one shot
@@ -821,7 +849,7 @@ def register_routes(bp):
         if str(body.get("kind") or "").lower() == "youtube":
             target = db.get_setting("youtube_path") or ""
         else:
-            target = _resolve_target(db, body.get("kind"), body.get("root_folder_id"))
+            target = _resolve_target(db, body.get("kind"), _root_folder_id_for_grab(db, body))
         from core.video import disk_guard, organization
         ok_room, free = disk_guard.has_room(target, organization.load(get_video_db()))
         if not ok_room:
@@ -871,7 +899,7 @@ def register_routes(bp):
             from core.video.client_grab import grab
             category = None
             if str(body.get("kind") or "").lower() != "youtube":
-                category = _resolve_category(db, body.get("kind"), body.get("root_folder_id"))
+                category = _resolve_category(db, body.get("kind"), _root_folder_id_for_grab(db, body))
             res = grab(source, body.get("download_url"), category=category)
             if not res.get("ok"):
                 return jsonify({"ok": False, "error": res.get("error") or "The download client refused it."}), 502
@@ -906,7 +934,7 @@ def register_routes(bp):
             return jsonify({"ok": False, "error": "Missing the pack's source info."}), 400
 
         db = get_video_db()
-        target = _resolve_target(db, "show", body.get("root_folder_id"))
+        target = _resolve_target(db, "show", _root_folder_id_for_grab(db, body))
         from core.video import disk_guard, organization
         ok_room, free = disk_guard.has_room(target, organization.load(get_video_db()))
         if not ok_room:

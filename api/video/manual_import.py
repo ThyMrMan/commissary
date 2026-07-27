@@ -169,10 +169,13 @@ def register_routes(bp):
         if scope not in ("movie", "episode"):
             return jsonify({"success": False, "error": "Choose a movie or an episode."}), 400
 
-        # The Place dialog sends the chosen Library as root_folder_id; with none
-        # (or an unknown one) the shared resolver falls back to the primary
-        # configured Library for the kind, then the legacy scalar path, same as
-        # an unattended grab.
+        # The Place dialog sends the chosen Library as root_folder_id. With none —
+        # the picker hides itself when there's only one Library for the kind — fall
+        # back to the Library the chosen TITLE is already filed under before the
+        # primary default, so placing a new episode of an existing Anime show lands
+        # beside the rest of that show instead of in the standard TV root.
+        _kind = _KIND_FOR_SCOPE[scope]
+        _rfid = body.get("root_folder_id") or db.root_folder_id_for_tmdb(_kind, body.get("media_id"))
         override = {
             "scope": scope,
             "title": body.get("title"),
@@ -181,7 +184,7 @@ def register_routes(bp):
             "episode": body.get("episode"),
             "episode_title": body.get("episode_title"),
             "media_id": body.get("media_id"),
-            "target_dir": _resolve_target(db, _KIND_FOR_SCOPE[scope], body.get("root_folder_id")),
+            "target_dir": _resolve_target(db, _kind, _rfid),
         }
         settings = organization.load(db)
         prober = probe if settings.get("verify_with_ffprobe", True) else None
