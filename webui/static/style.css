@@ -70946,8 +70946,18 @@ body.em-scroll-lock { overflow: hidden; }
    body except the lock overlays themselves — so removing the overlay (Safari
    "Hide Distracting Items", devtools) reveals a blank page, not the empty chrome
    or any of the on-demand modals/sidebars. The hide-element trick can only ADD
-   hiding, never undo this rule. initApp() drops body.app-locked once authenticated. */
-body.app-locked > *:not(#launch-pin-overlay):not(#login-overlay):not(script):not(style):not(noscript) {
+   hiding, never undo this rule. initApp() drops body.app-locked once authenticated.
+
+   #plex-signin-overlay is a THIRD lock-screen surface and must be excepted too:
+   it is the panel that shows the plex.tv PIN code, opened FROM the login screen
+   (so app-locked is still on) by startPlexSignIn(). Without it here, clicking
+   "Sign in with Plex" in login mode did all the right things — the POST returned
+   a real code and polling began — while `display: none !important` kept the code
+   invisible, so the button read as dead. It works from the profile picker
+   because that path never sets app-locked, which is why this only ever showed up
+   once Require Login was turned on. Safe to reveal: it is a lock overlay in its
+   own right, not app chrome. */
+body.app-locked > *:not(#launch-pin-overlay):not(#login-overlay):not(#plex-signin-overlay):not(script):not(style):not(noscript) {
     display: none !important;
 }
 

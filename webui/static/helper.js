@@ -3484,8 +3484,11 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.7.0': [
-        { date: 'July 2026 · 1.7.0 — security release' },
+    '1.7.1': [
+        { date: 'July 2026 · 1.7.1' },
+        { title: 'Sign in with Plex works again on the login screen', desc: 'with "Require login" turned on, pressing Sign in with Plex appeared to do nothing. It was actually working the whole time — the panel showing your plex.tv code was being hidden by the lock screen, so the code never appeared. It shows now.' },
+        { title: 'A much quieter login screen', desc: 'the sign-in page had been quietly firing off dozens of requests a minute to parts of SoulSync you are not signed in to yet, all of them refused. It now waits until you are signed in.' },
+        { title: 'Also in 1.7.0 — the security release', desc: 'if you are coming from 1.6.x you are getting these at the same time. They are worth reading before putting SoulSync on a public address.' },
         { title: 'Requests from other websites are now refused', desc: 'while you were signed in, any other site you happened to visit could quietly make your browser send commands to SoulSync as you. Those are now rejected. Nothing changes for normal use — it is your own tabs and your own apps that are unaffected — and there is a switch in Settings → Security if you ever need it off.' },
         { title: 'A way in without signing in has been closed', desc: 'a first-run shortcut could hand out an API key without asking who you were, even with "Require login" turned on. It now needs an admin who is actually signed in. If you use the API, create keys in Settings → API keys as normal.' },
         { title: 'SoulSync no longer fetches images from anywhere it is told', desc: 'the artwork fetcher had a check that let everything through, so it could be pointed at devices on your home network. It now only reaches your own media servers and public artwork sites. Plex and Jellyfin artwork behind a LAN address keeps working.' },
@@ -3522,7 +3525,15 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.7.0: ready to be reachable from outside your network",
+        title: "1.7.1: the login screen behaves itself",
+        description: "two follow-ups to 1.7.0, both on the sign-in screen, both reported from real use.",
+        features: [
+            "\"Sign in with Plex\" looked dead once Require login was on. It was never broken — the request went out, Plex returned a real code, and the panel showing that code was hidden by the lock screen's own blanking rule. The panel is now excepted from it, like the other two lock screens",
+            "the sign-in page had been starting the whole app's background polling before you were signed in: fifteen enrichment services, system stats, repair status, download activity, all on timers, all refused. Measured on the login screen it was dozens of requests a minute and a console full of red. Those now wait for sign-in — the same page over 46 seconds makes seventeen requests, none repeating",
+        ],
+    },
+    {
+        title: "Earlier in 1.7.0 — ready to be reachable from outside your network",
         description: "a security pass over the whole app, done before opening it up to people outside the house. Three real holes closed and one control that disagreed with its own rule. Nothing here changes how SoulSync works day to day.",
         features: [
             "another website can no longer act as you. While you were signed in, any page you visited could make your browser fire commands at SoulSync — add downloads, change settings — and SoulSync would carry them out, because your session cookie went along for the ride. Requests coming from somewhere other than SoulSync are now refused",

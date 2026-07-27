@@ -921,6 +921,9 @@ function _updateSpotifyEndpoints() {
 }
 
 async function fetchAndUpdateSystemStats() {
+    // Locked (login / PIN screen): auth-gated endpoint, so polling it here is
+    // 401 noise on a timer. Resumes on unlock (init.js drops 'app-locked').
+    if (document.body.classList.contains('app-locked')) return;
     if (!isWidgetVisible('music.stats')) return; // Card hidden for this profile
     if (socketConnected) return; // WebSocket handles this
     if (document.hidden) return; // Skip polling when tab is not visible

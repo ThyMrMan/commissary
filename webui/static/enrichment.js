@@ -34,6 +34,10 @@ function _enrichmentStatusFetch(id) {
  * Poll MusicBrainz status every 2 seconds and update UI
  */
 async function updateMusicBrainzStatus() {
+    // Locked (login / PIN screen): these endpoints are all auth-gated, so
+    // polling here just 401s on a timer and buries real errors in the
+    // console. Resumes on unlock — init.js drops 'app-locked'.
+    if (document.body.classList.contains('app-locked')) return;
     if (socketConnected) return; // WebSocket handles this
     if (document.hidden) return; // Skip polling when tab is not visible
     try {
@@ -172,6 +176,10 @@ if (document.readyState === 'loading') {
  * Poll AudioDB status every 2 seconds and update UI
  */
 async function updateAudioDBStatus() {
+    // Locked (login / PIN screen): these endpoints are all auth-gated, so
+    // polling here just 401s on a timer and buries real errors in the
+    // console. Resumes on unlock — init.js drops 'app-locked'.
+    if (document.body.classList.contains('app-locked')) return;
     if (socketConnected) return; // WebSocket handles this
     if (document.hidden) return; // Skip polling when tab is not visible
     try {
@@ -349,6 +357,10 @@ if (document.readyState === 'loading') {
 // ===================================================================
 
 async function updateDeezerStatus() {
+    // Locked (login / PIN screen): these endpoints are all auth-gated, so
+    // polling here just 401s on a timer and buries real errors in the
+    // console. Resumes on unlock — init.js drops 'app-locked'.
+    if (document.body.classList.contains('app-locked')) return;
     if (socketConnected) return; // WebSocket handles this
     if (document.hidden) return; // Skip polling when tab is not visible
     try {
@@ -468,6 +480,10 @@ if (document.readyState === 'loading') {
 // ===================================================================
 
 async function updateJioSaavnStatus() {
+    // Locked (login / PIN screen): these endpoints are all auth-gated, so
+    // polling here just 401s on a timer and buries real errors in the
+    // console. Resumes on unlock — init.js drops 'app-locked'.
+    if (document.body.classList.contains('app-locked')) return;
     if (socketConnected) return;
     if (document.hidden) return;
     try {
@@ -574,6 +590,10 @@ if (document.readyState === 'loading') {
 // ===================================================================
 
 async function updateSpotifyEnrichmentStatus() {
+    // Locked (login / PIN screen): these endpoints are all auth-gated, so
+    // polling here just 401s on a timer and buries real errors in the
+    // console. Resumes on unlock — init.js drops 'app-locked'.
+    if (document.body.classList.contains('app-locked')) return;
     if (socketConnected) return; // WebSocket handles this
     if (document.hidden) return; // Skip polling when tab is not visible
     try {
@@ -740,6 +760,10 @@ if (document.readyState === 'loading') {
 // ===================================================================
 
 async function updateiTunesEnrichmentStatus() {
+    // Locked (login / PIN screen): these endpoints are all auth-gated, so
+    // polling here just 401s on a timer and buries real errors in the
+    // console. Resumes on unlock — init.js drops 'app-locked'.
+    if (document.body.classList.contains('app-locked')) return;
     if (socketConnected) return; // WebSocket handles this
     if (document.hidden) return; // Skip polling when tab is not visible
     try {
@@ -859,6 +883,10 @@ if (document.readyState === 'loading') {
 // ===================================================================
 
 async function updateLastFMEnrichmentStatus() {
+    // Locked (login / PIN screen): these endpoints are all auth-gated, so
+    // polling here just 401s on a timer and buries real errors in the
+    // console. Resumes on unlock — init.js drops 'app-locked'.
+    if (document.body.classList.contains('app-locked')) return;
     if (socketConnected) return;
     if (document.hidden) return;
     try {
@@ -986,6 +1014,10 @@ if (document.readyState === 'loading') {
 // ===================================================================
 
 async function updateGeniusEnrichmentStatus() {
+    // Locked (login / PIN screen): these endpoints are all auth-gated, so
+    // polling here just 401s on a timer and buries real errors in the
+    // console. Resumes on unlock — init.js drops 'app-locked'.
+    if (document.body.classList.contains('app-locked')) return;
     if (socketConnected) return;
     if (document.hidden) return;
     try {
@@ -1112,6 +1144,10 @@ if (document.readyState === 'loading') {
 // 'albums'/'tracks' (core/bandcamp_worker.py has no artist-level pass).
 
 async function updateBandcampEnrichmentStatus() {
+    // Locked (login / PIN screen): these endpoints are all auth-gated, so
+    // polling here just 401s on a timer and buries real errors in the
+    // console. Resumes on unlock — init.js drops 'app-locked'.
+    if (document.body.classList.contains('app-locked')) return;
     if (socketConnected) return;
     if (document.hidden) return;
     try {
@@ -1234,6 +1270,10 @@ if (document.readyState === 'loading') {
 // ===================================================================
 
 async function updateTidalEnrichmentStatus() {
+    // Locked (login / PIN screen): these endpoints are all auth-gated, so
+    // polling here just 401s on a timer and buries real errors in the
+    // console. Resumes on unlock — init.js drops 'app-locked'.
+    if (document.body.classList.contains('app-locked')) return;
     if (socketConnected) return;
     if (document.hidden) return;
     try {
@@ -1359,6 +1399,10 @@ if (document.readyState === 'loading') {
 // ===================================================================
 
 async function updateQobuzEnrichmentStatus() {
+    // Locked (login / PIN screen): these endpoints are all auth-gated, so
+    // polling here just 401s on a timer and buries real errors in the
+    // console. Resumes on unlock — init.js drops 'app-locked'.
+    if (document.body.classList.contains('app-locked')) return;
     if (socketConnected) return;
     if (document.hidden) return;
     try {
@@ -1484,6 +1528,10 @@ if (document.readyState === 'loading') {
 // ===================================================================
 
 async function updateAmazonEnrichmentStatus() {
+    // Locked (login / PIN screen): these endpoints are all auth-gated, so
+    // polling here just 401s on a timer and buries real errors in the
+    // console. Resumes on unlock — init.js drops 'app-locked'.
+    if (document.body.classList.contains('app-locked')) return;
     if (socketConnected) return;
     if (document.hidden) return;
     try {
@@ -1590,6 +1638,10 @@ if (document.readyState === 'loading') {
 // ===================================================================
 
 async function updateSimilarArtistsEnrichmentStatus() {
+    // Locked (login / PIN screen): these endpoints are all auth-gated, so
+    // polling here just 401s on a timer and buries real errors in the
+    // console. Resumes on unlock — init.js drops 'app-locked'.
+    if (document.body.classList.contains('app-locked')) return;
     if (socketConnected) return;
     if (document.hidden) return;
     try {
@@ -1675,6 +1727,10 @@ if (document.readyState === 'loading') {
 // ===================================================================
 
 async function updateHydrabaseStatus() {
+    // Locked (login / PIN screen): these endpoints are all auth-gated, so
+    // polling here just 401s on a timer and buries real errors in the
+    // console. Resumes on unlock — init.js drops 'app-locked'.
+    if (document.body.classList.contains('app-locked')) return;
     if (socketConnected) return; // WebSocket handles this
     if (document.hidden) return; // Skip polling when tab is not visible
     try {
@@ -1750,6 +1806,10 @@ if (document.readyState === 'loading') {
 // ===================================================================
 
 async function updateRepairStatus() {
+    // Locked (login / PIN screen): these endpoints are all auth-gated, so
+    // polling here just 401s on a timer and buries real errors in the
+    // console. Resumes on unlock — init.js drops 'app-locked'.
+    if (document.body.classList.contains('app-locked')) return;
     if (socketConnected) return; // WebSocket handles this
     if (document.hidden) return; // Skip polling when tab is not visible
     try {

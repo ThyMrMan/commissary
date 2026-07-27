@@ -254,6 +254,8 @@
     }
 
     function pollBadge() {
+        // Locked (login / PIN screen): auth-gated, so this is 401 noise on a timer.
+        if (document.body.classList.contains('app-locked')) return;
         fetch('/api/video/requests/counts', { headers: { 'Accept': 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) { if (d && d.success) setBadge(d.pending || 0); })

@@ -316,6 +316,10 @@
     }
 
     function refresh() {
+        // Locked (login / PIN screen): /api/server-activity is auth-gated, and the
+        // badge poll runs app-wide every 20s — so while locked it is pure 401 noise
+        // on a timer. Resumes on unlock (init.js drops 'app-locked').
+        if (document.body.classList.contains('app-locked')) return Promise.resolve(null);
         return getJSON(URL).then(function (d) {
             if (d && d.ok === false && d.reason === 'no_server') setSupported(false);
             else if (d) setSupported(true);
