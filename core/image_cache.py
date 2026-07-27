@@ -276,7 +276,44 @@ class ImageCache:
     def _path_for_key(self, key: str, extension: str) -> Path:
         return self.cache_dir / key[:2] / key[2:4] / f"{key}{extension}"
 
+    # Config keys whose base_url names a media server we are SUPPOSED to reach on
+    # the LAN. Both sides: the video half can carry its own creds or inherit the
+    # music half's (see core/video/sources.py).
+    _INTERNAL_HOST_CONFIG_KEYS = (
+        "plex.base_url", "jellyfin.base_url", "navidrome.base_url", "slskd.base_url",
+        "video_plex.base_url", "video_jellyfin.base_url",
+    )
+
+    def _allowed_internal_hosts(self) -> set:
+        """Hostnames of the media servers the operator actually configured."""
+        hosts = set()
+        for key in self._INTERNAL_HOST_CONFIG_KEYS:
+            try:
+                raw = config_manager.get(key, "") or ""
+                host = (urlparse(str(raw).strip()).hostname or "").strip("[]").lower()
+                if host:
+                    hosts.add(host)
+            except Exception:      # noqa: BLE001 - a bad/missing setting is just "no host"
+                continue
+        return hosts
+
     def _is_fetch_allowed(self, url: str) -> bool:
+        """Whether this URL may be fetched server-side.
+
+        This used to end in ``bool(parsed.hostname) or is_internal_image_host(url)``,
+        which is a tautology — the no-hostname case already returned False above,
+        so the left side was always true and nothing was ever refused. That made
+        the proxy a server-side fetcher for ANY address a caller supplied,
+        including loopback, link-local (169.254.169.254) and RFC1918 hosts: SSRF.
+        ``is_internal_image_host`` could not have gated it even if reached — it
+        DETECTS internal hosts (to decide what needs proxying), so as an allow
+        condition it says yes to exactly the addresses that matter most.
+
+        Internal artwork still has to work: Plex/Jellyfin/Navidrome commonly live
+        on Docker or LAN-only URLs. So internal hosts are allowed only when they
+        match a media server the operator configured, and every other private
+        address is refused. Public hosts stay allowed (image-only, size-capped).
+        """
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"}:
             return False
@@ -285,10 +322,11 @@ class ImageCache:
         if not parsed.hostname:
             return False
 
-        # Internal hosts are explicitly supported because Plex/Jellyfin/Navidrome
-        # artwork often lives behind Docker/LAN-only URLs. Public hosts are allowed
-        # as image-only responses with size limits.
-        return bool(parsed.hostname) or is_internal_image_host(url)
+        if not is_internal_image_host(url):
+            return True     # ordinary public artwork host
+
+        host = parsed.hostname.strip("[]").lower()
+        return host in self._allowed_internal_hosts()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)

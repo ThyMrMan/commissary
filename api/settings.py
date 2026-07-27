@@ -2,9 +2,29 @@
 Settings and API key management endpoints.
 """
 
-from flask import request, current_app
+from flask import request, current_app, session
 from .auth import require_api_key, generate_api_key, _hash_key
 from .helpers import api_success, api_error
+
+
+def _session_is_admin() -> bool:
+    """Whether the cookie session belongs to an admin profile.
+
+    Resolved from the DB rather than flask.g: web_server's profile-context hook
+    skips /api/v1/ entirely (it's key-authed, not session-authed), so g.is_admin
+    is never populated on this blueprint. Fails CLOSED — an unreadable profile
+    is not an admin, the opposite of the app-wide default where a missing
+    session resolves to profile 1.
+    """
+    try:
+        from database.music_database import get_database
+        pid = session.get("profile_id")
+        if not pid:
+            return False
+        profile = get_database().get_profile(pid)
+        return bool(profile and profile.get("is_admin"))
+    except Exception:
+        return False
 
 # Keys that must NEVER be exposed via the API
 _SENSITIVE_KEYS = {
@@ -143,13 +163,41 @@ def register_routes(bp):
 
     @bp.route("/api-keys/bootstrap", methods=["POST"])
     def bootstrap_api_key():
-        """Generate the first API key when none exist (no auth required).
+        """Generate the first API key when none exist. Authenticated admins only.
 
-        This endpoint only works when zero API keys are configured.
+        This used to require no auth at all, which made it a login bypass on any
+        reachable instance. /api/v1/ is deliberately exempt from the login gate
+        (core/security/login_gate.py) because it authenticates with its own keys —
+        so a route here that mints a key WITHOUT one let an anonymous caller
+        obtain a credential, and PATCH /api/v1/settings could then set
+        security.require_login back to false. Two sound decisions, one hole
+        between them.
+
+        Requiring login mode is not belt-and-braces, it is the actual gate: with
+        login OFF every request resolves to profile 1 and therefore "admin", so
+        an admin check alone would still authorise anonymous callers. Same
+        reasoning (and same refusal) as the plaintext credential export in
+        web_server.export_config_bundle.
+
+        No UI depends on this: the Settings page creates keys through
+        /api/v1/api-keys-internal/generate, which is @admin_only and is the one
+        /api/v1/ path the login gate does NOT exempt.
+
         Body: {"label": "My First Key"}
         """
         try:
             cfg = current_app.soulsync["config_manager"]
+            if not cfg.get("security.require_login", False):
+                return api_error(
+                    "LOGIN_REQUIRED",
+                    "Minting an API key requires login mode. Enable Settings → "
+                    "Security → Require login, or create the key in Settings → "
+                    "API keys.", 403)
+            if not session.get("login_authenticated", False):
+                return api_error("AUTH_REQUIRED", "Sign in first.", 401)
+            if not _session_is_admin():
+                return api_error("FORBIDDEN", "Admin only.", 403)
+
             existing = cfg.get("api_keys", [])
             if existing:
                 return api_error("FORBIDDEN",

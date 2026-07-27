@@ -83,15 +83,31 @@ def test_serve_cached_folds_params_into_the_cache_key(monkeypatch):
     assert 'a=1' in seen['url'] and 'b=2' in seen['url']
 
 
-def test_internal_media_server_hosts_are_fetchable():
+def test_internal_media_server_hosts_are_fetchable(monkeypatch):
     """The cache's host check must permit LAN/Docker hosts — Plex and Jellyfin
     artwork is almost always behind one, so a public-only allowlist would mean
-    the cache silently never worked for the common case."""
+    the cache silently never worked for the common case.
+
+    That intent is unchanged; what an internal host must now do is MATCH A
+    CONFIGURED media server. This test used to assert that any LAN address was
+    fetchable with nothing configured at all, which is the SSRF the check is
+    supposed to prevent (see tests/test_security_ssrf_and_bootstrap.py) — an
+    arbitrary 192.168.x or 169.254.169.254 is not artwork, it's someone else's
+    network.
+    """
+    import core.image_cache as ic
     from core.image_cache import ImageCache
+    monkeypatch.setattr(ic.config_manager, "get", lambda key, default=None: {
+        "plex.base_url": "http://192.168.1.50:32400",
+        "video_jellyfin.base_url": "http://plex:32400",
+    }.get(key, default))
     c = ImageCache.__new__(ImageCache)
     assert c._is_fetch_allowed('http://192.168.1.50:32400/photo') is True
-    assert c._is_fetch_allowed('http://plex:32400/photo') is True
+    assert c._is_fetch_allowed('http://plex:32400/photo') is True     # docker service name
     assert c._is_fetch_allowed('https://image.tmdb.org/t/p/w500/x.jpg') is True
-    # ...but not credential-bearing or non-http URLs
+    # ...but not an internal host nobody configured
+    assert c._is_fetch_allowed('http://192.168.1.99:32400/photo') is False
+    assert c._is_fetch_allowed('http://169.254.169.254/latest/meta-data/') is False
+    # ...nor credential-bearing or non-http URLs
     assert c._is_fetch_allowed('http://user:pw@host/x.jpg') is False
     assert c._is_fetch_allowed('file:///etc/passwd') is False

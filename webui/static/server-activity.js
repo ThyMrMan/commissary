@@ -25,6 +25,16 @@
         return fetch(u, { headers: { Accept: 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
     }
+    // Ending someone else's stream is an admin move — /api/server-activity/stop
+    // has always answered 403 to anyone else, but the button was rendered for
+    // every profile, so a Plex/standard user could click it and just get an
+    // error. Same idiom as video-side.js's sideAllowed()/video-downloads-page.js's
+    // canImport(): the typeof guard survives script load order, and no profile
+    // (single-user, pre-boot) stays permissive because the server is the real gate.
+    function canStopStreams() {
+        var cp = (typeof currentProfile !== 'undefined') ? currentProfile : null;
+        return !cp || !!cp.is_admin || cp.id === 1;
+    }
     function img(path) { return path ? IMG + encodeURIComponent(path) : ''; }
     function mbps(kbps) { return kbps ? (kbps / 1000).toFixed(1) + ' Mbps' : ''; }
     function fmtTime(ms) {
@@ -70,7 +80,7 @@
         if (st.resolution) tags += '<span class="sact-tag">' + esc(st.resolution) + '</span>';
         if (s.bandwidth_kbps) tags += '<span class="sact-tag">' + mbps(s.bandwidth_kbps) + '</span>';
         if (s.location) tags += '<span class="sact-tag sact-tag--' + esc(s.location) + '">' + esc(s.location.toUpperCase()) + '</span>';
-        var stop = s.session_key
+        var stop = (s.session_key && canStopStreams())
             ? '<button class="sact-stop" type="button" data-sact-stop="' + esc(s.session_key) +
               '" data-sact-title="' + esc(s.title) + '" title="Stop this stream">' +
               '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2.5"/></svg></button>'
@@ -420,6 +430,10 @@
     // ── stop a stream (admin, with a message) ─────────────────────────────────
     function toast(m, t) { if (typeof showToast === 'function') showToast(m, t); }
     function openStop(key, title) {
+        // Re-checked at click time, not just at render: profiles switch without a
+        // page reload, so a card painted while an admin was signed in can still be
+        // sitting in the drawer afterwards.
+        if (!canStopStreams()) { toast('Only an admin can stop a stream', 'error'); return; }
         var ov = document.createElement('div');
         ov.className = 'sact-stop-ov';
         ov.innerHTML =

@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.6.13"
+_SOULSYNC_BASE_VERSION = "1.7.0"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -558,6 +558,56 @@ def _plex_login_enabled():
         return bool(config_manager.get('security.allow_plex_login', False)) if config_manager else False
     except Exception:
         return False
+
+
+def _csrf_enabled():
+    """CSRF checking, ON by default.
+
+    Unlike require_login / trust_reverse_proxy — which change what the user sees
+    and so ship OFF — this is invisible when it works: every same-origin request
+    the app itself makes carries a matching Origin, and non-browser clients
+    (which send no Origin at all) are deliberately allowed. So there is nothing
+    for an existing install to notice, and defaulting it off would leave the
+    protection unused by exactly the people who most need it.
+    """
+    try:
+        from core.security.csrf import CONFIG_KEY
+        return bool(config_manager.get(CONFIG_KEY, True)) if config_manager else True
+    except Exception:
+        return True
+
+
+# --- CSRF gate (cross-site state-changing requests) ---
+@app.before_request
+def _enforce_csrf():
+    """Reject cookie-authenticated writes that came from another origin.
+
+    Runs BEFORE the login gate so a cross-site probe is refused as cross-site
+    rather than being told whether it would have needed to log in.
+    """
+    try:
+        from core.security.csrf import EXTRA_ORIGINS_KEY, request_is_csrf
+        try:
+            extra = config_manager.get(EXTRA_ORIGINS_KEY, []) if config_manager else []
+        except Exception:
+            extra = []
+        if request_is_csrf(
+            request.path, request.method,
+            enabled=_csrf_enabled(),
+            origin=request.headers.get('Origin', ''),
+            referer=request.headers.get('Referer', ''),
+            request_host=request.host or '',
+            extra_origins=extra,
+        ):
+            logger.warning("[Security] CSRF: rejected %s %s from origin=%r referer=%r",
+                           request.method, request.path,
+                           request.headers.get('Origin', ''), request.headers.get('Referer', ''))
+            return jsonify({"error": "cross_site_request_blocked",
+                            "message": "This request appears to come from another site."}), 403
+    except Exception:
+        # Artwork must never be the reason a page errors, and neither must this:
+        # a bug in the check should not take the whole app offline.
+        logger.debug("CSRF check skipped", exc_info=True)
 
 
 # --- Login gate (opt-in username/password mode; replaces the launch PIN) ---
