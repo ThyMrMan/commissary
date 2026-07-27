@@ -176,6 +176,14 @@ def register_routes(bp):
             abort(404)
         try:
             import requests
+            # TMDB art goes through the on-disk cache like library posters do — a
+            # watchlist page is a grid of these, and every one was a fresh blocking
+            # TMDB fetch. Not the Google hosts: those need the UA below to answer.
+            if host == "image.tmdb.org":
+                hit = _serve_cached(url)
+                if hit is not None:
+                    hit.headers["Access-Control-Allow-Origin"] = "*"
+                    return hit
             # A browser UA — Google's image CDN (yt3/googleusercontent) 403s some
             # avatars when fetched with no User-Agent, which blanked search results.
             upstream = requests.get(url, timeout=15, stream=True, headers={

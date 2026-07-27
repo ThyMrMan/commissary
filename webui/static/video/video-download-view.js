@@ -416,6 +416,17 @@
         // not just where the file lands after a grab.
         var rfid = pickedRootFolderId(container);
         if (rfid) params.root_folder_id = rfid;
+        // Which TITLE this search is for. The backend needs it to look up the
+        // alias set AND the episode hints (air date / absolute number) — without
+        // it, a release carrying no SxxExx is rejected as having no episode
+        // number, and an alias-named release as a wrong title. Shows keep their
+        // state on _dl, movies on _opts.
+        var ident = (container && (container._opts || container._dl)) || {};
+        var mid = ident.id != null ? ident.id : ident.tvId;
+        if (mid != null && params.media_id == null) {
+            params.media_id = mid;
+            params.media_source = ident.source || 'library';
+        }
         triggerRows = (triggerRows || []).filter(Boolean);
         if (resultsEl._poll) { clearTimeout(resultsEl._poll); resultsEl._poll = null; }
         resultsEl._rows = null;   // drop any prior search's rows so Auto can't grab a stale hit

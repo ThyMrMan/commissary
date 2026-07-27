@@ -180,7 +180,50 @@
     }
 
     // ── panel ────────────────────────────────────────────────────────────────
+    // A title that isn't in your library has no local row and no server item, so
+    // every editor here — metadata, field locks, quality profile, series type,
+    // monitored/watched, Matches — has nothing to write to. "Also known as" is
+    // the exception: it's stored against the TMDB id, precisely so it can be set
+    // for something you don't own yet (which is when a release gets rejected as
+    // a wrong title). Rendering just that beats a panel of dead controls.
+    function tmdbOnlyBodyHtml(d) {
+        // Series type decides HOW episodes are hunted (SxxExx / air date /
+        // absolute number), so it's needed while you're still acquiring the show.
+        // Stored as an override against the tmdb id; the library row takes over
+        // once the show exists.
+        var st = (d.kind === 'show')
+            ? '<div class="vmg-field"><label>Series type</label>' +
+                '<select class="vmg-input" data-vmg-series-type>' +
+                ['standard', 'daily', 'anime'].map(function (t) {
+                    var cur = d.series_type || 'standard';
+                    return '<option value="' + t + '"' + (t === cur ? ' selected' : '') + '>' +
+                        t.charAt(0).toUpperCase() + t.slice(1) +
+                        (t === 'daily' ? ' (releases by air date)'
+                            : t === 'anime' ? ' (absolute numbering)' : '') + '</option>';
+                }).join('') + '</select>' +
+                '<div class="vmg-hint">How episode releases are searched for. Anime and ' +
+                    'daily shows are named differently from standard SxxExx releases.</div>' +
+              '</div>'
+            : '';
+        return (
+            '<div class="vmg-sect">Matching</div>' + st +
+            '<div class="vmg-field"><label>Also known as</label>' +
+                '<textarea class="vmg-input vmg-aka" data-vmg-aka rows="3" ' +
+                    'placeholder="One title per line — releases named this way will match"' +
+                    '>' + esc((d.aka_titles || []).join('\n')) + '</textarea>' +
+                '<div class="vmg-hint">Used only for matching downloads. Add the name ' +
+                    'releases actually use if it differs from the one shown above.</div>' +
+                '<button class="vmg-btn-ghost" type="button" data-vmg-aka-save>Save titles</button>' +
+            '</div>' +
+            '<div class="vmg-hint" style="margin-top:14px;">' +
+                'The rest of Manage — metadata, artwork, quality profile — needs the title ' +
+                'to be in your library. It appears once you have downloaded it.' +
+            '</div>'
+        );
+    }
+
     function bodyHtml(d) {
+        if (d._tmdbOnly) return tmdbOnlyBodyHtml(d);
         var isShow = d.kind === 'show';
         var brandField = isShow ? 'network' : 'studio';
         var ratings = RATING_HINTS[d.kind] || [];
@@ -406,15 +449,21 @@
                 '<div class="vmg-head">' +
                     '<div class="vmg-kick"><span class="vmg-kick-dot"></span>Manage</div>' +
                     '<div class="vmg-title">' + esc(d.title) + '</div>' +
-                    '<div class="vmg-sub">Edits are saved here, pushed to your server, and locked against scans.</div>' +
+                    '<div class="vmg-sub">' + (d._tmdbOnly
+                        ? 'Not in your library yet — only download matching can be set.'
+                        : 'Edits are saved here, pushed to your server, and locked against scans.') + '</div>' +
                     // Save lives in the header — the app's notification/help orbs
                     // float over the bottom-right corner (z 999999, by design),
                     // so a footer button there would sit underneath them.
-                    '<button class="vmg-save" type="button" data-vmg-save disabled>Save</button>' +
+                    // Save drives the metadata editor, which a not-in-library title
+                    // has none of — its one control saves itself.
+                    (d._tmdbOnly ? ''
+                        : '<button class="vmg-save" type="button" data-vmg-save disabled>Save</button>') +
                     '<button class="vmg-close" type="button" data-vmg-close aria-label="Close">×</button>' +
                 '</div>' +
                 '<div class="vmg-body">' + bodyHtml(d) +
-                    '<div class="vmg-hint">Locked fields wear a badge — click it to hand one back to the server.</div>' +
+                    (d._tmdbOnly ? ''
+                        : '<div class="vmg-hint">Locked fields wear a badge — click it to hand one back to the server.</div>') +
                 '</div>' +
             '</div>'
         );
@@ -560,7 +609,9 @@
     function setSeriesType(sel) {
         fetch('/api/video/detail/show/' + state.id + '/series-type', {
             method: 'PUT', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ series_type: sel.value }) })
+            // Not in the library → state.id is the tmdb id, stored as an override.
+            body: JSON.stringify({ series_type: sel.value,
+                                   source: state.tmdbOnly ? 'tmdb' : 'library' }) })
             .then(function (r) {
                 if (!r.ok) throw new Error();
                 toast('Series type updated — episode searches follow it', 'success');
@@ -574,7 +625,10 @@
         btn.disabled = true;
         fetch('/api/video/detail/' + state.kind + '/' + state.id + '/aka', {
             method: 'PUT', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ titles: box.value }) })
+            // For a not-in-library title state.id IS the tmdb id, and the endpoint
+            // has to be told so — it resolves a library row id by default.
+            body: JSON.stringify({ titles: box.value,
+                                   source: state.tmdbOnly ? 'tmdb' : 'library' }) })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {
                 btn.disabled = false;
@@ -756,29 +810,64 @@
         document.addEventListener('keydown', onKey, true);
     }
 
+    // opts: { kind, id, source?, detail?, akaTitles? }
+    //   source 'tmdb'  → `id` is a TMDB id for a title NOT in the library. There
+    //                    is no row to fetch, so the caller passes what it already
+    //                    has and only the matching section renders.
+    //   anything else  → `id` is a library row id; unchanged behaviour.
     function open(opts) {
         if (!opts || !opts.kind || opts.id == null) return;
         if (state) close(true);
         ensureStyles();
+
+        if (String(opts.source || '').toLowerCase() === 'tmdb') {
+            var src = opts.detail || {};
+            // The overrides live against the tmdb id, so they're readable with no
+            // library row — fetch them rather than trusting whatever the caller had.
+            fetch('/api/video/detail/aka/' + encodeURIComponent(opts.kind) +
+                  '/' + encodeURIComponent(opts.id), { headers: { Accept: 'application/json' } })
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .then(function (a) {
+                    _mount({ kind: opts.kind, id: opts.id, title: src.title || '',
+                             aka_titles: (a && a.aka_titles) || opts.akaTitles || [],
+                             series_type: (a && a.series_type) || src.series_type || 'standard',
+                             _tmdbOnly: true }, true);
+                })
+                .catch(function () {
+                    _mount({ kind: opts.kind, id: opts.id, title: src.title || '',
+                             aka_titles: opts.akaTitles || [],
+                             series_type: src.series_type || 'standard',
+                             _tmdbOnly: true }, true);
+                });
+            return;
+        }
+
         fetch('/api/video/detail/' + encodeURIComponent(opts.kind) + '/' + encodeURIComponent(opts.id))
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {
                 if (!d) { toast('Couldn’t load item', 'error'); return; }
-                var ov = document.createElement('div');
-                ov.className = 'vmg-overlay';
-                ov.innerHTML = panelHtml(d);
-                document.body.appendChild(ov);
-                state = { kind: d.kind, id: d.id, data: d, saving: false,
-                    genres: (d.genres || []).slice(), locked: (d.locked_fields || []).slice(),
-                    overlay: ov };
-                renderChips();
-                wire();
-                loadGenreSuggestions(d.kind);
-                loadMatches();
-                loadQualityProfiles(d);
-                requestAnimationFrame(function () { ov.classList.add('vmg-open'); });
+                _mount(d, false);
             })
             .catch(function () { toast('Couldn’t load item', 'error'); });
+    }
+
+    function _mount(d, tmdbOnly) {
+        var ov = document.createElement('div');
+        ov.className = 'vmg-overlay';
+        ov.innerHTML = panelHtml(d);
+        document.body.appendChild(ov);
+        state = { kind: d.kind, id: d.id, data: d, saving: false,
+                  genres: (d.genres || []).slice(), locked: (d.locked_fields || []).slice(),
+                  overlay: ov, tmdbOnly: !!tmdbOnly };
+        wire();
+        if (!tmdbOnly) {
+            // All row-backed: genre chips, TMDB/IMDb matches, per-title profiles.
+            renderChips();
+            loadGenreSuggestions(d.kind);
+            loadMatches();
+            loadQualityProfiles(d);
+        }
+        requestAnimationFrame(function () { ov.classList.add('vmg-open'); });
     }
 
     window.VideoManage = { open: open };

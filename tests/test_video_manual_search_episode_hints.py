@@ -125,6 +125,59 @@ def test_hints_are_not_gated_on_series_type(app_db):
                                "media_source": "tmdb"}, 1, 3)[1] == 3
 
 
+def test_season_one_absolute_is_derived_for_a_show_you_do_not_own(app_db):
+    """Reported after 1.6.11: '[SubsPlease] Oh Boy, Was I Wrong About Her - 01'
+    still rejected. episode_absolute_number counts the show's own episode rows,
+    so it can only answer for a show already IN the library — which is precisely
+    not the case when you're searching for something to download.
+
+    For season 1 the absolute number IS the episode number, by definition
+    (specials sit in season 0 and are excluded), so it needs no library at all."""
+    from api.video.downloads import _episode_hints
+    _, db = app_db      # nothing seeded — the show is unknown
+    assert _episode_hints(db, {"scope": "episode", "media_id": 500,
+                               "media_source": "tmdb"}, 1, 1) == (None, 1)
+    assert _episode_hints(db, {"scope": "episode", "media_id": 500,
+                               "media_source": "tmdb"}, 1, 12) == (None, 12)
+
+
+def test_a_later_season_is_never_guessed(app_db):
+    """The safety boundary. has_absolute_episode only ever ACCEPTS, so a wrong
+    guess is a false GRAB: wanting S02E05 and matching a bare 'Show - 05' would
+    pull season ONE's episode 5. Only season 1 is derivable without the library."""
+    from api.video.downloads import _episode_hints
+    _, db = app_db
+    assert _episode_hints(db, {"scope": "episode", "media_id": 500,
+                               "media_source": "tmdb"}, 2, 5) == (None, None)
+    assert _episode_hints(db, {"scope": "episode", "media_id": 500,
+                               "media_source": "tmdb"}, 3, 1) == (None, None)
+
+
+def test_the_library_still_wins_over_the_derivation(app_db):
+    """An owned show's real absolute number must not be overridden by the
+    season-1 shortcut — they agree for season 1, but the library is the source
+    of truth and stays first."""
+    from api.video.downloads import _episode_hints
+    _, db = app_db
+    _seed_show(db)
+    assert _episode_hints(db, {"scope": "episode", "media_id": 500,
+                               "media_source": "tmdb"}, 1, 3) == ("2026-07-20", 3)
+
+
+def test_the_search_modal_sends_the_title_identity():
+    """The other half of the reported failure: the backend gained the hint
+    plumbing in 1.6.11, but every searchInto params object was
+    {scope,title,season,episode,source} — no media_id, so there was never a
+    tmdb id to resolve the hints (or the alias set) FROM."""
+    from pathlib import Path
+    js = (Path(__file__).resolve().parent.parent / "webui" / "static" / "video"
+          / "video-download-view.js").read_text(encoding="utf-8")
+    inject = js.split("function searchInto", 1)[1].split("triggerRows =", 1)[0]
+    assert "params.media_id" in inject and "params.media_source" in inject
+    # shows keep identity on _dl, movies on _opts — both must be consulted
+    assert "container._opts || container._dl" in inject
+
+
 def test_hints_degrade_quietly(app_db):
     from api.video.downloads import _episode_hints
     _, db = app_db
@@ -132,15 +185,16 @@ def test_hints_degrade_quietly(app_db):
     assert _episode_hints(db, {"scope": "movie", "media_id": 1, "media_source": "tmdb"}) == (None, None)
     # nothing to resolve from
     assert _episode_hints(db, {"scope": "episode"}, 1, 3) == (None, None)
-    # unknown show
+    # unknown show, season > 1 — nothing is derivable, so nothing is claimed
+    # (season 1 IS derivable without the library; see the season-one test)
     assert _episode_hints(db, {"scope": "episode", "media_id": 999999,
-                               "media_source": "tmdb"}, 1, 3) == (None, None)
+                               "media_source": "tmdb"}, 2, 3) == (None, None)
     # missing season/episode
     assert _episode_hints(db, {"scope": "episode", "media_id": 500,
                                "media_source": "tmdb"}, None, None) == (None, None)
     # junk id must not raise
     assert _episode_hints(db, {"scope": "episode", "media_id": "nope",
-                               "media_source": "library"}, 1, 3) == (None, None)
+                               "media_source": "library"}, 2, 3) == (None, None)
 
 
 def test_every_search_endpoint_passes_the_hints():

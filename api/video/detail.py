@@ -50,9 +50,29 @@ def register_routes(bp):
             return jsonify({"error": res.get("error", "not found")}), 404
         return jsonify(res)
 
+    @bp.route("/detail/aka/<kind>/<int:tmdb_id>", methods=["GET"])
+    def video_get_aka_titles(kind, tmdb_id):
+        """A title's user AKAs by TMDB id. Readable with no library row, which is
+        the point — the manage panel opens on titles that aren't in the library
+        yet, and there is nothing else to read them from."""
+        from . import get_video_db
+        if kind not in ("movie", "show"):
+            return jsonify({"error": "bad kind"}), 400
+        db = get_video_db()
+        return jsonify({"ok": True,
+                        "aka_titles": db.aka_titles_for_tmdb(kind, tmdb_id),
+                        "series_type": (db.series_type_for_tmdb(tmdb_id)
+                                        if kind == "show" else None)})
+
     @bp.route("/detail/<kind>/<int:item_id>/aka", methods=["PUT"])
     def video_set_aka_titles(kind, item_id):
-        """Replace a title's user "also known as" list. Body: {titles: [...] | "a\\nb"}.
+        """Replace a title's user "also known as" list.
+        Body: {titles: [...] | "a\\nb", source?: 'library'|'tmdb'}.
+
+        ``item_id`` is a library row id by default; ``source: 'tmdb'`` says it is
+        a TMDB id instead. That matters because these aliases are stored AGAINST
+        the tmdb id — the releases they fix are for titles you do NOT own yet, so
+        there is frequently no library row to hang one off.
 
         A SoulSync-LOCAL matching aid, deliberately not part of /metadata: that
         endpoint pushes edits to Plex/Jellyfin and locks the field there, which
@@ -67,9 +87,16 @@ def register_routes(bp):
         if kind not in ("movie", "show"):
             return jsonify({"error": "bad kind"}), 400
         body = request.get_json(silent=True) or {}
-        stored = get_video_db().set_aka_titles(kind, item_id, body.get("titles"))
+        db = get_video_db()
+        if str(body.get("source") or "").lower() == "tmdb":
+            tmdb_id = item_id
+        else:
+            tmdb_id = db.tmdb_id_for_library_row(kind, item_id)
+            if tmdb_id is None:
+                return jsonify({"error": "unknown item, or it has no TMDB match yet"}), 404
+        stored = db.set_aka_titles(kind, tmdb_id, body.get("titles"))
         if stored is None:
-            return jsonify({"error": "unknown item"}), 404
+            return jsonify({"error": "could not save"}), 400
         return jsonify({"ok": True, "aka_titles": stored})
 
     @bp.route("/detail/<kind>/<int:item_id>/lock", methods=["POST"])

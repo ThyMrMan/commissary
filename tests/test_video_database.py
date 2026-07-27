@@ -1247,7 +1247,18 @@ def test_watchlist_reAdd_is_upsert_and_coalesces_library_id(db):
     rows = db.list_watchlist("show")
     assert len(rows) == 1                                            # no duplicate
     assert rows[0]["title"] == "Game of Thrones"                    # refreshed
-    assert rows[0]["library_id"] == 7 and rows[0]["poster_url"] == "/a.jpg"  # preserved
+    # Assert the COALESCE at the STORAGE layer, which is what this test is about.
+    # list_watchlist deliberately reports the LIVE library row instead of echoing
+    # the stored id (see test_video_watchlist_posters.py) — id 7 exists in no
+    # shows table here, and surfacing a dangling id gives cards that 404.
+    conn = db._get_connection()
+    try:
+        stored = dict(conn.execute("SELECT library_id, poster_url FROM video_watchlist "
+                                   "WHERE kind='show' AND tmdb_id=1399").fetchone())
+    finally:
+        conn.close()
+    assert stored["library_id"] == 7 and stored["poster_url"] == "/a.jpg"   # preserved
+    assert rows[0]["poster_url"] == "/a.jpg"        # still served to the card
 
 
 def test_watchlist_state_and_counts(db):

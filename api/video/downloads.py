@@ -217,6 +217,21 @@ def _episode_hints(db, body, season=None, episode=None):
         want_absolute = db.episode_absolute_number(tmdb_id, s, e)
     except Exception:   # noqa: BLE001
         logger.debug("absolute hint failed for %s S%sE%s", tmdb_id, s, e, exc_info=True)
+    if want_absolute is None:
+        # episode_absolute_number counts the show's own episode rows, so it can
+        # only answer for a show already IN the library — searching for one you
+        # don't own yet gets nothing, which is exactly when you're searching.
+        #
+        # For SEASON 1 the absolute number IS the episode number, by definition
+        # (specials sit in season 0 and are excluded). Deriving it only for
+        # season 1 is safe; guessing for a later season would be a real risk,
+        # since has_absolute_episode only ever ACCEPTS — wanting S02E05 and
+        # matching a bare "Show - 05" would grab season ONE's episode 5.
+        try:
+            if int(s) == 1 and int(e) >= 1:
+                want_absolute = int(e)
+        except (TypeError, ValueError):
+            pass
     return want_date, want_absolute
 
 
@@ -777,13 +792,24 @@ def register_routes(bp):
     @bp.route("/detail/show/<int:library_id>/series-type", methods=["PUT"])
     def video_show_series_type(library_id):
         """Set a show's series type (P8): standard | daily | anime. Drives how the
-        drain queries for its episodes (SxxExx vs air date vs absolute number)."""
+        drain queries for its episodes (SxxExx vs air date vs absolute number).
+
+        Body may carry ``source: 'tmdb'``, in which case ``library_id`` is a TMDB
+        id for a show NOT in the library and the value is stored as an override
+        keyed by that id. Which matters: series type decides how episodes are
+        HUNTED, so it's most needed while you're still trying to acquire the
+        show — exactly when no library row exists to write it to."""
         from . import get_video_db
         body = request.get_json(silent=True) or {}
         st = str(body.get("series_type") or "").strip().lower()
         if st not in ("standard", "daily", "anime"):
             return jsonify({"success": False, "error": "series_type must be standard|daily|anime"}), 400
-        if not get_video_db().set_show_series_type(library_id, st):
+        db = get_video_db()
+        if str(body.get("source") or "").lower() == "tmdb":
+            if db.set_series_type_override(library_id, st) is None:
+                return jsonify({"success": False, "error": "Could not save."}), 400
+            return jsonify({"success": True})
+        if not db.set_show_series_type(library_id, st):
             return jsonify({"success": False, "error": "Show not found."}), 404
         return jsonify({"success": True})
 

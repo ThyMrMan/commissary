@@ -885,3 +885,23 @@ CREATE INDEX IF NOT EXISTS idx_vissues_profile ON video_issues(profile_id);
 CREATE INDEX IF NOT EXISTS idx_vissues_status  ON video_issues(status);
 CREATE INDEX IF NOT EXISTS idx_vissues_entity  ON video_issues(entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_vissues_created ON video_issues(created_at);
+
+-- PER-TITLE USER OVERRIDES — settings that must be expressible for a title that
+-- is NOT in the library, keyed by TMDB id rather than by a library row.
+--
+-- Keyed that way deliberately. The problem these solve is a release named
+-- differently from the TMDB title, which bites hardest for a show you do NOT own
+-- yet — you're searching to grab the first episode. A library row doesn't exist
+-- then, so per-row storage had nowhere to put one. Keying on the tmdb id also
+-- means an alias survives the row being deleted and rescanned, and is shared by
+-- every copy of a title mirrored across servers.
+--
+-- Never pushed to Plex/Jellyfin: the media server has no concept of this.
+CREATE TABLE IF NOT EXISTS video_title_overrides (
+    kind        TEXT NOT NULL,           -- 'movie' | 'show'
+    tmdb_id     INTEGER NOT NULL,
+    aka_titles  TEXT,                    -- newline-separated "also known as" names
+    series_type TEXT,                    -- shows: standard | daily | anime
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (kind, tmdb_id)
+);

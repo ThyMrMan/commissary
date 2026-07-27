@@ -43,7 +43,7 @@ def _publish_video_event(event_type: str, data: dict) -> None:
 
 # Bump when video_schema.sql changes in a way worth recording. Stored in
 # PRAGMA user_version as a backstop indicator (nothing gates on it yet).
-SCHEMA_VERSION = 46   # v46: media_files format facts (channels/HDR/Atmos badges); v45: per-episode watch state + resume offsets (Continue Watching); v44: video_wishlist.search_attempts/last_search_at
+SCHEMA_VERSION = 47   # v47: per-title user overrides (AKA titles, series type) keyed by tmdb_id in video_title_overrides, not per library row; v46: media_files format facts (channels/HDR/Atmos badges); v45: per-episode watch state + resume offsets (Continue Watching); v44: video_wishlist.search_attempts/last_search_at
 
 _DEFAULT_DB_PATH = "database/video_library.db"
 _SCHEMA_FILE = Path(__file__).resolve().parent / "video_schema.sql"
@@ -399,6 +399,26 @@ def _norm_indexer_ids(raw) -> str | None:
     return ",".join(ids) if ids else None
 
 
+def _proxied_art(url) -> str | None:
+    """Route external TMDB art through the app's own image proxy.
+
+    Watchlist rows store whatever art the surface that added them happened to
+    have. The detail page proxies (``/api/video/img?u=``); the search/discover
+    cards pass TMDB's URL through raw, so those posters are fetched by the
+    BROWSER straight from image.tmdb.org — outside the disk cache, and dead for
+    any client whose DNS/blocklist eats that host or that has no route to it.
+    Same follow, different poster behaviour depending on where you clicked it.
+
+    Applied on write AND on read, so rows stored raw before this heal without
+    needing a migration. Anything not TMDB (a local proxy path, a Jellyfin URL)
+    is returned untouched."""
+    u = str(url or "").strip()
+    if u.startswith("https://image.tmdb.org/"):
+        from urllib.parse import quote
+        return "/api/video/img?u=" + quote(u, safe="")
+    return u or None
+
+
 def _history_library_clause(root) -> tuple:
     """(sql, args) scoping video_download_history to one configured Library.
 
@@ -547,6 +567,29 @@ class VideoDatabase:
         """One-time data fixes, gated on the PRAGMA user_version the DB carried
         BEFORE this boot (fresh DBs start at 0 with empty tables, so every step
         is a no-op there)."""
+        if prev_version < 47:
+            # v47: AKAs moved from shows/movies.aka_titles to video_title_overrides,
+            # keyed by tmdb_id. The columns could only hold an alias for a title
+            # already IN the library — which is precisely not the case when you
+            # need one. Carry anything already typed across; the now-unused
+            # columns are left in place rather than dropped (SQLite makes that
+            # expensive, and a stale column is harmless).
+            try:
+                for kind, table in (("movie", "movies"), ("show", "shows")):
+                    cols = {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+                    if "aka_titles" not in cols:
+                        continue
+                    for row in conn.execute(
+                            "SELECT tmdb_id, aka_titles FROM %s "
+                            "WHERE aka_titles IS NOT NULL AND TRIM(aka_titles) <> '' "
+                            "AND tmdb_id IS NOT NULL" % table).fetchall():
+                        conn.execute(
+                            "INSERT INTO video_title_overrides (kind, tmdb_id, aka_titles) VALUES (?,?,?) "
+                            "ON CONFLICT(kind, tmdb_id) DO NOTHING",
+                            (kind, row["tmdb_id"], row["aka_titles"]))
+            except sqlite3.Error:
+                logger.exception("v47 AKA migration failed; aliases may need re-entering")
+
         if prev_version < 41:
             # v41 heal: the details backfill used to swallow failed TMDB calls
             # (429/5xx/timeout) into empty metadata and still mark
@@ -1060,66 +1103,115 @@ class VideoDatabase:
                 out.append(t)
         return out
 
-    def set_aka_titles(self, kind: str, item_id, titles) -> list | None:
-        """Replace a title's user AKA list. ``titles`` may be a list or a raw
-        newline/comma string. Returns the stored list, or None for an unknown row."""
-        table = {"movie": "movies", "show": "shows"}.get(kind)
-        if not table or item_id is None:
+    def set_aka_titles(self, kind: str, tmdb_id, titles) -> list | None:
+        """Replace a title's user AKA list, keyed by TMDB id. ``titles`` may be a
+        list or a raw newline/comma string. Returns the stored list, or None when
+        the kind/tmdb id is unusable.
+
+        Keyed on the tmdb id rather than a library row deliberately: the releases
+        these fix are for titles you do NOT own yet — you're searching to grab the
+        first episode — and no row exists then. It also means an alias survives
+        the row being deleted and rescanned, and is shared by every copy of a
+        title mirrored across servers."""
+        if kind not in ("movie", "show") or tmdb_id is None:
             return None
         if isinstance(titles, (list, tuple)):
             titles = "\n".join(str(t or "") for t in titles)
         clean = self._split_akas(titles)
+        try:
+            tid = int(tmdb_id)
+        except (TypeError, ValueError):
+            return None
         conn = self._get_connection()
         try:
-            cur = conn.execute(f"UPDATE {table} SET aka_titles=? WHERE id=?",
-                               ("\n".join(clean) or None, int(item_id)))
+            if clean:
+                conn.execute(
+                    "INSERT INTO video_title_overrides (kind, tmdb_id, aka_titles, updated_at) "
+                    "VALUES (?,?,?,CURRENT_TIMESTAMP) "
+                    "ON CONFLICT(kind, tmdb_id) DO UPDATE SET "
+                    "  aka_titles=excluded.aka_titles, updated_at=CURRENT_TIMESTAMP",
+                    (kind, tid, "\n".join(clean)))
+            else:
+                # Clearing deletes the row rather than storing an empty string, so
+                # "no aliases" is one state instead of two.
+                conn.execute("UPDATE video_title_overrides SET aka_titles=NULL, updated_at=CURRENT_TIMESTAMP "
+                             "WHERE kind=? AND tmdb_id=?",
+                             (kind, tid))
             conn.commit()
-            return clean if cur.rowcount else None
-        except (sqlite3.Error, TypeError, ValueError):
-            logger.exception("set_aka_titles failed (%s %s)", kind, item_id)
+            return clean
+        except sqlite3.Error:
+            logger.exception("set_aka_titles failed (%s %s)", kind, tmdb_id)
             return None
         finally:
             conn.close()
 
-    def aka_titles(self, kind: str, item_id) -> list:
-        """One title's user AKAs by library row id."""
-        table = {"movie": "movies", "show": "shows"}.get(kind)
-        if not table or item_id is None:
+    def aka_titles_for_tmdb(self, kind: str, tmdb_id) -> list:
+        """User AKAs for a TMDB title — what the alias resolvers hold."""
+        if kind not in ("movie", "show") or tmdb_id is None:
             return []
         conn = self._get_connection()
         try:
-            row = conn.execute(f"SELECT aka_titles FROM {table} WHERE id=?",
-                               (int(item_id),)).fetchone()
+            row = conn.execute(
+                "SELECT aka_titles FROM video_title_overrides WHERE kind=? AND tmdb_id=?",
+                (kind, int(tmdb_id))).fetchone()
             return self._split_akas(row["aka_titles"]) if row else []
         except (sqlite3.Error, TypeError, ValueError):
             return []
         finally:
             conn.close()
 
-    def aka_titles_for_tmdb(self, kind: str, tmdb_id) -> list:
-        """User AKAs keyed by TMDB id — what the alias resolvers hold.
+    def set_series_type_override(self, tmdb_id, series_type) -> str | None:
+        """Set a show's series type BEFORE it's in the library, keyed by tmdb id.
 
-        Unions across every row for that tmdb_id: the same show mirrored on two
-        servers is two rows, and an AKA typed on one of them must still count."""
-        table = {"movie": "movies", "show": "shows"}.get(kind)
-        if not table or tmdb_id is None:
-            return []
+        Series type decides how episode releases are hunted — SxxExx (standard),
+        air date (daily), or absolute number (anime) — which matters most while
+        you're still trying to acquire the show. ``set_show_series_type`` writes
+        the shows row and so only works once you own it. Passing a blank/unknown
+        value clears the override and hands the decision back to the library row
+        (or the 'standard' default)."""
+        st = str(series_type or "").strip().lower()
+        if st not in ("standard", "daily", "anime", ""):
+            return None
+        try:
+            tid = int(tmdb_id)
+        except (TypeError, ValueError):
+            return None
         conn = self._get_connection()
         try:
-            rows = conn.execute(
-                f"SELECT aka_titles FROM {table} WHERE tmdb_id=? AND aka_titles IS NOT NULL",
-                (int(tmdb_id),)).fetchall()
-        except (sqlite3.Error, TypeError, ValueError):
-            return []
+            conn.execute(
+                "INSERT INTO video_title_overrides (kind, tmdb_id, series_type, updated_at) "
+                "VALUES ('show',?,?,CURRENT_TIMESTAMP) "
+                "ON CONFLICT(kind, tmdb_id) DO UPDATE SET "
+                "  series_type=excluded.series_type, updated_at=CURRENT_TIMESTAMP",
+                (tid, st or None))
+            conn.commit()
+            return st
+        except sqlite3.Error:
+            logger.exception("set_series_type_override failed (%s)", tmdb_id)
+            return None
         finally:
             conn.close()
-        out, seen = [], set()
-        for r in rows:
-            for t in self._split_akas(r["aka_titles"]):
-                if t.lower() not in seen:
-                    seen.add(t.lower())
-                    out.append(t)
-        return out
+
+    def series_type_for_tmdb(self, tmdb_id) -> str | None:
+        """A show's series-type override, or None when none is set."""
+        if tmdb_id is None:
+            return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT series_type FROM video_title_overrides "
+                "WHERE kind='show' AND tmdb_id=?", (int(tmdb_id),)).fetchone()
+            return (row["series_type"] or None) if row else None
+        except (sqlite3.Error, TypeError, ValueError):
+            return None
+        finally:
+            conn.close()
+
+    def aka_titles(self, kind: str, item_id) -> list:
+        """User AKAs for a LIBRARY ROW — resolves the row to its tmdb id first.
+        Kept so callers holding a row id (the detail payload) don't each repeat
+        that hop. A row with no tmdb id simply has no aliases."""
+        return self.aka_titles_for_tmdb(kind, self.tmdb_id_for_library_row(kind, item_id))
 
     def tmdb_id_for_library_row(self, kind: str, row_id):
         """The tmdb_id of a movies/shows ROW — the inverse of
@@ -4952,7 +5044,7 @@ class VideoDatabase:
             "wikidata_url": show["wikidata_url"],
             "genres": genres, "cast": credits["cast"], "crew": credits["crew"],
             "tmdb_id": show["tmdb_id"], "tvdb_id": show["tvdb_id"], "imdb_id": show["imdb_id"],
-            "aka_titles": self._split_akas(show["aka_titles"]),
+            "aka_titles": self.aka_titles_for_tmdb("show", show["tmdb_id"]),
             # The Library this show is filed under, so a grab/import started from the
             # detail page routes to ITS folder and category instead of defaulting to
             # the primary Library for the kind (an Anime show landing under TV Shows).
@@ -5854,8 +5946,8 @@ class VideoDatabase:
                        requested_by_name=COALESCE(video_watchlist.requested_by_name,
                                                   excluded.requested_by_name),
                        monitor=COALESCE(video_watchlist.monitor, excluded.monitor)""",
-                (kind, int(tmdb_id), title, poster_url, library_id, 1 if approved else 0,
-                 requested_by, requested_by_name, monitor))
+                (kind, int(tmdb_id), title, _proxied_art(poster_url), library_id,
+                 1 if approved else 0, requested_by, requested_by_name, monitor))
             conn.commit()
             # A refresh-upsert of an existing follow is not a new follow.
             if not (was and was["state"] == "follow"):
@@ -6015,15 +6107,42 @@ class VideoDatabase:
         is always approved: those are already-owned shows, not requests."""
         out, seen = [], set()
         wl_where = " AND w.approved=1" if approved_only else ""
+        # Resolve the LIVE library row instead of trusting w.library_id. Show rows
+        # are deleted and re-inserted when Plex re-keys an item (show_sync.py), and
+        # a follow added before the show was scanned never had an id at all — both
+        # strand the stored id, and with it the status, the episode counts and the
+        # '/api/video/poster/show/<id>' the follow was saved with.
+        heal, args = "", []
+        if server_source:
+            heal = " AND s2.server_source = ?"
+            args.append(server_source)
         for r in conn.execute(
-                "SELECT w.tmdb_id, w.title, w.poster_url, w.library_id, w.date_added, s.status, "
+                "SELECT w.tmdb_id, w.title, w.poster_url AS saved_poster, w.date_added, "
+                "s.id AS library_id, s.status, "
+                "(s.poster_url IS NOT NULL AND s.poster_url <> '') AS lib_has_poster, "
                 "w.approved, w.requested_by, w.requested_by_name, w.monitor, "
                 + self._EPS_COLS +
-                " FROM video_watchlist w LEFT JOIN shows s ON s.id = w.library_id "
+                " FROM video_watchlist w LEFT JOIN shows s ON s.id = COALESCE("
+                "(SELECT s1.id FROM shows s1 WHERE s1.id = w.library_id), "
+                "(SELECT s2.id FROM shows s2 WHERE s2.tmdb_id = w.tmdb_id" + heal +
+                " ORDER BY s2.id LIMIT 1)) "
                 "WHERE w.kind='show' AND w.state='follow'" + wl_where +
-                " ORDER BY w.date_added DESC, w.id DESC"):
+                " ORDER BY w.date_added DESC, w.id DESC", args):
             d = dict(r); d["kind"] = "show"
             d["approved"] = bool(d.get("approved", 1))
+            # An owned show's art comes from its library row: that's live, and it's
+            # what the poster manager edits. The follow's own poster_url is a
+            # snapshot taken when it was added, so it is only ever the fallback.
+            lib_art, saved = d.pop("lib_has_poster", 0), d.pop("saved_poster", None)
+            if d["library_id"] and lib_art:
+                d["poster_url"] = "/api/video/poster/show/%d" % d["library_id"]
+            elif str(saved or "").startswith("/api/video/poster/"):
+                # The follow saved a library-art path but no live row backs it, so
+                # that URL 404s. Report no art rather than making the card fire a
+                # request it is guaranteed to lose before it paints its placeholder.
+                d["poster_url"] = None
+            else:
+                d["poster_url"] = _proxied_art(saved)
             out.append(d); seen.add(r["tmdb_id"])
         muted = {r["tmdb_id"] for r in conn.execute(
             "SELECT tmdb_id FROM video_watchlist WHERE kind='show' AND state='mute'")}
@@ -6065,6 +6184,7 @@ class VideoDatabase:
                         cols + "FROM video_watchlist WHERE kind='person' AND state='follow'"
                         + gate + " ORDER BY date_added DESC, id DESC"):
                     d = dict(r); d["kind"] = "person"
+                    d["poster_url"] = _proxied_art(d.get("poster_url"))
                     d["approved"] = bool(d.get("approved", 1)); people.append(d)
             studios = []
             if kind in (None, "studio"):
@@ -6072,6 +6192,7 @@ class VideoDatabase:
                         cols + "FROM video_watchlist WHERE kind='studio' AND state='follow'"
                         + gate + " ORDER BY date_added DESC, id DESC"):
                     d = dict(r); d["kind"] = "studio"
+                    d["poster_url"] = _proxied_art(d.get("poster_url"))
                     d["approved"] = bool(d.get("approved", 1)); studios.append(d)
             shows = (self._effective_shows(conn, server_source, approved_only=approved_only)
                      if kind in (None, "show") else [])
@@ -6358,7 +6479,15 @@ class VideoDatabase:
                 # series type (P8): daily/anime shows QUERY differently (air date /
                 # absolute number). NULL for shows not in the library = standard.
                 # MAX = a type set on ANY server's row wins over a NULL sibling.
-                "(SELECT MAX(s.series_type) FROM shows s WHERE s.tmdb_id = w.tmdb_id) AS series_type "
+                # The library row WINS over the override. The override is a stand-in for
+                # a show that has no row yet; once one exists the full Manage panel
+                # edits the row, and leaving a stale override ahead of it would make
+                # that edit silently do nothing. An unset row is NULL, so the
+                # override keeps applying right up until someone sets it for real.
+                "COALESCE((SELECT MAX(s.series_type) FROM shows s WHERE s.tmdb_id = w.tmdb_id), "
+                "         (SELECT o.series_type FROM video_title_overrides o "
+                "          WHERE o.kind='show' AND o.tmdb_id = w.tmdb_id)) "
+                "AS series_type "
                 "FROM video_wishlist w WHERE w.kind='episode' AND w.tmdb_id IS NOT NULL "
                 # release-window gate: search an episode only once it's within a week of air
                 # (early scene releases show up a few days out) — a further-off episode stays on
@@ -6416,7 +6545,15 @@ class VideoDatabase:
                 "  AS owned_resolutions, "
                 "COALESCE(w.quality_profile_id, (SELECT s.quality_profile_id FROM shows s "
                 "  WHERE s.tmdb_id = w.tmdb_id)) AS quality_profile_id, "
-                "(SELECT MAX(s.series_type) FROM shows s WHERE s.tmdb_id = w.tmdb_id) AS series_type "
+                # The library row WINS over the override. The override is a stand-in for
+                # a show that has no row yet; once one exists the full Manage panel
+                # edits the row, and leaving a stale override ahead of it would make
+                # that edit silently do nothing. An unset row is NULL, so the
+                # override keeps applying right up until someone sets it for real.
+                "COALESCE((SELECT MAX(s.series_type) FROM shows s WHERE s.tmdb_id = w.tmdb_id), "
+                "         (SELECT o.series_type FROM video_title_overrides o "
+                "          WHERE o.kind='show' AND o.tmdb_id = w.tmdb_id)) "
+                "AS series_type "
                 "FROM video_wishlist w WHERE w.kind='episode' AND w.tmdb_id=?" + where +
                 " ORDER BY w.season_number, w.episode_number", args)]
         finally:
@@ -8068,7 +8205,7 @@ class VideoDatabase:
             "wikidata_url": m["wikidata_url"],
             "cast": credits["cast"], "crew": credits["crew"],
             "tmdb_id": m["tmdb_id"], "imdb_id": m["imdb_id"],
-            "aka_titles": self._split_akas(m["aka_titles"]),
+            "aka_titles": self.aka_titles_for_tmdb("movie", m["tmdb_id"]),
             # See show_detail — the Library this movie is filed under, so a grab
             # started from the detail page routes to ITS folder and category.
             "root_folder_id": m["root_folder_id"],

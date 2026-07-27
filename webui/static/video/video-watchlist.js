@@ -111,9 +111,13 @@
         var openId = source === 'library' ? it.library_id : it.tmdb_id;
         var href = '/video-detail/' + source + '/' + kind + '/' + openId;
         var ph = kind === 'person' ? '👤' : '📺';   // 👤 / 📺
+        // A failed poster must fall BACK to the placeholder, not just hide itself —
+        // display:none left a blank tile that looked like a broken card rather than
+        // a title with no art. Same idiom the search/discover cards already use.
         var art = it.poster_url
             ? '<img class="vwlp-card-img" src="' + esc(it.poster_url) + '" alt="" loading="lazy" ' +
-              'onload="this.classList.add(\'vwlp-loaded\')" onerror="this.style.display=\'none\'">'
+              'onload="this.classList.add(\'vwlp-loaded\')" ' +
+              'onerror="this.outerHTML=\'<div class=&quot;vwlp-card-ph&quot;>' + ph + '</div>\'">'
             : '<div class="vwlp-card-ph">' + ph + '</div>';
         var btn = window.VideoGet
             ? VideoGet.cardButton({ kind: kind, tmdbId: it.tmdb_id, libraryId: it.library_id,

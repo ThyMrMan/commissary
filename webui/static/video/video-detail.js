@@ -618,12 +618,16 @@
             html += '<button class="vd-trailer-btn" type="button" data-vd-act="poster" title="Change poster">' +
                 '<span class="vd-trailer-ic">🖼</span> Manage Poster</button>';
         }
-        // Manage — the per-item metadata editor (library items only: edits write
-        // to the local row + push to the item's own server). Library-sourced pages
-        // always have a row; TMDB pages only when owned (library_id resolves it).
-        if (ownLibItem && window.VideoManage &&
-                (d.source !== 'tmdb' || d.library_id != null)) {
-            html += '<button class="vd-manage-btn" type="button" data-vd-act="manage" title="Edit metadata">' +
+        // Manage — the per-item editor. For a library item that's the full
+        // metadata editor (edits write the local row + push to the item's own
+        // server). For a title NOT in the library there's no row and no server
+        // item, so the panel opens on its matching section alone — "Also known
+        // as" is stored against the TMDB id and is exactly what you need when a
+        // release for something you don't own yet is rejected as a wrong title.
+        if (window.VideoManage && (ownLibItem || d.tmdb_id)) {
+            var mTitle = (ownLibItem && (d.source !== 'tmdb' || d.library_id != null))
+                ? 'Edit metadata' : 'Set the names releases use for this title';
+            html += '<button class="vd-manage-btn" type="button" data-vd-act="manage" title="' + mTitle + '">' +
                 '<span class="vd-manage-ic">✎</span> Manage</button>';
         }
         // Synchronize — a deep scan scoped to THIS show: re-reads it from the
@@ -747,8 +751,12 @@
     function openManagePanel() {
         if (!window.VideoManage || !data) return;
         var libId = (data.source !== 'tmdb') ? ((data.id != null) ? data.id : currentId) : (data.library_id || null);
-        if (libId == null) return;
-        VideoManage.open({ kind: data.kind, id: libId });
+        if (libId != null) { VideoManage.open({ kind: data.kind, id: libId }); return; }
+        // Not in the library: no row to edit, but the TMDB id is enough to reach
+        // the "also known as" list, which is stored against it.
+        var tmdbId = data.tmdb_id || ((data.source === 'tmdb' && currentId) ? currentId : null);
+        if (tmdbId == null) return;
+        VideoManage.open({ kind: data.kind, id: tmdbId, source: 'tmdb', detail: data });
     }
 
     // Manage Poster — open the poster manager for this item (library id + tmdb id).
