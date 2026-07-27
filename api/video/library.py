@@ -59,6 +59,7 @@ def register_routes(bp):
                 server_source=server,
                 root_folder_id=root_folder_id,
                 include_unassigned=include_unassigned,
+                air_status=request.args.get("air_status") or None,
             ))
         except Exception:
             logger.exception("Failed to query video library")

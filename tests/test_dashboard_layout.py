@@ -34,6 +34,7 @@ def _read(rel):
 
 
 _LAYOUT_JS = _read('webui/static/dashboard-layout.js')
+_VIDEO_SIDE_CSS = _read('webui/static/video/video-side.css')
 
 
 def _strip_comments(js):
@@ -207,3 +208,36 @@ def test_every_layoutable_card_is_a_known_widget():
     registry = {i.split('.', 1)[1] for i in re.findall(r"id:\s*'([\w.-]+)'", _WIDGETS_JS)}
     cards = set(re.findall(r'data-card="([\w-]+)"', _INDEX))
     assert cards <= registry, f"cards unknown to the widget registry: {sorted(cards - registry)}"
+
+
+# ── video dashboard: nothing may out-rank the drag-to-reorder DOM order ─────
+# Regression: video-side.css used to pin every video dash-card to a fixed CSS
+# `order` (and hardcode `grid-column: span 2` on the wide ones). The layout
+# module works ENTIRELY by moving DOM nodes and relies on plain document
+# order to control the visual position — a fixed `order` always wins over
+# that, so dragging (and, for the wide cards, resizing) a video-dashboard
+# card visibly did nothing: the drop/resize was applied and persisted, but
+# the card snapped straight back to its CSS-defined slot.
+
+def test_video_side_css_pins_no_dash_card_order():
+    assert not re.search(r'dash-card\[data-card="[\w-]+"\]\s*\{[^}]*\border\s*:', _VIDEO_SIDE_CSS), (
+        "a per-card CSS order always beats dashboard-layout.js's DOM-order-based "
+        "drag-to-reorder, making the video dashboard's Customize mode a no-op")
+
+
+def test_video_dashboard_wide_cards_use_the_shared_modifier_not_a_page_override():
+    """The wide cards get their default span from the SAME .dash-card--wide
+    class the music dashboard uses, not a video-only `grid-column` rule that
+    would out-rank the shared `[data-span]` resize rules by specificity."""
+    block = _block_between(_INDEX, r'<section class="video-subpage" data-video-subpage="video-dashboard"', "</section>")
+    for card in ("recent", "studios", "upcoming"):
+        m = re.search(r'<article class="([^"]*)" data-card="%s"' % card, block)
+        assert m, f"{card} card markup not found"
+        assert "dash-card--wide" in m.group(1).split(), f"{card} should ship dash-card--wide"
+
+
+def _block_between(text, start_pattern, end_marker):
+    m = re.search(start_pattern, text)
+    start = m.start()
+    end = text.index(end_marker, start)
+    return text[start:end]

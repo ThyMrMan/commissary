@@ -85,18 +85,20 @@ body[data-side="video"] .side-toggle-thumb {
 /* Overlay Studio (poster builder) is admin-only — hide its launcher for non-admins. */
 body:not(.video-admin) [data-video-overlay-studio] { display: none !important; }
 
-/* Video dashboard bento order + column spans. SCOPED to the video subpage because
-   these data-card names (stats/library/tools) also exist on the music dashboard —
-   an unscoped rule would reorder music's grid too. Three balanced 2/3 + 1/3 rows:
-     Row 1  Recently Added (2 cols) · Library (1 col)
-     Row 2  Quick Actions (1 col) · Studios [Overlay + Collection] (2 cols)
-     Row 3  Upcoming (2 cols) · System Stats (1 col) */
-.video-subpage[data-video-subpage="video-dashboard"] .dash-card[data-card="recent"] { order: 1; grid-column: span 2; }
-.video-subpage[data-video-subpage="video-dashboard"] .dash-card[data-card="library"] { order: 2; }
-.video-subpage[data-video-subpage="video-dashboard"] .dash-card[data-card="tools"] { order: 3; }
-.video-subpage[data-video-subpage="video-dashboard"] .dash-card[data-card="studios"] { order: 4; grid-column: span 2; }
-.video-subpage[data-video-subpage="video-dashboard"] .dash-card[data-card="upcoming"] { order: 5; grid-column: span 2; }
-.video-subpage[data-video-subpage="video-dashboard"] .dash-card[data-card="stats"] { order: 6; }
+/* Video dashboard bento order + column spans used to be forced here via CSS
+   `order`/`grid-column` (scoped to the video subpage so the shared data-card
+   names — stats/library/tools — didn't reorder music's grid too). That
+   fixed `order` always beat dashboard-layout.js's drag-to-reorder (which
+   works by physically moving DOM nodes and relies on plain document order),
+   so customizing the video dashboard silently did nothing — the card always
+   snapped back to its CSS-defined slot. The three wide cards' `order: N;
+   grid-column: span 2` here also outranked the shared `.dash-card[data-span]`
+   resize rules by specificity, so resizing them was equally dead.
+   Fixed by moving the markup itself into the intended default order (recent,
+   library, tools, studios, upcoming, stats) and giving recent/studios/
+   upcoming the shared `.dash-card--wide` class instead — the exact same
+   mechanism the music dashboard already uses, so drag/resize now works
+   identically on both sides with no page-specific override needed. */
 
 /* ── Dashboard responsive (tablet + phone) ──────────────────────────────────
    The shared .dash-grid (style.css) collapses 3→2 cols at 1499px and →1 col at
@@ -4854,6 +4856,7 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
     color: rgba(255, 255, 255, 0.9); background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.14);
     transition: background 0.15s, border-color 0.15s; }
 .vimp-refresh:hover { background: rgba(255, 255, 255, 0.12); border-color: rgba(255, 255, 255, 0.28); }
+.vimp-head-actions { flex-shrink: 0; display: flex; align-items: center; gap: 10px; }
 
 .vimp-grid { display: flex; flex-direction: column; gap: 10px; }
 
@@ -5029,6 +5032,10 @@ body.vdh-locked { overflow: hidden; }
 .vdh-tab-n { font-size: 10.5px; font-weight: 800; min-width: 16px; text-align: center; padding: 1px 5px;
     border-radius: 999px; background: rgba(255, 255, 255, 0.08); color: rgba(255, 255, 255, 0.6); }
 .vdh-tab--on .vdh-tab-n { background: rgba(var(--accent-rgb), 0.28); color: #fff; }
+.vdh-lib-select { flex: 0 0 auto; height: 38px; padding: 0 12px; border-radius: 11px; cursor: pointer;
+    background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); color: rgba(255, 255, 255, 0.85);
+    font-size: 12.5px; font-weight: 700; max-width: 180px; }
+.vdh-lib-select[hidden] { display: none; }
 .vdh-search { position: relative; display: flex; align-items: center; gap: 9px; margin-left: auto; height: 38px;
     flex: 1; min-width: 180px; max-width: 320px; padding: 0 13px; box-sizing: border-box;
     background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 11px;

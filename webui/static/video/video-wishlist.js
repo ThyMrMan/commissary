@@ -13,6 +13,7 @@
     var PAGE_ID = 'video-wishlist';
     var LIMIT = 60;
     var state = { loaded: false, tab: 'movie', search: '', sort: 'added', page: 1,
+                  rootFolderId: '',
                   counts: { movie: 0, show: 0, episode: 0 }, ytChannel: 0, ytVideo: 0,
                   showData: {}, showInfo: {},
                   // "⚠ Failing" filter (the LiveLeak fix-it hub): show only items
@@ -599,6 +600,7 @@
         if (state.tab === 'youtube') { loadYoutube(); return; }
         var ld = $('[data-vwsh-loading]'); if (ld) ld.classList.remove('hidden');
         var params = new URLSearchParams({ kind: state.tab, search: state.search, sort: state.sort, page: state.page, limit: LIMIT });
+        if (state.rootFolderId) params.set('root_folder_id', state.rootFolderId);
         fetch('/api/video/wishlist?' + params.toString(), { headers: { Accept: 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {
@@ -650,12 +652,39 @@
     function setTab(tab) {
         if (tab !== 'movie' && tab !== 'show' && tab !== 'youtube') return;
         state.tab = tab; state.page = 1; state.search = '';
+        state.rootFolderId = '';
         var si = $('[data-vwsh-search]'); if (si) si.value = '';
         var tabs = document.querySelectorAll('[data-vwsh-tab]');
         for (var i = 0; i < tabs.length; i++)
             tabs[i].classList.toggle('vwsh-tab--on', tabs[i].getAttribute('data-vwsh-tab') === tab);
         updateClearBtn();
+        loadLibraries();
         load();
+    }
+
+    // Filter by a specific configured Library (e.g. a separate Anime library) —
+    // 'Movies'/'TV' alone doesn't distinguish libraries of the same kind. Hidden
+    // entirely when there's 0 or 1 Library configured for the active tab's kind,
+    // and not offered at all on the YouTube tab (no library concept there).
+    var _libsFor = null;
+    function loadLibraries() {
+        var sel = $('[data-vwsh-lib]');
+        if (!sel) return;
+        if (state.tab === 'youtube') { sel.hidden = true; return; }
+        if (_libsFor === state.tab) return;
+        fetch('/api/video/libraries', { headers: { Accept: 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+                if (!d || state.tab === 'youtube') return;
+                var list = (state.tab === 'show' ? d.tv : d.movies) || [];
+                _libsFor = state.tab;
+                if (list.length < 2) { sel.hidden = true; return; }
+                sel.innerHTML = '<option value="">All Libraries</option>' + list.map(function (l) {
+                    return '<option value="' + esc(l.id) + '">' + esc(l.label || l.server_title || '') + '</option>';
+                }).join('');
+                sel.hidden = false;
+            })
+            .catch(function () {});
     }
 
     // Empty the whole current tab (movies / TV / YouTube), after a confirm.
@@ -819,6 +848,10 @@
         });
         var sortSel = $('[data-vwsh-sort]');
         if (sortSel) sortSel.addEventListener('change', function () { state.sort = sortSel.value; state.page = 1; load(); });
+        var libSel = $('[data-vwsh-lib]');
+        if (libSel) libSel.addEventListener('change', function () {
+            state.rootFolderId = libSel.value || ''; state.page = 1; load();
+        });
         var failBtn = $('[data-vwsh-failing]');
         if (failBtn) failBtn.addEventListener('click', function () {
             state.failingOnly = !state.failingOnly;
@@ -856,6 +889,7 @@
 
     function init() {
         wire();
+        loadLibraries();
         document.addEventListener('soulsync:video-page-shown', onShown);
         refreshBadge();
         refreshYtCount();

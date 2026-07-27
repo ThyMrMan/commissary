@@ -51,6 +51,7 @@
         open: false, selected: 'tmdb', statuses: {}, breakdown: null,
         unmatched: null, kind: 'movie', page: 0, pageSize: 50,
         statusFilter: 'unmatched', search: '', priority: '', pollTimer: null, searchTimer: null,
+        libraries: null,   // {movies:[{id,label,...}], tv:[...]} — configured Libraries, for per-library priority
     };
 
     function esc(s) {
@@ -167,6 +168,13 @@
             renderGlobalTabs();
         });
     }
+    function loadLibraries() {
+        if (state.libraries) return Promise.resolve();
+        return getJSON('/api/video/libraries').then(function (d) {
+            state.libraries = d ? { movies: d.movies || [], tv: d.tv || [] } : { movies: [], tv: [] };
+            renderGlobalTabs();
+        }).catch(function () { state.libraries = { movies: [], tv: [] }; });
+    }
 
     // ── render ─────────────────────────────────────────────────────────────────
     function renderRail() {
@@ -278,7 +286,9 @@
             var pct = total ? Math.round(matched / total * 100) : 0;
             var seg = function (n) { return total ? (n / total) * 100 : 0; };
             var left = nf + pend;
-            var isPinned = state.priority === e && (e === 'movie' || e === 'show');
+            // priority may be a bare kind ('show') or a library-scoped one ('show:3')
+            var isPinned = (e === 'movie' || e === 'show') &&
+                (state.priority === e || state.priority.indexOf(e + ':') === 0);
             var isDone = total > 0 && left === 0;
             var cls = 'em-card' +
                 (e === state.kind ? ' em-card--current' : '') +
@@ -312,9 +322,32 @@
         }
     }
 
+    // 'Process first everywhere' — was a fixed Movies/Shows/Auto choice; now
+    // also offers each configured Library within a kind (e.g. prioritize just
+    // an Anime library's shows), encoded as 'show:<root_folder_id>'. Rebuilt
+    // whenever the library list changes (libraries load async, after priority).
     function renderGlobalTabs() {
         var host = byId('vem-global-tabs');
         if (!host) return;
+        var libs = state.libraries || { movies: [], tv: [] };
+        var tab = function (value, label) {
+            return '<button data-em-priority="' + esc(value) + '"' +
+                (value === '' ? ' class="em-global-auto"' : '') + '>' + esc(label) + '</button>';
+        };
+        var html = tab('movie', 'Movies');
+        if (libs.movies.length > 1) {
+            libs.movies.forEach(function (l) {
+                html += tab('movie:' + l.id, (l.label || l.server_title || 'Library'));
+            });
+        }
+        html += tab('show', 'Shows');
+        if (libs.tv.length > 1) {
+            libs.tv.forEach(function (l) {
+                html += tab('show:' + l.id, (l.label || l.server_title || 'Library'));
+            });
+        }
+        html += tab('', 'Auto');
+        host.innerHTML = html;
         var btns = host.querySelectorAll('[data-em-priority]');
         for (var i = 0; i < btns.length; i++) {
             btns[i].classList.toggle('active', btns[i].getAttribute('data-em-priority') === state.priority);
@@ -503,10 +536,7 @@
             '<div class="em-topbar-titles"><h3 class="em-topbar-title">Video Enrichment Workers</h3>' +
             '<div class="em-topbar-sub">Match your library to TMDB &amp; TVDB</div></div>' +
             '<div class="em-global"><span class="em-global-label">Process first<br><span>everywhere</span></span>' +
-            '<div class="em-global-tabs" id="vem-global-tabs">' +
-            '<button data-em-priority="movie">Movies</button>' +
-            '<button data-em-priority="show">Shows</button>' +
-            '<button data-em-priority="" class="em-global-auto">Auto</button></div></div>' +
+            '<div class="em-global-tabs" id="vem-global-tabs"></div></div>' +
             '<div class="em-topbar-actions">' +
             '<button class="em-icon-btn em-retry-global" data-em-retry-all-global title="Re-queue every failed item across ALL workers">↻ Retry all failed</button>' +
             '<button class="em-icon-btn" data-em-refresh title="Refresh">⟳</button>' +
@@ -562,6 +592,7 @@
         refreshAll().then(function () {
             renderRail();
             loadPriority();
+            loadLibraries();
             selectWorker(state.selected);
         });
         if (state.pollTimer) clearInterval(state.pollTimer);

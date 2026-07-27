@@ -170,6 +170,70 @@
         return null;
     }
 
+    // ── add-file modal: fully manual import, no failed download required ──────
+    function ensureAddModal() {
+        if ($('[data-vimp-add-modal]')) return;
+        var m = document.createElement('div');
+        m.className = 'vimp-modal';
+        m.setAttribute('data-vimp-add-modal', '');
+        m.innerHTML =
+            '<div class="vimp-modal-scrim" data-vimp-add-close></div>' +
+            '<div class="vimp-modal-card" role="dialog" aria-label="Add a file to import">' +
+                '<div class="vimp-modal-head">' +
+                    '<div class="vimp-modal-titles">' +
+                        '<h2 class="vimp-modal-title">Add a file to import</h2>' +
+                        '<div class="vimp-modal-file">The full path to a video file already on this server &mdash; ' +
+                            'nothing needs to have failed first.</div>' +
+                    '</div>' +
+                    '<button class="vimp-modal-x" type="button" data-vimp-add-close aria-label="Close">&times;</button>' +
+                '</div>' +
+                '<div class="vimp-search">' +
+                    '<input type="text" class="vimp-search-input" data-vimp-add-path ' +
+                        'placeholder="/path/to/the/file.mkv" autocomplete="off" spellcheck="false">' +
+                '</div>' +
+                '<div class="vimp-modal-foot">' +
+                    '<button class="vimp-btn vimp-btn--ghost" type="button" data-vimp-add-close>Cancel</button>' +
+                    '<button class="vimp-btn vimp-btn--place" type="button" data-vimp-add-confirm disabled>Add</button>' +
+                '</div>' +
+            '</div>';
+        document.body.appendChild(m);
+    }
+
+    function openAddFile() {
+        ensureAddModal();
+        var input = $('[data-vimp-add-path]');
+        if (input) { input.value = ''; input.focus(); }
+        var btn = $('[data-vimp-add-confirm]'); if (btn) { btn.disabled = true; btn.textContent = 'Add'; }
+    }
+
+    function closeAddFile() {
+        var m = $('[data-vimp-add-modal]');
+        if (m) m.remove();
+    }
+
+    function submitAddFile() {
+        var input = $('[data-vimp-add-path]');
+        var path = input ? input.value.trim() : '';
+        if (!path) return;
+        var btn = $('[data-vimp-add-confirm]'); if (btn) { btn.disabled = true; btn.textContent = 'Adding…'; }
+        fetch('/api/video/import/add', {
+            method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ path: path }),
+        }).then(function (r) { return r.json().catch(function () { return null; }); })
+            .then(function (d) {
+                if (d && d.success) {
+                    toast(d.already ? 'Already queued for placement' : 'Added — place it below', 'success');
+                    closeAddFile();
+                    load();
+                } else {
+                    toast((d && d.error) || 'Couldn’t add that file', 'error');
+                    if (btn) { btn.disabled = false; btn.textContent = 'Add'; }
+                }
+            })
+            .catch(function () { toast('Couldn’t add that file', 'error');
+                if (btn) { btn.disabled = false; btn.textContent = 'Add'; } });
+    }
+
     // ── resolve modal ─────────────────────────────────────────────────────────
     function openResolve(item) {
         state.resolve = {
@@ -434,15 +498,28 @@
         if (grid) grid.addEventListener('click', onGridClick);
         var refresh = $('[data-vimp-refresh]');
         if (refresh) refresh.addEventListener('click', load);
-        // The resolve modal is created on demand; delegate from the document.
+        var addBtn = $('[data-vimp-add]');
+        if (addBtn) addBtn.addEventListener('click', openAddFile);
+        // The resolve + add-file modals are created on demand; delegate from the document.
         document.addEventListener('click', function (e) {
             if (state.resolve && e.target.closest('[data-vimp-modal]')) {
                 if (e.target.closest('[data-vimp-confirm]')) { place(); return; }
                 onModalClick(e);
             }
+            if (e.target.closest('[data-vimp-add-modal]')) {
+                if (e.target.closest('[data-vimp-add-close]')) { closeAddFile(); return; }
+                if (e.target.closest('[data-vimp-add-confirm]')) { submitAddFile(); return; }
+            }
         });
         document.addEventListener('input', function (e) {
             if (state.resolve && e.target.closest('[data-vimp-modal]')) onModalInput(e);
+            if (e.target.matches('[data-vimp-add-path]')) {
+                var btn = $('[data-vimp-add-confirm]');
+                if (btn) btn.disabled = !e.target.value.trim();
+            }
+        });
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' && e.target.matches('[data-vimp-add-path]') && e.target.value.trim()) submitAddFile();
         });
         document.addEventListener('soulsync:video-page-shown', onShown);
         if (isShown()) onShown({ detail: PAGE_ID });

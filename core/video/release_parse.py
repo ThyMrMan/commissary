@@ -159,6 +159,11 @@ _META_BOUNDARY = re.compile(
     r"|x264|x265|h\.?264|h\.?265|hevc|avc|av1"
     r"|s\d{1,3}(?:e\d{1,3})?|season)\b", re.I)
 _ARTICLE = re.compile(r"^(?:the|a|an)\s+")
+# A leading fansub/release-group tag ('[SubsPlease] ...', '[Erai-raws] ...').
+_LEADING_GROUP_TAG = re.compile(r"^\s*\[[^\]]{1,40}\]\s*")
+# A bare episode number glued onto the title with a dash ('Title - 40', '- 0523v2') —
+# the fansub convention for absolute numbering, not part of the title itself.
+_TRAILING_EP_NUM = re.compile(r"[-_]\s*\d{1,4}(?:v\d+)?\s*(?=[\[(]|$)")
 # Trailing words that are an edition of the SAME film, not a different title.
 _EDITION_TOKENS = frozenset({
     "extended", "remastered", "remaster", "unrated", "uncut", "directors", "director",
@@ -246,7 +251,16 @@ def titles_match(release_name: Any, want_title: Any) -> bool:
     SEGMENT is tried as a title candidate, not just the whole string. An
     unknown/unisolable title passes (the year gate still applies) so a numeric
     title like '2012' is never falsely rejected — we only ever REJECT on a
-    confident mismatch against every acceptable title, never guess a match."""
+    confident mismatch against every acceptable title, never guess a match.
+
+    Fansub releases ('[SubsPlease] One Piece - 1071 (1080p)') hide the real title
+    behind a leading release-group tag AND glue the absolute episode number onto
+    it with a bare dash — neither of which extract_title's year/quality-boundary
+    cut accounts for, so 'subsplease one piece 1071' never matches 'one piece'.
+    Every candidate that HAS such a tag gets a second try with the tag and the
+    glued-on episode number stripped; candidates without one are untouched, so
+    ordinary scene names (including ones that legitimately end in a number, like
+    'Moana 2') can't be affected."""
     wants = acceptable_titles(want_title)
     if not wants:
         return True
@@ -255,6 +269,13 @@ def titles_match(release_name: Any, want_title: Any) -> bool:
     segs = [s for s in re.split(r"[\\/]+", raw) if s.strip()]
     if len(segs) > 1:
         cands += segs
+    fansub_cands = []
+    for c in cands:
+        tagless = _LEADING_GROUP_TAG.sub("", c, count=1)
+        if tagless != c:
+            fansub_cands.append(tagless)
+            fansub_cands.append(_TRAILING_EP_NUM.sub("", tagless))
+    cands += [c for c in fansub_cands if c not in cands]
     saw_any = False
     for cand in cands:
         got = normalize_title(extract_title(cand))

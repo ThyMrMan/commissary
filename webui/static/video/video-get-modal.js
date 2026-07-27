@@ -109,8 +109,11 @@
 
     // ── wishlist / watchlist writes ───────────────────────────────────────────
     function postJSON(url, body) {
+        // Parse the body even on a non-2xx status — the backend's {ok:false, error:'…'}
+        // detail lives there too; discarding it on !r.ok left every failure toast
+        // showing the generic fallback text instead of the real reason.
         return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body) }).then(function (r) { return r.ok ? r.json() : null; });
+            body: JSON.stringify(body) }).then(function (r) { return r.json().catch(function () { return null; }); });
     }
     // Build the wishlist payload from the modal's selection and POST it; for a
     // show, optionally also follow it (the "Add to watchlist" tick).

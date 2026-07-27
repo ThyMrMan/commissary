@@ -80,6 +80,52 @@ def test_place_triggers_a_library_refresh(env):
         download_events._reset_for_tests()
 
 
+# ── /import/add: manual placement isn't gated on a prior failed download ──────
+
+def test_add_queues_an_arbitrary_file_with_no_prior_download(env, tmp_path):
+    stray = tmp_path / "some.other.movie.2020.1080p.mkv"
+    stray.write_bytes(b"y" * 2048)
+    r = env["client"].post("/api/video/import/add", json={"path": str(stray)}).get_json()
+    assert r["success"] and r["id"]
+    items = env["client"].get("/api/video/import/failed").get_json()["items"]
+    assert {i["file"] for i in items} == {str(env["src"]), str(stray)}
+    added = next(i for i in items if i["file"] == str(stray))
+    assert "manual" in added["reason"].lower() or "manual" in (added.get("source") or "")
+
+
+def test_add_is_idempotent_for_the_same_path(env, tmp_path):
+    stray = tmp_path / "dupe.2020.1080p.mkv"
+    stray.write_bytes(b"z" * 1024)
+    r1 = env["client"].post("/api/video/import/add", json={"path": str(stray)}).get_json()
+    r2 = env["client"].post("/api/video/import/add", json={"path": str(stray)}).get_json()
+    assert r1["id"] == r2["id"] and r2.get("already") is True
+    items = env["client"].get("/api/video/import/failed").get_json()["items"]
+    assert len([i for i in items if i["file"] == str(stray)]) == 1
+
+
+def test_add_rejects_missing_or_non_video_paths(env, tmp_path):
+    r = env["client"].post("/api/video/import/add", json={"path": str(tmp_path / "nope.mkv")})
+    assert r.status_code == 404
+    txt = tmp_path / "notes.txt"
+    txt.write_text("hi")
+    r2 = env["client"].post("/api/video/import/add", json={"path": str(txt)})
+    assert r2.status_code == 400
+    r3 = env["client"].post("/api/video/import/add", json={})
+    assert r3.status_code == 400
+
+
+def test_added_file_places_the_same_way_and_never_deletes_the_users_original(env, tmp_path):
+    stray = tmp_path / "manual.pickup.2020.1080p.mkv"
+    stray.write_bytes(b"w" * 8192)
+    r = env["client"].post("/api/video/import/add", json={"path": str(stray)}).get_json()
+    place = env["client"].post("/api/video/import/%d/place" % r["id"],
+                               json={"scope": "movie", "title": "Manual Pickup", "year": 2020}).get_json()
+    assert place["success"] and place["status"] == "completed"
+    final_dir = env["movies"] / "Manual Pickup (2020)"
+    assert final_dir.is_dir() and any(final_dir.iterdir())
+    assert stray.exists()          # the user's own file — copy mode must not reclaim it
+
+
 def test_media_ids_resolves_tmdb_and_library_regrabs():
     from core.video.download_monitor import _media_ids
     # grabbed straight from TMDB → media_id is the tmdb id

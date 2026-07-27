@@ -10,6 +10,11 @@ import pytest
 
 from database.video_database import VideoDatabase
 
+from pathlib import Path as _P
+
+_ROOT = _P(__file__).resolve().parent.parent
+_VDH_JS = (_ROOT / "webui" / "static" / "video" / "video-download-history.js").read_text(encoding="utf-8")
+
 
 @pytest.fixture()
 def db(tmp_path):
@@ -62,6 +67,77 @@ def test_history_tabs_classify_real_episode_and_youtube_kinds(db):
     assert kinds("show") == ["episode"]      # TV tab now catches kind='episode'
     assert kinds("youtube") == ["youtube"]   # YouTube gets its own tab
     assert len(db.query_download_history(kind=None)["items"]) == 3   # 'All'
+
+
+def _add_library(db, *, path, kind="show", category=None, server="plex"):
+    conn = db._get_connection()
+    cur = conn.execute(
+        "INSERT INTO root_folders (path, content_kind, server, category) VALUES (?,?,?,?)",
+        (str(path), kind, server, category))
+    rid = cur.lastrowid
+    conn.commit(); conn.close()
+    return rid
+
+
+def test_root_folder_id_filter_scopes_to_one_configured_library(db, tmp_path):
+    # the reported gap: the History filter only knew Movies/TV/YouTube, never a
+    # SPECIFIC configured Library (e.g. an Anime library that's also kind='show')
+    anime_lib = _add_library(db, path=str(tmp_path / "anime"))
+    tv_lib = _add_library(db, path=str(tmp_path / "tv"))
+    db.record_download_history(_episode(id=2, kind="episode",
+                                        dest_path=str(tmp_path / "anime" / "Show" / "S01E01.mkv")))
+    db.record_download_history(_episode(id=3, kind="episode", title="Other Show",
+                                        dest_path=str(tmp_path / "tv" / "Other" / "S01E01.mkv")))
+    anime_items = db.query_download_history(root_folder_id=anime_lib)["items"]
+    assert [i["title"] for i in anime_items] == ["Severance"]
+    tv_items = db.query_download_history(root_folder_id=tv_lib)["items"]
+    assert [i["title"] for i in tv_items] == ["Other Show"]
+
+
+def test_root_folder_id_composes_with_kind_and_search(db, tmp_path):
+    anime_lib = _add_library(db, path=str(tmp_path / "anime"))
+    db.record_download_history(_movie(id=1, dest_path=str(tmp_path / "anime" / "movie.mkv")))
+    db.record_download_history(_episode(id=2, kind="episode",
+                                        dest_path=str(tmp_path / "anime" / "Show" / "S01E01.mkv")))
+    scoped_shows = db.query_download_history(kind="show", root_folder_id=anime_lib)["items"]
+    assert [i["kind"] for i in scoped_shows] == ["episode"]
+    scoped_search = db.query_download_history(root_folder_id=anime_lib, search="Severance")["items"]
+    assert len(scoped_search) == 1
+
+
+def test_root_folder_id_for_unknown_library_matches_nothing(db, tmp_path):
+    db.record_download_history(_movie())
+    assert db.query_download_history(root_folder_id=999999)["items"] == []
+
+
+def test_root_folder_id_none_is_a_no_op(db):
+    db.record_download_history(_movie())
+    db.record_download_history(_episode(kind="episode"))
+    assert len(db.query_download_history(root_folder_id=None)["items"]) == 2
+
+
+def test_api_passes_root_folder_id_through(tmp_path):
+    import api.video as videoapi
+    from flask import Flask
+    db = VideoDatabase(database_path=str(tmp_path / "video_library.db"))
+    anime_lib = _add_library(db, path=str(tmp_path / "anime"))
+    db.record_download_history(_episode(dest_path=str(tmp_path / "anime" / "Show" / "S01E01.mkv")))
+    db.record_download_history(_episode(id=3, title="Other", dest_path=str(tmp_path / "other" / "x.mkv")))
+    videoapi._video_db = db
+    try:
+        app = Flask(__name__)
+        app.register_blueprint(videoapi.create_video_blueprint(), url_prefix="/api/video")
+        c = app.test_client()
+        out = c.get("/api/video/downloads/history?root_folder_id=%d" % anime_lib).get_json()
+        assert [i["title"] for i in out["items"]] == ["Severance"]
+    finally:
+        videoapi._video_db = None
+
+
+def test_js_wires_the_library_filter():
+    assert "data-vdh-lib" in _VDH_JS
+    assert "root_folder_id" in _VDH_JS
+    assert "/api/video/libraries" in _VDH_JS
 
 
 def test_records_a_completed_movie_with_parsed_quality(db):

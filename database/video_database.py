@@ -518,13 +518,18 @@ class VideoDatabase:
         can enrich BY ID instead of re-searching by title.
 
         ``priority`` ('movie'/'show') pins a kind to be processed first across the
-        queue — drives the modal's 'Process first everywhere' control."""
+        queue; a compound 'movie:<root_folder_id>'/'show:<root_folder_id>' also
+        prefers one configured Library WITHIN that kind before the rest of it (e.g.
+        an Anime library's shows ahead of the rest of the show queue) — drives the
+        modal's 'Process first everywhere' control."""
         kinds = _ENRICH.get(service)
         if not kinds:
             return None
         items = list(kinds.items())
-        if priority in kinds:
-            items.sort(key=lambda kv: 0 if kv[0] == priority else 1)
+        priority_kind, _, priority_root = str(priority or "").partition(":")
+        priority_root = int(priority_root) if priority_root.isdigit() else None
+        if priority_kind in kinds:
+            items.sort(key=lambda kv: 0 if kv[0] == priority_kind else 1)
         cutoff = (datetime.now(timezone.utc) - timedelta(days=retry_days)).strftime("%Y-%m-%d %H:%M:%S")
         conn = self._get_connection()
 
@@ -534,11 +539,26 @@ class VideoDatabase:
 
         try:
             for kind, (tbl, idc, sc, _ac) in items:
+                if priority_root and kind == priority_kind:
+                    row = conn.execute(
+                        f"SELECT id, title, year, {idc} FROM {tbl} "
+                        f"WHERE {sc} IS NULL AND root_folder_id=? ORDER BY id LIMIT 1",
+                        (priority_root,)).fetchone()
+                    if row:
+                        return _row(row, kind, idc)
                 row = conn.execute(
                     f"SELECT id, title, year, {idc} FROM {tbl} WHERE {sc} IS NULL ORDER BY id LIMIT 1").fetchone()
                 if row:
                     return _row(row, kind, idc)
             for kind, (tbl, idc, sc, ac) in items:
+                if priority_root and kind == priority_kind:
+                    row = conn.execute(
+                        f"SELECT id, title, year, {idc} FROM {tbl} "
+                        f"WHERE {sc} IN ('not_found','error') AND root_folder_id=? "
+                        f"AND ({ac} IS NULL OR {ac} < ?) ORDER BY {ac} LIMIT 1",
+                        (priority_root, cutoff)).fetchone()
+                    if row:
+                        return _row(row, kind, idc)
                 row = conn.execute(
                     f"SELECT id, title, year, {idc} FROM {tbl} "
                     f"WHERE {sc} IN ('not_found','error') "
@@ -2276,9 +2296,13 @@ class VideoDatabase:
             conn.close()
 
     def query_download_history(self, *, kind=None, search=None, outcome=None,
-                               page=1, limit=40) -> dict:
+                               root_folder_id=None, page=1, limit=40) -> dict:
         """Paged history slice for the modal. ``kind`` ∈ movie|show (None=all);
-        ``outcome`` filters by result. Newest first. {items, pagination}."""
+        ``outcome`` filters by result. ``root_folder_id`` scopes to one configured
+        Library (its ``dest_path`` prefix — the only place a placed download
+        remembers where it landed; history rows predate root_folder_id and were
+        never tied to a specific Library the way movies/shows rows are). Newest
+        first. {items, pagination}."""
         try:
             page = max(1, int(page or 1)); limit = max(1, min(200, int(limit or 40)))
         except (TypeError, ValueError):
@@ -2297,6 +2321,15 @@ class VideoDatabase:
             where.append(_yt)
         if outcome:
             where.append("outcome = ?"); args.append(outcome)
+        if root_folder_id:
+            root = self.get_root_folder(root_folder_id)
+            root_path = str((root or {}).get("path") or "").strip()
+            if root_path:
+                norm = root_path.replace("\\", "/").rstrip("/") + "/"
+                where.append("REPLACE(COALESCE(dest_path, ''), '\\', '/') LIKE ? ESCAPE '\\' COLLATE NOCASE")
+                args.append(norm.replace("%", "\\%").replace("_", "\\_") + "%")
+            else:
+                where.append("0")   # unknown/unset Library path → match nothing, not everything
         s = (search or "").strip()
         if s:
             where.append("(title LIKE ? OR release_title LIKE ?) COLLATE NOCASE")
@@ -2824,6 +2857,27 @@ class VideoDatabase:
             def scalar(sql: str, params=()):
                 return conn.execute(sql, params).fetchone()[0]
 
+            # Per-Library breakdown — the fixed movies/shows totals above sum EVERY
+            # configured Library of that kind into one number, so a second Library
+            # (an Anime library alongside the standard one, say) had no way to show
+            # its own count. Only surfaced for a kind that actually has more than
+            # one configured Library — a single-library install (the common case)
+            # gets nothing extra here.
+            lib_rows = [r for r in self.all_library_rows() if r.get("content_kind") in ("movie", "show")]
+            movie_libs = [r for r in lib_rows if r["content_kind"] == "movie"]
+            show_libs = [r for r in lib_rows if r["content_kind"] == "show"]
+            by_library = []
+            for r in ((movie_libs if len(movie_libs) > 1 else []) +
+                      (show_libs if len(show_libs) > 1 else [])):
+                tbl = "movies" if r["content_kind"] == "movie" else "shows"
+                where = "root_folder_id=?" + (" AND server_source=?" if server_source else "")
+                params = (r["id"],) + (sv if server_source else ())
+                by_library.append({
+                    "id": r["id"], "kind": r["content_kind"],
+                    "label": r.get("label") or r.get("server_title") or "Library",
+                    "count": scalar(f"SELECT COUNT(*) FROM {tbl} WHERE {where}", params),
+                })
+
             return {
                 "library": {
                     "movies": scalar("SELECT COUNT(*) FROM movies" + mw, sv),
@@ -2831,6 +2885,7 @@ class VideoDatabase:
                     "episodes": scalar(
                         "SELECT COUNT(*) FROM episodes e JOIN shows s ON s.id=e.show_id" + sw, sv),
                     "size_bytes": scalar(size_sql, (sv + sv) if server_source else ()),
+                    "by_library": by_library,
                 },
                 "downloads": {
                     "active": scalar(
@@ -6171,11 +6226,16 @@ class VideoDatabase:
         finally:
             conn.close()
 
-    def query_wishlist(self, kind: str, *, search=None, sort="added", page=1, limit=60) -> dict:
+    def query_wishlist(self, kind: str, *, search=None, sort="added", page=1, limit=60,
+                       root_folder_id=None) -> dict:
         """One paged slice of the wishlist. kind='movie' → movie cards; kind='show'
         → shows grouped show→season→episode with wanted/done roll-ups. ``sort`` ∈
-        added | title | wanted (wanted = most episodes, shows only). {items,
-        pagination} like the other paged queries."""
+        added | title | wanted (wanted = most episodes, shows only). ``root_folder_id``
+        scopes to one configured Library (e.g. Anime, not just the movie/show kind
+        split) — matched via ``library_id``, the FK to the movie's/show's own row,
+        so a title wished before it's linked to any Library (``library_id`` unset)
+        won't appear under a specific Library filter, same as the Library page's
+        per-Library tabs. {items, pagination} like the other paged queries."""
         try:
             page = max(1, int(page or 1))
             limit = max(1, min(200, int(limit or 60)))
@@ -6188,6 +6248,9 @@ class VideoDatabase:
                 where, args = ["kind='movie'"], []
                 if s:
                     where.append("title LIKE ? COLLATE NOCASE"); args.append("%" + s + "%")
+                if root_folder_id:
+                    where.append("library_id IN (SELECT id FROM movies WHERE root_folder_id = ?)")
+                    args.append(root_folder_id)
                 wsql = " WHERE " + " AND ".join(where)
                 order = {"title": "title COLLATE NOCASE", "oldest": "date_added ASC, id ASC",
                          "added": "date_added DESC, id DESC"}.get(sort, "date_added DESC, id DESC")
@@ -6206,6 +6269,9 @@ class VideoDatabase:
                 where, args = ["kind='episode'"], []
                 if s:
                     where.append("title LIKE ? COLLATE NOCASE"); args.append("%" + s + "%")
+                if root_folder_id:
+                    where.append("library_id IN (SELECT id FROM shows WHERE root_folder_id = ?)")
+                    args.append(root_folder_id)
                 wsql = " WHERE " + " AND ".join(where)
                 total = conn.execute(
                     "SELECT COUNT(DISTINCT tmdb_id) c FROM video_wishlist" + wsql, args).fetchone()["c"]
@@ -7635,7 +7701,8 @@ class VideoDatabase:
     # ── paged/filtered/sorted library query (server-side, like music) ─────────
     def query_library(self, kind: str, *, search=None, letter=None, sort="title",
                       status="all", genre=None, resolution=None, page=1, limit=75,
-                      server_source=None, root_folder_id=None, include_unassigned=False) -> dict:
+                      server_source=None, root_folder_id=None, include_unassigned=False,
+                      air_status=None) -> dict:
         """One page of movies/shows with search + A–Z + sort + owned/wanted/
         watched + genre filtering done in SQL. Scoped to ``server_source`` (the
         active video server) so Plex and Jellyfin libraries never commingle —
@@ -7650,6 +7717,10 @@ class VideoDatabase:
         Library page); ``include_unassigned`` additionally pulls in items
         scanned before that column was populated (used for the PRIMARY
         library's tab only, so nothing vanishes post-upgrade until a rescan).
+        ``air_status`` (shows only) buckets TMDB's free-text ``status``
+        ('Returning Series', 'Ended', 'Canceled', 'In Production', ...) into
+        airing | ended | upcoming — the same buckets the poster badge already
+        shows, so the filter never disagrees with what's on screen.
         Returns {items, total_size_bytes, pagination:{...}}."""
         try:
             page = max(1, int(page or 1))
@@ -7714,6 +7785,15 @@ class VideoDatabase:
             elif status == "unwatched":
                 where.append("COALESCE(s.watched_episodes, 0) = 0 AND "
                              "EXISTS (SELECT 1 FROM episodes e WHERE e.show_id=s.id AND e.has_file=1)")
+            if air_status in ("airing", "ended", "upcoming"):
+                buckets = {
+                    "airing": ("continu", "return", "air"),
+                    "ended": ("end", "cancel"),
+                    "upcoming": ("upcoming", "production", "planned"),
+                }[air_status]
+                where.append("(" + " OR ".join(
+                    "LOWER(COALESCE(s.status, '')) LIKE ?" for _ in buckets) + ")")
+                params += ["%" + b + "%" for b in buckets]
         where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
         title_key = f"COALESCE({alias}.sort_title, {alias}.title) COLLATE NOCASE ASC"

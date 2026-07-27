@@ -184,7 +184,7 @@ def test_wishlist_view_is_wanted_but_missing(db):
 
 def test_dashboard_stats_empty_is_all_zero(db):
     s = db.dashboard_stats()
-    assert s["library"] == {"movies": 0, "shows": 0, "episodes": 0, "size_bytes": 0}
+    assert s["library"] == {"movies": 0, "shows": 0, "episodes": 0, "size_bytes": 0, "by_library": []}
     assert s["downloads"] == {"active": 0, "finished": 0, "speed_bps": 0}
     assert s["watchlist"] == 0 and s["wishlist"] == 0
 
@@ -202,10 +202,48 @@ def test_dashboard_stats_counts_content_and_downloads(db):
                      "VALUES (1,'d','downloading',500)")
         conn.commit()
     s = db.dashboard_stats()
-    assert s["library"] == {"movies": 1, "shows": 1, "episodes": 1, "size_bytes": 1000}
+    assert s["library"] == {"movies": 1, "shows": 1, "episodes": 1, "size_bytes": 1000, "by_library": []}
     assert s["downloads"]["active"] == 1 and s["downloads"]["speed_bps"] == 500
     # watchlist = the airing show (curated default); wishlist is cleared for now
     assert s["watchlist"] == 1 and s["wishlist"] == 0
+
+
+def test_dashboard_stats_by_library_only_appears_with_more_than_one_library_per_kind(db):
+    # a single configured movie library + single show library → no breakdown at all,
+    # same as an install with no Libraries configured (nothing extra to show)
+    solo_movie = _add_root_folder(db, path="/media/movies", kind="movie", label="Movies")
+    solo_show = _add_root_folder(db, path="/media/tv", kind="show", label="TV")
+    mid = db.upsert_movie("plex", {"server_id": "m1", "title": "A"})
+    sid = db.upsert_show_tree("plex", {"server_id": "s1", "title": "B"})
+    with db.connect() as conn:
+        conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (solo_movie, mid))
+        conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (solo_show, sid))
+        conn.commit()
+    assert db.dashboard_stats()["library"]["by_library"] == []
+
+    # a SECOND show library (Anime) → now shows break out per-library; movies still don't
+    anime = _add_root_folder(db, path="/media/anime", kind="show", label="Anime")
+    aid = db.upsert_show_tree("plex", {"server_id": "s2", "title": "Anime Show"})
+    with db.connect() as conn:
+        conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (anime, aid))
+        conn.commit()
+    by_lib = db.dashboard_stats()["library"]["by_library"]
+    labels = {e["label"]: e["count"] for e in by_lib}
+    assert labels == {"TV": 1, "Anime": 1}
+    assert all(e["kind"] == "show" for e in by_lib)   # movies untouched — still solo
+
+
+def test_dashboard_stats_by_library_scoped_to_server_source(db):
+    plex_lib = _add_root_folder(db, path="/media/plex-anime", kind="show", label="Plex Anime")
+    _add_root_folder(db, path="/media/plex-tv", kind="show", label="Plex TV")
+    sid = db.upsert_show_tree("plex", {"server_id": "s1", "title": "On Plex"})
+    with db.connect() as conn:
+        conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (plex_lib, sid))
+        conn.commit()
+    by_plex = {e["label"]: e["count"] for e in db.dashboard_stats("plex")["library"]["by_library"]}
+    assert by_plex["Plex Anime"] == 1
+    by_jf = {e["label"]: e["count"] for e in db.dashboard_stats("jellyfin")["library"]["by_library"]}
+    assert by_jf["Plex Anime"] == 0   # scoped away — the show is on plex, not jellyfin
 
 
 def test_library_selection_roundtrip(db):
@@ -683,6 +721,73 @@ def test_enrichment_next_pending_then_none_when_fresh(db):
     db.enrichment_apply("tmdb", "movie", nxt2["id"], matched=False)
     # both attempted; not_found is fresh (<30d) so nothing is due
     assert db.enrichment_next("tmdb") is None
+
+
+def _add_root_folder(db, *, path, kind="movie", label=None):
+    conn = db._get_connection()
+    cur = conn.execute(
+        "INSERT INTO root_folders (path, content_kind, server, label) VALUES (?,?,?,?)",
+        (str(path), kind, "plex", label))
+    rid = cur.lastrowid
+    conn.commit(); conn.close()
+    return rid
+
+
+def test_enrichment_next_library_scoped_priority_prefers_that_library_first(db):
+    anime = _add_root_folder(db, path="/media/anime", kind="show", label="Anime")
+    standard = _add_root_folder(db, path="/media/tv", kind="show", label="TV")
+    show_a = db.upsert_show_tree("plex", {"server_id": "s1", "title": "Standard Show"})
+    show_b = db.upsert_show_tree("plex", {"server_id": "s2", "title": "Anime Show"})
+    conn = db._get_connection()
+    conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (standard, show_a))
+    conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (anime, show_b))
+    conn.commit(); conn.close()
+    # no priority: whichever the plain 'id' order picks (Standard Show, added first)
+    assert db.enrichment_next("tmdb", priority=None)["title"] == "Standard Show"
+    # library-scoped priority: the Anime library's show comes first despite id order
+    nxt = db.enrichment_next("tmdb", priority="show:%d" % anime)
+    assert nxt["title"] == "Anime Show" and nxt["kind"] == "show"
+
+
+def test_enrichment_next_library_scoped_priority_falls_through_when_library_empty(db):
+    anime = _add_root_folder(db, path="/media/anime", kind="show", label="Anime")
+    db.upsert_show_tree("plex", {"server_id": "s1", "title": "Standard Show"})   # no root_folder_id
+    nxt = db.enrichment_next("tmdb", priority="show:%d" % anime)
+    assert nxt["title"] == "Standard Show"   # nothing in the pinned library → falls through
+
+
+def test_enrichment_next_bare_kind_priority_still_works_unscoped(db):
+    db.upsert_movie("plex", {"server_id": "m1", "title": "A Movie"})
+    db.upsert_show_tree("plex", {"server_id": "s1", "title": "A Show"})
+    assert db.enrichment_next("tmdb", priority="show")["kind"] == "show"
+    assert db.enrichment_next("tmdb", priority="movie")["kind"] == "movie"
+
+
+def test_enrichment_priority_endpoint_accepts_and_validates_library_scope(tmp_path):
+    import api.video as videoapi
+    from flask import Flask
+    db = VideoDatabase(database_path=str(tmp_path / "video_library.db"))
+    show_lib = _add_root_folder(db, path="/media/anime", kind="show", label="Anime")
+    movie_lib = _add_root_folder(db, path="/media/movies", kind="movie", label="Main")
+    videoapi._video_db = db
+    try:
+        app = Flask(__name__)
+        app.register_blueprint(videoapi.create_video_blueprint(), url_prefix="/api/video")
+        c = app.test_client()
+        ok = c.post("/api/video/enrichment/priority", json={"priority": "show:%d" % show_lib})
+        assert ok.get_json()["success"] is True
+        assert c.get("/api/video/enrichment/priority").get_json()["priority"] == "show:%d" % show_lib
+        # a movie-kind library id can't be used with the 'show' prefix
+        bad = c.post("/api/video/enrichment/priority", json={"priority": "show:%d" % movie_lib})
+        assert bad.status_code == 400
+        # an unknown library id
+        bad2 = c.post("/api/video/enrichment/priority", json={"priority": "show:99999"})
+        assert bad2.status_code == 400
+        # still accepts the plain bare-kind + auto forms
+        assert c.post("/api/video/enrichment/priority", json={"priority": "movie"}).get_json()["success"]
+        assert c.post("/api/video/enrichment/priority", json={"priority": ""}).get_json()["success"]
+    finally:
+        videoapi._video_db = None
 
 
 def test_enrichment_apply_matched_sets_id_status_and_metadata(db):

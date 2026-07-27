@@ -5,8 +5,14 @@ the file left on disk (``dest_path`` points at it). The Import page surfaces the
 lets the user place them by hand:
 
   GET  /api/video/import/failed          → the queue of unplaced downloads
+  POST /api/video/import/add             → queue an arbitrary on-disk file for placement
   POST /api/video/import/<id>/place      → force-import to the user's chosen identity
   POST /api/video/import/<id>/dismiss    → drop the row (optionally delete the file)
+
+``add`` exists so manual placement isn't gated on SoulSync having failed a download
+first — a file that was never grabbed through SoulSync at all (moved in by hand, left
+over from another tool) gets the exact same ``import_failed`` row shape and rides the
+same queue/place/dismiss UI, no separate code path.
 
 The identity picker on the page reuses the existing /api/video/search (TMDB, with a
 ``library_id`` annotation for owned titles) — no new search endpoint needed here.
@@ -78,6 +84,43 @@ def register_routes(bp):
         from . import get_video_db
         rows = get_video_db().get_import_failed_video_downloads()
         return jsonify({"success": True, "items": [_failed_view(r) for r in rows]})
+
+    @bp.route("/import/add", methods=["POST"])
+    def video_import_add():
+        """Queue an arbitrary on-disk video file for manual placement, with no
+        prior download/grab involved. Body: {path}. Idempotent — re-adding a path
+        already queued returns the existing row instead of duplicating it."""
+        from . import get_video_db
+        from core.video.importer import is_video
+
+        body = request.get_json(silent=True) or {}
+        path = str(body.get("path") or "").strip()
+        if not path:
+            return jsonify({"success": False, "error": "Enter a file path."}), 400
+        if not os.path.isfile(path):
+            return jsonify({"success": False, "error": "No file at that path."}), 404
+        if not is_video(path):
+            return jsonify({"success": False, "error": "Not a recognized video file."}), 400
+
+        db = get_video_db()
+        for row in db.get_import_failed_video_downloads():
+            if row.get("dest_path") == path:
+                return jsonify({"success": True, "id": row.get("id"), "already": True})
+
+        try:
+            size_bytes = os.path.getsize(path)
+        except OSError:
+            size_bytes = None
+        name = os.path.basename(path)
+        dl_id = db.add_video_download({
+            "kind": "movie", "title": name, "release_title": name, "source": "manual",
+            "filename": name, "size_bytes": size_bytes, "status": "downloading",
+            "candidates": "[]", "search_ctx": "{}", "tried_queries": "[]",
+            "tried_files": "[]", "attempts": 0,
+        })
+        db.update_video_download(dl_id, status="import_failed",
+                                  error="Added for manual placement", dest_path=path)
+        return jsonify({"success": True, "id": dl_id})
 
     @bp.route("/import/<int:dl_id>/place", methods=["POST"])
     def video_import_place(dl_id):

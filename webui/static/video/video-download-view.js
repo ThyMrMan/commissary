@@ -44,8 +44,12 @@
             .then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
     }
     function postJSON(url, body) {
+        // Parse the body even on a non-2xx status — the backend's {ok:false, error:'…'}
+        // detail lives there too; discarding it on !r.ok left every failure toast
+        // showing the generic fallback text instead of the real reason.
         return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-            body: JSON.stringify(body) }).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
+            body: JSON.stringify(body) }).then(function (r) { return r.json().catch(function () { return null; }); })
+            .catch(function () { return null; });
     }
 
     // Library picker (multi-library, P.4): which configured Library a grab's

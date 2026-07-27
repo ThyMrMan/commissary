@@ -374,9 +374,11 @@ def run_import(dl: dict, src_path: str, *, fs: Any, prober: Callable | None = No
                 (recycle or fs.remove)(plan["replace_path"])
             except Exception:   # noqa: BLE001 - failing to delete the old file isn't fatal
                 pass
-        # Copy mode reclaims the download copy UNLESS it's a torrent (keep seeding);
+        # Copy mode reclaims the download copy UNLESS it's a torrent (keep seeding) or a
+        # manually-added file (the user pointed at a file that's theirs, not a download
+        # client's temp copy — copying it into the library must never also delete it);
         # move mode already relocated it.
-        if not move_mode and str(dl.get("source") or "").lower() != "torrent":
+        if not move_mode and str(dl.get("source") or "").lower() not in ("torrent", "manual"):
             try:
                 fs.remove(src_path)
             except Exception:   # noqa: BLE001

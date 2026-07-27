@@ -83,6 +83,22 @@ def test_episode_release_matches_on_the_show_name():
     assert titles_match("Some.Other.Show.S02E03.1080p", "The Wire") is False
 
 
+def test_fansub_leading_group_tag_and_glued_episode_number_dont_poison_the_title():
+    # reported bug: '[SubsPlease] DIGIMON BEATBREAK - 40 [...]' was rejected as
+    # 'Wrong title (subsplease digimon beatbreak 40 — wanted digimon beatbreak)' —
+    # the bracketed group tag and the dash-glued episode number both leaked into
+    # the extracted title.
+    name = ("[SubsPlease] DIGIMON BEATBREAK - 40 [Web][MKV][h264][1080p][AAC 2.0]"
+            "[Softsubs (SubsPlease)][Episode 40]")
+    assert titles_match(name, "DIGIMON BEATBREAK") is True
+    # a real mismatch behind the same tag convention must still reject
+    assert titles_match("[SubsPlease] Naruto - 40 [1080p]", "One Piece") is False
+    # non-anime releases (no leading bracket tag) are completely unaffected —
+    # a number that's actually part of the title still isn't stripped
+    assert titles_match("Moana.2.2024.1080p.WEBRip", "Moana 2") is True
+    assert titles_match("Moana.2016.1080p.BluRay", "Moana 2") is False
+
+
 def test_alias_set_beats_false_negatives():
     # the 'beat Radarr' win: a release named by a KNOWN alias still matches
     # ('God Particle' is TMDB's alternative title for 'The Cloverfield Paradox').

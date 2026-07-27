@@ -10,7 +10,7 @@
     'use strict';
 
     var LIMIT = 40;
-    var state = { open: false, tab: 'all', search: '', page: 1, loading: false,
+    var state = { open: false, tab: 'all', search: '', rootFolderId: '', page: 1, loading: false,
                   counts: { movie: 0, show: 0, youtube: 0, total: 0 }, items: [], pages: 1 };
     var el = null, searchTimer = null;
 
@@ -70,6 +70,7 @@
                         '<button class="vdh-tab" type="button" data-vdh-tab="show">TV <span class="vdh-tab-n" data-vdh-c-show>0</span></button>' +
                         '<button class="vdh-tab" type="button" data-vdh-tab="youtube">YouTube <span class="vdh-tab-n" data-vdh-c-youtube>0</span></button>' +
                     '</div>' +
+                    '<select class="vdh-lib-select" data-vdh-lib hidden title="Library"></select>' +
                     '<div class="vdh-search">' +
                         '<svg class="vdh-search-ic" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>' +
                         '<input type="text" class="vdh-search-input" data-vdh-search placeholder="Search history…" autocomplete="off" spellcheck="false">' +
@@ -171,7 +172,37 @@
                 state.search = si.value.trim(); state.page = 1; load(false);
             }, 250);
         });
+        var libSel = el.querySelector('[data-vdh-lib]');
+        if (libSel) libSel.addEventListener('change', function () {
+            state.rootFolderId = libSel.value || ''; state.page = 1; load(false);
+        });
         return el;
+    }
+
+    // Every configured Library (movies + tv + youtube) flattened into one filter —
+    // 'TV' alone doesn't distinguish a standard TV library from a separate Anime
+    // one, so this is the only way to see just one Library's grabs. Hidden
+    // entirely when there's 0 or 1 Library configured (nothing to filter by).
+    var libsLoaded = false;
+    function loadLibraries() {
+        if (libsLoaded) return;
+        libsLoaded = true;
+        fetch('/api/video/libraries', { headers: { Accept: 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+                if (!d) return;
+                var all = [].concat(
+                    (d.movies || []).map(function (l) { return { id: l.id, label: 'Movies: ' + (l.label || l.server_title || '') }; }),
+                    (d.tv || []).map(function (l) { return { id: l.id, label: 'TV: ' + (l.label || l.server_title || '') }; }),
+                    (d.youtube || []).map(function (l) { return { id: l.id, label: 'YouTube: ' + (l.label || l.server_title || '') }; }));
+                var sel = el.querySelector('[data-vdh-lib]');
+                if (!sel || all.length < 2) return;
+                sel.innerHTML = '<option value="">All Libraries</option>' + all.map(function (l) {
+                    return '<option value="' + esc(l.id) + '">' + esc(l.label) + '</option>';
+                }).join('');
+                sel.hidden = false;
+            })
+            .catch(function () {});
     }
 
     function setTab(tab) {
@@ -288,6 +319,7 @@
         if (!append) body.classList.add('vdh-body--loading');
         var params = new URLSearchParams({ page: state.page, limit: LIMIT, search: state.search });
         if (state.tab !== 'all') params.set('kind', state.tab);
+        if (state.rootFolderId) params.set('root_folder_id', state.rootFolderId);
         fetch('/api/video/downloads/history?' + params.toString(), { headers: { Accept: 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {
@@ -313,6 +345,7 @@
         var si = el.querySelector('[data-vdh-search]'); if (si) si.value = '';
         el.classList.add('vdh-overlay--on');
         document.body.classList.add('vdh-locked');
+        loadLibraries();
         load(false);
     }
     function close() {

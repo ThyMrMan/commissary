@@ -103,9 +103,15 @@ def register_routes(bp):
             counts = db.wishlist_counts()
             kind = request.args.get("kind")
             if kind in _KINDS:
+                root_folder_id = request.args.get("root_folder_id")
+                try:
+                    root_folder_id = int(root_folder_id) if root_folder_id else None
+                except (TypeError, ValueError):
+                    root_folder_id = None
                 res = db.query_wishlist(
                     kind, search=request.args.get("search", ""), sort=request.args.get("sort", "added"),
-                    page=request.args.get("page", 1), limit=request.args.get("limit", 60))
+                    page=request.args.get("page", 1), limit=request.args.get("limit", 60),
+                    root_folder_id=root_folder_id)
                 _annotate_live_state(db, kind, res.get("items") or [])
                 return jsonify({"success": True, "kind": kind, "counts": counts, **res})
             return jsonify({"success": True, "counts": counts})

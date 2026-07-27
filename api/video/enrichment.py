@@ -214,13 +214,24 @@ def register_routes(bp):
 
     @bp.route("/enrichment/priority", methods=["GET", "POST"])
     def video_enrichment_priority():
+        """'Process first everywhere': movie|show pins a whole kind; a compound
+        'movie:<root_folder_id>'/'show:<root_folder_id>' pins one configured
+        Library within that kind (e.g. prioritize just an Anime library's shows).
+        '' = auto (no pin)."""
         from . import get_video_db
         db = get_video_db()
         if request.method == "POST":
             body = request.get_json(silent=True) or {}
-            kind = body.get("priority") or ""
-            if kind not in ("", "movie", "show"):
+            kind = str(body.get("priority") or "")
+            base, _, root_folder_id = kind.partition(":")
+            if base not in ("", "movie", "show"):
                 return jsonify({"error": "bad priority"}), 400
+            if root_folder_id:
+                if base == "" or not root_folder_id.isdigit():
+                    return jsonify({"error": "bad priority"}), 400
+                root = db.get_root_folder(int(root_folder_id))
+                if not root or root.get("content_kind") != base:
+                    return jsonify({"error": "unknown library"}), 400
             db.set_setting("enrichment_priority", kind)
             return jsonify({"success": True, "priority": kind})
         return jsonify({"priority": db.get_setting("enrichment_priority") or ""})

@@ -417,15 +417,23 @@ def register_routes(bp):
     @bp.route("/downloads/history", methods=["GET"])
     def video_downloads_history():
         """Paged permanent history of grabs (movies + episodes + YouTube). ?kind=
-        movie|show|youtube, ?search=, ?outcome=, ?page=, ?limit=. Always returns counts."""
+        movie|show|youtube, ?search=, ?outcome=, ?root_folder_id= (a configured
+        Library — e.g. Anime, not just the movie/show kind split), ?page=, ?limit=.
+        Always returns counts."""
         from . import get_video_db
         try:
             db = get_video_db()
             kind = request.args.get("kind")
+            root_folder_id = request.args.get("root_folder_id")
+            try:
+                root_folder_id = int(root_folder_id) if root_folder_id else None
+            except (TypeError, ValueError):
+                root_folder_id = None
             res = db.query_download_history(
                 kind=kind if kind in ("movie", "show", "youtube") else None,
                 search=request.args.get("search", ""),
                 outcome=request.args.get("outcome") or None,
+                root_folder_id=root_folder_id,
                 page=request.args.get("page", 1), limit=request.args.get("limit", 40))
             return jsonify({"success": True, "counts": db.download_history_counts(), **res})
         except Exception:

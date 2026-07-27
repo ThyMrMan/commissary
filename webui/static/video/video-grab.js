@@ -23,8 +23,11 @@
     'use strict';
 
     function postJSON(url, body) {
+        // Parse the body even on a non-2xx status — the backend's {ok:false, error:'…'}
+        // detail lives there too; discarding it on !r.ok left every failure falling
+        // back to the generic 'grab failed' text instead of the real reason.
         return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body) }).then(function (r) { return r.ok ? r.json() : null; })
+            body: JSON.stringify(body) }).then(function (r) { return r.json().catch(function () { return null; }); })
             .catch(function () { return null; });
     }
     function getJSON(url) {

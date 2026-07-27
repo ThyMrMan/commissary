@@ -473,14 +473,10 @@
                     <span class="nav-text">Requests</span>
                     <span class="dl-nav-badge hidden" data-video-requests-badge>0</span>
                 </a>
-                <!-- Import page hidden for now: on the video side the media server does
-                     the identification, so this only ever surfaced the rare download the
-                     auto-filer couldn't place. Route + video-import.js stay in place; just
-                     uncomment this nav entry to bring it back. -->
-                <!-- <a class="nav-button" data-video-page="video-import" href="/video-import">
+                <a class="nav-button" data-video-page="video-import" href="/video-import">
                     <span class="nav-icon"><svg class="nav-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/><polyline points="7 9 12 4 17 9"/><line x1="12" y1="4" x2="12" y2="16"/></svg></span>
                     <span class="nav-text">Import</span>
-                </a> -->
+                </a>
                 <button type="button" class="nav-section-label" data-section="video-system" onclick="toggleNavSection(this)">
                     <span class="nav-section-title">System</span>
                     <svg class="nav-section-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
@@ -837,7 +833,7 @@
                         <div class="dash-grid">
 
                             <!-- Recently Added -->
-                            <article class="dash-card" data-card="recent">
+                            <article class="dash-card dash-card--wide" data-card="recent">
                                 <header class="dash-card__head">
                                     <h3 class="dash-card__title">Recently Added</h3>
                                     <p class="dash-card__sub">The newest movies &amp; shows in your library.</p>
@@ -845,48 +841,6 @@
                                 <div class="dash-card__body">
                                     <div class="video-recent-grid" data-video-recent>
                                         <div class="video-recent-empty">Loading…</div>
-                                    </div>
-                                </div>
-                            </article>
-
-                            <!-- System Stats -->
-                            <article class="dash-card" data-card="stats">
-                                <header class="dash-card__head">
-                                    <h3 class="dash-card__title">System Stats</h3>
-                                    <p class="dash-card__sub">Live performance metrics.</p>
-                                </header>
-                                <div class="dash-card__body">
-                                    <div class="stats-grid-dashboard">
-                                        <div class="stat-card-dashboard">
-                                            <p class="stat-card-title">Active Downloads</p>
-                                            <p class="stat-card-value" data-video-stat="active-downloads">0</p>
-                                            <p class="stat-card-subtitle">Currently downloading</p>
-                                        </div>
-                                        <div class="stat-card-dashboard">
-                                            <p class="stat-card-title">Finished Downloads</p>
-                                            <p class="stat-card-value" data-video-stat="finished-downloads">0</p>
-                                            <p class="stat-card-subtitle">Completed this session</p>
-                                        </div>
-                                        <div class="stat-card-dashboard">
-                                            <p class="stat-card-title">Download Speed</p>
-                                            <p class="stat-card-value" data-video-stat="download-speed">0 KB/s</p>
-                                            <p class="stat-card-subtitle">Combined speed</p>
-                                        </div>
-                                        <div class="stat-card-dashboard">
-                                            <p class="stat-card-title">Disk Usage</p>
-                                            <p class="stat-card-value" data-video-stat="disk-usage">--</p>
-                                            <p class="stat-card-subtitle">Video library size</p>
-                                        </div>
-                                        <div class="stat-card-dashboard">
-                                            <p class="stat-card-title">System Uptime</p>
-                                            <p class="stat-card-value" data-video-stat="uptime">0m</p>
-                                            <p class="stat-card-subtitle">Application runtime</p>
-                                        </div>
-                                        <div class="stat-card-dashboard">
-                                            <p class="stat-card-title">Memory Usage</p>
-                                            <p class="stat-card-value" data-video-stat="memory">--</p>
-                                            <p class="stat-card-subtitle" data-video-stat="memory_note">Current usage</p>
-                                        </div>
                                     </div>
                                 </div>
                             </article>
@@ -919,7 +873,7 @@
                                                 </button>
                                             </div>
                                         </div>
-                                        <div class="library-status-stats">
+                                        <div class="library-status-stats" data-video-lib-stats>
                                             <div class="library-status-stat">
                                                 <div class="library-status-stat-icon">
                                                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/></svg>
@@ -962,19 +916,6 @@
                                             <div class="library-status-bar"><div class="library-status-bar-fill" data-video-dash-bar style="width: 0%;"></div></div>
                                             <div class="library-status-progress-detail" data-video-dash-detail>0 movies, 0 shows</div>
                                         </div>
-                                    </div>
-                                </div>
-                            </article>
-
-                            <!-- Upcoming (calendar preview) -->
-                            <article class="dash-card" data-card="upcoming">
-                                <header class="dash-card__head">
-                                    <h3 class="dash-card__title">Upcoming</h3>
-                                    <p class="dash-card__sub">Airing today for the shows you follow. <a class="dash-card__link" href="/video-calendar" data-video-goto="video-calendar">Open calendar →</a></p>
-                                </header>
-                                <div class="dash-card__body">
-                                    <div class="video-upcoming" data-video-upcoming>
-                                        <p class="video-empty-note">Loading…</p>
                                     </div>
                                 </div>
                             </article>
@@ -1032,7 +973,7 @@
                             <!-- Studios — Overlay + Collection combined (they share the enrichment
                                  metadata, so one card, one 'Metadata ready' widget). Each half is a
                                  whole clickable launcher; backgrounds are painted by video-dashboard.js. -->
-                            <article class="dash-card vst-combo" data-card="studios">
+                            <article class="dash-card dash-card--wide vst-combo" data-card="studios">
                                 <header class="dash-card__head dash-card__head--withaction dash-card__head--cov">
                                     <div class="dash-card__head-txt">
                                         <h3 class="dash-card__title">Studios</h3>
@@ -1061,6 +1002,61 @@
                                             <span class="vst-half-cta">Open Studio <span aria-hidden="true">&rarr;</span></span>
                                         </span>
                                     </button>
+                                </div>
+                            </article>
+
+                            <!-- Upcoming (calendar preview) -->
+                            <article class="dash-card dash-card--wide" data-card="upcoming">
+                                <header class="dash-card__head">
+                                    <h3 class="dash-card__title">Upcoming</h3>
+                                    <p class="dash-card__sub">Airing today for the shows you follow. <a class="dash-card__link" href="/video-calendar" data-video-goto="video-calendar">Open calendar →</a></p>
+                                </header>
+                                <div class="dash-card__body">
+                                    <div class="video-upcoming" data-video-upcoming>
+                                        <p class="video-empty-note">Loading…</p>
+                                    </div>
+                                </div>
+                            </article>
+
+                            <!-- System Stats -->
+                            <article class="dash-card" data-card="stats">
+                                <header class="dash-card__head">
+                                    <h3 class="dash-card__title">System Stats</h3>
+                                    <p class="dash-card__sub">Live performance metrics.</p>
+                                </header>
+                                <div class="dash-card__body">
+                                    <div class="stats-grid-dashboard">
+                                        <div class="stat-card-dashboard">
+                                            <p class="stat-card-title">Active Downloads</p>
+                                            <p class="stat-card-value" data-video-stat="active-downloads">0</p>
+                                            <p class="stat-card-subtitle">Currently downloading</p>
+                                        </div>
+                                        <div class="stat-card-dashboard">
+                                            <p class="stat-card-title">Finished Downloads</p>
+                                            <p class="stat-card-value" data-video-stat="finished-downloads">0</p>
+                                            <p class="stat-card-subtitle">Completed this session</p>
+                                        </div>
+                                        <div class="stat-card-dashboard">
+                                            <p class="stat-card-title">Download Speed</p>
+                                            <p class="stat-card-value" data-video-stat="download-speed">0 KB/s</p>
+                                            <p class="stat-card-subtitle">Combined speed</p>
+                                        </div>
+                                        <div class="stat-card-dashboard">
+                                            <p class="stat-card-title">Disk Usage</p>
+                                            <p class="stat-card-value" data-video-stat="disk-usage">--</p>
+                                            <p class="stat-card-subtitle">Video library size</p>
+                                        </div>
+                                        <div class="stat-card-dashboard">
+                                            <p class="stat-card-title">System Uptime</p>
+                                            <p class="stat-card-value" data-video-stat="uptime">0m</p>
+                                            <p class="stat-card-subtitle">Application runtime</p>
+                                        </div>
+                                        <div class="stat-card-dashboard">
+                                            <p class="stat-card-title">Memory Usage</p>
+                                            <p class="stat-card-value" data-video-stat="memory">--</p>
+                                            <p class="stat-card-subtitle" data-video-stat="memory_note">Current usage</p>
+                                        </div>
+                                    </div>
                                 </div>
                             </article>
 
@@ -1113,6 +1109,12 @@
                                         <option value="missing" hidden>Missing episodes</option>
                                         <option value="watched">Watched</option>
                                         <option value="unwatched">Unwatched</option>
+                                    </select>
+                                    <select class="library-source-filter-select" data-video-lib-airing title="Airing status" hidden>
+                                        <option value="">Any Status</option>
+                                        <option value="airing">Airing</option>
+                                        <option value="ended">Ended</option>
+                                        <option value="upcoming">Upcoming</option>
                                     </select>
                                     <select class="library-source-filter-select" data-video-lib-res title="Quality">
                                         <option value="">Any Quality</option>
@@ -1528,6 +1530,9 @@
                                 <option value="wanted">Most wanted</option>
                                 <option value="title">A&ndash;Z</option>
                             </select>
+                            <select class="vwsh-sort" data-vwsh-lib aria-label="Library" hidden>
+                                <option value="">All Libraries</option>
+                            </select>
                             <button class="vwsh-failing-filter" type="button" data-vwsh-failing hidden
                                     title="Show only items that keep failing to download — the fix-it hub: auto search, manual search or remove each one">
                                 &#9888; Failing <span class="vwsh-failing-n" data-vwsh-failing-n></span>
@@ -1572,7 +1577,10 @@
                                 <h1 class="vimp-title">Import <span class="vimp-count" data-vimp-count></span></h1>
                                 <p class="vimp-sub">Downloads that need a hand &mdash; place them by hand or dismiss</p>
                             </div>
-                            <button class="vimp-refresh" type="button" data-vimp-refresh>Refresh</button>
+                            <div class="vimp-head-actions">
+                                <button class="vimp-btn vimp-btn--place" type="button" data-vimp-add>+ Add file&hellip;</button>
+                                <button class="vimp-refresh" type="button" data-vimp-refresh>Refresh</button>
+                            </div>
                         </div>
                         <div class="vimp-body">
                             <div class="vimp-loading hidden" data-vimp-loading>
@@ -1583,7 +1591,7 @@
                             <div class="vimp-state hidden" data-vimp-empty>
                                 <div class="vimp-state-ic">&#10003;</div>
                                 <div class="vimp-state-title">Nothing needs attention</div>
-                                <div class="vimp-state-sub">Finished downloads that can't be auto-filed show up here for manual placement.</div>
+                                <div class="vimp-state-sub">Finished downloads that can't be auto-filed show up here for manual placement &mdash; or add any file on disk yourself with "Add file&hellip;" above.</div>
                             </div>
                         </div>
                     </div>

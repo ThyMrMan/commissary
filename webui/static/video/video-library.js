@@ -18,7 +18,7 @@
     // state.libs maps every rendered tab key -> its {kind (plural, the API
     // param), kindSingular, rootFolderId, label}, (re)built by buildTabs().
     var state = { tab: '', libs: {}, search: '', letter: 'all', sort: 'title',
-                  status: 'all', genre: '', resolution: '', page: 1, limit: 75, loaded: false,
+                  status: 'all', airStatus: '', genre: '', resolution: '', page: 1, limit: 75, loaded: false,
                   // Bulk select mode: id→true map (persists across pages), the
                   // open action popover, and the running-job poll timer.
                   selecting: false, selected: {}, bulkPop: null, bulkTimer: null };
@@ -246,6 +246,7 @@
             status: state.status, genre: state.genre, page: state.page, limit: state.limit });
         if (lib.rootFolderId) params.set('root_folder_id', lib.rootFolderId);
         if (state.resolution && kind === 'movie') params.set('resolution', state.resolution);
+        if (state.airStatus && kind === 'show') params.set('air_status', state.airStatus);
         fetch(LIBRARY_URL + '?' + params.toString(), { headers: { 'Accept': 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {
@@ -365,6 +366,14 @@
             resSel.style.display = lib.kindSingular === 'movie' ? '' : 'none';
             if (lib.kindSingular !== 'movie' && state.resolution) {
                 state.resolution = ''; resSel.value = '';
+            }
+        }
+        // airing/ended/upcoming is a show-lifecycle concept — movies have no TMDB status
+        var airingSel = $('[data-video-lib-airing]');
+        if (airingSel) {
+            airingSel.hidden = isCh || lib.kindSingular !== 'show';
+            if (lib.kindSingular !== 'show' && state.airStatus) {
+                state.airStatus = ''; airingSel.value = '';
             }
         }
         loadGenres();
@@ -687,6 +696,8 @@
         if (sort) sort.addEventListener('change', function () { state.sort = sort.value; reload(); });
         var status = $('[data-video-lib-status]');
         if (status) status.addEventListener('change', function () { state.status = status.value; reload(); });
+        var airingSel = $('[data-video-lib-airing]');
+        if (airingSel) airingSel.addEventListener('change', function () { state.airStatus = airingSel.value; reload(); });
         var genreSel = $('[data-video-lib-genre]');
         if (genreSel) genreSel.addEventListener('change', function () { state.genre = genreSel.value; reload(); });
         var resSel = $('[data-video-lib-res]');

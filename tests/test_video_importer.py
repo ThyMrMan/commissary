@@ -191,6 +191,15 @@ def test_run_import_keeps_torrent_source():
     assert "/dl/x/matrix.mkv" not in fs.removed      # torrent left seeding
 
 
+def test_run_import_keeps_manually_added_source():
+    # a manually-added file is the user's own copy, not a download client's temp
+    # file — copying it into the library must never delete their original
+    dl = _movie_dl("The Matrix 1999 1080p BluRay", source="manual")
+    fs = FakeFS()
+    importer.run_import(dl, "/dl/x/matrix.mkv", fs=fs)
+    assert "/dl/x/matrix.mkv" not in fs.removed
+
+
 def test_run_import_carries_subtitles_and_deletes_old_on_upgrade():
     dl = _movie_dl("The Matrix 1999 2160p BluRay")
     folder = os.path.join("/lib/movies", "The Matrix (1999)")
