@@ -111,6 +111,24 @@ def register_routes(bp):
         return jsonify({"ok": True, "added": max(0, after - before),
                         "total": after, "before": before})
 
+    @bp.route("/detail/show/<int:show_id>/episode-source", methods=["PUT"])
+    def video_set_episode_source(show_id):
+        """Which provider supplies this show's episode list.
+        Body: {episode_source: 'auto'|'tmdb'|'tvdb'}.
+
+        Episodes are keyed by the MEDIA SERVER's season numbers, so a provider
+        that splits the show differently can only write rows into seasons they
+        don't belong to. 'auto' compares each provider's season structure against
+        what your server reports; the explicit values are for when that gets it
+        wrong. Changing this doesn't rewrite anything by itself — re-scan after."""
+        from . import get_video_db
+        body = request.get_json(silent=True) or {}
+        src = body.get("episode_source")
+        if not get_video_db().set_show_episode_source(show_id, src):
+            return jsonify({"success": False,
+                            "error": "episode_source must be auto, tmdb or tvdb"}), 400
+        return jsonify({"success": True, "episode_source": src})
+
     @bp.route("/detail/<kind>/<int:item_id>/library", methods=["PUT"])
     def video_set_item_library(kind, item_id):
         """File a movie/show under one of the configured Libraries.

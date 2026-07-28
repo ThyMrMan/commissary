@@ -1255,6 +1255,32 @@ class TVDBClient:
                         "poster_url": it.get("image_url") or None})
         return out
 
+    def season_numbers(self, series_id):
+        """The series' season numbers in TVDB's default (aired) order.
+
+        Used to compare TVDB's season STRUCTURE against the media server's, which
+        is how SoulSync decides whose numbering to trust for episodes (see
+        core/video/episode_numbering). Best-effort — [] on any error, which
+        simply leaves TVDB out of the comparison."""
+        if not self.api_key or series_id is None:
+            return []
+        try:
+            d = self._authed_get("/series/" + str(series_id) + "/extended", {}) or {}
+        except Exception:
+            logger.exception("TVDB season list fetch failed for %s", series_id)
+            return []
+        out = set()
+        for s in (((d.get("data") or {}).get("seasons")) or []):
+            # TVDB carries several parallel orderings (aired / dvd / absolute).
+            # Only the aired order is comparable with what a media server reports.
+            stype = ((s.get("type") or {}).get("type") or "").lower()
+            if stype and stype != "official":
+                continue
+            n = s.get("number")
+            if isinstance(n, int):
+                out.add(n)
+        return sorted(out)
+
     def season_episodes(self, series_id, season_number):
         """A TVDB series+season's episodes (v4) → [{episode_number, title, overview, air_date,
         runtime_minutes, still_url}]. Used to GAP-FILL episode metadata TMDB is missing (TVDB

@@ -315,6 +315,23 @@
                       // run). The metadata gap-fill used to insert under TMDB's number,
                       // filing episodes in a season they never belonged to. Same
                       // two-click shape: look, then agree.
+                      // Which database supplies this show's episode LIST. Episodes
+                      // are keyed by your media server's season numbers, so a
+                      // provider that splits the show differently can only file
+                      // them wrongly. Auto compares both against your server.
+                      '<div class="vmg-field" style="margin-top:10px;">' +
+                          '<label>Episode numbering</label>' +
+                          '<select class="vmg-input" data-vmg-episode-source>' +
+                          [['auto', 'Auto — match my server'], ['tmdb', 'TMDB'], ['tvdb', 'TVDB']]
+                              .map(function (o) {
+                                  var cur = d.episode_source || 'auto';
+                                  return '<option value="' + o[0] + '"' +
+                                      (o[0] === cur ? ' selected' : '') + '>' + o[1] + '</option>';
+                              }).join('') +
+                          '</select>' +
+                          '<div class="vmg-hint">Only change this if a show\'s seasons ' +
+                              'are split differently here than on your server. Re-scan after.</div>' +
+                      '</div>' +
                       '<button class="vmg-btn-ghost" type="button" data-vmg-unlisted-eps ' +
                           'style="margin-top:8px;">Check for out-of-place episodes</button>' +
                       '<div class="vmg-hint" data-vmg-unlisted-note>Finds episodes filed ' +
@@ -713,8 +730,7 @@
                 var msg = b.added
                     ? 'Added ' + b.added + ' episode' + (b.added === 1 ? '' : 's') +
                       ' — ' + b.total + ' now known'
-                    : 'Already up to date — ' + b.total + ' episode' +
-                      (b.total === 1 ? '' : 's') + ' known';
+                    : 'No new episodes — ' + b.total + ' known';
                 if (note) note.textContent = msg;
                 toast(msg, 'success');
                 if (b.added) document.dispatchEvent(new CustomEvent('soulsync:video-episodes-changed'));
@@ -838,6 +854,24 @@
             if (note) note.textContent = (e && e.message) || 'Check failed';
             toast((e && e.message) || 'Check failed', 'error');
         }).then(function () { btn.disabled = false; });
+    }
+
+    // Which provider supplies the episode LIST. Changing it rewrites nothing on
+    // its own — the next re-scan is what applies it — so the toast says so
+    // rather than implying the library just changed.
+    function setEpisodeSource(sel) {
+        fetch('/api/video/detail/show/' + state.id + '/episode-source', {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ episode_source: sel.value }),
+        }).then(function (r) { return r.json().catch(function () { return {}; }); })
+            .then(function (b) {
+                if (!b.success) { toast(b.error || 'Could not save', 'error'); return; }
+                toast(sel.value === 'auto'
+                    ? 'Episode numbering back to auto — re-scan to apply'
+                    : 'Episode numbering set to ' + sel.value.toUpperCase() + ' — re-scan to apply',
+                    'success');
+            })
+            .catch(function () { toast('Could not save', 'error'); });
     }
 
     function setSeriesType(sel) {
@@ -1021,6 +1055,8 @@
             if (st) setSeriesType(st);
             var lib = e.target.closest('[data-vmg-library]');
             if (lib) setLibrary(lib);
+            var es = e.target.closest('[data-vmg-episode-source]');
+            if (es) setEpisodeSource(es);
         });
         ov.addEventListener('keydown', function (e) {
             var msin = e.target.closest('[data-vmg-msearch-in]');

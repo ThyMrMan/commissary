@@ -40,13 +40,24 @@ def app_db(tmp_path, monkeypatch):
 
 
 def _bleach(db):
-    """Season 2 owned from Plex (2005), TYBW owned under season 17."""
+    """Plex's structure: 17 seasons. Season 2 is the 2005 arc, 21 episodes.
+
+    The other sixteen are present because the numbering detection scores a
+    provider on how much of the SERVER's structure it can serve — with only
+    season 2 there is no evidence TMDB's three-season split is wrong, and it
+    correctly declines to switch."""
+    seasons = [{"season_number": 2, "episodes": [
+        {"season_number": 2, "episode_number": n, "title": "2005 ep %d" % n,
+         "air_date": "2005-03-%02d" % n, "server_id": "p%d" % n,
+         "files": [{"path": "/tv/Bleach/S02E%02d.mkv" % n}]} for n in range(1, 22)]}]
+    seasons += [{"season_number": sn, "episodes": [
+        {"season_number": sn, "episode_number": 1, "title": "S%d" % sn,
+         "air_date": "2006-01-01", "server_id": "q%d" % sn,
+         "files": [{"path": "/tv/Bleach/S%02dE01.mkv" % sn}]}]}
+        for sn in list(range(1, 2)) + list(range(3, 18))]
     return db.upsert_show_tree("plex", {
         "server_id": "44632", "tmdb_id": 30984, "tvdb_id": 74796, "title": "Bleach",
-        "seasons": [{"season_number": 2, "episodes": [
-            {"season_number": 2, "episode_number": n, "title": "2005 ep %d" % n,
-             "air_date": "2005-03-%02d" % n, "server_id": "p%d" % n,
-             "files": [{"path": "/tv/Bleach/S02E%02d.mkv" % n}]} for n in range(1, 22)]}]})
+        "seasons": seasons})
 
 
 def _tvdb_junk(db, show_id):
@@ -160,15 +171,19 @@ class _FakeTmdb:
             return {"episodes": [{"episode_number": n} for n in range(1, 22)]} if sn == 2 else {}
 
 
-def _patch_tmdb(monkeypatch, worker):
-    import core.video.enrichment.engine as eng
-    monkeypatch.setattr(eng, "get_video_enrichment_engine",
-                        lambda *a, **k: type("E", (), {"workers": {"tmdb": worker}})())
+def _patch_tmdb(monkeypatch, worker, db=None, tvdb=None):
+    """A REAL engine instance — the endpoint now asks it which provider owns the
+    show's numbering, so a stub with only `workers` no longer stands in."""
+    import core.video.enrichment.engine as engmod
+    e = engmod.VideoEnrichmentEngine.__new__(engmod.VideoEnrichmentEngine)
+    e.workers = {"tmdb": worker, "tvdb": tvdb}
+    e.db = db
+    monkeypatch.setattr(engmod, "get_video_enrichment_engine", lambda *a, **k: e)
 
 
 def test_preview_then_remove_through_the_api(app_db, monkeypatch):
     c, db = app_db
-    _patch_tmdb(monkeypatch, _FakeTmdb())
+    _patch_tmdb(monkeypatch, _FakeTmdb(), db)
     sid = _bleach(db); _tvdb_junk(db, sid)
     prev = c.get("/api/video/repair/unlisted-episodes?show_id=%d" % sid).get_json()
     assert prev["count"] == 17
@@ -179,7 +194,7 @@ def test_preview_then_remove_through_the_api(app_db, monkeypatch):
 
 def test_the_api_refuses_when_tmdb_is_unavailable(app_db, monkeypatch):
     c, db = app_db
-    _patch_tmdb(monkeypatch, type("W", (), {"enabled": False, "client": None})())
+    _patch_tmdb(monkeypatch, type("W", (), {"enabled": False, "client": None})(), db)
     sid = _bleach(db); _tvdb_junk(db, sid)
     before = _eps(db, sid)
     r = c.post("/api/video/repair/unlisted-episodes", json={"show_id": sid})
@@ -194,7 +209,7 @@ def test_it_needs_a_show(app_db):
 
 def test_the_cleanup_is_admin_only(app_db, monkeypatch):
     c, db = app_db
-    _patch_tmdb(monkeypatch, _FakeTmdb())
+    _patch_tmdb(monkeypatch, _FakeTmdb(), db)
     sid = _bleach(db); _tvdb_junk(db, sid)
 
     @c.application.before_request
@@ -204,3 +219,49 @@ def test_the_cleanup_is_admin_only(app_db, monkeypatch):
     assert c.post("/api/video/repair/unlisted-episodes",
                   json={"show_id": sid}).status_code == 403
     assert 25 in _eps(db, sid)
+
+
+# ── the real Bleach: the authority must be TVDB, not TMDB ────────────────────
+class _BleachTmdb:
+    """TMDB's Bleach: 3 seasons. Season 2 is Thousand-Year Blood War."""
+    enabled = True
+
+    class client:
+        @staticmethod
+        def match(_k, _t, _y, known_id=None):
+            return {"id": 30984, "metadata": {"seasons": [{"season_number": n} for n in (0, 1, 2)]}}
+
+        @staticmethod
+        def season_episodes(_id, sn):
+            return {"episodes": [{"episode_number": n} for n in range(1, 51)]} if sn == 2 else {}
+
+
+class _BleachTvdb:
+    """TVDB's Bleach: 17 seasons, matching Plex. Season 2 is the 2005 arc."""
+    enabled = True
+
+    class client:
+        @staticmethod
+        def season_numbers(_id):
+            return [0] + list(range(1, 18))
+
+        @staticmethod
+        def season_episodes(_id, sn):
+            return [{"episode_number": n} for n in range(1, 22)] if sn == 2 else []
+
+
+def test_the_check_uses_tvdb_when_tvdb_owns_the_numbering(app_db, monkeypatch):
+    """Checking against TMDB would call the library's 2005 season out of place
+    and the injected 2023-2026 rows legitimate — exactly backwards. This is the
+    scenario that made the 1.8.3 clean-up report 'no out-of-place episodes'."""
+    c, db = app_db
+    sid = _bleach(db)              # Plex season 2, 21 owned 2005 episodes
+    _tvdb_junk(db, sid)            # 25, 26, 39, 40, 41-53 — TMDB's TYBW numbering
+    _patch_tmdb(monkeypatch, _BleachTmdb(), db, _BleachTvdb())
+
+    prev = c.get("/api/video/repair/unlisted-episodes?show_id=%d" % sid).get_json()
+    assert prev["source"] == "tvdb"
+    assert prev["count"] == 17     # every injected row, not just 51-53
+    assert c.post("/api/video/repair/unlisted-episodes",
+                  json={"show_id": sid}).get_json()["removed"] == 17
+    assert _eps(db, sid) == list(range(1, 22))

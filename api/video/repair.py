@@ -64,35 +64,54 @@ def register_routes(bp):
         return jsonify({"ok": True, "removed": removed,
                         "requested": len(ids or [])})
 
-    def _tmdb_season_numbers(db, show_id):
-        """{season_number: {episode numbers TMDB lists}} for a show, straight from
-        TMDB. Returns ({}, reason) when it can't be established — the caller must
-        NOT fall back to 'no episodes', which would make every missing episode a
-        deletion candidate."""
+    def _authoritative_episode_numbers(db, show_id):
+        """{season_number: {episode numbers}} from whichever provider owns this
+        show's NUMBERING, plus the source name.
+
+        Must be the resolved provider, not always TMDB: for a show where TMDB's
+        structure disagrees with the media server (Bleach — TMDB has 3 seasons
+        where Plex and TVDB have 17), checking against TMDB would call the
+        library's correct rows out of place and the invented ones legitimate,
+        which is precisely backwards.
+
+        Returns ({}, source, reason) when it can't be established. The caller
+        must NOT read that as 'no episodes' — every missing episode would become
+        a deletion candidate."""
         info = db.show_match_info(show_id)
         if not info:
-            return {}, "That show isn't in the library."
+            return {}, None, "That show isn't in the library."
         from core.video.enrichment.engine import get_video_enrichment_engine
-        w = get_video_enrichment_engine().workers.get("tmdb")
-        if not w or not w.enabled:
-            return {}, "TMDB isn't configured, so there's nothing to check against."
-        res = w.client.match("show", info.get("title"), info.get("year"),
-                             known_id=info.get("tmdb_id"))
+        eng = get_video_enrichment_engine()
+        tw = eng.workers.get("tmdb")
+        if not tw or not tw.enabled:
+            return {}, None, "TMDB isn't configured, so there's nothing to check against."
+        res = tw.client.match("show", info.get("title"), info.get("year"),
+                              known_id=info.get("tmdb_id"))
         if not res or not res.get("id"):
-            return {}, "This show has no TMDB match to check against."
+            return {}, None, "This show has no TMDB match to check against."
+        tmdb_nums = [s.get("season_number") for s in ((res.get("metadata") or {}).get("seasons") or [])
+                     if s.get("season_number") is not None]
+        source = eng._episode_source(show_id, info, tmdb_nums)
         out = {}
-        for s in ((res.get("metadata") or {}).get("seasons") or []):
-            sn = s.get("season_number")
-            if sn is None:
-                continue
-            data = w.client.season_episodes(res["id"], sn) or {}
-            nums = {e["episode_number"] for e in (data.get("episodes") or [])
-                    if e.get("episode_number") is not None}
-            if nums:                     # a season that answered empty proves nothing
-                out[sn] = nums
+        if source == "tvdb":
+            vw = eng.workers.get("tvdb")
+            if not vw or not vw.enabled:
+                return {}, source, "TVDB owns this show's numbering but isn't configured."
+            for sn in (eng._tvdb_season_numbers(info.get("tvdb_id")) or []):
+                nums = {e["episode_number"] for e in (vw.client.season_episodes(info["tvdb_id"], sn) or [])
+                        if e.get("episode_number") is not None}
+                if nums:
+                    out[sn] = nums
+        else:
+            for sn in tmdb_nums:
+                data = tw.client.season_episodes(res["id"], sn) or {}
+                nums = {e["episode_number"] for e in (data.get("episodes") or [])
+                        if e.get("episode_number") is not None}
+                if nums:                 # a season that answered empty proves nothing
+                    out[sn] = nums
         if not out:
-            return {}, "Couldn't read this show's episode list from TMDB just now."
-        return out, None
+            return {}, source, "Couldn't read this show's episode list just now."
+        return out, source, None
 
     @bp.route("/repair/unlisted-episodes", methods=["GET", "POST"])
     def video_unlisted_episodes():
@@ -118,20 +137,25 @@ def register_routes(bp):
         if not show_id:
             return jsonify({"ok": False, "error": "show_id is required"}), 400
         try:
-            listed, err = _tmdb_season_numbers(db, int(show_id))
+            listed, source, err = _authoritative_episode_numbers(db, int(show_id))
         except Exception:
-            logger.exception("unlisted-episodes: TMDB read failed for show %s", show_id)
-            return jsonify({"ok": False, "error": "Couldn't reach TMDB — see app.log"}), 502
+            logger.exception("unlisted-episodes: provider read failed for show %s", show_id)
+            return jsonify({"ok": False,
+                            "error": "Couldn't reach the metadata provider — see app.log"}), 502
         if err:
             return jsonify({"ok": False, "error": err}), 400
+        # A season the authority doesn't have at all is NOT evidence its rows are
+        # junk — it's the case where the two providers disagree about structure,
+        # which is what put them there. Only seasons the authority knows are judged.
         if request.method == "GET":
             items = []
             for sn, keep in sorted(listed.items()):
                 items += db.unlisted_episode_rows(int(show_id), sn, keep)
-            return jsonify({"ok": True, "count": len(items), "items": items})
+            return jsonify({"ok": True, "count": len(items), "items": items,
+                            "source": source})
         removed = sum(db.delete_unlisted_episode_rows(int(show_id), sn, keep)
                       for sn, keep in listed.items())
-        return jsonify({"ok": True, "removed": removed})
+        return jsonify({"ok": True, "removed": removed, "source": source})
 
     @bp.route("/repair/status", methods=["GET"])
     def video_repair_status():

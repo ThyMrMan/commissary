@@ -368,6 +368,12 @@ _COLUMN_MIGRATIONS = [
     # one of these indexers ranks higher for titles in this Library; NULL/blank
     # means no preference (every allowed indexer ranks equally, as today).
     ("root_folders", "preferred_indexer_ids", "TEXT"),
+    # Which provider owns this show's EPISODE NUMBERING: NULL/'auto' detects it
+    # from the season structure, 'tmdb'/'tvdb' pins it. Exists because episodes
+    # are keyed by the SERVER's season numbers, and a provider that splits the
+    # show differently (TMDB has Bleach in 3 seasons where Plex and TVDB have 17)
+    # can only write rows into seasons they don't belong to.
+    ("shows", "episode_source", "TEXT"),
     # The Library a wishlist item is destined for, chosen when it was added.
     # NULL falls back to the owned movies/shows row's Library (via library_id),
     # then to the primary — so existing rows keep their current behavior.
@@ -993,12 +999,52 @@ class VideoDatabase:
 
     def show_match_info(self, show_id: int) -> dict | None:
         """Title/year/tmdb_id/tvdb_id for one show — for on-demand (lazy) art refresh
-        (tvdb_id lets the refresh gap-fill episode metadata TMDB is missing)."""
+        (tvdb_id lets the refresh gap-fill episode metadata TMDB is missing).
+        ``episode_source`` is the per-show numbering override (see
+        core/video/episode_numbering); NULL means detect it."""
         conn = self._get_connection()
         try:
-            row = conn.execute("SELECT title, year, tmdb_id, tvdb_id FROM shows WHERE id=?",
-                               (show_id,)).fetchone()
+            row = conn.execute("SELECT title, year, tmdb_id, tvdb_id, episode_source "
+                               "FROM shows WHERE id=?", (show_id,)).fetchone()
             return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def server_season_numbers(self, show_id: int) -> list:
+        """Season numbers the MEDIA SERVER actually reports for this show — the
+        structure a provider has to match to be usable for episode numbering.
+
+        Deliberately not ``show_season_numbers``: that returns every season row,
+        including ones a mis-numbered backfill invented, so comparing a provider
+        against it would score the provider against its own mistakes."""
+        conn = self._get_connection()
+        try:
+            return [r["season_number"] for r in conn.execute(
+                "SELECT DISTINCT season_number FROM episodes "
+                "WHERE show_id=? AND server_id IS NOT NULL ORDER BY season_number",
+                (show_id,)).fetchall()]
+        except sqlite3.Error:
+            logger.exception("server_season_numbers failed for show %s", show_id)
+            return []
+        finally:
+            conn.close()
+
+    def set_show_episode_source(self, show_id: int, source) -> bool:
+        """Pin which provider supplies this show's episode list, or None/'auto'
+        to go back to detecting it."""
+        from core.video.episode_numbering import SOURCES
+        val = str(source or "auto").strip().lower()
+        if val not in SOURCES:
+            return False
+        conn = self._get_connection()
+        try:
+            cur = conn.execute("UPDATE shows SET episode_source=? WHERE id=?",
+                               (None if val == "auto" else val, show_id))
+            conn.commit()
+            return cur.rowcount > 0
+        except sqlite3.Error:
+            logger.exception("set_show_episode_source failed for show %s", show_id)
+            return False
         finally:
             conn.close()
 
@@ -2086,6 +2132,14 @@ class VideoDatabase:
                     "SELECT id FROM episodes WHERE show_id=? AND season_number=? AND episode_number=?",
                     (show_id, season_number, en)).fetchone()
                 if row:
+                    # Gap-fill only, always. An earlier attempt let the primary
+                    # provider OVERWRITE rows that looked provider-owned (no
+                    # server_id, no file) to repair mis-filed metadata — but a
+                    # server CAN report an episode without a per-episode id, and
+                    # that heuristic then clobbered real server data. Mis-filed
+                    # rows are handled by choosing the right provider in the first
+                    # place (core/video/episode_numbering) and removing what does
+                    # not belong, not by weakening this guarantee.
                     sets, params = [], []
                     for col in ("title", "still_url", "overview", "air_date", "rating", "runtime_minutes"):
                         if e.get(col) is None:
@@ -5260,6 +5314,9 @@ class VideoDatabase:
             "sort_title": show["sort_title"],
             "quality_profile_id": show["quality_profile_id"] or 0,
             "series_type": show["series_type"] or "standard",
+            # NULL = 'auto' (detect from the season structure). See
+            # core/video/episode_numbering.
+            "episode_source": show["episode_source"] or "auto",
             "locked_fields": sorted(self._parse_locked(show["locked_fields"])),
             "watched": (show["watched_episodes"] or 0) >= total > 0,
             "watched_episodes": show["watched_episodes"] or 0,   # raw count for "N of M watched"

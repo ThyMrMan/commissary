@@ -3484,8 +3484,16 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.3': [
-        { date: 'July 2026 · 1.8.3' },
+    '1.8.4': [
+        { date: 'July 2026 · 1.8.4' },
+        { title: 'SoulSync now uses the episode numbering your server uses', desc: 'the actual cause of the Bleach problem, found by dumping the rows instead of reasoning about them. TMDB has Bleach as three seasons — specials, the 366-episode original run, and Thousand-Year Blood War. TVDB has seventeen, which is what Plex reports. SoulSync always took its season numbers from TMDB, so TMDB\'s "season 2" (the 2022 run) was written on top of the 2005 season.' },
+        { title: 'The evidence was exact', desc: 'every season with invented rows was a season TMDB has (0, 1 and 2). Every season with none was one TMDB does not have (3 to 17). Seasons 3 to 16 were untouched the whole time.' },
+        { title: 'It is also why Season 17 never filled', desc: 'TMDB has no season 17, so nothing could ever add episodes to the season where your library actually keeps that run. Not a separate problem — the same one. SoulSync can now fill it, because it takes the episode list from the database whose seasons match yours.' },
+        { title: 'How it decides', desc: 'it scores each database on how much of your server\'s season structure it can actually serve, and only switches when the difference is decisive. A show both agree on — nearly all of them — carries on using TMDB exactly as before. Nothing is rearranged quietly.' },
+        { title: 'And you can overrule it', desc: 'Manage on a TV show has an "Episode numbering" box: Auto, TMDB or TVDB. An explicit choice is obeyed even if the automatic guess disagrees, which is the entire point of having it. Re-scan afterwards to apply it.' },
+        { title: 'The out-of-place check now asks the right database', desc: 'it was comparing against TMDB, which for a show like this considers your correct season wrong and the invented rows right — exactly backwards, and why it reported nothing to do. It now checks against whichever database owns that show\'s numbering.' },
+        { title: 'A correction to 1.8.3', desc: 'that release blamed TVDB and stopped it adding episodes. It was the wrong database: TVDB is the one that agrees with Plex here, and blocking it removed the only source that could fill Season 17 while leaving the real cause running. Reverted.' },
+        { title: 'Also in 1.8.3', desc: 'a clean-up for episodes filed under a season they do not belong to, and a read-only diagnostic script (tools/diagnose_show.py) that dumps a show\'s rows — it is what found the real cause.' },
         { title: 'Episodes filed under a season they never belonged to', desc: 'the real cause of the Bleach problem, and it was not what 1.8.2 assumed. TMDB calls Bleach season 2 the 2005 arc; TVDB calls its season 2 the 2022 Thousand-Year Blood War run. SoulSync read the season list from TMDB and then asked TVDB for those same season numbers — so TVDB\'s season 2 was written into TMDB\'s, putting seventeen 2023-2026 episodes inside a 21-episode season from 2005.' },
         { title: 'Why it stopped things being found', desc: 'an episode filed under a season number no release uses can never be matched. That is why the missing episodes were hunted for months and never turned up — SoulSync was searching for season 2, episode 41, which does not exist anywhere.' },
         { title: 'TVDB now enriches, never invents', desc: 'TVDB is still used, and still valuable — it is often first with titles and synopses for episodes that just aired. It can now fill in details for an episode TMDB already lists. It can no longer decide which episodes exist, because a season number does not mean the same thing in two different databases.' },
@@ -3540,7 +3548,29 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.8.3: the Bleach problem, properly diagnosed",
+        title: "1.8.4: episode numbering follows your server",
+        description: "the real cause, found by dumping the rows rather than reasoning about them. Two databases split Bleach differently, and SoulSync had always taken the numbering from the one that disagrees with Plex.",
+        features: [
+            "TMDB has Bleach as three seasons — specials, the 366-episode 2004-2012 run, and Thousand-Year Blood War. TVDB has seventeen, which is what Plex reports. SoulSync used TMDB's numbers, so TMDB's \"season 2\" (the 2022 run) was written on top of the 2005 season",
+            "the evidence was exact: every season carrying invented rows was a season TMDB has (0, 1, 2); every season with none was one it does not (3 to 17)",
+            "the same fault is why Season 17 never filled — TMDB has no season 17, so nothing could ever add episodes to the season where the library actually keeps that run. It can fill now",
+            "SoulSync scores each database on how much of your server's season structure it can serve, and switches only when the difference is decisive. A show both agree on — nearly all of them — keeps using TMDB exactly as before",
+            "Manage → \"Episode numbering\" (Auto / TMDB / TVDB) overrules it per show. An explicit choice is obeyed even when the automatic guess disagrees",
+            "the out-of-place check now asks whichever database owns that show's numbering. It had been asking TMDB, which for a show like this treats your correct season as the wrong one",
+        ],
+        usage_note: "Open the show → Manage → Check for out-of-place episodes, then Re-scan episodes from TMDB.",
+    },
+    {
+        title: "A correction to 1.8.3",
+        description: "that release named TVDB as the culprit and stopped it adding episodes. It was the wrong database.",
+        features: [
+            "TVDB is the one that AGREES with Plex on this show. Blocking it removed the only source that could ever fill Season 17, while the database actually causing the problem carried on writing",
+            "reverted. TVDB supplies episodes again whenever its structure is the one your server matches",
+            "1.8.3's clean-up tool and the read-only diagnostic script it shipped are both kept — the diagnostic is what found this",
+        ],
+    },
+    {
+        title: "Earlier in 1.8.3 — the first attempt",
         description: "1.8.2 shipped a theory about why a show's episodes were listed under two different season numbers. A dump of the actual rows showed the theory was wrong, and the real cause was one line handing one database's season numbers to a different database.",
         features: [
             "TMDB's Bleach season 2 is the 2005 arc. TVDB's season 2 is the 2022 Thousand-Year Blood War run. SoulSync read its season list from TMDB, then asked TVDB for episodes using those same numbers — so TVDB's season 2 landed inside TMDB's, putting seventeen episodes dated 2023-2026 inside a season from 2005",

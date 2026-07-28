@@ -267,35 +267,83 @@ class VideoEnrichmentEngine:
         nums = []
         try:
             nums = [s["season_number"] for s in (result.get("metadata") or {}).get("seasons") or []]
+            # WHICH provider's season numbers may create episodes. Episodes are
+            # keyed by the SERVER's numbering, so a provider that splits the show
+            # differently can only write rows into the wrong seasons — and leaves
+            # the seasons it doesn't have unable to fill at all. Bleach: TMDB has
+            # 3 seasons, Plex and TVDB have 17.
+            source = self._episode_source(show_id, info, nums)
             if recent_seasons_only:
                 nums = _latest_seasons(nums)    # only the current season(s) gain new episodes
-            # mark_synced only when we pulled the FULL season list — a scoped refresh must
-            # not claim the show is fully synced (the background pass finishes the rest).
-            w._cascade_episodes(show_id, result["id"], nums,
-                                mark_synced=not recent_seasons_only)
+            if source == "tmdb":
+                # mark_synced only when we pulled the FULL season list — a scoped refresh must
+                # not claim the show is fully synced (the background pass finishes the rest).
+                w._cascade_episodes(show_id, result["id"], nums,
+                                    mark_synced=not recent_seasons_only)
         except Exception:
+            source = "tmdb"
             logger.exception("refresh_show_art: episode cascade failed for show %s", show_id)
-        # TVDB episode GAP-FILL — TMDB is often slow on just-aired / reality-TV episode
-        # overviews + titles; TVDB frequently has them first. backfill_episodes is COALESCE
-        # gap-fill, so this only fills what TMDB left blank and never clobbers.
-        self._cascade_tvdb_episodes(show_id, info.get("tvdb_id"), nums)
+        # TVDB pass. When TVDB owns the numbering it supplies the episode LIST
+        # (its own season numbers, the ones the server agrees with); otherwise it
+        # is the gap-fill it has always been — filling titles/overviews/stills
+        # TMDB is slow with, over the seasons TMDB defined, creating nothing.
+        self._cascade_tvdb_episodes(show_id, info.get("tvdb_id"), nums,
+                                    authoritative=(source == "tvdb"))
         if with_ratings:
             self._backfill_ratings("show", show_id)
         return {"ok": True}
 
-    def _cascade_tvdb_episodes(self, show_id, tvdb_id, season_nums) -> None:
-        """Fill episode overviews/titles/stills TMDB lacked from TVDB (best-effort, gap-only).
+    def _tvdb_season_numbers(self, tvdb_id) -> list:
+        """TVDB's own season list for a series, for the structure comparison.
+        [] when TVDB isn't configured or the call fails — which scores it out of
+        the running and leaves the historical TMDB default in place."""
+        tw = self.workers.get("tvdb")
+        if not tvdb_id or not tw or not tw.enabled:
+            return []
+        try:
+            return list(tw.client.season_numbers(tvdb_id) or [])
+        except Exception:   # noqa: BLE001 - a failed probe must never break a refresh
+            logger.debug("tvdb season list failed for %s", tvdb_id, exc_info=True)
+            return []
 
-        ``season_nums`` are TMDB's season numbers — this is a gap-fill over the
-        list TMDB defined, so it writes with ``update_only``. A season number is
-        NOT a shared key between providers: TMDB's Bleach season 2 is the 2005
-        arc, TVDB's is Thousand-Year Blood War (2022+). Letting this insert filed
-        seventeen TYBW episodes under the 2005 season, none of which any release
-        could match. TVDB may improve an episode TMDB already listed; it may not
-        decide which episodes exist."""
+    def _episode_source(self, show_id, info, tmdb_season_nums) -> str:
+        """'tmdb' | 'tvdb' — see core/video/episode_numbering. Honours the
+        per-show override; otherwise compares both providers' season structures
+        against what the media server reports."""
+        from core.video.episode_numbering import choose_source, explain
+        override = (info or {}).get("episode_source")
+        try:
+            server = self.db.server_season_numbers(show_id)
+        except Exception:   # noqa: BLE001
+            return "tmdb"
+        tvdb_nums = self._tvdb_season_numbers((info or {}).get("tvdb_id"))
+        chosen = choose_source(server, tmdb_season_nums, tvdb_nums, override)
+        if chosen != "tmdb":
+            logger.info("episode numbering for show %s: %s",
+                        show_id, explain(server, tmdb_season_nums, tvdb_nums, override))
+        return chosen
+
+    def _cascade_tvdb_episodes(self, show_id, tvdb_id, season_nums,
+                               authoritative: bool = False) -> None:
+        """TVDB episodes, in one of two modes.
+
+        ``authoritative=False`` (the default, and what happens for almost every
+        show): a GAP-FILL over the seasons TMDB defined, filling titles,
+        overviews and stills TMDB is slow with. It writes with ``update_only``,
+        so it enriches episodes TMDB already listed and creates nothing — a
+        season NUMBER is not a shared key between providers, and letting the
+        wrong one insert is what filed Thousand-Year Blood War episodes inside
+        Bleach's 2005 season.
+
+        ``authoritative=True``: TVDB's structure is the one the media server
+        agrees with, so TVDB supplies the episode LIST, over ITS OWN season
+        numbers rather than TMDB's. This is the only way a season TMDB doesn't
+        have (Bleach's season 17) can ever be filled."""
         tw = self.workers.get("tvdb")
         if not tvdb_id or not tw or not tw.enabled:
             return
+        if authoritative:
+            season_nums = self._tvdb_season_numbers(tvdb_id) or season_nums
         for sn in season_nums or []:
             try:
                 eps = tw.client.season_episodes(tvdb_id, sn) or []
@@ -304,7 +352,8 @@ class VideoEnrichmentEngine:
                 continue
             if eps:
                 try:
-                    self.db.backfill_episodes(show_id, sn, eps, update_only=True)
+                    self.db.backfill_episodes(show_id, sn, eps,
+                                              update_only=not authoritative)
                 except Exception:   # noqa: BLE001
                     logger.debug("tvdb episode backfill failed (show %s S%s)", show_id, sn, exc_info=True)
 
