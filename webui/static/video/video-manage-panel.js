@@ -310,6 +310,16 @@
                           'style="margin-top:8px;">Check for duplicate episodes</button>' +
                       '<div class="vmg-hint" data-vmg-dupe-note>Finds episodes listed twice ' +
                           'because your server and TMDB number the seasons differently.</div>' +
+                      // TVDB numbers some long-running shows' seasons differently from
+                      // TMDB (TMDB's Bleach S2 is the 2005 arc; TVDB's is the 2022+
+                      // run). The metadata gap-fill used to insert under TMDB's number,
+                      // filing episodes in a season they never belonged to. Same
+                      // two-click shape: look, then agree.
+                      '<button class="vmg-btn-ghost" type="button" data-vmg-unlisted-eps ' +
+                          'style="margin-top:8px;">Check for out-of-place episodes</button>' +
+                      '<div class="vmg-hint" data-vmg-unlisted-note>Finds episodes filed ' +
+                          'under a season TMDB doesn\'t list them in — they can never be ' +
+                          'matched by a search.</div>' +
                   '</div>'
                 : '') +
             // Also known as (matching aid): extra titles the release-title gate will
@@ -773,6 +783,63 @@
         }).then(function () { btn.disabled = false; });
     }
 
+    // Same two-step contract as duplicateEpisodes: look, then agree to a named
+    // count. Separate from it because the RULE is different — that one pairs a
+    // row against an episode you own under another season; this one asks TMDB
+    // whether the season lists that episode number at all.
+    function unlistedEpisodes(btn) {
+        if (btn.disabled) return;
+        var note = state.overlay && state.overlay.querySelector('[data-vmg-unlisted-note]');
+        var armed = btn.getAttribute('data-armed') === '1';
+        var idle = 'Check for out-of-place episodes';
+        btn.disabled = true;
+        btn.textContent = armed ? 'Removing…' : 'Checking…';
+        var req = armed
+            ? fetch('/api/video/repair/unlisted-episodes', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ show_id: state.id }) })
+            : fetch('/api/video/repair/unlisted-episodes?show_id=' + state.id,
+                { headers: { Accept: 'application/json' } });
+        req.then(function (r) {
+            return r.json().catch(function () { return {}; }).then(function (b) {
+                if (!r.ok || !b.ok) throw new Error(b.error || 'Request failed');
+                return b;
+            });
+        }).then(function (b) {
+            if (armed) {
+                btn.removeAttribute('data-armed');
+                btn.textContent = idle;
+                var msg = 'Removed ' + b.removed + ' out-of-place row' + (b.removed === 1 ? '' : 's');
+                if (note) note.textContent = msg + '. Nothing on disk was touched.';
+                toast(msg, 'success');
+                if (b.removed) document.dispatchEvent(new CustomEvent('soulsync:video-episodes-changed'));
+                return;
+            }
+            if (!b.count) {
+                btn.textContent = idle;
+                if (note) note.textContent = 'Every episode is filed under a season TMDB lists it in.';
+                toast('No out-of-place episodes found', 'info');
+                return;
+            }
+            btn.setAttribute('data-armed', '1');
+            btn.textContent = 'Remove ' + b.count + ' out-of-place row' + (b.count === 1 ? '' : 's');
+            var eg = (b.items || []).slice(0, 3).map(function (it) {
+                return 'S' + it.season_number + 'E' + it.episode_number +
+                       (it.air_date ? ' (' + it.air_date + ')' : '');
+            }).join(', ');
+            if (note) {
+                note.textContent = b.count + ' episode(s) TMDB doesn\'t list in that season: ' +
+                    eg + (b.count > 3 ? ', …' : '') + '. None are on disk — removing only ' +
+                    'clears the listing.';
+            }
+        }).catch(function (e) {
+            btn.removeAttribute('data-armed');
+            btn.textContent = idle;
+            if (note) note.textContent = (e && e.message) || 'Check failed';
+            toast((e && e.message) || 'Check failed', 'error');
+        }).then(function () { btn.disabled = false; });
+    }
+
     function setSeriesType(sel) {
         fetch('/api/video/detail/show/' + state.id + '/series-type', {
             method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -935,6 +1002,8 @@
             if (rsc) { rescanEpisodes(rsc); return; }
             var dup = e.target.closest('[data-vmg-dupe-eps]');
             if (dup) { duplicateEpisodes(dup); return; }
+            var unl = e.target.closest('[data-vmg-unlisted-eps]');
+            if (unl) { unlistedEpisodes(unl); return; }
             var tw = e.target.closest('[data-vmg-watched]');
             if (tw) { toggle('watched', tw); return; }
             var tm = e.target.closest('[data-vmg-monitored]');

@@ -64,6 +64,75 @@ def register_routes(bp):
         return jsonify({"ok": True, "removed": removed,
                         "requested": len(ids or [])})
 
+    def _tmdb_season_numbers(db, show_id):
+        """{season_number: {episode numbers TMDB lists}} for a show, straight from
+        TMDB. Returns ({}, reason) when it can't be established — the caller must
+        NOT fall back to 'no episodes', which would make every missing episode a
+        deletion candidate."""
+        info = db.show_match_info(show_id)
+        if not info:
+            return {}, "That show isn't in the library."
+        from core.video.enrichment.engine import get_video_enrichment_engine
+        w = get_video_enrichment_engine().workers.get("tmdb")
+        if not w or not w.enabled:
+            return {}, "TMDB isn't configured, so there's nothing to check against."
+        res = w.client.match("show", info.get("title"), info.get("year"),
+                             known_id=info.get("tmdb_id"))
+        if not res or not res.get("id"):
+            return {}, "This show has no TMDB match to check against."
+        out = {}
+        for s in ((res.get("metadata") or {}).get("seasons") or []):
+            sn = s.get("season_number")
+            if sn is None:
+                continue
+            data = w.client.season_episodes(res["id"], sn) or {}
+            nums = {e["episode_number"] for e in (data.get("episodes") or [])
+                    if e.get("episode_number") is not None}
+            if nums:                     # a season that answered empty proves nothing
+                out[sn] = nums
+        if not out:
+            return {}, "Couldn't read this show's episode list from TMDB just now."
+        return out, None
+
+    @bp.route("/repair/unlisted-episodes", methods=["GET", "POST"])
+    def video_unlisted_episodes():
+        """Episodes a SECONDARY metadata provider invented, which TMDB doesn't
+        list for the season they were filed under.
+
+        The Bleach case: TMDB's season 2 is the 2005 arc, TVDB's season 2 is
+        Thousand-Year Blood War. The TVDB gap-fill was handed TMDB's season
+        numbers and allowed to insert, so seventeen TYBW episodes (25, 26,
+        39-53) landed inside the 21-episode 2005 season. A wished episode under
+        a season number no release uses can never be matched, which is why the
+        missing episodes were never found. ``update_only`` on the TVDB cascade
+        stops new ones; this clears what was already written.
+
+        GET previews, POST removes — deleting rows, so looking first is a
+        separate step. Only ever removes a row with no server_id, no file and no
+        media_files, whose episode number TMDB does not list for that season,
+        re-derived at delete time. Nothing on disk is touched."""
+        from . import get_video_db
+        db = get_video_db()
+        body = request.get_json(silent=True) or {}
+        show_id = request.args.get("show_id", type=int) or body.get("show_id")
+        if not show_id:
+            return jsonify({"ok": False, "error": "show_id is required"}), 400
+        try:
+            listed, err = _tmdb_season_numbers(db, int(show_id))
+        except Exception:
+            logger.exception("unlisted-episodes: TMDB read failed for show %s", show_id)
+            return jsonify({"ok": False, "error": "Couldn't reach TMDB — see app.log"}), 502
+        if err:
+            return jsonify({"ok": False, "error": err}), 400
+        if request.method == "GET":
+            items = []
+            for sn, keep in sorted(listed.items()):
+                items += db.unlisted_episode_rows(int(show_id), sn, keep)
+            return jsonify({"ok": True, "count": len(items), "items": items})
+        removed = sum(db.delete_unlisted_episode_rows(int(show_id), sn, keep)
+                      for sn, keep in listed.items())
+        return jsonify({"ok": True, "removed": removed})
+
     @bp.route("/repair/status", methods=["GET"])
     def video_repair_status():
         return jsonify(_worker().get_stats())

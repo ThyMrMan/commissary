@@ -3484,8 +3484,15 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.2': [
-        { date: 'July 2026 · 1.8.2' },
+    '1.8.3': [
+        { date: 'July 2026 · 1.8.3' },
+        { title: 'Episodes filed under a season they never belonged to', desc: 'the real cause of the Bleach problem, and it was not what 1.8.2 assumed. TMDB calls Bleach season 2 the 2005 arc; TVDB calls its season 2 the 2022 Thousand-Year Blood War run. SoulSync read the season list from TMDB and then asked TVDB for those same season numbers — so TVDB\'s season 2 was written into TMDB\'s, putting seventeen 2023-2026 episodes inside a 21-episode season from 2005.' },
+        { title: 'Why it stopped things being found', desc: 'an episode filed under a season number no release uses can never be matched. That is why the missing episodes were hunted for months and never turned up — SoulSync was searching for season 2, episode 41, which does not exist anywhere.' },
+        { title: 'TVDB now enriches, never invents', desc: 'TVDB is still used, and still valuable — it is often first with titles and synopses for episodes that just aired. It can now fill in details for an episode TMDB already lists. It can no longer decide which episodes exist, because a season number does not mean the same thing in two different databases.' },
+        { title: 'A clean-up for episodes already filed wrongly', desc: 'Manage on a TV show gains "Check for out-of-place episodes". It asks TMDB which episode numbers belong to each season and offers to remove rows TMDB does not list. Two clicks, like the other one, and it only ever touches rows with no file and nothing from your server.' },
+        { title: 'It refuses if it cannot check', desc: 'if TMDB cannot be reached, it removes nothing at all. An empty answer would make every episode you do not own look out of place, which would be the worst possible time to start deleting.' },
+        { title: 'A correction to 1.8.2', desc: 'the duplicate-episode tool from 1.8.2 read this situation backwards for shows like Bleach, and removed correctly-numbered rows instead of the misfiled ones. It never touched a file or anything your server reported, so nothing was lost — but if you ran it on a show whose seasons looked wrong, run the new out-of-place check and then "Re-scan episodes from TMDB" to rebuild the listing properly.' },
+        { title: 'Also in 1.8.2', desc: 'every Wishlist card gained a Library box, so a title you do not own yet can be pointed at the right Library instead of always landing in the primary one.' },
         { title: 'Send a wished title to the right Library', desc: 'every card on the Wishlist now has a Library box. Until now a title you did not already own had nowhere to record where it belonged, so anything the automation grabbed landed in your primary Movies or TV folder regardless. Pick a Library and the next grab goes there. Nothing on disk moves.' },
         { title: 'It shows where a title is actually headed', desc: 'not just whether someone has set it. A show already filed under Anime reads "Anime" rather than "Default". The box only appears when you have more than one Library of that kind — with one there is no choice to make.' },
         { title: 'Episodes listed twice under two season numbers', desc: 'reported on Bleach: the newest episodes appeared under Season 2 AND again under Season 17, and the ones being hunted were never found. Plex files that run as S2, TMDB calls it S17 — both are right, and SoulSync was storing both as separate episodes. It no longer creates the second copy when your server already has that episode under another season number.' },
@@ -3533,7 +3540,28 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.8.2: where things go, and things counted twice",
+        title: "1.8.3: the Bleach problem, properly diagnosed",
+        description: "1.8.2 shipped a theory about why a show's episodes were listed under two different season numbers. A dump of the actual rows showed the theory was wrong, and the real cause was one line handing one database's season numbers to a different database.",
+        features: [
+            "TMDB's Bleach season 2 is the 2005 arc. TVDB's season 2 is the 2022 Thousand-Year Blood War run. SoulSync read its season list from TMDB, then asked TVDB for episodes using those same numbers — so TVDB's season 2 landed inside TMDB's, putting seventeen episodes dated 2023-2026 inside a season from 2005",
+            "that is why the missing episodes were never found: they were being searched for as season 2 episode 41, a thing no release will ever be labelled. Meanwhile the library already had the whole run correctly under season 17",
+            "TVDB is still used and still valuable — it is usually first with titles and synopses for a just-aired episode. It may now enrich an episode TMDB already listed. It may not decide which episodes exist",
+            "Manage → \"Check for out-of-place episodes\" clears rows already written this way. It asks TMDB which episode numbers belong to each season, shows you what it found, and removes nothing until a second click — and nothing that has a file or came from your server",
+            "if TMDB cannot be reached it deletes nothing, rather than treating an empty answer as \"none of these belong\"",
+        ],
+        usage_note: "Open the show → Manage → Check for out-of-place episodes, then Re-scan episodes from TMDB.",
+    },
+    {
+        title: "A correction to 1.8.2's duplicate tool",
+        description: "the clean-up added in 1.8.2 read this situation backwards. It assumed your media server's numbering was the odd one out; for Bleach the server was right all along and the invented rows were the ones it kept.",
+        features: [
+            "it only ever removed rows with no file, nothing on disk, and nothing your media server had reported — so no episode you own was affected and no file was touched",
+            "it did remove correctly-numbered rows on shows in this situation, which entrenched the wrong listing rather than fixing it",
+            "if you ran it on a show whose seasons looked wrong, run the new out-of-place check and then \"Re-scan episodes from TMDB\" — that rebuilds the season listing from the authoritative source",
+        ],
+    },
+    {
+        title: "Earlier in 1.8.2 — where a wished title goes",
         description: "one long-standing gap and one confusing report. A wished title had nowhere to record which Library it belonged to, so everything the automation grabbed went to the primary folder — and a show your server and TMDB number differently was being stored as two sets of episodes.",
         features: [
             "every Wishlist card now has a Library box. Until a title exists on disk there was no row to hold that choice, which is why unattended grabs all landed in All Movies / All TV however your Libraries were set up. Pick one and the next grab goes there — nothing already on disk moves",

@@ -284,7 +284,15 @@ class VideoEnrichmentEngine:
         return {"ok": True}
 
     def _cascade_tvdb_episodes(self, show_id, tvdb_id, season_nums) -> None:
-        """Fill episode overviews/titles/stills TMDB lacked from TVDB (best-effort, gap-only)."""
+        """Fill episode overviews/titles/stills TMDB lacked from TVDB (best-effort, gap-only).
+
+        ``season_nums`` are TMDB's season numbers — this is a gap-fill over the
+        list TMDB defined, so it writes with ``update_only``. A season number is
+        NOT a shared key between providers: TMDB's Bleach season 2 is the 2005
+        arc, TVDB's is Thousand-Year Blood War (2022+). Letting this insert filed
+        seventeen TYBW episodes under the 2005 season, none of which any release
+        could match. TVDB may improve an episode TMDB already listed; it may not
+        decide which episodes exist."""
         tw = self.workers.get("tvdb")
         if not tvdb_id or not tw or not tw.enabled:
             return
@@ -296,7 +304,7 @@ class VideoEnrichmentEngine:
                 continue
             if eps:
                 try:
-                    self.db.backfill_episodes(show_id, sn, eps)
+                    self.db.backfill_episodes(show_id, sn, eps, update_only=True)
                 except Exception:   # noqa: BLE001
                     logger.debug("tvdb episode backfill failed (show %s S%s)", show_id, sn, exc_info=True)
 

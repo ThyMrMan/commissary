@@ -2045,20 +2045,34 @@ class VideoDatabase:
                 and int(row["season_number"] or -1) != int(season_number))
 
     def backfill_episodes(self, show_id: int, season_number: int, episodes: list,
-                          season_overview: str | None = None, season_poster: str | None = None) -> int:
+                          season_overview: str | None = None, season_poster: str | None = None,
+                          update_only: bool = False) -> int:
         """UPSERT a season's episodes from the metadata provider so the show's
         FULL episode list is represented — owned episodes (from the server) keep
         has_file=1, and episodes the server doesn't have are inserted as MISSING
         (has_file=0). Existing rows get gap-only metadata fills (never clobbered);
         the season row is created if it didn't exist (a fully-missing season).
-        Returns the number of episode rows touched."""
+        Returns the number of episode rows touched.
+
+        ``update_only=True`` fills metadata on episodes that already exist and
+        NEVER creates one. Required for any SECONDARY provider, because a season
+        NUMBER does not mean the same thing in two providers. Bleach is the case
+        that proved it: TMDB season 2 is the 2005 Soul Society arc, while TVDB
+        files the 2022+ Thousand-Year Blood War run as its season 2. Feeding
+        TMDB's season numbers to TVDB (which is what the caller has) and letting
+        it insert put seventeen TYBW episodes — numbered 25, 26, 39-53 — inside
+        the 21-episode 2005 season, where no release will ever match them."""
         conn = self._get_connection()
         touched = 0
         try:
-            conn.execute("INSERT OR IGNORE INTO seasons (show_id, season_number) VALUES (?, ?)",
-                         (show_id, season_number))
-            season_id = conn.execute("SELECT id FROM seasons WHERE show_id=? AND season_number=?",
-                                     (show_id, season_number)).fetchone()["id"]
+            if not update_only:
+                conn.execute("INSERT OR IGNORE INTO seasons (show_id, season_number) VALUES (?, ?)",
+                             (show_id, season_number))
+            srow = conn.execute("SELECT id FROM seasons WHERE show_id=? AND season_number=?",
+                                (show_id, season_number)).fetchone()
+            if srow is None:
+                return 0          # update_only, and this season isn't ours to create
+            season_id = srow["id"]
             if season_overview or season_poster:
                 conn.execute("UPDATE seasons SET overview=COALESCE(NULLIF(overview, ''), ?), "
                              "poster_url=COALESCE(NULLIF(poster_url, ''), ?) WHERE id=?",
@@ -2082,6 +2096,8 @@ class VideoDatabase:
                         params += [row["id"]]
                         conn.execute(f"UPDATE episodes SET {', '.join(sets)} WHERE id=?", params)
                         touched += 1
+                elif update_only:
+                    continue          # a secondary provider may enrich, never invent
                 elif (str(e.get("air_date") or "").strip()[:10] not in _ambiguous
                       and self._already_owned_elsewhere(conn, show_id, season_number,
                                                         e.get("air_date"))):
@@ -7040,6 +7056,60 @@ class VideoDatabase:
         return {"items": items, "pagination": {
             "page": page, "total_pages": total_pages, "total_count": total,
             "has_prev": page > 1, "has_next": page < total_pages}}
+
+    # Rows a metadata provider invented: no server_id (your server never reported
+    # it), has_file=0 and no media_files (nothing on disk). Only such a row is
+    # ever a deletion candidate — everything owned is untouchable by definition.
+    _UNLISTED_SQL = (
+        "SELECT e.id, e.season_number, e.episode_number, e.title, e.air_date "
+        "FROM episodes e WHERE e.show_id=? AND e.season_number=? "
+        "AND e.server_id IS NULL AND COALESCE(e.has_file, 0)=0 "
+        "AND NOT EXISTS (SELECT 1 FROM media_files f WHERE f.episode_id = e.id) ")
+
+    def unlisted_episode_rows(self, show_id: int, season_number: int, keep_numbers) -> list:
+        """Server-less, file-less rows in this season that the AUTHORITATIVE
+        provider doesn't list — i.e. episodes nothing asked for and nothing can
+        match.
+
+        ``keep_numbers`` is TMDB's own episode-number set for the season. The
+        caller must have actually fetched it: an empty set would make every
+        missing episode in the season a candidate, so this refuses outright
+        rather than trusting a failed lookup."""
+        keep = {int(n) for n in (keep_numbers or []) if str(n).lstrip("-").isdigit()}
+        if not keep:
+            return []
+        conn = self._get_connection()
+        try:
+            return [dict(r) for r in conn.execute(
+                self._UNLISTED_SQL + "ORDER BY e.episode_number",
+                (int(show_id), int(season_number))).fetchall()
+                if r["episode_number"] not in keep]
+        except (sqlite3.Error, TypeError, ValueError):
+            logger.exception("unlisted_episode_rows failed (show %s S%s)", show_id, season_number)
+            return []
+        finally:
+            conn.close()
+
+    def delete_unlisted_episode_rows(self, show_id: int, season_number: int, keep_numbers) -> int:
+        """Delete exactly what ``unlisted_episode_rows`` reports, RE-DERIVED here
+        rather than trusting ids from a preview — a scan landing in between must
+        not let a stale list remove an episode that has since become real."""
+        rows = self.unlisted_episode_rows(show_id, season_number, keep_numbers)
+        if not rows:
+            return 0
+        conn = self._get_connection()
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")   # raw connections default OFF
+            cur = conn.execute(
+                "DELETE FROM episodes WHERE id IN (%s)" % ",".join("?" * len(rows)),
+                [r["id"] for r in rows])
+            conn.commit()
+            return cur.rowcount
+        except sqlite3.Error:
+            logger.exception("delete_unlisted_episode_rows failed (show %s)", show_id)
+            return 0
+        finally:
+            conn.close()
 
     def set_wishlist_root_folder(self, kind: str, tmdb_id, root_folder_id) -> int:
         """Direct a WISHED title at a specific Library, before it exists on disk.
