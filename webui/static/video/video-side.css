@@ -3632,6 +3632,23 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
 .vwsh-movie-title { display: block; font-size: 13.5px; font-weight: 700; color: #fff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .vwsh-movie-meta { display: block; font-size: 11.5px; color: rgba(255, 255, 255, 0.45); margin-top: 2px; }
 
+/* Per-item Library picker ("where is this meant to go?"). The slot is emitted
+   empty and stays empty when there's only one Library configured — :empty keeps
+   the card's spacing identical to before in that case. */
+.vwsh-lib:empty { display: none; }
+.vwsh-lib { margin-top: 5px; }
+.vwsh-lib-sel { width: 100%; max-width: 100%; padding: 3px 6px; font-size: 11px; font-family: inherit;
+    color: rgba(255, 255, 255, 0.72); background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px; cursor: pointer;
+    transition: border-color 0.18s ease, color 0.18s ease; }
+.vwsh-lib-sel:hover, .vwsh-lib-sel:focus { color: #fff;
+    border-color: rgba(var(--accent-rgb, 29, 185, 84), 0.55); outline: none; }
+.vwsh-lib-sel:disabled { opacity: 0.5; cursor: progress; }
+.vwsh-lib-sel option { background: #181818; color: #fff; }
+/* In the show nebula the picker sits under the orb label, where space is tight */
+.vwsh-nebula .vwsh-lib { margin-top: 6px; max-width: 130px; }
+.vwsh-nebula .vwsh-lib-sel { font-size: 10px; text-align: center; }
+
 /* shows = the "Nebula" (reuses the music wl-* orb/album/track design). EVERY
    video enhancement is scoped under .vwsh-nebula (a class only the video field
    gets) so the music wishlist's wl-* styling is never affected. */

@@ -24,6 +24,46 @@ def _worker():
 
 
 def register_routes(bp):
+    @bp.route("/repair/duplicate-episodes", methods=["GET"])
+    def video_duplicate_episodes():
+        """Preview: episodes listed twice because the media server and TMDB
+        number the show's seasons differently (Plex files Bleach's newer run as
+        S2, TMDB calls it S17 — different rows under
+        UNIQUE(show_id, season_number, episode_number)).
+
+        Read-only, and deliberately its own step: the clean-up deletes rows, so
+        it must be possible to look before agreeing. ``?show_id=`` scopes it to
+        one show."""
+        from . import get_video_db
+        show_id = request.args.get("show_id", type=int)
+        rows = get_video_db().duplicate_episode_rows(show_id)
+        return jsonify({"ok": True, "count": len(rows), "items": rows})
+
+    @bp.route("/repair/duplicate-episodes", methods=["POST"])
+    def video_remove_duplicate_episodes():
+        """Delete the phantom rows. Body: {ids: [...]} or {show_id: N}.
+
+        Only ever removes a row that is server-less, has no file and no media
+        files, and whose air date matches exactly one OWNED episode under a
+        different season — re-checked at delete time, so a preview that has gone
+        stale cannot destroy something that became real in between.
+
+        Nothing on disk is touched: these rows are placeholders for episodes you
+        do not have, listed under the wrong season number."""
+        from . import get_video_db
+        db = get_video_db()
+        body = request.get_json(silent=True) or {}
+        ids = body.get("ids")
+        if ids is None:
+            show_id = body.get("show_id")
+            if show_id is None:
+                return jsonify({"ok": False,
+                                "error": "Pass ids, or show_id to clear one show."}), 400
+            ids = [r["id"] for r in db.duplicate_episode_rows(show_id)]
+        removed = db.delete_episode_rows(ids)
+        return jsonify({"ok": True, "removed": removed,
+                        "requested": len(ids or [])})
+
     @bp.route("/repair/status", methods=["GET"])
     def video_repair_status():
         return jsonify(_worker().get_stats())

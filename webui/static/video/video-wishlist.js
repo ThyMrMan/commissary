@@ -92,6 +92,70 @@
         'stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h9M4 18h6"/>' +
         '<circle cx="17.5" cy="16.5" r="3.4"/><path d="M21.8 20.8l-2-2"/></svg>';
 
+    // ── "where does this land?" picker ────────────────────────────────────────
+    // A wished title has no movies/shows row yet, so the detail page's Manage
+    // panel can't reassign it — which is why unattended grabs all ended up in
+    // the primary ('All Movies'/'All TV') Library. The card carries the choice
+    // instead. Emitted as an empty SLOT because the Library registry loads
+    // asynchronously and may land after the first render; paintLibPickers()
+    // fills every slot, and is called from BOTH ends of that race.
+    function libSlot(kind, tmdb, rfid) {
+        return '<div class="vwsh-lib" data-vwsh-lib-slot data-kind="' + esc(kind) +
+            '" data-tmdb="' + esc(tmdb) + '" data-current="' + esc(rfid == null ? '' : rfid) + '"></div>';
+    }
+
+    function paintLibPickers(root) {
+        var slots = (root || document).querySelectorAll('[data-vwsh-lib-slot]');
+        for (var i = 0; i < slots.length; i++) {
+            var el = slots[i];
+            var libs = _allLibsByKind[el.getAttribute('data-kind')] || [];
+            // One Library (or none configured) = no decision to make; an empty
+            // slot collapses, so the card looks exactly as it did before.
+            if (libs.length < 2) { el.innerHTML = ''; continue; }
+            var cur = el.getAttribute('data-current') || '';
+            var opts = '<option value=""' + (cur ? '' : ' selected') + '>Default library</option>';
+            for (var j = 0; j < libs.length; j++) {
+                var l = libs[j];
+                opts += '<option value="' + esc(l.id) + '"' + (String(l.id) === cur ? ' selected' : '') +
+                    '>' + esc(l.label || l.server_title || ('Library ' + l.id)) + '</option>';
+            }
+            el.innerHTML = '<select class="vwsh-lib-sel" data-vwsh-lib ' +
+                'title="Which Library this lands in when it\'s grabbed">' + opts + '</select>';
+        }
+    }
+
+    function setItemLibrary(sel) {
+        var slot = sel.closest('[data-vwsh-lib-slot]');
+        if (!slot) return;
+        var was = slot.getAttribute('data-current') || '';
+        var val = sel.value;
+        sel.disabled = true;
+        fetch('/api/video/wishlist/library', {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ kind: slot.getAttribute('data-kind'),
+                                   tmdb_id: parseInt(slot.getAttribute('data-tmdb'), 10),
+                                   root_folder_id: val ? parseInt(val, 10) : null }),
+        }).then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+                sel.disabled = false;
+                if (!d || !d.success) {
+                    sel.value = was;   // the server refused — don't leave the UI claiming otherwise
+                    if (typeof showToast === 'function')
+                        showToast((d && d.error) || 'Could not change the Library', 'error');
+                    return;
+                }
+                slot.setAttribute('data-current', val);
+                if (typeof showToast === 'function') {
+                    var name = sel.options[sel.selectedIndex].text;
+                    showToast(val ? ('Future grabs go to ' + name) : 'Using the default Library', 'success');
+                }
+            })
+            .catch(function () {
+                sel.disabled = false; sel.value = was;
+                if (typeof showToast === 'function') showToast('Could not change the Library', 'error');
+            });
+    }
+
     function pickBtn(cls, scope, attrs) {
         return '<button class="' + cls + ' vwsh-pick" type="button" ' +
             'title="Manual search — pick a release" aria-label="Manual search" ' +
@@ -131,6 +195,7 @@
             rmBtn('movie', ' data-tmdb="' + esc(it.tmdb_id) + '"') + '</div>' +
             '<div class="vwsh-movie-info"><span class="vwsh-movie-title" title="' + esc(it.title) + '">' +
             esc(it.title) + '</span>' + (meta ? '<span class="vwsh-movie-meta">' + esc(meta) + '</span>' : '') +
+            libSlot('movie', it.tmdb_id, it.root_folder_id) +
             '</div></div>';
     }
 
@@ -218,6 +283,9 @@
                     '</div>' +
                     '<div class="wl-orb-label" ' + openAttrs + ' title="' + esc(sh.title) + '">' + esc(sh.title) + '</div>' +
                     '<div class="wl-orb-meta">' + eps + (sh.done ? ' · ' + sh.done + ' done' : '') + '</div>' +
+                    // YouTube channels aren't filed under a Library at all (see
+                    // renderLibraryTabs) — no picker for them.
+                    (yt ? '' : libSlot('show', sh.tmdb_id, sh.root_folder_id)) +
                 '</div>' +
                 '<div class="vwsh-info-cast" data-vwsh-cast></div>' +
             '</div>' +
@@ -431,6 +499,7 @@
         grid.innerHTML = nebula
             ? items.map(function (sh, i) { return nebulaOrb(sh, i); }).join('')
             : items.map(movieCard).join('');
+        paintLibPickers(grid);
     }
 
     // ── counts / badges / pager ───────────────────────────────────────────────
@@ -693,13 +762,27 @@
     // tab called 'Movies' just reads as a duplicate.
     var KIND_ALL_LABEL = { movie: 'All Movies', show: 'All TV' };
     var _libsByKind = {};
+    // Every configured Library per kind — the per-card picker needs the full
+    // list, where _libsByKind holds only the ones that earn their own TAB.
+    var _allLibsByKind = {};
     var libsLoaded = false;
     function loadLibraries() {
         if (libsLoaded) return;
         libsLoaded = true;
         fetch('/api/video/libraries', { headers: { Accept: 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) { renderLibraryTabs((d && d.configured) || {}); })
+            .then(function (d) {
+                var configured = (d && d.configured) || {};
+                // Kept OUT of renderLibraryTabs, which bails when the tab strip
+                // isn't in the DOM — the per-card pickers need this either way.
+                Object.keys(LIB_KEY).forEach(function (kind) {
+                    _allLibsByKind[kind] = configured[LIB_KEY[kind]] || [];
+                });
+                renderLibraryTabs(configured);
+                // The other end of the race: cards rendered before the registry
+                // arrived have empty slots waiting to be filled.
+                paintLibPickers();
+            })
             .catch(function () {});
     }
 
@@ -831,6 +914,9 @@
     }
 
     function onGridClick(e) {
+        // The Library picker sits INSIDE a card that opens on click — using it
+        // must not navigate away mid-choice.
+        if (e.target.closest('[data-vwsh-lib-slot]')) { e.stopPropagation(); return; }
         var pick = e.target.closest('[data-vwsh-pick]');
         if (pick) { e.preventDefault(); e.stopPropagation(); doPick(pick); return; }
         var hunt = e.target.closest('[data-vwsh-hunt]');
@@ -893,7 +979,14 @@
             var b = e.target.closest('[data-vwsh-tab]');
             if (b) setTab(b.getAttribute('data-vwsh-tab'));
         });
-        var grid = $('[data-vwsh-grid]'); if (grid) grid.addEventListener('click', onGridClick);
+        var grid = $('[data-vwsh-grid]');
+        if (grid) {
+            grid.addEventListener('click', onGridClick);
+            grid.addEventListener('change', function (e) {
+                var sel = e.target.closest('[data-vwsh-lib]');
+                if (sel) setItemLibrary(sel);
+            });
+        }
         var search = $('[data-vwsh-search]');
         if (search) search.addEventListener('input', function () {
             if (searchTimer) clearTimeout(searchTimer);

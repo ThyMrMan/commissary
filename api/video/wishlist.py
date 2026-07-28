@@ -214,6 +214,39 @@ def register_routes(bp):
             logger.exception("Failed to add to video wishlist")
             return jsonify({"success": False, "error": "Failed"}), 500
 
+    @bp.route("/wishlist/library", methods=["PUT"])
+    def video_wishlist_set_library():
+        """Direct a wished title at a Library. Body: {kind, tmdb_id, root_folder_id}
+        where kind ∈ movie|show and root_folder_id null = 'default' (inherit from
+        the library row, else the primary Library for the kind).
+
+        Admin-only — the '/library' suffix gate in this blueprint's before_request
+        covers it, same as the detail page's reassignment.
+
+        Metadata only: nothing on disk moves. It's where the NEXT grab lands."""
+        from . import get_video_db
+        body = request.get_json(silent=True) or {}
+        kind, tmdb_id = body.get("kind"), body.get("tmdb_id")
+        if kind not in ("movie", "show") or not tmdb_id:
+            return jsonify({"success": False,
+                            "error": "kind (movie|show) and tmdb_id are required"}), 400
+        try:
+            db = get_video_db()
+            rfid = body.get("root_folder_id")
+            # Reject a bad Library HERE rather than reading it back off the row
+            # count: a title with nothing left on the wishlist also updates 0
+            # rows, and reporting that as "no such Library" would be a lie.
+            if rfid not in (None, "", "null"):
+                row = db.get_root_folder(rfid)
+                if not row or str(row.get("content_kind") or "") != kind:
+                    return jsonify({"success": False,
+                                    "error": "That Library doesn't exist, or isn't for this kind"}), 400
+            return jsonify({"success": True,
+                            "updated": db.set_wishlist_root_folder(kind, int(tmdb_id), rfid)})
+        except Exception:
+            logger.exception("Failed to set wishlist library")
+            return jsonify({"success": False, "error": "Failed"}), 500
+
     @bp.route("/wishlist/remove", methods=["POST"])
     def video_wishlist_remove():
         """Remove at any granularity. Body: {scope, tmdb_id, season_number?, episode_number?}

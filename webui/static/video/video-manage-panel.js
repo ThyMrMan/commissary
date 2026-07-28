@@ -301,6 +301,15 @@
                           'Re-scan episodes from TMDB</button>' +
                       '<div class="vmg-hint" data-vmg-rescan-note>Pulls the full season/episode ' +
                           'list again. Use this when TMDB lists episodes SoulSync is missing.</div>' +
+                      // Your media server and TMDB can split a long-running show into
+                      // seasons differently (Plex files Bleach's newer run as S2 where
+                      // TMDB calls it S17). Those are separate rows, so the episode is
+                      // listed twice — once owned, once missing. Two clicks: look, then
+                      // agree, because this deletes rows.
+                      '<button class="vmg-btn-ghost" type="button" data-vmg-dupe-eps ' +
+                          'style="margin-top:8px;">Check for duplicate episodes</button>' +
+                      '<div class="vmg-hint" data-vmg-dupe-note>Finds episodes listed twice ' +
+                          'because your server and TMDB number the seasons differently.</div>' +
                   '</div>'
                 : '') +
             // Also known as (matching aid): extra titles the release-title gate will
@@ -707,6 +716,63 @@
             .then(function () { btn.disabled = false; btn.textContent = orig; });
     }
 
+    // Two-step on purpose: the first click only LOOKS, the second agrees to the
+    // delete. No modal — the button itself becomes the confirmation, and it names
+    // the exact number so "remove 12 duplicate rows" is what you agree to, not a
+    // generic yes. State lives on the button so re-opening the panel resets it.
+    function duplicateEpisodes(btn) {
+        if (btn.disabled) return;
+        var note = state.overlay && state.overlay.querySelector('[data-vmg-dupe-note]');
+        var armed = btn.getAttribute('data-armed') === '1';
+        btn.disabled = true;
+        btn.textContent = armed ? 'Removing…' : 'Checking…';
+        var req = armed
+            ? fetch('/api/video/repair/duplicate-episodes', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ show_id: state.id }) })
+            : fetch('/api/video/repair/duplicate-episodes?show_id=' + state.id,
+                { headers: { Accept: 'application/json' } });
+        req.then(function (r) {
+            return r.json().catch(function () { return {}; }).then(function (b) {
+                if (!r.ok || !b.ok) throw new Error(b.error || 'Request failed');
+                return b;
+            });
+        }).then(function (b) {
+            if (armed) {
+                btn.removeAttribute('data-armed');
+                btn.textContent = 'Check for duplicate episodes';
+                var msg = 'Removed ' + b.removed + ' duplicate row' + (b.removed === 1 ? '' : 's');
+                if (note) note.textContent = msg + '. Nothing on disk was touched.';
+                toast(msg, 'success');
+                if (b.removed) document.dispatchEvent(new CustomEvent('soulsync:video-episodes-changed'));
+                return;
+            }
+            if (!b.count) {
+                btn.textContent = 'Check for duplicate episodes';
+                if (note) note.textContent = 'No duplicates found for this show.';
+                toast('No duplicate episodes found', 'info');
+                return;
+            }
+            // Arm the confirm, and say exactly what would go.
+            btn.setAttribute('data-armed', '1');
+            btn.textContent = 'Remove ' + b.count + ' duplicate row' + (b.count === 1 ? '' : 's');
+            var eg = (b.items || []).slice(0, 3).map(function (it) {
+                return 'S' + it.season_number + 'E' + it.episode_number +
+                       ' (you have it as S' + it.owned_season + 'E' + it.owned_episode + ')';
+            }).join(', ');
+            if (note) {
+                note.textContent = b.count + ' episode(s) listed twice: ' + eg +
+                    (b.count > 3 ? ', …' : '') + '. Removing only clears the duplicate ' +
+                    'listing — no files are deleted.';
+            }
+        }).catch(function (e) {
+            btn.removeAttribute('data-armed');
+            btn.textContent = 'Check for duplicate episodes';
+            if (note) note.textContent = (e && e.message) || 'Check failed';
+            toast((e && e.message) || 'Check failed', 'error');
+        }).then(function () { btn.disabled = false; });
+    }
+
     function setSeriesType(sel) {
         fetch('/api/video/detail/show/' + state.id + '/series-type', {
             method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -867,6 +933,8 @@
             if (akaBtn) { saveAkaTitles(akaBtn); return; }
             var rsc = e.target.closest('[data-vmg-rescan-eps]');
             if (rsc) { rescanEpisodes(rsc); return; }
+            var dup = e.target.closest('[data-vmg-dupe-eps]');
+            if (dup) { duplicateEpisodes(dup); return; }
             var tw = e.target.closest('[data-vmg-watched]');
             if (tw) { toggle('watched', tw); return; }
             var tm = e.target.closest('[data-vmg-monitored]');

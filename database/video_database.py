@@ -1891,6 +1891,159 @@ class VideoDatabase:
         finally:
             conn.close()
 
+    # A backfilled row is a PHANTOM when the media server already holds that
+    # episode under a different season number. Same identity rule as
+    # _already_owned_elsewhere, run in reverse over rows that already exist —
+    # and with the same refusal to guess: exactly one owned row and exactly one
+    # server-less row may share the date, or the pairing is not provable.
+    _DUPE_EPISODE_SQL = """
+        SELECT e.id, e.show_id, e.season_number, e.episode_number, e.title,
+               substr(COALESCE(e.air_date,''),1,10) AS air_date,
+               s.title AS show_title,
+               (SELECT o.season_number FROM episodes o
+                 WHERE o.show_id = e.show_id
+                   AND substr(COALESCE(o.air_date,''),1,10) = substr(e.air_date,1,10)
+                   AND o.server_id IS NOT NULL) AS owned_season,
+               (SELECT o.episode_number FROM episodes o
+                 WHERE o.show_id = e.show_id
+                   AND substr(COALESCE(o.air_date,''),1,10) = substr(e.air_date,1,10)
+                   AND o.server_id IS NOT NULL) AS owned_episode
+          FROM episodes e
+          JOIN shows s ON s.id = e.show_id
+         WHERE e.server_id IS NULL            -- never a row the server put there
+           AND e.has_file = 0                 -- never something you actually hold
+           AND COALESCE(e.air_date,'') <> ''
+           AND NOT EXISTS (SELECT 1 FROM media_files mf WHERE mf.episode_id = e.id)
+           AND (SELECT COUNT(*) FROM episodes o
+                 WHERE o.show_id = e.show_id
+                   AND substr(COALESCE(o.air_date,''),1,10) = substr(e.air_date,1,10)
+                   AND o.server_id IS NOT NULL) = 1
+           AND (SELECT COUNT(*) FROM episodes o
+                 WHERE o.show_id = e.show_id
+                   AND substr(COALESCE(o.air_date,''),1,10) = substr(e.air_date,1,10)
+                   AND o.server_id IS NULL) = 1
+           AND EXISTS (SELECT 1 FROM episodes o
+                 WHERE o.show_id = e.show_id
+                   AND substr(COALESCE(o.air_date,''),1,10) = substr(e.air_date,1,10)
+                   AND o.server_id IS NOT NULL
+                   AND o.season_number <> e.season_number)
+    """
+
+    def duplicate_episode_rows(self, show_id=None, limit: int = 2000) -> list:
+        """Phantom episode rows — the same episode listed a second time under the
+        OTHER source's season numbering (see _already_owned_elsewhere).
+
+        Read-only. This is the preview a destructive clean-up is chosen from, so
+        it returns enough to judge each row: which season/episode the phantom
+        claims to be, and which owned one it duplicates.
+        """
+        sql = self._DUPE_EPISODE_SQL
+        params: list = []
+        if show_id is not None:
+            sql += " AND e.show_id = ?"
+            params.append(int(show_id))
+        sql += " ORDER BY s.title COLLATE NOCASE, e.season_number, e.episode_number LIMIT ?"
+        params.append(max(1, int(limit)))
+        conn = self._get_connection()
+        try:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        except (sqlite3.Error, ValueError, TypeError):
+            logger.exception("duplicate_episode_rows failed")
+            return []
+        finally:
+            conn.close()
+
+    def delete_episode_rows(self, ids) -> int:
+        """Delete specific episode rows by id — but only ones that still qualify
+        as phantoms at delete time.
+
+        The caller passes ids it got from a PREVIEW, and the library may have
+        changed since (a scan landed, a file arrived). Re-checking against the
+        same rule means a row that has since become real is skipped rather than
+        deleted, so a stale preview can never destroy something you own.
+        """
+        wanted = {int(i) for i in (ids or []) if str(i).strip().lstrip("-").isdigit()}
+        if not wanted:
+            return 0
+        conn = self._get_connection()
+        try:
+            still = {int(r["id"]) for r in conn.execute(self._DUPE_EPISODE_SQL).fetchall()}
+            doomed = sorted(wanted & still)
+            if not doomed:
+                return 0
+            ph = ",".join("?" * len(doomed))
+            conn.execute(f"DELETE FROM episodes WHERE id IN ({ph})", doomed)
+            conn.commit()
+            return len(doomed)
+        except (sqlite3.Error, ValueError, TypeError):
+            logger.exception("delete_episode_rows failed")
+            return 0
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _ambiguous_air_dates(episodes) -> set:
+        """Air dates shared by more than one episode in THIS batch.
+
+        The other half of the streaming-drop problem. A whole season released in
+        one go carries a single date across every episode, so if you happen to
+        own just one of them, every other episode would match that one owned row
+        and be suppressed — hiding the very episodes the backfill exists to
+        surface. A date that cannot identify a single episode on the incoming
+        side is no more usable than one that cannot on the existing side.
+        """
+        seen, dupes = set(), set()
+        for e in (episodes or []):
+            d = str((e or {}).get("air_date") or "").strip()[:10]
+            if not d:
+                continue
+            if d in seen:
+                dupes.add(d)
+            seen.add(d)
+        return dupes
+
+    @staticmethod
+    def _already_owned_elsewhere(conn, show_id: int, season_number: int, air_date) -> bool:
+        """Whether the media server already holds this episode under a DIFFERENT
+        season number, so backfilling it again would duplicate it.
+
+        Media servers and TMDB do not always agree on how a long-running show is
+        split into seasons — Plex files Bleach's newer run as S2 where TMDB calls
+        it S17. Both numbers are 'right', but they are different rows under
+        UNIQUE(show_id, season_number, episode_number), so the episode appears
+        twice: once owned, once missing. The scan's prune only ever inspects rows
+        with a server_id, so the backfilled phantom survives every rescan.
+
+        The air date is the only identity both sources reliably share (TMDB's
+        season endpoint carries no tvdb id). It is used under three guards,
+        because a careless match here would HIDE episodes:
+
+          • the existing row must be SERVER-BACKED (server_id NOT NULL). A row
+            put there by an earlier backfill proves nothing about ownership.
+          • it must be under a different season — same-season is the normal
+            update path handled above.
+          • the date must identify exactly ONE episode in the show. A streaming
+            season that drops in one go shares a single air date across every
+            episode; matching on that would suppress all but one of them.
+
+        No air date → no judgement, and the episode is created as before.
+        """
+        d = str(air_date or "").strip()[:10]
+        if not d:
+            return False
+        try:
+            rows = conn.execute(
+                "SELECT season_number, server_id FROM episodes "
+                "WHERE show_id=? AND substr(COALESCE(air_date,''),1,10)=?",
+                (int(show_id), d)).fetchall()
+        except (sqlite3.Error, ValueError, TypeError):
+            return False
+        if len(rows) != 1:      # ambiguous (or nothing) — never guess
+            return False
+        row = rows[0]
+        return (row["server_id"] is not None
+                and int(row["season_number"] or -1) != int(season_number))
+
     def backfill_episodes(self, show_id: int, season_number: int, episodes: list,
                           season_overview: str | None = None, season_poster: str | None = None) -> int:
         """UPSERT a season's episodes from the metadata provider so the show's
@@ -1910,6 +2063,7 @@ class VideoDatabase:
                 conn.execute("UPDATE seasons SET overview=COALESCE(NULLIF(overview, ''), ?), "
                              "poster_url=COALESCE(NULLIF(poster_url, ''), ?) WHERE id=?",
                              (season_overview, season_poster, season_id))
+            _ambiguous = self._ambiguous_air_dates(episodes)
             for e in (episodes or []):
                 en = e.get("episode_number")
                 if en is None:
@@ -1928,6 +2082,17 @@ class VideoDatabase:
                         params += [row["id"]]
                         conn.execute(f"UPDATE episodes SET {', '.join(sets)} WHERE id=?", params)
                         touched += 1
+                elif (str(e.get("air_date") or "").strip()[:10] not in _ambiguous
+                      and self._already_owned_elsewhere(conn, show_id, season_number,
+                                                        e.get("air_date"))):
+                    # The media server already has this episode under ITS OWN season
+                    # numbering. Bleach: Plex files the newer run as S2, TMDB calls it
+                    # S17 — different season numbers are different rows under
+                    # UNIQUE(show_id, season_number, episode_number), so inserting
+                    # would list the same episode twice, once owned and once missing.
+                    # Worse, the scan's prune only ever looks at rows with a
+                    # server_id, so the phantom copy survives every rescan forever.
+                    continue
                 else:
                     conn.execute(
                         "INSERT INTO episodes (show_id, season_id, season_number, episode_number, title, "
@@ -6801,12 +6966,19 @@ class VideoDatabase:
                 total = conn.execute("SELECT COUNT(*) c FROM video_wishlist" + wsql, args).fetchone()["c"]
                 rows = conn.execute(
                     "SELECT tmdb_id, title, poster_url, year, status, library_id, date_added, "
-                    "search_attempts, last_search_at "
+                    "search_attempts, last_search_at, "
+                    # The EFFECTIVE destination, resolved the same way the drain
+                    # resolves it (_root_folder_for_item) — so the Library picker
+                    # on the card shows where this actually lands, not just
+                    # whether someone has set an override.
+                    "COALESCE(root_folder_id, (SELECT root_folder_id FROM movies WHERE id = library_id)) "
+                    "AS root_folder_id "
                     "FROM video_wishlist" + wsql + " ORDER BY " + order + " LIMIT ? OFFSET ?",
                     args + [limit, (page - 1) * limit]).fetchall()
                 items = [{"kind": "movie", "tmdb_id": r["tmdb_id"], "title": r["title"],
                           "poster_url": r["poster_url"], "year": r["year"], "status": r["status"],
                           "library_id": r["library_id"],
+                          "root_folder_id": r["root_folder_id"],
                           "search_attempts": r["search_attempts"] or 0,
                           "last_search_at": r["last_search_at"]} for r in rows]
             else:   # shows (grouped from episode rows)
@@ -6834,11 +7006,18 @@ class VideoDatabase:
                     eps = conn.execute(
                         "SELECT season_number, episode_number, episode_title, still_url, "
                         "episode_overview, season_poster_url, air_date, status, "
-                        "search_attempts, last_search_at "
+                        "search_attempts, last_search_at, "
+                        "COALESCE(root_folder_id, (SELECT root_folder_id FROM shows WHERE id = library_id)) "
+                        "AS root_folder_id "
                         "FROM video_wishlist WHERE kind='episode' AND tmdb_id=? "
                         "ORDER BY season_number, episode_number", (sr["tmdb_id"],)).fetchall()
                     by_season: dict = {}
                     season_poster: dict = {}
+                    # A show's Library is only reportable when EVERY wished episode
+                    # agrees. Rows can disagree (some predate the assignment), and
+                    # showing one of them as "the" Library would let a picker that
+                    # looks unchanged silently move the rest.
+                    ep_roots = {e["root_folder_id"] for e in eps}
                     for e in eps:
                         by_season.setdefault(e["season_number"], []).append({
                             "episode_number": e["episode_number"], "title": e["episode_title"],
@@ -6852,6 +7031,7 @@ class VideoDatabase:
                                 "episodes": by_season[sn]} for sn in sorted(by_season)]
                     items.append({"kind": "show", "tmdb_id": sr["tmdb_id"], "title": sr["title"],
                                   "poster_url": sr["poster_url"], "library_id": sr["library_id"],
+                                  "root_folder_id": (list(ep_roots)[0] if len(ep_roots) == 1 else None),
                                   "wanted": sr["wanted"], "done": sr["done"] or 0, "seasons": seasons})
         finally:
             conn.close()
@@ -6860,6 +7040,60 @@ class VideoDatabase:
         return {"items": items, "pagination": {
             "page": page, "total_pages": total_pages, "total_count": total,
             "has_prev": page > 1, "has_next": page < total_pages}}
+
+    def set_wishlist_root_folder(self, kind: str, tmdb_id, root_folder_id) -> int:
+        """Direct a WISHED title at a specific Library, before it exists on disk.
+
+        ``set_item_root_folder`` can only reassign a title that already has a
+        movies/shows row — which a wished title usually doesn't, and that gap is
+        why everything unattended landed in the primary ('All Movies'/'All TV')
+        Library no matter what it was. This writes the same decision one step
+        earlier, onto the wishlist rows the drain reads.
+
+        Metadata only — nothing on disk moves. It decides where the next grab
+        for this title goes: every acquisition path resolves its destination
+        through ``_root_folder_for_item``, which reads
+        ``COALESCE(video_wishlist.root_folder_id, <the library row's>)``.
+
+        Setting a Library also stamps the linked library row (if any), so a
+        title that IS already in the library doesn't end up split — new episodes
+        in one Library, the existing ones in another. CLEARING deliberately does
+        not: 'Default' means 'inherit from the library row', so wiping that row
+        too would make choosing Default unassign a title it was never asked to
+        touch.
+
+        Returns the number of wishlist rows changed. 0 for an unknown Library, or
+        one whose ``content_kind`` doesn't match — a movie filed under a TV
+        Library would send every future grab to the wrong tree, silently."""
+        want = str(kind or "").lower()
+        row_kind = {"movie": "movie", "show": "episode"}.get(want)
+        if not row_kind or not tmdb_id:
+            return 0
+        rid = None
+        if root_folder_id not in (None, "", "null"):
+            try:
+                rid = int(root_folder_id)
+            except (TypeError, ValueError):
+                return 0
+            row = self.get_root_folder(rid)
+            if not row or str(row.get("content_kind") or "") != want:
+                return 0
+        conn = self._get_connection()
+        try:
+            cur = conn.execute(
+                "UPDATE video_wishlist SET root_folder_id=? WHERE kind=? AND tmdb_id=?",
+                (rid, row_kind, int(tmdb_id)))
+            if rid is not None:
+                conn.execute(
+                    "UPDATE %s SET root_folder_id=? WHERE tmdb_id=?"
+                    % ("movies" if want == "movie" else "shows"), (rid, int(tmdb_id)))
+            conn.commit()
+            return cur.rowcount
+        except (sqlite3.Error, ValueError, TypeError):
+            logger.exception("set_wishlist_root_folder failed (%s %s)", kind, tmdb_id)
+            return 0
+        finally:
+            conn.close()
 
     # ── named quality profiles (the schema's day-one quality_profiles table,
     #    finally in service; arr-parity P2). ``items`` holds the FULL normalized
