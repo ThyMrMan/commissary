@@ -3484,8 +3484,14 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.9': [
-        { date: 'July 2026 · 1.8.9' },
+    '1.8.10': [
+        { date: 'July 2026 · 1.8.10' },
+        { title: 'A wishlist request now waits for you', desc: 'the Watchlist has worked this way since 1.6.7; the wishlist did not. A title added by someone without download rights went straight into the hourly automation and was fetched unattended. It now lands as "Awaiting approval" — visible on the wishlist immediately, so the person who asked can see they asked, while nothing goes looking for it until you say yes.' },
+        { title: 'Approve or Decline on the card', desc: 'admins see both buttons with the requester\'s name. Approving a show releases every pending episode under it at once. Declining removes the request; nothing re-adds a wish on its own, so it stays gone until somebody asks again.' },
+        { title: 'Every route that could fetch it is covered', desc: 'that is the part that matters — one missed path and the automation quietly downloads something nobody approved. The hourly drain, RSS matching, "Search now", "Search all missing" and the YouTube worker all read the wishlist through the same four places, and all four skip anything still waiting. Pressing a different button cannot get round it.' },
+        { title: 'Nothing you already had stops downloading', desc: 'approval defaults to granted, so your own wishes, everything your automation added, and every row that predates this release carry on exactly as before. Only new requests from profiles without download rights wait.' },
+        { title: 'And a member can still change their mind', desc: 'they can remove their own pending request without needing you — asking and then thinking better of it should not need an approval too.' },
+        { title: 'Also in 1.8.9', desc: 'controls that could only fail were hidden, three genuinely open endpoints were closed, wishlist items became removable only by whoever added them, and the search picker stopped showing connections you have not set up.' },
         { title: 'Buttons that could only fail are gone', desc: 'the follow-up to 1.8.8. Standard and Plex users were still being shown a row of controls that answered "not allowed" when clicked — Retry on a failed download, Block release, Clear, the download-history actions, Search now on an individual episode. All of them are hidden for profiles that cannot use them.' },
         { title: 'Three of them were not just cosmetic', desc: 'clearing the finished downloads on both the music and video sides, and every part of the music Import page, were behind no permission check at all. Those are not dead buttons — they work, on shared data. Any signed-in profile could empty your download history or import files into your library. All of them are now checked on the server, which is the part that counts.' },
         { title: 'And cancelling a music download is checked too', desc: 'the music side had the same gap the video side had in 1.8.8: all four cancel routes were open, so a standard profile could stop your in-flight downloads. One of them also re-added the cancelled track to the shared wishlist, so a single call both stopped a download and changed shared state.' },
@@ -3588,6 +3594,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.8.10: a wishlist request waits for you",
+        description: "the Watchlist has needed approval since 1.6.7. The wishlist did not — a title added by someone without download rights went straight into the hourly automation and was fetched unattended.",
+        features: [
+            "a request now lands as \"Awaiting approval\": on the wishlist immediately, so the person who asked can see they asked, while nothing goes looking for it until you say yes",
+            "admins get Approve and Decline on the card with the requester's name. Approving a show releases every pending episode under it at once; declining removes the request",
+            "every route that could fetch it is covered — the hourly drain, RSS matching, \"Search now\", \"Search all missing\" and the YouTube worker. One missed path would mean the automation quietly downloading something nobody approved, so they all read the wishlist through the same four places and all four skip anything still waiting",
+            "nothing you already had stops downloading. Approval defaults to granted, so your own wishes, everything your automation added and every row predating this release carry on exactly as before",
+            "a member can still remove their own pending request without asking you — thinking better of it should not need an approval as well",
+        ],
+        usage_note: "Wishlist → pending cards carry Approve / Decline. Manage Profiles → 'Can download' decides who needs approval.",
+    },
     {
         title: "1.8.9: what you can see is what you can do",
         description: "the follow-up to 1.8.8. Standard and Plex users were still shown controls that answered \"not allowed\" when clicked — and a few of those controls were not dead at all, they worked, on shared data.",

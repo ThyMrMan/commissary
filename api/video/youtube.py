@@ -15,7 +15,7 @@ yt-dlp only; reads/writes only video_library.db.
 
 from __future__ import annotations
 
-from flask import jsonify, request
+from flask import g, jsonify, request
 
 from utils.logging_config import get_logger
 
@@ -109,8 +109,12 @@ def register_routes(bp):
             # Wishlist only the configured recent slice (the resolve/preview may carry more).
             recent = (channel.get("videos") or [])[:count]
             from . import acting_profile_id
+            _ok = bool(getattr(g, "can_download", True))
             added = db.add_videos_to_wishlist(channel, recent, server_source=_server(),
-                                              added_by_profile_id=acting_profile_id())
+                                              added_by_profile_id=acting_profile_id(),
+                                              approved=_ok,
+                                              requested_by=None if _ok else acting_profile_id(),
+                                              requested_by_name=None if _ok else getattr(g, "profile_name", None))
             if followed:   # followed channels get their full upload-date catalog in the background
                 try:
                     from core.video.youtube_enrichment import get_youtube_date_enricher
@@ -631,9 +635,15 @@ def register_routes(bp):
             db = get_video_db()
             # A manual add is deliberate — it may re-wish an already-downloaded
             # video (the user can see the ✓ downloaded marker; they want it again).
+            # Pending unless this profile may acquire — same gate as the TMDB
+            # wishlist. The videos are wished and visible either way.
+            _ok = bool(getattr(g, "can_download", True))
             n = db.add_videos_to_wishlist(channel, videos, server_source=_server(),
                                           allow_downloaded=True,
-                                          added_by_profile_id=acting_profile_id())
+                                          added_by_profile_id=acting_profile_id(),
+                                          approved=_ok,
+                                          requested_by=None if _ok else acting_profile_id(),
+                                          requested_by_name=None if _ok else getattr(g, "profile_name", None))
             if not n:
                 return jsonify({"success": False, "added": 0,
                                 "error": "Couldn't add — the video may be missing its id"})

@@ -557,7 +557,15 @@ CREATE TABLE IF NOT EXISTS video_wishlist (
     -- wishes and nothing else. NULL = added by automation (watchlist scan,
     -- collections, RSS) or before this column existed — nobody's personal wish,
     -- so only a profile with can_download may remove it.
-    added_by_profile_id INTEGER
+    added_by_profile_id INTEGER,
+    -- Approval gate, mirroring video_watchlist. A wish added by a profile
+    -- WITHOUT download rights lands approved=0: it appears on the wishlist
+    -- straight away (so the requester can see they asked) but every ACQUISITION
+    -- path skips it until an admin approves. Defaults to 1 so admin wishes,
+    -- automation rows and everything predating this column stay live.
+    approved          INTEGER NOT NULL DEFAULT 1,
+    requested_by      INTEGER,   -- profile id that asked (NULL = admin/automation/legacy)
+    requested_by_name TEXT       -- display name, captured at request time
 );
 -- one row per movie, one per (show, season, episode), one per youtube video —
 -- partial uniques so the shapes don't collide and re-adding is an idempotent upsert.

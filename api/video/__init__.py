@@ -168,6 +168,10 @@ def create_video_blueprint() -> Blueprint:
                 "/api/video/wishlist/search",
                 # approving IS acquisition — admin-only, checked in the route too
                 "/api/video/watchlist/approve",
+                # same for the wishlist's queue: releasing a pending wish is what
+                # lets it be fetched. '/wishlist/approve' also covers the deny
+                # sibling by name below.
+                "/api/video/wishlist/approve", "/api/video/wishlist/deny",
                 # Destructive siblings of the above. These were unreachable while
                 # every non-download profile was music-only; now that a Plex sign-in
                 # gets video access by default, an un-gated one would let a member

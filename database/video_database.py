@@ -263,6 +263,13 @@ _COLUMN_MIGRATIONS = [
     # can_download may remove it. Set on INSERT only: re-adding a title someone
     # else already wished must not transfer ownership of their row.
     ("video_wishlist", "added_by_profile_id", "INTEGER"),
+    # Wishlist approval gate (see schema.sql), mirroring video_watchlist.
+    # approved defaults to 1 so admin wishes, automation rows and every row that
+    # predates this column stay live; a wish from a profile without download
+    # rights lands 0 and every acquisition path skips it until approved.
+    ("video_wishlist", "approved", "INTEGER NOT NULL DEFAULT 1"),
+    ("video_wishlist", "requested_by", "INTEGER"),
+    ("video_wishlist", "requested_by_name", "TEXT"),
     # which source produced a channel's dates — NULL on legacy (pre-InnerTube) rows
     # so they re-enrich once and upgrade to the full InnerTube catalog.
     ("youtube_channel_enrichment", "method", "TEXT"),
@@ -556,6 +563,10 @@ class VideoDatabase:
         # queue reads it on every watchlist render and nav-badge poll.
         "CREATE INDEX IF NOT EXISTS idx_video_watchlist_approved "
         "ON video_watchlist(approved) WHERE approved = 0",
+        # Same for the wishlist's gate: every acquisition feed filters on
+        # approved, and the pending queue + nav badge poll for the 0s.
+        "CREATE INDEX IF NOT EXISTS idx_video_wishlist_approved "
+        "ON video_wishlist(approved) WHERE approved = 0",
         # Recently-Added ranks shows by their newest episode's add-date — MAX(added_at)
         # per show over a 200k-episode table, so index it.
         "CREATE INDEX IF NOT EXISTS idx_episodes_show_added ON episodes(show_id, added_at)",
@@ -6580,7 +6591,8 @@ class VideoDatabase:
     def add_movie_to_wishlist(self, tmdb_id, title, *, year=None, poster_url=None,
                               library_id=None, server_source=None, status='wanted',
                               detail_json=None, root_folder_id=None,
-                              added_by_profile_id=None) -> bool:
+                              added_by_profile_id=None, approved: bool = True,
+                              requested_by=None, requested_by_name=None) -> bool:
         """Wish for a movie. Idempotent upsert on its tmdb id.
 
         ``status`` lets the watchlist-people scan add an UPCOMING (unreleased) movie as
@@ -6612,8 +6624,8 @@ class VideoDatabase:
                 # ownership belongs to whoever asked FIRST. Re-adding a title
                 # someone else wished must not hand their row to the re-adder,
                 # which would be a way to delete another member's wish.
-                """INSERT INTO video_wishlist (kind, tmdb_id, title, poster_url, year, library_id, server_source, status, detail_json, root_folder_id, added_by_profile_id)
-                   VALUES ('movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO video_wishlist (kind, tmdb_id, title, poster_url, year, library_id, server_source, status, detail_json, root_folder_id, added_by_profile_id, approved, requested_by, requested_by_name)
+                   VALUES ('movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(tmdb_id) WHERE kind='movie' DO UPDATE SET
                        title=excluded.title,
                        poster_url=COALESCE(excluded.poster_url, video_wishlist.poster_url),
@@ -6622,9 +6634,16 @@ class VideoDatabase:
                        root_folder_id=COALESCE(excluded.root_folder_id, video_wishlist.root_folder_id),
                        detail_json=COALESCE(excluded.detail_json, video_wishlist.detail_json),
                        status=CASE WHEN video_wishlist.status='monitored' AND excluded.status='wanted'
-                                   THEN 'wanted' ELSE video_wishlist.status END""",
+                                   THEN 'wanted' ELSE video_wishlist.status END,
+                       -- MAX, so a pending re-add can never DOWNGRADE a wish an
+                       -- admin already approved (and a member re-wishing something
+                       -- live cannot quietly park it back in the queue).
+                       approved=MAX(video_wishlist.approved, excluded.approved),
+                       requested_by=COALESCE(video_wishlist.requested_by, excluded.requested_by),
+                       requested_by_name=COALESCE(video_wishlist.requested_by_name, excluded.requested_by_name)""",
                 (int(tmdb_id), title, poster_url, year, library_id, server_source, status,
-                 detail_json, root_folder_id, added_by_profile_id))
+                 detail_json, root_folder_id, added_by_profile_id,
+                 1 if approved else 0, requested_by, requested_by_name))
             conn.commit()
             if not existed:   # a refresh-upsert is not a new wish
                 _publish_video_event("video_wishlist_item_added",
@@ -6693,7 +6712,10 @@ class VideoDatabase:
                 "COALESCE(w.quality_profile_id, (SELECT m.quality_profile_id FROM movies m "
                 "  WHERE m.tmdb_id=w.tmdb_id)) AS quality_profile_id "
                 "FROM video_wishlist w "
-                "WHERE w.kind='movie' AND w.status='wanted' AND w.tmdb_id IS NOT NULL "
+                # APPROVAL GATE: a wish from a profile without download rights is
+                # invisible to every acquisition path until an admin approves it.
+                # It still shows on the wishlist — only the fetching waits.
+                "WHERE w.approved=1 AND w.kind='movie' AND w.status='wanted' AND w.tmdb_id IS NOT NULL "
                 # release-window gate: only search once within a week of release (early scene
                 # releases appear a few days out). A further-off movie stays wished but isn't
                 # hunted — no risk of grabbing a wrong-titled or fake 'release' before it exists.
@@ -6791,7 +6813,8 @@ class VideoDatabase:
                 "         (SELECT o.series_type FROM video_title_overrides o "
                 "          WHERE o.kind='show' AND o.tmdb_id = w.tmdb_id)) "
                 "AS series_type "
-                "FROM video_wishlist w WHERE w.kind='episode' AND w.tmdb_id IS NOT NULL "
+                # APPROVAL GATE — see movie_wishlist_to_download.
+                "FROM video_wishlist w WHERE w.approved=1 AND w.kind='episode' AND w.tmdb_id IS NOT NULL "
                 # release-window gate: search an episode only once it's within a week of air
                 # (early scene releases show up a few days out) — a further-off episode stays on
                 # the wishlist but isn't searched yet, so the drain never hunts a release that
@@ -6825,7 +6848,10 @@ class VideoDatabase:
                     "COALESCE(w.quality_profile_id, (SELECT m.quality_profile_id FROM movies m "
                     "  WHERE m.tmdb_id=w.tmdb_id)) AS quality_profile_id "
                     "FROM video_wishlist w "
-                    "WHERE w.kind='movie' AND w.tmdb_id=?", (int(tmdb_id),))]
+                    # APPROVAL GATE: 'Search now' is a manual acquisition path, so
+                    # it must respect the queue too — otherwise a pending wish
+                    # could be fetched by pressing a different button.
+                    "WHERE w.approved=1 AND w.kind='movie' AND w.tmdb_id=?", (int(tmdb_id),))]
             where, args = "", [int(tmdb_id)]
             if scope == "season" and season_number is not None:
                 where, args = " AND w.season_number=?", args + [int(season_number)]
@@ -6857,14 +6883,17 @@ class VideoDatabase:
                 "         (SELECT o.series_type FROM video_title_overrides o "
                 "          WHERE o.kind='show' AND o.tmdb_id = w.tmdb_id)) "
                 "AS series_type "
-                "FROM video_wishlist w WHERE w.kind='episode' AND w.tmdb_id=?" + where +
+                # APPROVAL GATE — see the movie arm above.
+                "FROM video_wishlist w WHERE w.approved=1 AND w.kind='episode' AND w.tmdb_id=?" + where +
                 " ORDER BY w.season_number, w.episode_number", args)]
         finally:
             conn.close()
 
     def add_episodes_to_wishlist(self, show_tmdb_id, show_title, episodes, *,
                                  poster_url=None, library_id=None, server_source=None,
-                                 root_folder_id=None, added_by_profile_id=None) -> int:
+                                 root_folder_id=None, added_by_profile_id=None,
+                                 approved: bool = True, requested_by=None,
+                                 requested_by_name=None) -> int:
         """Wish for one or more episodes of a show (the show's tmdb id keys them).
         ``episodes`` = [{season_number, episode_number, title?, air_date?}, …].
         Idempotent per (show, season, episode). Returns the count written."""
@@ -6885,8 +6914,9 @@ class VideoDatabase:
                     """INSERT INTO video_wishlist
                            (kind, tmdb_id, title, poster_url, season_number, episode_number,
                             episode_title, still_url, episode_overview, season_poster_url,
-                            air_date, library_id, server_source, root_folder_id, added_by_profile_id)
-                       VALUES ('episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            air_date, library_id, server_source, root_folder_id, added_by_profile_id,
+                            approved, requested_by, requested_by_name)
+                       VALUES ('episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(tmdb_id, season_number, episode_number) WHERE kind='episode' DO UPDATE SET
                            title=excluded.title,
                            poster_url=COALESCE(excluded.poster_url, video_wishlist.poster_url),
@@ -6896,11 +6926,15 @@ class VideoDatabase:
                            season_poster_url=COALESCE(excluded.season_poster_url, video_wishlist.season_poster_url),
                            air_date=COALESCE(excluded.air_date, video_wishlist.air_date),
                            library_id=COALESCE(excluded.library_id, video_wishlist.library_id),
-                           root_folder_id=COALESCE(excluded.root_folder_id, video_wishlist.root_folder_id)""",
+                           root_folder_id=COALESCE(excluded.root_folder_id, video_wishlist.root_folder_id),
+                           -- MAX — see add_movie_to_wishlist.
+                           approved=MAX(video_wishlist.approved, excluded.approved),
+                           requested_by=COALESCE(video_wishlist.requested_by, excluded.requested_by),
+                           requested_by_name=COALESCE(video_wishlist.requested_by_name, excluded.requested_by_name)""",
                     (int(show_tmdb_id), show_title, poster_url, int(sn), int(en),
                      e.get("title"), e.get("still_url"), e.get("overview"), e.get("season_poster_url"),
                      e.get("air_date"), library_id, server_source, root_folder_id,
-                     added_by_profile_id))
+                     added_by_profile_id, 1 if approved else 0, requested_by, requested_by_name))
                 n += 1
             new_rows = conn.execute(
                 "SELECT COUNT(*) FROM video_wishlist WHERE kind='episode' AND tmdb_id=?",
@@ -6959,6 +6993,106 @@ class VideoDatabase:
             cur = conn.execute("DELETE FROM video_wishlist WHERE " + where, args)
             conn.commit()
             return cur.rowcount
+        finally:
+            conn.close()
+
+    # ── approval queue ───────────────────────────────────────────────────────
+    def approve_wishlist(self, scope, *, tmdb_id, season_number=None,
+                         episode_number=None) -> int:
+        """Release a pending wish to the acquisition paths. Returns rows approved.
+
+        Only ever touches approved=0 rows, so approving twice is a no-op rather
+        than something that could reset state on a live wish."""
+        sel = self._wishlist_scope(scope, tmdb_id, season_number, episode_number)
+        if sel is None:
+            return 0
+        where, args = sel
+        conn = self._get_connection()
+        try:
+            cur = conn.execute(
+                "UPDATE video_wishlist SET approved=1 WHERE approved=0 AND " + where, args)
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+    def approve_youtube_wishlist(self, scope: str, source_id: str) -> int:
+        """Same, for wished YouTube videos ('video') or a whole channel's ('channel')."""
+        sel = self._youtube_wishlist_scope(scope, source_id)
+        if sel is None:
+            return 0
+        where, args = sel
+        conn = self._get_connection()
+        try:
+            cur = conn.execute(
+                "UPDATE video_wishlist SET approved=1 WHERE approved=0 AND " + where, args)
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+    def count_pending_wishlist_rows(self, scope, *, tmdb_id, season_number=None,
+                                    episode_number=None) -> int:
+        """How many rows in this scope are still awaiting approval — lets deny
+        refuse cleanly rather than silently removing nothing."""
+        sel = self._wishlist_scope(scope, tmdb_id, season_number, episode_number)
+        if sel is None:
+            return 0
+        where, args = sel
+        conn = self._get_connection()
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) c FROM video_wishlist WHERE approved=0 AND " + where,
+                args).fetchone()["c"]
+        finally:
+            conn.close()
+
+    def deny_wishlist(self, scope, *, tmdb_id, season_number=None, episode_number=None) -> int:
+        """Remove pending wishes in this scope. Never touches an approved row, so
+        a deny aimed at the wrong thing cannot delete a live wish."""
+        sel = self._wishlist_scope(scope, tmdb_id, season_number, episode_number)
+        if sel is None:
+            return 0
+        where, args = sel
+        conn = self._get_connection()
+        try:
+            cur = conn.execute(
+                "DELETE FROM video_wishlist WHERE approved=0 AND " + where, args)
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+    def pending_wishlist_entries(self, requested_by=None) -> list:
+        """Wishes awaiting approval, newest first. ``requested_by`` scopes it to one
+        profile's own asks — what a member sees of the queue."""
+        sql = ("SELECT id, kind, tmdb_id, title, poster_url, year, season_number, "
+               "episode_number, episode_title, source, source_id, parent_source_id, "
+               "requested_by, requested_by_name, date_added "
+               "FROM video_wishlist WHERE approved=0")
+        args: list = []
+        if requested_by is not None:
+            sql += " AND requested_by=?"
+            args.append(int(requested_by))
+        sql += " ORDER BY date_added DESC, id DESC"
+        conn = self._get_connection()
+        try:
+            return [dict(r) for r in conn.execute(sql, args)]
+        finally:
+            conn.close()
+
+    def pending_wishlist_count(self, requested_by=None) -> int:
+        """How many wishes are awaiting approval — the badge."""
+        sql = "SELECT COUNT(*) c FROM video_wishlist WHERE approved=0"
+        args: list = []
+        if requested_by is not None:
+            sql += " AND requested_by=?"
+            args.append(int(requested_by))
+        conn = self._get_connection()
+        try:
+            return conn.execute(sql, args).fetchone()["c"]
+        except Exception:
+            return 0
         finally:
             conn.close()
 
@@ -7094,6 +7228,7 @@ class VideoDatabase:
                 rows = conn.execute(
                     "SELECT tmdb_id, title, poster_url, year, status, library_id, date_added, "
                     "search_attempts, last_search_at, added_by_profile_id, "
+                    "approved, requested_by_name, "
                     # The EFFECTIVE destination, resolved the same way the drain
                     # resolves it (_root_folder_for_item) — so the Library picker
                     # on the card shows where this actually lands, not just
@@ -7110,7 +7245,9 @@ class VideoDatabase:
                           "last_search_at": r["last_search_at"],
                           # who asked for it — the page shows a remove control
                           # only on rows the viewer added (or to a downloader)
-                          "added_by_profile_id": r["added_by_profile_id"]} for r in rows]
+                          "added_by_profile_id": r["added_by_profile_id"],
+                          "approved": r["approved"],
+                          "requested_by_name": r["requested_by_name"]} for r in rows]
             else:   # shows (grouped from episode rows)
                 where, args = ["kind='episode'"], []
                 if s:
@@ -7137,6 +7274,7 @@ class VideoDatabase:
                         "SELECT season_number, episode_number, episode_title, still_url, "
                         "episode_overview, season_poster_url, air_date, status, "
                         "search_attempts, last_search_at, added_by_profile_id, "
+                        "approved, requested_by_name, "
                         "COALESCE(root_folder_id, (SELECT root_folder_id FROM shows WHERE id = library_id)) "
                         "AS root_folder_id "
                         "FROM video_wishlist WHERE kind='episode' AND tmdb_id=? "
@@ -7155,7 +7293,9 @@ class VideoDatabase:
                             "air_date": e["air_date"], "status": e["status"],
                             "search_attempts": e["search_attempts"] or 0,
                             "last_search_at": e["last_search_at"],
-                            "added_by_profile_id": e["added_by_profile_id"]})
+                            "added_by_profile_id": e["added_by_profile_id"],
+                            "approved": e["approved"],
+                            "requested_by_name": e["requested_by_name"]})
                         if e["season_poster_url"] and e["season_number"] not in season_poster:
                             season_poster[e["season_number"]] = e["season_poster_url"]
                     seasons = [{"season_number": sn, "poster_url": season_poster.get(sn),
@@ -8165,7 +8305,8 @@ class VideoDatabase:
 
     def add_videos_to_wishlist(self, channel: dict, videos: list, *, server_source=None,
                                allow_downloaded: bool = False,
-                               added_by_profile_id=None) -> int:
+                               added_by_profile_id=None, approved: bool = True,
+                               requested_by=None, requested_by_name=None) -> int:
         """Wish for a channel's videos. ``channel`` = {youtube_id, title, avatar_url?};
         ``videos`` = [{youtube_id, title, published_at?, thumbnail_url?, description?}, …].
         Idempotent per video id. Returns the count written."""
@@ -8198,18 +8339,23 @@ class VideoDatabase:
                     """INSERT INTO video_wishlist
                            (kind, tmdb_id, title, poster_url, episode_title, still_url,
                             episode_overview, air_date, source, source_id, parent_source_id,
-                            server_source, added_by_profile_id)
-                       VALUES ('video', ?, ?, ?, ?, ?, ?, ?, 'youtube', ?, ?, ?, ?)
+                            server_source, added_by_profile_id, approved, requested_by,
+                            requested_by_name)
+                       VALUES ('video', ?, ?, ?, ?, ?, ?, ?, 'youtube', ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(source_id) WHERE kind='video' DO UPDATE SET
                            title=excluded.title,
                            poster_url=COALESCE(excluded.poster_url, video_wishlist.poster_url),
                            episode_title=COALESCE(excluded.episode_title, video_wishlist.episode_title),
                            still_url=COALESCE(excluded.still_url, video_wishlist.still_url),
                            episode_overview=COALESCE(excluded.episode_overview, video_wishlist.episode_overview),
-                           air_date=COALESCE(excluded.air_date, video_wishlist.air_date)""",
+                           air_date=COALESCE(excluded.air_date, video_wishlist.air_date),
+                           -- MAX — see add_movie_to_wishlist.
+                           approved=MAX(video_wishlist.approved, excluded.approved),
+                           requested_by=COALESCE(video_wishlist.requested_by, excluded.requested_by),
+                           requested_by_name=COALESCE(video_wishlist.requested_by_name, excluded.requested_by_name)""",
                     (surrogate, ctitle, avatar, v.get("title"), v.get("thumbnail_url"),
                      v.get("description"), v.get("published_at"), vid, cid, server_source,
-                     added_by_profile_id))
+                     added_by_profile_id, 1 if approved else 0, requested_by, requested_by_name))
                 n += 1
             new_rows = conn.execute(
                 "SELECT COUNT(*) FROM video_wishlist WHERE kind='video' AND parent_source_id=?",
@@ -8440,7 +8586,8 @@ class VideoDatabase:
             sql = ("SELECT source_id AS video_id, parent_source_id AS channel_id, "
                    "title AS channel_title, episode_title AS video_title, "
                    "still_url AS thumbnail_url, air_date AS published_at "
-                   "FROM video_wishlist WHERE kind='video' AND source='youtube' "
+                   # APPROVAL GATE — see movie_wishlist_to_download.
+                   "FROM video_wishlist WHERE approved=1 AND kind='video' AND source='youtube' "
                    "AND source_id IS NOT NULL ORDER BY air_date DESC, id DESC")
             if limit and int(limit) > 0:
                 sql += " LIMIT %d" % int(limit)
@@ -8636,7 +8783,7 @@ class VideoDatabase:
             for cr in chan_rows:
                 vids = conn.execute(
                     "SELECT source_id, episode_title, still_url, episode_overview, air_date, status, "
-                    "added_by_profile_id "
+                    "added_by_profile_id, approved, requested_by_name "
                     "FROM video_wishlist WHERE kind='video' AND parent_source_id=? "
                     "ORDER BY (air_date IS NULL), air_date DESC, id DESC", (cr["parent_source_id"],)).fetchall()
                 # group by upload year → "seasons"; newest video in a year = episode 1
@@ -8653,7 +8800,9 @@ class VideoDatabase:
                                     "still_url": v["still_url"], "overview": v["episode_overview"],
                                     "air_date": v["air_date"], "status": v["status"],
                                     "source_id": v["source_id"],
-                                    "added_by_profile_id": v["added_by_profile_id"]})
+                                    "added_by_profile_id": v["added_by_profile_id"],
+                                    "approved": v["approved"],
+                                    "requested_by_name": v["requested_by_name"]})
                     poster = next((e["still_url"] for e in eps if e["still_url"]), cr["poster_url"])
                     seasons.append({"season_number": yr, "year": yr, "poster_url": poster, "episodes": eps})
                 items.append({

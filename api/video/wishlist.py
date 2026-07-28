@@ -10,7 +10,7 @@ Reads/writes only video_library.db via the shared VideoDatabase.
 
 from __future__ import annotations
 
-from flask import jsonify, request
+from flask import g, jsonify, request
 
 from utils.logging_config import get_logger
 
@@ -18,6 +18,24 @@ logger = get_logger("video_api.wishlist")
 
 _KINDS = ("movie", "show")
 _SCOPES = ("movie", "show", "season", "episode")
+
+
+def _me():
+    return int(getattr(g, "profile_id", 1) or 1)
+
+
+def _is_admin():
+    return bool(getattr(g, "is_admin", _me() == 1))
+
+
+def _may_acquire():
+    """Whether this profile's wishes are fetched straight away, or land pending.
+
+    Keyed on can_download ALONE, deliberately not on is_admin — the same rule the
+    watchlist's approval gate uses. The blueprint treats the two as orthogonal (a
+    download-disabled admin is still refused /downloads/grab), so approving on
+    is_admin would hand that admin a way around their own gate."""
+    return bool(getattr(g, "can_download", True))
 
 
 def _server():
@@ -190,6 +208,13 @@ def register_routes(bp):
         # Stamp who asked, so they can take it back later without being able to
         # remove anyone else's wishes. Automation adds leave this NULL.
         who = acting_profile_id()
+        # ...and whether it is fetched now or waits for an admin. A pending wish
+        # is written and shown exactly like any other — only the acquisition
+        # paths skip it — so the requester can see that they asked.
+        approved = _may_acquire()
+        req = dict(approved=approved,
+                   requested_by=None if approved else who,
+                   requested_by_name=None if approved else getattr(g, "profile_name", None))
         try:
             movie = body.get("movie")
             if movie and movie.get("tmdb_id") and (movie.get("title") or "").strip():
@@ -197,7 +222,7 @@ def register_routes(bp):
                     int(movie["tmdb_id"]), movie["title"].strip(), year=movie.get("year"),
                     poster_url=movie.get("poster_url") or None,
                     library_id=movie.get("library_id") or None, server_source=srv,
-                    added_by_profile_id=who,
+                    added_by_profile_id=who, **req,
                     root_folder_id=(movie.get("root_folder_id")
                                     or db.root_folder_id_for_tmdb("movie", movie["tmdb_id"])))
                 return jsonify({"success": ok, "added": 1 if ok else 0, "counts": db.wishlist_counts()})
@@ -209,7 +234,7 @@ def register_routes(bp):
                     int(show["tmdb_id"]), show["title"].strip(), episodes,
                     poster_url=show.get("poster_url") or None,
                     library_id=show.get("library_id") or None, server_source=srv,
-                    added_by_profile_id=who,
+                    added_by_profile_id=who, **req,
                     root_folder_id=(show.get("root_folder_id")
                                     or db.root_folder_id_for_tmdb("show", show["tmdb_id"])))
                 return jsonify({"success": n > 0, "added": n, "counts": db.wishlist_counts()})
@@ -310,6 +335,77 @@ def register_routes(bp):
                             "counts": counts, "youtube_counts": db.youtube_wishlist_counts()})
         except Exception:
             logger.exception("Failed to clear video wishlist")
+            return jsonify({"success": False, "error": "Failed"}), 500
+
+    @bp.route("/wishlist/pending", methods=["GET"])
+    def video_wishlist_pending():
+        """Wishes awaiting approval. An admin sees the whole queue; anyone else
+        sees only their own asks — the queue is other people's requests, which is
+        not a member's business, but their own pending items are."""
+        from . import get_video_db
+        try:
+            db = get_video_db()
+            scope = None if _is_admin() else _me()
+            return jsonify({"success": True,
+                            "entries": db.pending_wishlist_entries(requested_by=scope),
+                            "count": db.pending_wishlist_count(requested_by=scope)})
+        except Exception:
+            logger.exception("Failed to list pending wishlist entries")
+            return jsonify({"success": False, "error": "Failed", "entries": [], "count": 0}), 500
+
+    @bp.route("/wishlist/approve", methods=["POST"])
+    def video_wishlist_approve():
+        """Admin releases a pending wish to the acquisition paths. Body:
+        {scope, tmdb_id, season_number?, episode_number?} — the same shape as
+        /wishlist/remove, so a whole show or season can be approved at once."""
+        from . import get_video_db
+        if not _is_admin():
+            return jsonify({"success": False, "error": "Admin only."}), 403
+        body = request.get_json(silent=True) or {}
+        scope, tmdb_id = body.get("scope"), body.get("tmdb_id")
+        if scope not in _SCOPES or not tmdb_id:
+            return jsonify({"success": False, "error": "scope and tmdb_id are required"}), 400
+        try:
+            db = get_video_db()
+            n = db.approve_wishlist(scope, tmdb_id=int(tmdb_id),
+                                    season_number=body.get("season_number"),
+                                    episode_number=body.get("episode_number"))
+            if not n:
+                return jsonify({"success": False,
+                                "error": "Nothing pending there — it may already be approved."}), 404
+            return jsonify({"success": True, "approved": n,
+                            "pending": db.pending_wishlist_count()})
+        except Exception:
+            logger.exception("Failed to approve wishlist entry")
+            return jsonify({"success": False, "error": "Failed"}), 500
+
+    @bp.route("/wishlist/deny", methods=["POST"])
+    def video_wishlist_deny():
+        """Admin rejects a pending wish — it is simply removed. Unlike the
+        watchlist there is no tombstone to leave: nothing re-adds a wish on its
+        own, so a removed row stays gone until somebody asks again."""
+        from . import get_video_db
+        if not _is_admin():
+            return jsonify({"success": False, "error": "Admin only."}), 403
+        body = request.get_json(silent=True) or {}
+        scope, tmdb_id = body.get("scope"), body.get("tmdb_id")
+        if scope not in _SCOPES or not tmdb_id:
+            return jsonify({"success": False, "error": "scope and tmdb_id are required"}), 400
+        try:
+            db = get_video_db()
+            kw = dict(tmdb_id=int(tmdb_id), season_number=body.get("season_number"),
+                      episode_number=body.get("episode_number"))
+            # Only ever removes rows still awaiting approval, so a mis-aimed deny
+            # can't delete a wish that is already live.
+            if not db.count_pending_wishlist_rows(scope, **kw):
+                return jsonify({"success": False,
+                                "error": "Nothing pending there."}), 404
+            removed = db.deny_wishlist(scope, **kw)
+            return jsonify({"success": True, "removed": removed,
+                            "counts": db.wishlist_counts(),
+                            "pending": db.pending_wishlist_count()})
+        except Exception:
+            logger.exception("Failed to deny wishlist entry")
             return jsonify({"success": False, "error": "Failed"}), 500
 
     @bp.route("/wishlist/backfill-art", methods=["POST"])

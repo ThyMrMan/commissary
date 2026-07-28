@@ -99,6 +99,35 @@
         });
         return out;
     }
+    function isAdmin() {
+        var cp = (typeof currentProfile !== 'undefined') ? currentProfile : null;
+        return !cp || !!cp.is_admin || cp.id === 1;
+    }
+    // A wish added by a profile without download rights sits approved=0: it is on
+    // the list so the requester can see they asked, but every acquisition path
+    // skips it until an admin approves. Deliberately the same markup and CSS
+    // classes the watchlist uses (vwlp-pending-*), so the two queues read alike.
+    function pendingChrome(it, scope, attrs) {
+        if (it.approved !== false && it.approved !== 0) return { badge: '', actions: '' };
+        var who = it.requested_by_name ? ' · asked by ' + esc(it.requested_by_name) : '';
+        var badge = '<span class="vwlp-pending-badge" title="Waiting for an admin to approve' +
+            (it.requested_by_name ? ' — requested by ' + esc(it.requested_by_name) : '') + '">' +
+            '⏳ Awaiting approval' + (isAdmin() ? who : '') + '</span>';
+        if (!isAdmin()) return { badge: badge, actions: '' };
+        var d = 'data-vwsh-ap-scope="' + esc(scope) + '"' + attrs;
+        return { badge: badge, actions:
+            '<div class="vwlp-pending-actions">' +
+            '<button type="button" class="vwlp-approve" data-vwsh-approve ' + d + '>Approve</button>' +
+            '<button type="button" class="vwlp-deny" data-vwsh-deny ' + d + '>Decline</button></div>' };
+    }
+    // Any episode of a show still waiting? Drives the show orb's badge.
+    function showPending(sh) {
+        return (sh.seasons || []).some(function (se) {
+            return (se.episodes || []).some(function (e) {
+                return e.approved === false || e.approved === 0;
+            });
+        });
+    }
     function rmBtn(scope, attrs, addedBy) {
         if (!mayRemove(addedBy)) return '';
         return '<button class="vwsh-rm" type="button" title="Remove" aria-label="Remove" ' +
@@ -219,6 +248,7 @@
         // Repeatedly-failing marker (#liveleak-failing-hub): only meaningful while
         // the drain is still hunting (wanted/upgrade) — a monitored or already
         // downloading item isn't "failing".
+        var pend = pendingChrome(it, 'movie', ' data-tmdb="' + esc(it.tmdb_id) + '"');
         var fails = Number(it.search_attempts) || 0;
         var failChip = (fails >= 3 && (st === 'wanted' || st === 'upgrade'))
             ? '<span class="vwsh-failing" title="' + esc(fails + ' searches without a grab' +
@@ -236,6 +266,7 @@
             rmBtn('movie', ' data-tmdb="' + esc(it.tmdb_id) + '"', it.added_by_profile_id) + '</div>' +
             '<div class="vwsh-movie-info"><span class="vwsh-movie-title" title="' + esc(it.title) + '">' +
             esc(it.title) + '</span>' + (meta ? '<span class="vwsh-movie-meta">' + esc(meta) + '</span>' : '') +
+            pend.badge + pend.actions +
             libSlot('movie', it.tmdb_id, it.root_folder_id) +
             '</div></div>';
     }
@@ -327,6 +358,15 @@
                         '<div class="vwsh-prog"></div>' +
                     '</div>' +
                     '<div class="wl-orb-label" ' + openAttrs + ' title="' + esc(sh.title) + '">' + esc(sh.title) + '</div>' +
+                    // Show-level: approving here releases every pending episode
+                    // under it in one go (approve_wishlist only touches approved=0).
+                    (yt ? '' : (function () {
+                        if (!showPending(sh)) return '';
+                        var first = (((sh.seasons || [])[0] || {}).episodes || [])[0] || {};
+                        var p = pendingChrome({ approved: false, requested_by_name: first.requested_by_name },
+                                              'show', ' data-tmdb="' + esc(sh.tmdb_id) + '"');
+                        return p.badge + p.actions;
+                    })()) +
                     '<div class="wl-orb-meta">' + eps + (sh.done ? ' · ' + sh.done + ' done' : '') + '</div>' +
                     // YouTube channels aren't filed under a Library at all (see
                     // renderLibraryTabs) — no picker for them.
@@ -493,6 +533,9 @@
             (mayRemove(e.added_by_profile_id)
                 ? '<button class="vwsh-epc-rm" type="button" ' + rm + ' title="Remove">&#10005;</button>'
                 : '') +
+            // Per-episode: badge only. The Approve/Decline pair lives on the show
+            // orb — a pair of buttons on every episode tile would drown the grid.
+            (yt ? '' : pendingChrome(e, 'episode', '').badge) +
         '</div>';
     }
 
@@ -931,6 +974,39 @@
         } else { go(); }
     }
 
+    // ── approve / decline a pending wish (admin) ─────────────────────────────
+    function doApproval(btn) {
+        var deny = btn.hasAttribute('data-vwsh-deny');
+        var body = { scope: btn.getAttribute('data-vwsh-ap-scope'),
+                     tmdb_id: parseInt(btn.getAttribute('data-tmdb'), 10) };
+        if (btn.hasAttribute('data-s')) body.season_number = parseInt(btn.getAttribute('data-s'), 10);
+        if (btn.hasAttribute('data-e')) body.episode_number = parseInt(btn.getAttribute('data-e'), 10);
+        // Disable BOTH buttons — approving and declining the same row in quick
+        // succession is exactly the double-click a pending queue invites.
+        var pair = btn.parentNode ? btn.parentNode.querySelectorAll('button') : [btn];
+        Array.prototype.forEach.call(pair, function (b) { b.disabled = true; });
+        fetch('/api/video/wishlist/' + (deny ? 'deny' : 'approve'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        }).then(function (r) { return r.json().catch(function () { return null; }); })
+            .then(function (d) {
+                if (!d || !d.success) {
+                    Array.prototype.forEach.call(pair, function (b) { b.disabled = false; });
+                    if (typeof showToast === 'function')
+                        showToast((d && d.error) || 'Could not update that request', 'error');
+                    return;
+                }
+                if (typeof showToast === 'function')
+                    showToast(deny ? 'Request declined' : 'Approved — it will be searched for',
+                              deny ? 'info' : 'success');
+                load();
+                document.dispatchEvent(new CustomEvent('soulsync:video-wishlist-changed'));
+            })
+            .catch(function () {
+                Array.prototype.forEach.call(pair, function (b) { b.disabled = false; });
+            });
+    }
+
     // ── remove (TMDB scopes via /wishlist/remove; YouTube scopes via youtube) ──
     function doRemove(btn) {
         var scope = btn.getAttribute('data-vwsh-rm');
@@ -1008,6 +1084,8 @@
         if (pick) { e.preventDefault(); e.stopPropagation(); doPick(pick); return; }
         var hunt = e.target.closest('[data-vwsh-hunt]');
         if (hunt) { e.preventDefault(); e.stopPropagation(); doHunt(hunt); return; }
+        var ap = e.target.closest('[data-vwsh-approve], [data-vwsh-deny]');
+        if (ap) { e.preventDefault(); e.stopPropagation(); doApproval(ap); return; }
         var rm = e.target.closest('[data-vwsh-rm]');
         if (rm) { e.preventDefault(); e.stopPropagation(); doRemove(rm); return; }
         if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
