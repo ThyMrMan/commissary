@@ -66,7 +66,13 @@ def register_routes(bp):
 
     @bp.route("/detail/show/<int:show_id>/rescan-episodes", methods=["POST"])
     def video_rescan_episodes(show_id):
-        """Re-read a show's FULL episode list from TMDB, right now.
+        """Re-read a show's FULL episode list, right now.
+
+        Reads from whichever provider owns this show's NUMBERING (see
+        core/video/episode_numbering) — TMDB for most shows, TVDB for one whose
+        seasons your media server splits the way TVDB does. The caller must not
+        assume TMDB: for a show like Bleach the correct list only exists in
+        TVDB, and re-scanning against TMDB would find nothing to add.
 
         Exists because nothing else could. A show is cascaded once, then
         ``episodes_synced=1`` and the background pass only ever picks
@@ -99,17 +105,54 @@ def register_routes(bp):
         except Exception:
             logger.exception("episode re-scan failed for show %s", show_id)
             return jsonify({"ok": False, "reason": "error",
-                            "error": "Couldn't reach TMDB — see app.log"}), 502
+                            "error": "Couldn't reach the metadata provider "
+                                     "— see app.log"}), 502
         if not res.get("ok"):
             reason = res.get("reason") or "error"
             msg = {"not_found": "That show isn't in the library.",
-                   "no_match": "This show has no TMDB match to read episodes from.",
-                   "match_error": "Couldn't reach TMDB just now."}.get(
+                   "no_match": "This show has no metadata match to read episodes from.",
+                   "match_error": "Couldn't reach the metadata provider just now."}.get(
                        reason, "Couldn't refresh the episode list.")
             return jsonify({"ok": False, "reason": reason, "error": msg}), 400
         after = db.show_episode_count(show_id)
         return jsonify({"ok": True, "added": max(0, after - before),
                         "total": after, "before": before})
+
+    @bp.route("/detail/show/<int:show_id>/episode-source", methods=["GET"])
+    def video_get_episode_source(show_id):
+        """Which provider currently owns this show's episode list, AND why.
+
+        Exists because 'Auto' is otherwise unfalsifiable: when a re-scan does
+        nothing there is no way to tell whether auto picked the provider you
+        expected, or silently kept the default because a probe failed. Returns
+        the scores and the seasons each provider can't serve."""
+        from core.video.episode_numbering import explain
+        from . import get_video_db
+        db = get_video_db()
+        info = db.show_match_info(show_id)
+        if not info:
+            return jsonify({"success": False, "error": "Unknown show"}), 404
+        try:
+            from core.video.enrichment.engine import get_video_enrichment_engine
+            eng = get_video_enrichment_engine()
+            w = eng.workers.get("tmdb")
+            tmdb_nums = []
+            if w and w.enabled:
+                res = w.client.match("show", info.get("title"), info.get("year"),
+                                     known_id=info.get("tmdb_id")) or {}
+                tmdb_nums = [s.get("season_number")
+                             for s in ((res.get("metadata") or {}).get("seasons") or [])
+                             if s.get("season_number") is not None]
+            tvdb_nums = eng._tvdb_season_numbers(info.get("tvdb_id"))
+            out = explain(db.server_season_numbers(show_id), tmdb_nums, tvdb_nums,
+                          info.get("episode_source"))
+            out["tmdb_seasons"], out["tvdb_seasons"] = tmdb_nums, tvdb_nums
+            out["success"] = True
+            return jsonify(out)
+        except Exception:
+            logger.exception("episode-source probe failed for show %s", show_id)
+            return jsonify({"success": False,
+                            "error": "Couldn't reach the metadata providers — see app.log"}), 502
 
     @bp.route("/detail/show/<int:show_id>/episode-source", methods=["PUT"])
     def video_set_episode_source(show_id):

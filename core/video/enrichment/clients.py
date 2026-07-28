@@ -1292,22 +1292,40 @@ class TVDBClient:
             sn = int(season_number)
         except (TypeError, ValueError):
             return []
-        try:
-            d = self._authed_get("/series/" + str(series_id) + "/episodes/default",
-                                 {"season": sn, "page": 0}) or {}
-        except Exception:
-            logger.exception("TVDB season episodes fetch failed for %s S%s", series_id, sn)
-            return []
-        out = []
-        for e in (((d.get("data") or {}).get("episodes")) or []):
-            if e.get("seasonNumber") != sn:
-                continue
-            num = e.get("number")
-            if num is None:
-                continue
-            out.append({"episode_number": num, "title": e.get("name") or None,
-                        "overview": e.get("overview") or None, "air_date": e.get("aired") or None,
-                        "runtime_minutes": e.get("runtime") or None, "still_url": e.get("image") or None})
+        # PAGINATED. /episodes/default returns the whole series in aired order,
+        # and the `season` parameter is not reliably applied server-side — so on
+        # a long-running show (Bleach: 366 + a 50-episode revival) reading only
+        # page 0 silently truncates, and the later seasons come back EMPTY. An
+        # empty answer is indistinguishable from "this season has no episodes",
+        # which is exactly the input that makes callers do nothing and report
+        # success. Walk until a page adds no episodes, with a hard cap so a
+        # misbehaving endpoint can't spin forever.
+        out, seen = [], set()
+        for page in range(0, 12):
+            try:
+                d = self._authed_get("/series/" + str(series_id) + "/episodes/default",
+                                     {"season": sn, "page": page}) or {}
+            except Exception:
+                logger.exception("TVDB season episodes fetch failed for %s S%s p%s",
+                                 series_id, sn, page)
+                break
+            batch = ((d.get("data") or {}).get("episodes")) or []
+            if not batch:
+                break
+            for e in batch:
+                if e.get("seasonNumber") != sn:
+                    continue
+                num = e.get("number")
+                if num is None or num in seen:
+                    continue
+                seen.add(num)
+                out.append({"episode_number": num, "title": e.get("name") or None,
+                            "overview": e.get("overview") or None, "air_date": e.get("aired") or None,
+                            "runtime_minutes": e.get("runtime") or None,
+                            "still_url": e.get("image") or None})
+            # A short page is the last one; ask no further.
+            if len(batch) < 100:
+                break
         return out
 
 

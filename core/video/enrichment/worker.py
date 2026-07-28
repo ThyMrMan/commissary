@@ -152,7 +152,8 @@ class VideoEnrichmentWorker:
             # with their show instead of being a separate (huge) queue.
             if item["kind"] == "show" and hasattr(self.client, "season_episodes"):
                 nums = [s["season_number"] for s in (result.get("metadata") or {}).get("seasons") or []]
-                self._cascade_episodes(item["id"], result["id"], nums)
+                if self._owns_numbering(item["id"], nums):
+                    self._cascade_episodes(item["id"], result["id"], nums)
         else:
             self.db.enrichment_apply(self.service, item["kind"], item["id"], matched=False)
             self.stats["not_found"] += 1
@@ -234,8 +235,18 @@ class VideoEnrichmentWorker:
                 self.db.enrichment_apply("tmdb", "show", show["id"], matched=True,
                                          external_id=result["id"], metadata=result.get("metadata"))
                 nums = [s["season_number"] for s in (result.get("metadata") or {}).get("seasons") or []]
-                self._cascade_episodes(show["id"], result["id"], nums)   # marks synced
-                logger.info("Synced full episode list for show '%s'", show["title"])
+                if self._owns_numbering(show["id"], nums):
+                    self._cascade_episodes(show["id"], result["id"], nums)   # marks synced
+                    logger.info("Synced full episode list for show '%s'", show["title"])
+                else:
+                    # Another provider owns this show's season numbering. Writing
+                    # ours would re-create exactly the rows the out-of-place
+                    # clean-up just removed — this background pass runs
+                    # unattended, so it would undo the repair silently. Mark it
+                    # synced so the queue moves on rather than looping.
+                    self.db.mark_episodes_synced(show["id"])
+                    logger.info("Skipped episode sync for '%s' — another provider owns "
+                                "its season numbering", show["title"])
             else:
                 self.db.mark_episodes_synced(show["id"])     # no match → don't re-pick
         except Exception:
@@ -273,6 +284,29 @@ class VideoEnrichmentWorker:
             logger.exception("detail backfill failed for %s '%s'", item["kind"], item["title"])
             self.stats["errors"] += 1
         return True
+
+    def _owns_numbering(self, show_id, tmdb_season_nums) -> bool:
+        """Does THIS provider own the show's episode numbering?
+
+        Episodes are keyed by the media server's season numbers, so only the
+        provider whose season structure matches the server may create them (see
+        core/video/episode_numbering). The two background passes here run
+        unattended, so an unguarded cascade would quietly re-create the rows an
+        out-of-place clean-up had just removed — the repair would appear to work
+        and then undo itself.
+
+        Fails OPEN: any problem resolving this leaves the historical behaviour
+        (cascade) in place, because refusing to write episodes is the more
+        damaging way to be wrong."""
+        try:
+            from core.video.enrichment.engine import get_video_enrichment_engine
+            info = self.db.show_match_info(show_id) or {}
+            src = get_video_enrichment_engine()._episode_source(
+                show_id, info, tmdb_season_nums)
+        except Exception:   # noqa: BLE001
+            logger.debug("numbering check failed for show %s", show_id, exc_info=True)
+            return True
+        return src == self.service
 
     def _cascade_episodes(self, show_id, tv_id, season_numbers=None, mark_synced=True) -> None:
         """Backfill a show's episode list from the provider (one call per season) —

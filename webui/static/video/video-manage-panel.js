@@ -297,10 +297,15 @@
                   // "Sync show now" reconciles against Plex, and the page's
                   // lazy refresh skips a show that already has its art.
                   '<div class="vmg-field"><label>Episode list</label>' +
+                      // Provider-agnostic on purpose. All three buttons below act on
+                      // whichever database owns this show's numbering (the box above),
+                      // so naming one here would be wrong for any show using the other
+                      // — and would be a second place to keep in step.
                       '<button class="vmg-btn-ghost" type="button" data-vmg-rescan-eps>' +
-                          'Re-scan episodes from TMDB</button>' +
-                      '<div class="vmg-hint" data-vmg-rescan-note>Pulls the full season/episode ' +
-                          'list again. Use this when TMDB lists episodes SoulSync is missing.</div>' +
+                          'Re-scan episode list</button>' +
+                      '<div class="vmg-hint" data-vmg-rescan-note>Reads every season again ' +
+                          'from the database above. Use this when it lists episodes SoulSync ' +
+                          'is missing.</div>' +
                       // Your media server and TMDB can split a long-running show into
                       // seasons differently (Plex files Bleach's newer run as S2 where
                       // TMDB calls it S17). Those are separate rows, so the episode is
@@ -309,7 +314,9 @@
                       '<button class="vmg-btn-ghost" type="button" data-vmg-dupe-eps ' +
                           'style="margin-top:8px;">Check for duplicate episodes</button>' +
                       '<div class="vmg-hint" data-vmg-dupe-note>Finds episodes listed twice ' +
-                          'because your server and TMDB number the seasons differently.</div>' +
+                          'twice because the same episode is filed under two different ' +
+                          'season numbers. Compares your library against itself — no ' +
+                          'database is consulted.</div>' +
                       // TVDB numbers some long-running shows' seasons differently from
                       // TMDB (TMDB's Bleach S2 is the 2005 arc; TVDB's is the 2022+
                       // run). The metadata gap-fill used to insert under TMDB's number,
@@ -329,14 +336,14 @@
                                       (o[0] === cur ? ' selected' : '') + '>' + o[1] + '</option>';
                               }).join('') +
                           '</select>' +
-                          '<div class="vmg-hint">Only change this if a show\'s seasons ' +
-                              'are split differently here than on your server. Re-scan after.</div>' +
+                          '<div class="vmg-hint" data-vmg-episode-source-note>Checking which ' +
+                              'database matches your server…</div>' +
                       '</div>' +
                       '<button class="vmg-btn-ghost" type="button" data-vmg-unlisted-eps ' +
                           'style="margin-top:8px;">Check for out-of-place episodes</button>' +
                       '<div class="vmg-hint" data-vmg-unlisted-note>Finds episodes filed ' +
-                          'under a season TMDB doesn\'t list them in — they can never be ' +
-                          'matched by a search.</div>' +
+                          'under a season the database above doesn\'t list them in — they ' +
+                          'can never be matched by a search.</div>' +
                   '</div>'
                 : '') +
             // Also known as (matching aid): extra titles the release-title gate will
@@ -717,7 +724,7 @@
         var orig = btn.textContent;
         btn.disabled = true;
         btn.textContent = 'Re-scanning…';
-        if (note) note.textContent = 'Reading every season from TMDB — this can take a moment.';
+        if (note) note.textContent = 'Reading every season — this can take a moment.';
         fetch('/api/video/detail/show/' + state.id + '/rescan-episodes', {
             method: 'POST', headers: { Accept: 'application/json' } })
             .then(function (r) {
@@ -801,8 +808,8 @@
 
     // Same two-step contract as duplicateEpisodes: look, then agree to a named
     // count. Separate from it because the RULE is different — that one pairs a
-    // row against an episode you own under another season; this one asks TMDB
-    // whether the season lists that episode number at all.
+    // row against an episode you own under another season; this one asks the
+    // show's numbering database whether the season lists that number at all.
     function unlistedEpisodes(btn) {
         if (btn.disabled) return;
         var note = state.overlay && state.overlay.querySelector('[data-vmg-unlisted-note]');
@@ -844,7 +851,7 @@
                        (it.air_date ? ' (' + it.air_date + ')' : '');
             }).join(', ');
             if (note) {
-                note.textContent = b.count + ' episode(s) TMDB doesn\'t list in that season: ' +
+                note.textContent = b.count + ' episode(s) ' + src + ' doesn\'t list in that season: ' +
                     eg + (b.count > 3 ? ', …' : '') + '. None are on disk — removing only ' +
                     'clears the listing.';
             }
@@ -854,6 +861,38 @@
             if (note) note.textContent = (e && e.message) || 'Check failed';
             toast((e && e.message) || 'Check failed', 'error');
         }).then(function () { btn.disabled = false; });
+    }
+
+    // Name the provider that's ACTUALLY in force, and why. 'Auto' is otherwise
+    // unfalsifiable: when a re-scan reports nothing there's no way to tell
+    // whether auto chose what you expected or quietly kept the default because
+    // a probe failed. Also relabels the re-scan button, which used to claim
+    // TMDB regardless of where it really reads from.
+    function loadEpisodeSource() {
+        var note = state.overlay && state.overlay.querySelector('[data-vmg-episode-source-note]');
+        if (!note) return;
+        fetch('/api/video/detail/show/' + state.id + '/episode-source',
+              { headers: { Accept: 'application/json' } })
+            .then(function (r) { return r.json().catch(function () { return {}; }); })
+            .then(function (d) {
+                if (!d.success) {
+                    note.textContent = d.error || 'Could not check the databases just now.';
+                    return;
+                }
+                var name = String(d.source || 'tmdb').toUpperCase();
+                if (d.override) {
+                    note.textContent = 'Pinned to ' + name + '. Auto would use ' +
+                        (d.tvdb_score > d.tmdb_score ? 'TVDB' : 'TMDB') + '.';
+                    return;
+                }
+                var miss = (d.source === 'tvdb' ? d.missing_from_tmdb : d.missing_from_tvdb) || [];
+                note.textContent = 'Using ' + name + ' — it covers ' +
+                    Math.round((d.source === 'tvdb' ? d.tvdb_score : d.tmdb_score) * 100) +
+                    '% of your server\'s seasons' +
+                    (miss.length ? ' (the other is missing season' + (miss.length === 1 ? ' ' : 's ') +
+                        miss.slice(0, 6).join(', ') + (miss.length > 6 ? '…' : '') + ')' : '') + '.';
+            })
+            .catch(function () { note.textContent = 'Could not check the databases just now.'; });
     }
 
     // Which provider supplies the episode LIST. Changing it rewrites nothing on
@@ -1143,6 +1182,7 @@
             renderChips();
             loadGenreSuggestions(d.kind);
             loadMatches();
+            if (d.kind === 'show') loadEpisodeSource();
             loadQualityProfiles(d);
             loadLibraries(d);
         }

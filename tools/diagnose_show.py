@@ -91,6 +91,80 @@ def episodes(conn, show_id, season):
         (show_id, season)).fetchall()
 
 
+def live_check(show_id, title):
+    """What the APP decides, using the same code and the same API keys.
+
+    Answers the question the row dump can't: when a clean-up reports nothing to
+    do, was it asking the right provider, and did that provider actually answer?
+    An empty answer for a season is the failure that looks exactly like success —
+    a season with no episode list cannot be judged, so its rows are skipped.
+    """
+    print("\n" + "=" * 70)
+    print("LIVE CHECK — show id=%s (%s)" % (show_id, title))
+    print("=" * 70)
+    try:
+        from core.video.enrichment.engine import get_video_enrichment_engine
+        from core.video.episode_numbering import explain
+        from database.video_database import VideoDatabase
+    except Exception as exc:
+        print("  couldn't import the app: %s" % exc)
+        print("  run this INSIDE the container, from /app.")
+        return
+
+    db = VideoDatabase()
+    info = db.show_match_info(show_id)
+    eng = get_video_enrichment_engine()
+
+    tmdb_nums, tvdb_nums = [], []
+    w = eng.workers.get("tmdb")
+    if w and w.enabled:
+        try:
+            res = w.client.match("show", info.get("title"), info.get("year"),
+                                 known_id=info.get("tmdb_id")) or {}
+            tmdb_nums = [s.get("season_number")
+                         for s in ((res.get("metadata") or {}).get("seasons") or [])
+                         if s.get("season_number") is not None]
+        except Exception as exc:
+            print("  TMDB lookup FAILED: %s" % exc)
+    else:
+        print("  TMDB worker not enabled")
+    try:
+        tvdb_nums = eng._tvdb_season_numbers(info.get("tvdb_id"))
+    except Exception as exc:
+        print("  TVDB season probe FAILED: %s" % exc)
+
+    server = db.server_season_numbers(show_id)
+    print("  server seasons : %s" % server)
+    print("  TMDB seasons   : %s" % (tmdb_nums or "(none returned)"))
+    print("  TVDB seasons   : %s" % (tvdb_nums or "(none returned)"))
+    print("  stored override: %s" % (info.get("episode_source") or "auto"))
+    print("  decision       : %s" % explain(server, tmdb_nums, tvdb_nums,
+                                            info.get("episode_source")))
+
+    print("\n  per-season episode list from the CHOSEN provider, and what the")
+    print("  out-of-place check would remove. A season showing 0 episodes is the")
+    print("  bug — it gets skipped, which reads as 'nothing to do'.")
+    src = explain(server, tmdb_nums, tvdb_nums, info.get("episode_source"))["source"]
+    print("  %-8s %-12s %s" % ("season", "listed", "would remove"))
+    seasons = tvdb_nums if src == "tvdb" else tmdb_nums
+    for sn in seasons or []:
+        try:
+            if src == "tvdb":
+                eps = eng.workers["tvdb"].client.season_episodes(info["tvdb_id"], sn) or []
+                nums = {e["episode_number"] for e in eps if e.get("episode_number") is not None}
+            else:
+                data = eng.workers["tmdb"].client.season_episodes(info["tmdb_id"], sn) or {}
+                nums = {e["episode_number"] for e in (data.get("episodes") or [])
+                        if e.get("episode_number") is not None}
+        except Exception as exc:
+            print("  %-8s FETCH FAILED: %s" % (sn, exc))
+            continue
+        rows = db.unlisted_episode_rows(show_id, sn, nums) if nums else []
+        flag = "   <-- EMPTY, season skipped" if not nums else ""
+        print("  %-8s %-12s %s%s" % (sn, len(nums),
+                                     [r["episode_number"] for r in rows][:12] or "-", flag))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("title", nargs="?", default="", help="show title (partial match)")
@@ -98,6 +172,11 @@ def main():
     ap.add_argument("--tmdb", type=int, help="match on tmdb id instead of title")
     ap.add_argument("--season", type=int, action="append", default=[],
                     help="dump every episode of this season (repeatable)")
+    ap.add_argument("--check", action="store_true",
+                    help="ALSO ask the app which provider owns this show's numbering "
+                         "and what the out-of-place check would find. Unlike the rest "
+                         "of this script that CONTACTS TMDB/TVDB and opens the database "
+                         "the way the app does, so run it on the instance itself.")
     a = ap.parse_args()
     if not a.title and not a.tmdb:
         sys.exit("Give a title or --tmdb.")
@@ -144,6 +223,10 @@ def main():
                        e["server_source"] or "-", e["server_id"] or "(none)",
                        "yes" if e["has_file"] else "no"))
     conn.close()
+
+    if a.check:
+        for s in shows:
+            live_check(s["id"], s["title"])
 
 
 if __name__ == "__main__":
