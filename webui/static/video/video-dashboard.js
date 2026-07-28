@@ -514,6 +514,9 @@
         var t = e.target.closest && e.target.closest('[data-video-poster-manager]');
         if (!t) return;
         e.preventDefault();
+        // Setting a poster is admin-only — same guard as the two studio launchers
+        // below, which this one was missing.
+        if (typeof currentProfile !== 'undefined' && currentProfile && !currentProfile.is_admin) return;
         if (window.VideoPoster) VideoPoster.openSearch();
     });
 

@@ -89,12 +89,13 @@
     var IMP_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
     var BAN_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="5.6" y1="5.6" x2="18.4" y2="18.4"/></svg>';
     var URL_BLOCKLIST = '/api/video/downloads/blocklist';
-    // the Import page is an admin tool (videoPageAllowed in video-side.js) — same gate here
-    // so non-admins never see a button that would just bounce them to the dashboard.
-    function canImport() {
+    function isAdmin() {
         var cp = (typeof currentProfile !== 'undefined') ? currentProfile : null;
         return !cp || !!cp.is_admin || cp.id === 1;
     }
+    // the Import page is an admin tool (videoPageAllowed in video-side.js) — same gate here
+    // so non-admins never see a button that would just bounce them to the dashboard.
+    function canImport() { return isAdmin(); }
     var R_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>';
     var OPEN_SVG = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>';
 
@@ -287,7 +288,10 @@
                   '" title="Open ' + (d.kind === 'movie' ? 'movie' : 'show') + ' page">' + OPEN_SVG + '</button>');
         var stateBtn = active
             ? (mayGrab() ? '<button class="adl-row-cancel" type="button" data-vdpg-cancel="' + d.id + '" title="Cancel">' + X_SVG + '</button>' : '')
-            : isFail(d.status)
+            // Retry re-grabs — /downloads/retry is behind can_download, so for a
+            // member this button only ever produced a 403 toast on someone else's
+            // failed download.
+            : (isFail(d.status) && mayGrab())
                 ? '<button class="vdpg-row-retry" type="button" data-vdpg-retry="' + d.id + '" title="Retry">' + R_SVG + '</button>'
                 : '';
         // the file downloaded fine but couldn't be placed — retrying the grab won't
@@ -298,7 +302,9 @@
         // Block this exact release (slskd rows only — YT has no release identity).
         // failed → block + auto-retry with another candidate; import_failed → block
         // (the file itself may still be manually importable, so no auto-retry).
-        var blockBtn = ((d.status === 'failed' || d.status === 'import_failed') &&
+        // /downloads/blocklist is ADMIN-only (Settings-class config), not merely
+        // can_download — this one bounced even for a member with download rights.
+        var blockBtn = ((d.status === 'failed' || d.status === 'import_failed') && isAdmin() &&
                         dlType(d.kind) !== 'youtube' && d.username && d.filename)
             ? '<button class="vdpg-row-retry vdpg-row-block" type="button" data-vdpg-block="' + d.id +
               '" data-was="' + esc(d.status) + '" title="' +
@@ -448,7 +454,7 @@
         if (isActive(d.status) && mayGrab()) btns.push('<button class="vdpg-dr-btn vdpg-dr-danger" type="button" data-vdpg-cancel="' + d.id + '">Cancel</button>');
         else if (isFail(d.status)) {
             if (d.status === 'import_failed' && canImport()) btns.push('<button class="vdpg-dr-btn vdpg-dr-accent" type="button" data-vdpg-import>Manual Import</button>');
-            btns.push('<button class="vdpg-dr-btn vdpg-dr-accent" type="button" data-vdpg-retry="' + d.id + '">Retry</button>');
+            if (mayGrab()) btns.push('<button class="vdpg-dr-btn vdpg-dr-accent" type="button" data-vdpg-retry="' + d.id + '">Retry</button>');
         }
         var actions = btns.length ? '<div class="vdpg-dr-actions">' + btns.join('') + '</div>' : '';
 
@@ -512,8 +518,10 @@
         var cancelAll = document.querySelector('[data-vdpg-cancel-all]');
         if (cancelAll) cancelAll.style.display = (counts.active && mayGrab()) ? '' : 'none';
         var retryAll = document.querySelector('[data-vdpg-retry-all]');
-        if (retryAll) retryAll.style.display = counts.retryable >= 2 ? '' : 'none';
-        var clearBtn = document.querySelector('[data-vdpg-clear]'); if (clearBtn) clearBtn.style.display = (counts.completed + counts.failed) ? '' : 'none';
+        if (retryAll) retryAll.style.display = (counts.retryable >= 2 && mayGrab()) ? '' : 'none';
+        // Clear empties the finished rows off the SHARED queue for everyone.
+        var clearBtn = document.querySelector('[data-vdpg-clear]');
+        if (clearBtn) clearBtn.style.display = ((counts.completed + counts.failed) && mayGrab()) ? '' : 'none';
         var sub = document.querySelector('[data-vdpg-sub]');
         if (sub) {
             var parts = [];

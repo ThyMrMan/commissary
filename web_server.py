@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.8.8"
+_SOULSYNC_BASE_VERSION = "1.8.9"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -8118,6 +8118,11 @@ from core.downloads import cancel as _downloads_cancel
 @app.route('/api/downloads/cancel', methods=['POST'])
 def cancel_download():
     """Cancel a specific download transfer, matching GUI functionality."""
+    # Cancelling touches the SHARED slskd queue — a member could otherwise kill
+    # the admin's in-flight transfers. Same gate as every other download action.
+    dl_err = check_download_permission()
+    if dl_err:
+        return dl_err
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "error": "No data provided."}), 400
@@ -8141,6 +8146,10 @@ def cancel_download():
 @app.route('/api/downloads/cancel-all', methods=['POST'])
 def cancel_all_downloads():
     """Cancel all active downloads from slskd, then clear completed ones."""
+    # Cancels EVERY active transfer at once, then clears completed ones.
+    dl_err = check_download_permission()
+    if dl_err:
+        return dl_err
     try:
         success, msg = _downloads_cancel.cancel_all_active(
             download_orchestrator, run_async, _sweep_empty_download_directories,
@@ -21258,7 +21267,16 @@ def clear_completed_downloads():
     session tasks AND the persisted download-history tail (so the list actually
     empties and stays empty across restart). Rows still awaiting verification
     (unverified / force_imported) are preserved — they belong to the review
-    queue, not this cleanup."""
+    queue, not this cleanup.
+
+    Requires download rights: library_history is NOT profile-scoped, so this
+    empties the download history for every profile at once and drops the
+    verification review flags with it. It was behind no gate at all, which let
+    any signed-in profile wipe the admin's history. The Downloads page hides the
+    button to match, but this check is the authority."""
+    dl_err = check_download_permission()
+    if dl_err:
+        return dl_err
     try:
         cleared = _downloads_cancel.clear_completed_local()
         history_cleared = get_database().clear_completed_download_history()
@@ -21277,6 +21295,11 @@ def cancel_download_task():
     This version is now identical to the GUI, adding the cancelled track to
     the wishlist for future automatic retries.
     """
+    # Also re-adds the cancelled track to the wishlist, so an ungated call let a
+    # member both stop the admin's download and mutate the shared wishlist.
+    dl_err = check_download_permission()
+    if dl_err:
+        return dl_err
     data = request.get_json()
     task_id = data.get('task_id')
     if not task_id:
@@ -21546,6 +21569,10 @@ def cancel_task_v2():
     Performs atomic cancellation with proper worker slot management.
     No race conditions, no dual state management.
     """
+    # The atomic V2 path the Downloads page actually calls.
+    dl_err = check_download_permission()
+    if dl_err:
+        return dl_err
     data = request.get_json()
     playlist_id = data.get('playlist_id')
     track_index = data.get('track_index')
@@ -40431,30 +40458,35 @@ def _build_import_route_runtime():
 
 
 @app.route('/api/import/staging/files', methods=['GET'])
+@admin_only
 def import_staging_files():
     payload, status = _import_staging_files(_build_import_route_runtime())
     return jsonify(payload), status
 
 
 @app.route('/api/import/staging/groups', methods=['GET'])
+@admin_only
 def import_staging_groups():
     payload, status = _import_staging_groups(_build_import_route_runtime())
     return jsonify(payload), status
 
 
 @app.route('/api/import/staging/scan-status', methods=['GET'])
+@admin_only
 def import_staging_scan_status():
     payload, status = _import_staging_scan_status(_build_import_route_runtime())
     return jsonify(payload), status
 
 
 @app.route('/api/import/staging/hints', methods=['GET'])
+@admin_only
 def import_staging_hints():
     payload, status = _import_staging_hints(_build_import_route_runtime())
     return jsonify(payload), status
 
 
 @app.route('/api/import/search/albums', methods=['GET'])
+@admin_only
 def import_search_albums():
     payload, status = _import_search_albums(
         _build_import_route_runtime(),
@@ -40466,24 +40498,28 @@ def import_search_albums():
 
 
 @app.route('/api/import/search/sources', methods=['GET'])
+@admin_only
 def import_search_sources_route():
     payload, status = _import_search_sources()
     return jsonify(payload), status
 
 
 @app.route('/api/import/album/match', methods=['POST'])
+@admin_only
 def import_album_match():
     payload, status = _import_album_match(_build_import_route_runtime(), request.get_json() or {})
     return jsonify(payload), status
 
 
 @app.route('/api/import/album/process', methods=['POST'])
+@admin_only
 def import_album_process():
     payload, status = _import_album_process(_build_import_route_runtime(), request.get_json() or {})
     return jsonify(payload), status
 
 
 @app.route('/api/import/search/tracks', methods=['GET'])
+@admin_only
 def import_search_tracks():
     payload, status = _import_search_tracks(
         _build_import_route_runtime(),
@@ -40498,6 +40534,7 @@ def _process_single_import_file(file_info):
 
 
 @app.route('/api/import/singles/process', methods=['POST'])
+@admin_only
 def import_singles_process():
     data = request.get_json() or {}
     payload, status = _import_singles_process(_build_import_route_runtime(), data.get('files', []))
@@ -40719,6 +40756,7 @@ def auto_import_clear_completed():
 
 
 @app.route('/api/import/staging/suggestions', methods=['GET'])
+@admin_only
 def import_staging_suggestions():
     payload, status = _import_staging_suggestions()
     return jsonify(payload), status

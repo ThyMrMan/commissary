@@ -290,7 +290,26 @@ function createSearchController({
 
     function renderSourceRow() {
         if (!sourceRowElement) return;
-        const order = visibleSourceOrder(state.enabledExperimental);
+        const fullOrder = visibleSourceOrder(state.enabledExperimental);
+        // Show only connections that are actually set up. An unconfigured source
+        // can't answer a search — it used to render greyed out with a "set up in
+        // Settings" tooltip, which is a row of buttons that don't work.
+        //
+        // Two rails, because an empty picker is worse than a greyed-out one:
+        //   • the ACTIVE source always stays visible, so the current selection
+        //     can never become invisible;
+        //   • if nothing is configured, fall back to the full row — that's the
+        //     one case where the "set up in Settings" tooltips are the point.
+        // fetchSourceConfiguredMap already fails permissive (everything true) if
+        // /api/settings/config-status errors, so a blip can't empty the row.
+        // The "is anything set up?" question is asked BEFORE the active-source
+        // rail is applied — that rail always keeps one entry, so testing the
+        // combined list for emptiness would make the fallback unreachable.
+        const anyConfigured = fullOrder.some(src => state.configuredSources[src] !== false);
+        const order = anyConfigured
+            ? fullOrder.filter(src =>
+                state.configuredSources[src] !== false || src === state.activeSource)
+            : fullOrder;
         sourceRowElement.innerHTML = order.map(src => {
             const info = SOURCE_LABELS[src];
             if (!info) return '';

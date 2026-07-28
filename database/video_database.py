@@ -256,6 +256,13 @@ _COLUMN_MIGRATIONS = [
     ("video_wishlist", "source", "TEXT NOT NULL DEFAULT 'tmdb'"),
     ("video_wishlist", "source_id", "TEXT"),
     ("video_wishlist", "parent_source_id", "TEXT"),   # owning channel youtube id (video rows)
+    # Who asked for this. A member without download rights may remove their OWN
+    # wishes and nothing else, so the row has to remember who added it. NULL =
+    # added before this column existed, or added by automation (the watchlist
+    # scan, collections, RSS) — nobody's personal wish, so only a profile with
+    # can_download may remove it. Set on INSERT only: re-adding a title someone
+    # else already wished must not transfer ownership of their row.
+    ("video_wishlist", "added_by_profile_id", "INTEGER"),
     # which source produced a channel's dates — NULL on legacy (pre-InnerTube) rows
     # so they re-enrich once and upgrade to the full InnerTube catalog.
     ("youtube_channel_enrichment", "method", "TEXT"),
@@ -6572,7 +6579,8 @@ class VideoDatabase:
     # are just bulk add/remove operations over those rows.
     def add_movie_to_wishlist(self, tmdb_id, title, *, year=None, poster_url=None,
                               library_id=None, server_source=None, status='wanted',
-                              detail_json=None, root_folder_id=None) -> bool:
+                              detail_json=None, root_folder_id=None,
+                              added_by_profile_id=None) -> bool:
         """Wish for a movie. Idempotent upsert on its tmdb id.
 
         ``status`` lets the watchlist-people scan add an UPCOMING (unreleased) movie as
@@ -6600,8 +6608,12 @@ class VideoDatabase:
                 "SELECT 1 FROM video_wishlist WHERE kind='movie' AND tmdb_id=?",
                 (int(tmdb_id),)).fetchone()
             conn.execute(
-                """INSERT INTO video_wishlist (kind, tmdb_id, title, poster_url, year, library_id, server_source, status, detail_json, root_folder_id)
-                   VALUES ('movie', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                # added_by_profile_id is deliberately absent from the DO UPDATE:
+                # ownership belongs to whoever asked FIRST. Re-adding a title
+                # someone else wished must not hand their row to the re-adder,
+                # which would be a way to delete another member's wish.
+                """INSERT INTO video_wishlist (kind, tmdb_id, title, poster_url, year, library_id, server_source, status, detail_json, root_folder_id, added_by_profile_id)
+                   VALUES ('movie', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(tmdb_id) WHERE kind='movie' DO UPDATE SET
                        title=excluded.title,
                        poster_url=COALESCE(excluded.poster_url, video_wishlist.poster_url),
@@ -6612,7 +6624,7 @@ class VideoDatabase:
                        status=CASE WHEN video_wishlist.status='monitored' AND excluded.status='wanted'
                                    THEN 'wanted' ELSE video_wishlist.status END""",
                 (int(tmdb_id), title, poster_url, year, library_id, server_source, status,
-                 detail_json, root_folder_id))
+                 detail_json, root_folder_id, added_by_profile_id))
             conn.commit()
             if not existed:   # a refresh-upsert is not a new wish
                 _publish_video_event("video_wishlist_item_added",
@@ -6852,7 +6864,7 @@ class VideoDatabase:
 
     def add_episodes_to_wishlist(self, show_tmdb_id, show_title, episodes, *,
                                  poster_url=None, library_id=None, server_source=None,
-                                 root_folder_id=None) -> int:
+                                 root_folder_id=None, added_by_profile_id=None) -> int:
         """Wish for one or more episodes of a show (the show's tmdb id keys them).
         ``episodes`` = [{season_number, episode_number, title?, air_date?}, …].
         Idempotent per (show, season, episode). Returns the count written."""
@@ -6869,11 +6881,12 @@ class VideoDatabase:
                 if sn is None or en is None:
                     continue
                 conn.execute(
+                    # added_by_profile_id set on INSERT only — see add_movie_to_wishlist.
                     """INSERT INTO video_wishlist
                            (kind, tmdb_id, title, poster_url, season_number, episode_number,
                             episode_title, still_url, episode_overview, season_poster_url,
-                            air_date, library_id, server_source, root_folder_id)
-                       VALUES ('episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            air_date, library_id, server_source, root_folder_id, added_by_profile_id)
+                       VALUES ('episode', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(tmdb_id, season_number, episode_number) WHERE kind='episode' DO UPDATE SET
                            title=excluded.title,
                            poster_url=COALESCE(excluded.poster_url, video_wishlist.poster_url),
@@ -6886,7 +6899,8 @@ class VideoDatabase:
                            root_folder_id=COALESCE(excluded.root_folder_id, video_wishlist.root_folder_id)""",
                     (int(show_tmdb_id), show_title, poster_url, int(sn), int(en),
                      e.get("title"), e.get("still_url"), e.get("overview"), e.get("season_poster_url"),
-                     e.get("air_date"), library_id, server_source, root_folder_id))
+                     e.get("air_date"), library_id, server_source, root_folder_id,
+                     added_by_profile_id))
                 n += 1
             new_rows = conn.execute(
                 "SELECT COUNT(*) FROM video_wishlist WHERE kind='episode' AND tmdb_id=?",
@@ -6903,45 +6917,85 @@ class VideoDatabase:
         finally:
             conn.close()
 
-    def remove_from_wishlist(self, scope, *, tmdb_id, season_number=None, episode_number=None) -> int:
-        """Remove at any granularity: 'movie' | 'show' (all its episodes) |
-        'season' | 'episode'. Returns the number of rows removed."""
+    @staticmethod
+    def _wishlist_scope(scope, tmdb_id, season_number, episode_number):
+        """(where, args) selecting the rows a remove/count at this granularity
+        covers, or None when the scope+arguments don't name anything."""
         if not tmdb_id:
-            return 0
+            return None
         if scope == "movie":
-            sql, args = "DELETE FROM video_wishlist WHERE kind='movie' AND tmdb_id=?", (int(tmdb_id),)
-        elif scope == "show":
-            sql, args = "DELETE FROM video_wishlist WHERE kind='episode' AND tmdb_id=?", (int(tmdb_id),)
-        elif scope == "season":
+            return "kind='movie' AND tmdb_id=?", [int(tmdb_id)]
+        if scope == "show":
+            return "kind='episode' AND tmdb_id=?", [int(tmdb_id)]
+        if scope == "season":
             if season_number is None:
-                return 0
-            sql = "DELETE FROM video_wishlist WHERE kind='episode' AND tmdb_id=? AND season_number=?"
-            args = (int(tmdb_id), int(season_number))
-        elif scope == "episode":
+                return None
+            return "kind='episode' AND tmdb_id=? AND season_number=?", [int(tmdb_id), int(season_number)]
+        if scope == "episode":
             if season_number is None or episode_number is None:
-                return 0
-            sql = ("DELETE FROM video_wishlist WHERE kind='episode' AND tmdb_id=? "
-                   "AND season_number=? AND episode_number=?")
-            args = (int(tmdb_id), int(season_number), int(episode_number))
-        else:
+                return None
+            return ("kind='episode' AND tmdb_id=? AND season_number=? AND episode_number=?",
+                    [int(tmdb_id), int(season_number), int(episode_number)])
+        return None
+
+    def remove_from_wishlist(self, scope, *, tmdb_id, season_number=None, episode_number=None,
+                             only_profile_id=None) -> int:
+        """Remove at any granularity: 'movie' | 'show' (all its episodes) |
+        'season' | 'episode'. Returns the number of rows removed.
+
+        ``only_profile_id`` narrows the delete to rows THAT profile added — how a
+        member without download rights removes their own wishes without being
+        able to touch anyone else's (or automation's, whose rows have no adder).
+        None = no ownership restriction, for admins and can_download profiles."""
+        sel = self._wishlist_scope(scope, tmdb_id, season_number, episode_number)
+        if sel is None:
             return 0
+        where, args = sel
+        if only_profile_id is not None:
+            where += " AND added_by_profile_id=?"
+            args = args + [int(only_profile_id)]
         conn = self._get_connection()
         try:
-            cur = conn.execute(sql, args)
+            cur = conn.execute("DELETE FROM video_wishlist WHERE " + where, args)
             conn.commit()
             return cur.rowcount
         finally:
             conn.close()
 
-    def clear_wishlist(self, kind: str) -> int:
-        """Empty an entire wishlist tab in one go. ``kind`` is the user-facing tab:
-        'movie' | 'show' (TV) | 'youtube'. Returns the number of rows removed."""
+    def count_wishlist_rows(self, scope, *, tmdb_id, season_number=None, episode_number=None) -> int:
+        """How many rows a remove at this granularity WOULD cover, ignoring who
+        added them. Lets the API tell 'those aren't yours' apart from 'there was
+        nothing there' — an ownership-scoped delete reports 0 for both."""
+        sel = self._wishlist_scope(scope, tmdb_id, season_number, episode_number)
+        if sel is None:
+            return 0
+        where, args = sel
+        conn = self._get_connection()
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) c FROM video_wishlist WHERE " + where, args).fetchone()["c"]
+        finally:
+            conn.close()
+
+    def clear_wishlist(self, kind: str, *, only_profile_id=None) -> int:
+        """Empty a wishlist tab in one go. ``kind`` is the user-facing tab:
+        'movie' | 'show' (TV) | 'youtube'. Returns the number of rows removed.
+
+        ``only_profile_id`` limits it to the rows THAT profile added, so 'Clear
+        all' means "clear all of mine" for a member and "clear the tab" for a
+        profile that manages the shared wishlist. Same rule as
+        remove_from_wishlist — one bulk button must not be a way around the
+        per-item ownership check."""
         dbkind = {"movie": "movie", "show": "episode", "youtube": "video"}.get(kind)
         if not dbkind:
             return 0
+        sql, args = "DELETE FROM video_wishlist WHERE kind=?", [dbkind]
+        if only_profile_id is not None:
+            sql += " AND added_by_profile_id=?"
+            args.append(int(only_profile_id))
         conn = self._get_connection()
         try:
-            cur = conn.execute("DELETE FROM video_wishlist WHERE kind=?", (dbkind,))
+            cur = conn.execute(sql, args)
             conn.commit()
             return cur.rowcount
         finally:
@@ -7039,7 +7093,7 @@ class VideoDatabase:
                 total = conn.execute("SELECT COUNT(*) c FROM video_wishlist" + wsql, args).fetchone()["c"]
                 rows = conn.execute(
                     "SELECT tmdb_id, title, poster_url, year, status, library_id, date_added, "
-                    "search_attempts, last_search_at, "
+                    "search_attempts, last_search_at, added_by_profile_id, "
                     # The EFFECTIVE destination, resolved the same way the drain
                     # resolves it (_root_folder_for_item) — so the Library picker
                     # on the card shows where this actually lands, not just
@@ -7053,7 +7107,10 @@ class VideoDatabase:
                           "library_id": r["library_id"],
                           "root_folder_id": r["root_folder_id"],
                           "search_attempts": r["search_attempts"] or 0,
-                          "last_search_at": r["last_search_at"]} for r in rows]
+                          "last_search_at": r["last_search_at"],
+                          # who asked for it — the page shows a remove control
+                          # only on rows the viewer added (or to a downloader)
+                          "added_by_profile_id": r["added_by_profile_id"]} for r in rows]
             else:   # shows (grouped from episode rows)
                 where, args = ["kind='episode'"], []
                 if s:
@@ -7079,7 +7136,7 @@ class VideoDatabase:
                     eps = conn.execute(
                         "SELECT season_number, episode_number, episode_title, still_url, "
                         "episode_overview, season_poster_url, air_date, status, "
-                        "search_attempts, last_search_at, "
+                        "search_attempts, last_search_at, added_by_profile_id, "
                         "COALESCE(root_folder_id, (SELECT root_folder_id FROM shows WHERE id = library_id)) "
                         "AS root_folder_id "
                         "FROM video_wishlist WHERE kind='episode' AND tmdb_id=? "
@@ -7097,7 +7154,8 @@ class VideoDatabase:
                             "still_url": e["still_url"], "overview": e["episode_overview"],
                             "air_date": e["air_date"], "status": e["status"],
                             "search_attempts": e["search_attempts"] or 0,
-                            "last_search_at": e["last_search_at"]})
+                            "last_search_at": e["last_search_at"],
+                            "added_by_profile_id": e["added_by_profile_id"]})
                         if e["season_poster_url"] and e["season_number"] not in season_poster:
                             season_poster[e["season_number"]] = e["season_poster_url"]
                     seasons = [{"season_number": sn, "poster_url": season_poster.get(sn),
@@ -8106,7 +8164,8 @@ class VideoDatabase:
             conn.close()
 
     def add_videos_to_wishlist(self, channel: dict, videos: list, *, server_source=None,
-                               allow_downloaded: bool = False) -> int:
+                               allow_downloaded: bool = False,
+                               added_by_profile_id=None) -> int:
         """Wish for a channel's videos. ``channel`` = {youtube_id, title, avatar_url?};
         ``videos`` = [{youtube_id, title, published_at?, thumbnail_url?, description?}, …].
         Idempotent per video id. Returns the count written."""
@@ -8135,10 +8194,12 @@ class VideoDatabase:
                 if not vid or vid in downloaded:
                     continue
                 conn.execute(
+                    # added_by_profile_id set on INSERT only — see add_movie_to_wishlist.
                     """INSERT INTO video_wishlist
                            (kind, tmdb_id, title, poster_url, episode_title, still_url,
-                            episode_overview, air_date, source, source_id, parent_source_id, server_source)
-                       VALUES ('video', ?, ?, ?, ?, ?, ?, ?, 'youtube', ?, ?, ?)
+                            episode_overview, air_date, source, source_id, parent_source_id,
+                            server_source, added_by_profile_id)
+                       VALUES ('video', ?, ?, ?, ?, ?, ?, ?, 'youtube', ?, ?, ?, ?)
                        ON CONFLICT(source_id) WHERE kind='video' DO UPDATE SET
                            title=excluded.title,
                            poster_url=COALESCE(excluded.poster_url, video_wishlist.poster_url),
@@ -8147,7 +8208,8 @@ class VideoDatabase:
                            episode_overview=COALESCE(excluded.episode_overview, video_wishlist.episode_overview),
                            air_date=COALESCE(excluded.air_date, video_wishlist.air_date)""",
                     (surrogate, ctitle, avatar, v.get("title"), v.get("thumbnail_url"),
-                     v.get("description"), v.get("published_at"), vid, cid, server_source))
+                     v.get("description"), v.get("published_at"), vid, cid, server_source,
+                     added_by_profile_id))
                 n += 1
             new_rows = conn.execute(
                 "SELECT COUNT(*) FROM video_wishlist WHERE kind='video' AND parent_source_id=?",
@@ -8164,22 +8226,48 @@ class VideoDatabase:
         finally:
             conn.close()
 
-    def remove_youtube_from_wishlist(self, scope: str, source_id: str) -> int:
-        """Remove wished videos: scope 'channel' (all of a channel, source_id=channel
-        id) or 'video' (one, source_id=video id). Returns rows removed."""
+    @staticmethod
+    def _youtube_wishlist_scope(scope: str, source_id: str):
         if not source_id:
-            return 0
+            return None
         if scope == "channel":
-            sql = "DELETE FROM video_wishlist WHERE kind='video' AND parent_source_id=?"
-        elif scope == "video":
-            sql = "DELETE FROM video_wishlist WHERE kind='video' AND source_id=?"
-        else:
+            return "kind='video' AND parent_source_id=?", [source_id]
+        if scope == "video":
+            return "kind='video' AND source_id=?", [source_id]
+        return None
+
+    def remove_youtube_from_wishlist(self, scope: str, source_id: str,
+                                     only_profile_id=None) -> int:
+        """Remove wished videos: scope 'channel' (all of a channel, source_id=channel
+        id) or 'video' (one, source_id=video id). Returns rows removed.
+
+        ``only_profile_id`` scopes the delete to that profile's own wishes — same
+        rule as remove_from_wishlist."""
+        sel = self._youtube_wishlist_scope(scope, source_id)
+        if sel is None:
             return 0
+        where, args = sel
+        if only_profile_id is not None:
+            where += " AND added_by_profile_id=?"
+            args = args + [int(only_profile_id)]
         conn = self._get_connection()
         try:
-            cur = conn.execute(sql, (source_id,))
+            cur = conn.execute("DELETE FROM video_wishlist WHERE " + where, args)
             conn.commit()
             return cur.rowcount
+        finally:
+            conn.close()
+
+    def count_youtube_wishlist_rows(self, scope: str, source_id: str) -> int:
+        """How many rows that removal WOULD cover regardless of who added them."""
+        sel = self._youtube_wishlist_scope(scope, source_id)
+        if sel is None:
+            return 0
+        where, args = sel
+        conn = self._get_connection()
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) c FROM video_wishlist WHERE " + where, args).fetchone()["c"]
         finally:
             conn.close()
 
@@ -8547,7 +8635,8 @@ class VideoDatabase:
             items = []
             for cr in chan_rows:
                 vids = conn.execute(
-                    "SELECT source_id, episode_title, still_url, episode_overview, air_date, status "
+                    "SELECT source_id, episode_title, still_url, episode_overview, air_date, status, "
+                    "added_by_profile_id "
                     "FROM video_wishlist WHERE kind='video' AND parent_source_id=? "
                     "ORDER BY (air_date IS NULL), air_date DESC, id DESC", (cr["parent_source_id"],)).fetchall()
                 # group by upload year → "seasons"; newest video in a year = episode 1
@@ -8563,7 +8652,8 @@ class VideoDatabase:
                         eps.append({"episode_number": i + 1, "title": v["episode_title"],
                                     "still_url": v["still_url"], "overview": v["episode_overview"],
                                     "air_date": v["air_date"], "status": v["status"],
-                                    "source_id": v["source_id"]})
+                                    "source_id": v["source_id"],
+                                    "added_by_profile_id": v["added_by_profile_id"]})
                     poster = next((e["still_url"] for e in eps if e["still_url"]), cr["poster_url"])
                     seasons.append({"season_number": yr, "year": yr, "poster_url": poster, "episodes": eps})
                 items.append({

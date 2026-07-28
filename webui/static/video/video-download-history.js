@@ -10,6 +10,19 @@
     'use strict';
 
     var LIMIT = 40;
+
+    // Reading the history is open to anyone with video access; every ACTION in
+    // here is not. Re-download and Clear are behind can_download (they mutate the
+    // shared history), and the two Block buttons are Settings-class admin. The
+    // server is the authority — this only stops the panel offering buttons that
+    // come straight back 403.
+    function mayGrab() {
+        return (typeof canDownload !== 'function') || canDownload();
+    }
+    function isAdmin() {
+        var cp = (typeof currentProfile !== 'undefined') ? currentProfile : null;
+        return !cp || !!cp.is_admin || cp.id === 1;
+    }
     var state = { open: false, tab: 'all', search: '', rootFolderId: '', page: 1, loading: false,
                   counts: { movie: 0, show: 0, youtube: 0, total: 0 }, items: [], pages: 1 };
     var el = null, searchTimer = null;
@@ -74,7 +87,9 @@
                         '<svg class="vdh-search-ic" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>' +
                         '<input type="text" class="vdh-search-input" data-vdh-search placeholder="Search history…" autocomplete="off" spellcheck="false">' +
                     '</div>' +
-                    '<button class="vdh-clear" type="button" data-vdh-clear title="Clear the whole download history">Clear</button>' +
+                    (mayGrab()
+                        ? '<button class="vdh-clear" type="button" data-vdh-clear title="Clear the whole download history">Clear</button>'
+                        : '') +
                 '</div>' +
                 '<div class="vdh-body" data-vdh-body></div>' +
                 '<div class="vdh-foot" data-vdh-foot hidden>' +
@@ -267,13 +282,15 @@
                 dl('Path', it.dest_path) +
                 (it.error ? '<div class="vdh-d vdh-d--err"><span class="vdh-d-k">Error</span><span class="vdh-d-v">' + esc(it.error) + '</span></div>' : '') +
                 '<div class="vdh-detail-act">' +
-                    '<button class="vdh-redl" type="button" data-vdh-redl="' + esc(it.id) +
-                        '" title="Forget this grab so it re-downloads on the next scan">&#8635; Re-download</button>' +
-                    ((it.outcome === 'failed' || it.outcome === 'import_failed') && it.username && it.filename && it.source !== 'youtube'
+                    (mayGrab()
+                        ? '<button class="vdh-redl" type="button" data-vdh-redl="' + esc(it.id) +
+                          '" title="Forget this grab so it re-downloads on the next scan">&#8635; Re-download</button>'
+                        : '') +
+                    ((it.outcome === 'failed' || it.outcome === 'import_failed') && isAdmin() && it.username && it.filename && it.source !== 'youtube'
                         ? '<button class="vdh-redl vdh-block" type="button" data-vdh-block="' + esc(it.id) +
                           '" title="Never pick this exact release again">&#8856; Block release</button>'
                         : '') +
-                    (it.username && it.source !== 'youtube'
+                    (it.username && isAdmin() && it.source !== 'youtube'
                         ? '<button class="vdh-redl vdh-block" type="button" data-vdh-block-src="' + esc(it.id) +
                           '" title="Never grab from this uploader (' + esc(it.username) + ') again">&#8856; Block uploader</button>'
                         : '') +

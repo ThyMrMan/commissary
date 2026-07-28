@@ -183,10 +183,13 @@ def register_routes(bp):
         it's inferred from the title's existing library row when it has one, and
         finally falls back to the primary Library at drain time — so a NOT-yet-owned
         Anime show no longer has to land in the standard TV Library."""
-        from . import get_video_db
+        from . import get_video_db, acting_profile_id
         body = request.get_json(silent=True) or {}
         srv = _server()
         db = get_video_db()
+        # Stamp who asked, so they can take it back later without being able to
+        # remove anyone else's wishes. Automation adds leave this NULL.
+        who = acting_profile_id()
         try:
             movie = body.get("movie")
             if movie and movie.get("tmdb_id") and (movie.get("title") or "").strip():
@@ -194,6 +197,7 @@ def register_routes(bp):
                     int(movie["tmdb_id"]), movie["title"].strip(), year=movie.get("year"),
                     poster_url=movie.get("poster_url") or None,
                     library_id=movie.get("library_id") or None, server_source=srv,
+                    added_by_profile_id=who,
                     root_folder_id=(movie.get("root_folder_id")
                                     or db.root_folder_id_for_tmdb("movie", movie["tmdb_id"])))
                 return jsonify({"success": ok, "added": 1 if ok else 0, "counts": db.wishlist_counts()})
@@ -205,6 +209,7 @@ def register_routes(bp):
                     int(show["tmdb_id"]), show["title"].strip(), episodes,
                     poster_url=show.get("poster_url") or None,
                     library_id=show.get("library_id") or None, server_source=srv,
+                    added_by_profile_id=who,
                     root_folder_id=(show.get("root_folder_id")
                                     or db.root_folder_id_for_tmdb("show", show["tmdb_id"])))
                 return jsonify({"success": n > 0, "added": n, "counts": db.wishlist_counts()})
@@ -250,17 +255,29 @@ def register_routes(bp):
     @bp.route("/wishlist/remove", methods=["POST"])
     def video_wishlist_remove():
         """Remove at any granularity. Body: {scope, tmdb_id, season_number?, episode_number?}
-        where scope ∈ movie|show|season|episode."""
-        from . import get_video_db
+        where scope ∈ movie|show|season|episode.
+
+        NOT behind the blanket can_download gate — a member who asked for a title
+        must be able to take that back. Instead the delete is scoped to the rows
+        THEY added (``wishlist_owner_filter``), so the shared wishlist is safe
+        from a profile emptying someone else's requests."""
+        from . import get_video_db, wishlist_owner_filter
         body = request.get_json(silent=True) or {}
         scope, tmdb_id = body.get("scope"), body.get("tmdb_id")
         if scope not in _SCOPES or not tmdb_id:
             return jsonify({"success": False, "error": "scope and tmdb_id are required"}), 400
         try:
             db = get_video_db()
-            removed = db.remove_from_wishlist(
-                scope, tmdb_id=int(tmdb_id),
-                season_number=body.get("season_number"), episode_number=body.get("episode_number"))
+            owner = wishlist_owner_filter()
+            kw = dict(tmdb_id=int(tmdb_id), season_number=body.get("season_number"),
+                      episode_number=body.get("episode_number"))
+            removed = db.remove_from_wishlist(scope, only_profile_id=owner, **kw)
+            # An ownership-scoped delete reports 0 both for 'not yours' and for
+            # 'nothing there'. Say which — a silent no-op on someone else's title
+            # reads as a broken button.
+            if owner is not None and not removed and db.count_wishlist_rows(scope, **kw):
+                return jsonify({"success": False,
+                                "error": "You can only remove titles you added yourself."}), 403
             return jsonify({"success": True, "removed": removed, "counts": db.wishlist_counts()})
         except Exception:
             logger.exception("Failed to remove from video wishlist")
@@ -268,17 +285,29 @@ def register_routes(bp):
 
     @bp.route("/wishlist/clear", methods=["POST"])
     def video_wishlist_clear():
-        """Empty an entire wishlist tab. Body: {kind} where kind ∈ movie|show|youtube."""
-        from . import get_video_db
+        """Empty a wishlist tab. Body: {kind} where kind ∈ movie|show|youtube.
+
+        Ownership-scoped exactly like /wishlist/remove: for a profile that manages
+        the shared wishlist this empties the tab, and for everyone else it clears
+        the titles THEY added and leaves the rest. Returns ``left`` so the page can
+        say so rather than claiming it emptied a list that still has items in it."""
+        from . import get_video_db, wishlist_owner_filter
         body = request.get_json(silent=True) or {}
         kind = body.get("kind")
         if kind not in ("movie", "show", "youtube"):
             return jsonify({"success": False, "error": "kind must be movie|show|youtube"}), 400
         try:
             db = get_video_db()
-            removed = db.clear_wishlist(kind)
+            owner = wishlist_owner_filter()
+            removed = db.clear_wishlist(kind, only_profile_id=owner)
+            counts = db.wishlist_counts()
+            left = counts.get("movie" if kind == "movie" else "episode", 0) \
+                if kind != "youtube" else db.youtube_wishlist_counts().get("video", 0)
             return jsonify({"success": True, "removed": removed,
-                            "counts": db.wishlist_counts(), "youtube_counts": db.youtube_wishlist_counts()})
+                            # rows other profiles asked for, which this clear left alone
+                            "left": left if owner is not None else 0,
+                            "scoped": owner is not None,
+                            "counts": counts, "youtube_counts": db.youtube_wishlist_counts()})
         except Exception:
             logger.exception("Failed to clear video wishlist")
             return jsonify({"success": False, "error": "Failed"}), 500

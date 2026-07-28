@@ -303,8 +303,10 @@ def test_download_and_destructive_endpoints_stay_behind_can_download(app_db):
             ("/api/video/downloads/grab-pack", {}),      # covered by the 'grab' prefix
             ("/api/video/downloads/cancel", {}),
             ("/api/video/downloads/history/clear", {}),
-            ("/api/video/wishlist/remove", {}),
-            ("/api/video/wishlist/clear", {}),
+            ("/api/video/downloads/clear", {}),
+            # NOTE: the wishlist removes and /wishlist/clear are NOT here — they
+            # are ownership-scoped in the route instead, so a member clears their
+            # own requests and nobody else's. See test_video_wishlist_ownership.py.
             ("/api/video/watchlist/approve", {"kind": "show", "tmdb_id": 1}),
             # 'Search now' / 'Search all' start REAL grabs from the shared
             # wishlist and were behind no gate at all.
@@ -340,10 +342,37 @@ def test_the_two_asking_endpoints_are_deliberately_not_in_the_gate():
     # …while every acquisition/destructive route stays behind it.
     for guarded in ("/api/video/watchlist/approve", "/api/video/downloads/grab",
                     "/api/video/downloads/retry", "/api/video/downloads/cancel",
-                    "/api/video/wishlist/remove", "/api/video/wishlist/clear",
+                    "/api/video/downloads/clear",
                     # 'Search now' / 'Search all' START GRABS and had no gate at all.
                     "/api/video/wishlist/search"):
         assert guarded in gate, guarded
+
+
+def test_the_wishlist_removes_are_ownership_scoped_rather_than_gated():
+    """The third category. A blanket gate meant a member could ask for a title and
+    never take it back, so the rule moved into the routes: the delete is scoped to
+    the rows THAT profile added. Putting any of these back in the gate silently
+    reverts that.
+
+    /wishlist/clear is in this group too. Gating the bulk button while leaving the
+    per-item × open would not have protected anything — it would just have meant
+    more clicks for the same result."""
+    gate = _VIDEO_INIT.split('can_download", True) and _p(')[1].split("):")[0]
+    for scoped in ("/api/video/wishlist/remove", "/api/video/youtube/wishlist/remove",
+                   "/api/video/wishlist/clear"):
+        assert scoped not in gate, scoped
+    for route_src in ("api/video/wishlist.py", "api/video/youtube.py"):
+        src = (Path(__file__).resolve().parents[1] / route_src).read_text(encoding="utf-8")
+        assert "wishlist_owner_filter" in src, route_src
+
+
+def test_the_bulk_clear_cannot_outrun_the_per_item_check():
+    """Both must consult the same helper, or 'Clear all' becomes a way around the
+    ownership rule the × enforces."""
+    src = (Path(__file__).resolve().parents[1] / "api/video/wishlist.py").read_text(encoding="utf-8")
+    clear = src.split("def video_wishlist_clear()")[1].split("@bp.route")[0]
+    assert "wishlist_owner_filter()" in clear
+    assert "only_profile_id=owner" in clear
 
 
 def test_the_wishlist_search_gate_covers_search_all_by_prefix():

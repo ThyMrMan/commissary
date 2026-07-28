@@ -611,10 +611,17 @@
                 '<span class="discog-btn-icon">＋</span><span class="discog-btn-text">Wishlist Missing</span>' +
                 '<span class="discog-btn-shimmer"></span></button>';
         }
+        // Manage Poster / Manage / Synchronize are library MANAGEMENT: everything
+        // they write (/poster/set, /metadata, /lock, /aka, /library, /sync,
+        // /quality-profile, …) is admin-only in the blueprint's gate. Offering them
+        // to a standard or Plex profile only produced a panel whose every save came
+        // back 403. Same admin test the dashboard's studio launchers use.
+        var _isAdmin = (typeof currentProfile === 'undefined') || !currentProfile ||
+            !!currentProfile.is_admin || currentProfile.id === 1;
         // Manage Poster — library items only (we need a server id + folder to push a
         // new poster to) and a tmdb id (to fetch the alternates). Opens VideoPoster.
         var ownLibItem = (d.source !== 'tmdb') || d.owned;
-        if (ownLibItem && d.tmdb_id && window.VideoPoster) {
+        if (_isAdmin && ownLibItem && d.tmdb_id && window.VideoPoster) {
             html += '<button class="vd-trailer-btn" type="button" data-vd-act="poster" title="Change poster">' +
                 '<span class="vd-trailer-ic">🖼</span> Manage Poster</button>';
         }
@@ -624,7 +631,7 @@
         // item, so the panel opens on its matching section alone — "Also known
         // as" is stored against the TMDB id and is exactly what you need when a
         // release for something you don't own yet is rejected as a wrong title.
-        if (window.VideoManage && (ownLibItem || d.tmdb_id)) {
+        if (_isAdmin && window.VideoManage && (ownLibItem || d.tmdb_id)) {
             var mTitle = (ownLibItem && (d.source !== 'tmdb' || d.library_id != null))
                 ? 'Edit metadata' : 'Set the names releases use for this title';
             html += '<button class="vd-manage-btn" type="button" data-vd-act="manage" title="' + mTitle + '">' +
@@ -633,7 +640,7 @@
         // Synchronize — a deep scan scoped to THIS show: re-reads it from the
         // server and reconciles episodes (adds + removals) without waiting for
         // a full library scan. Library shows only (needs a local row).
-        var libShowId = (d.kind === 'show' && ownLibItem)
+        var libShowId = (d.kind === 'show' && ownLibItem && _isAdmin)
             ? (d.source !== 'tmdb' ? d.id : d.library_id) : null;
         if (libShowId != null) {
             html += '<button class="vd-manage-btn" type="button" data-vd-act="sync-show" data-vd-sync-id="' + esc(libShowId) +
@@ -725,16 +732,20 @@
             document.dispatchEvent(new CustomEvent('soulsync:video-wishlist-changed'));
             if (typeof showToast === 'function') showToast(msg, 'success');
         };
-        var fail = function () {
+        // Parse the body even on a non-2xx: the reason lives in {error}. Removing
+        // a wish someone else added comes back 403 with a sentence worth showing
+        // — "Wishlist update failed" reads like a bug instead of a rule.
+        var fail = function (res) {
             if (btn) btn.disabled = false;
-            if (typeof showToast === 'function') showToast('Wishlist update failed', 'error');
+            if (typeof showToast === 'function')
+                showToast((res && res.error) || 'Wishlist update failed', 'error');
         };
         var opts = { method: 'POST', headers: { 'Content-Type': 'application/json' } };
         if (wished) {
             opts.body = JSON.stringify({ scope: 'movie', tmdb_id: d.tmdb_id });
             fetch('/api/video/wishlist/remove', opts)
-                .then(function (r) { return r.ok ? r.json() : null; })
-                .then(function (res) { (res && res.success) ? done(false, 'Removed from wishlist') : fail(); })
+                .then(function (r) { return r.json().catch(function () { return null; }); })
+                .then(function (res) { (res && res.success) ? done(false, 'Removed from wishlist') : fail(res); })
                 .catch(fail);
         } else {
             opts.body = JSON.stringify({ movie: { tmdb_id: d.tmdb_id, title: d.title,

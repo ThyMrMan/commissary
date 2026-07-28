@@ -552,7 +552,12 @@ CREATE TABLE IF NOT EXISTS video_wishlist (
     parent_source_id TEXT,                   -- owning channel's youtube id (video rows)
     date_added     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     search_attempts INTEGER DEFAULT 0,       -- consecutive fruitless drain searches (reset on grab)
-    last_search_at  TEXT                     -- when the drain last searched this row
+    last_search_at  TEXT,                    -- when the drain last searched this row
+    -- Who asked for it. A member without download rights may remove their OWN
+    -- wishes and nothing else. NULL = added by automation (watchlist scan,
+    -- collections, RSS) or before this column existed — nobody's personal wish,
+    -- so only a profile with can_download may remove it.
+    added_by_profile_id INTEGER
 );
 -- one row per movie, one per (show, season, episode), one per youtube video —
 -- partial uniques so the shapes don't collide and re-adding is an idempotent upsert.

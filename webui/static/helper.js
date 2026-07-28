@@ -3484,8 +3484,19 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.8': [
-        { date: 'July 2026 · 1.8.8' },
+    '1.8.9': [
+        { date: 'July 2026 · 1.8.9' },
+        { title: 'Buttons that could only fail are gone', desc: 'the follow-up to 1.8.8. Standard and Plex users were still being shown a row of controls that answered "not allowed" when clicked — Retry on a failed download, Block release, Clear, the download-history actions, Search now on an individual episode. All of them are hidden for profiles that cannot use them.' },
+        { title: 'Three of them were not just cosmetic', desc: 'clearing the finished downloads on both the music and video sides, and every part of the music Import page, were behind no permission check at all. Those are not dead buttons — they work, on shared data. Any signed-in profile could empty your download history or import files into your library. All of them are now checked on the server, which is the part that counts.' },
+        { title: 'And cancelling a music download is checked too', desc: 'the music side had the same gap the video side had in 1.8.8: all four cancel routes were open, so a standard profile could stop your in-flight downloads. One of them also re-added the cancelled track to the shared wishlist, so a single call both stopped a download and changed shared state.' },
+        { title: 'You can remove your own wishlist items — and only your own', desc: 'the wishlist is one shared list, so until now removing was all-or-nothing: either a profile could clear anyone\'s requests or it could not remove even its own. Each entry now remembers who asked for it. A member can take back what they added; everything else is refused with a reason rather than silently doing nothing.' },
+        { title: 'Clear all follows the same rule', desc: 'for you it still empties the tab. For a member it clears the titles they added and leaves the rest, and says so — "Cleared 3 movies you added — 2 from other people left in place". The confirmation says which it is going to do before you commit, since "Remove ALL" would otherwise read like it wipes everyone\'s.' },
+        { title: 'Re-adding cannot take over someone else\'s entry', desc: 'ownership is recorded when a title is first added and never reassigned. Otherwise wishing for something already on the list would hand you the other person\'s entry to delete. Items added by your automation belong to nobody and stay yours alone to clear.' },
+        { title: 'Manage and Manage Poster are admin-only', desc: 'on a movie or show, these open the metadata editor and the artwork picker. Everything they save was already admin-only on the server, so for anyone else they opened a panel where every save came back refused. Synchronize went with them, for the same reason.' },
+        { title: 'The music Import page is admin-only', desc: 'it stages files off your disk and writes them into the shared library. It had been a per-profile page toggle that was ON by default, so every standard and Plex user could see it — while the same page on the video side has always been admin-only.' },
+        { title: 'The search source picker only shows what you have set up', desc: 'sources with no credentials were shown greyed out with a "set up in Settings" tooltip — a row of buttons that cannot answer a search. They are hidden now. If you have not configured anything at all the full row comes back, since that is the one time those tooltips are the point.' },
+        { title: 'Music wishlist buttons were already per-user', desc: 'worth saying, since it came up: Ignored, Cleanup and Clear All on the music wishlist have always acted only on your own list. The music wishlist is stored per profile, so you never see anyone else\'s tracks to begin with — which is why it needed no equivalent fix.' },
+        { title: 'Also in 1.8.8', desc: 'members could start downloads from the wishlist and cancel yours, while being blocked from the one thing they should be able to do — adding to it.' },
         { title: 'Members could start downloads from the wishlist', desc: 'the "Search now" and "Search all" buttons on the wishlist start real downloads, and they were behind no permission check at all — so anyone signed in with access to the video side could set them off. Every other download action was already checked; these two were missed. They now need download permission, like the rest.' },
         { title: 'And they can no longer cancel your downloads', desc: 'cancelling was already checked, but a standard profile you created started with download permission switched ON, so it inherited the ability. That default has changed.' },
         { title: 'New profiles now match their role', desc: 'a new admin can download; a new standard user cannot, until you say so. Previously every new profile could download unless you noticed and turned it off. Existing profiles are left exactly as they are — quietly taking away something someone relies on would be its own kind of bug.' },
@@ -3577,6 +3588,38 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.8.9: what you can see is what you can do",
+        description: "the follow-up to 1.8.8. Standard and Plex users were still shown controls that answered \"not allowed\" when clicked — and a few of those controls were not dead at all, they worked, on shared data.",
+        features: [
+            "Retry, Block release, Clear, the download-history actions and Search now on an individual episode are hidden for profiles that cannot use them, on both sides",
+            "three were not merely cosmetic: clearing the finished downloads (music AND video) and every part of the music Import page had no permission check at all. Any signed-in profile could empty your download history or import files into your library. They are now checked on the server, which is the part that counts",
+            "cancelling a music download was open too — the same gap the video side had in 1.8.8. One of the four routes also re-added the cancelled track to the shared wishlist, so a single call both stopped a download and changed shared state",
+            "Manage, Manage Poster and Synchronize on a movie or show are admin-only. Everything they save already was, so for anyone else they opened a panel where every save came back refused",
+            "the music Import page is admin-only. It stages files off your disk into the shared library, and had been a per-profile toggle that was ON by default — while the same page on the video side has always been admin-only",
+        ],
+        usage_note: "Manage Profiles → per-profile 'Can download'. Import and Manage follow the admin flag.",
+    },
+    {
+        title: "Your wishlist items are yours to remove",
+        description: "the wishlist is one shared list, so removing used to be all-or-nothing: either a profile could clear anyone's requests or it could not remove even its own.",
+        features: [
+            "each entry now remembers who asked for it. A member can take back what they added; anything else is refused with a reason rather than silently doing nothing",
+            "Clear all follows the same rule — for you it empties the tab, for a member it clears their own and says what it left: \"Cleared 3 movies you added — 2 from other people left in place\". The confirmation says which it will do before you commit",
+            "ownership is set when a title is first added and never reassigned, or wishing for something already on the list would hand you someone else's entry to delete",
+            "items added by your automation belong to nobody and stay yours alone to clear",
+            "the ⚠ Failing filter is hidden for members: it narrows the list down to what keeps failing so you can re-search or drop each one, and a member has none of those actions",
+        ],
+    },
+    {
+        title: "The search picker shows only what you have set up",
+        description: "sources with no credentials were shown greyed out with a \"set up in Settings\" tooltip — a row of buttons that cannot answer a search.",
+        features: [
+            "unconfigured sources are simply absent now, on the Search page and in the global search box alike",
+            "if you have not configured anything at all the full row comes back — that is the one time those tooltips are the point, and an empty picker would leave nothing to click and no explanation",
+            "the source you are currently searching is never hidden, even if its credentials go away",
+        ],
+    },
     {
         title: "1.8.8: members can ask, not fetch",
         description: "a permission fix. Standard and Plex users could start downloads from the wishlist, and a standard profile could cancel yours — while the one thing they SHOULD be able to do, adding to the wishlist, was blocked.",

@@ -2494,6 +2494,15 @@ function _syncDetailFilter(btn, filter) {
 // ACTIVE DOWNLOADS PAGE — Centralized Live View
 // ============================================
 
+// Can THIS profile act on the shared download queue — cancel a transfer, cancel
+// everything, or clear the completed list? All of those routes sit behind
+// check_download_permission() server-side; this only stops the page offering a
+// button that comes straight back 403, and stops a member cancelling the ADMIN's
+// downloads. One helper so the row button, Cancel All and Clear can't disagree.
+function _mayCancel() {
+    return (typeof canDownload !== 'function') || canDownload();
+}
+
 let _adlPoller = null;
 let _adlFilter = 'all';
 let _adlData = [];
@@ -3394,9 +3403,12 @@ function _adlRender() {
         countEl.textContent = parts.join(' / ');
     }
 
-    // Show/hide clear button
+    // Show/hide clear button. Clear Completed empties the download history for
+    // EVERYONE (library_history is not profile-scoped) and drops the verification
+    // review queue with it, so it's a downloader's action — the server enforces
+    // the same rule via check_download_permission().
     const clearBtn = document.getElementById('adl-clear-btn');
-    if (clearBtn) clearBtn.style.display = completedN > 0 ? '' : 'none';
+    if (clearBtn) clearBtn.style.display = (completedN > 0 && _mayCancel()) ? '' : 'none';
 
     // Show/hide cancel-all button — only visible when there's something to cancel
     const cancelAllBtn = document.getElementById('adl-cancel-all-btn');
@@ -3404,7 +3416,7 @@ function _adlRender() {
         const hasRunningWork = _adlData.some(d =>
             [...activeStatuses, ...queuedStatuses].includes(d.status)
         );
-        cancelAllBtn.style.display = hasRunningWork ? '' : 'none';
+        cancelAllBtn.style.display = (hasRunningWork && _mayCancel()) ? '' : 'none';
     }
 
     // Batch filter indicator banner
@@ -3539,7 +3551,10 @@ function _adlRender() {
 
             // Per-row cancel only makes sense for in-flight tasks. Terminal
             // states (completed/failed/cancelled) have nothing to cancel.
-            const isCancellable = statusClass === 'active' || statusClass === 'queued';
+            // ...and only for a profile allowed to act on the shared queue. The
+            // cancel routes are behind check_download_permission(), so for anyone
+            // else this was a button that killed nothing and returned 403.
+            const isCancellable = (statusClass === 'active' || statusClass === 'queued') && _mayCancel();
             const cancelBtnHtml = isCancellable && dl.playlist_id && dl.track_index !== undefined
                 ? `<button class="adl-row-cancel" onclick="event.stopPropagation(); adlCancelRow(this, '${_adlEsc(dl.playlist_id)}', ${dl.track_index})" title="Cancel this download" aria-label="Cancel download">
                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>

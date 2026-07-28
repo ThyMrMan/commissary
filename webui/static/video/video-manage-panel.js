@@ -1139,6 +1139,12 @@
     //   anything else  → `id` is a library row id; unchanged behaviour.
     function open(opts) {
         if (!opts || !opts.kind || opts.id == null) return;
+        // Every save in this panel is admin-only server-side (/metadata, /lock,
+        // /aka, /library, /quality-profile, /series-type, /rescan-episodes,
+        // /episode-source). Defense in depth behind the hidden launcher, same as
+        // the Overlay and Collection studios — a panel that can only 403 should
+        // not open at all.
+        if (typeof currentProfile !== 'undefined' && currentProfile && !currentProfile.is_admin) return;
         if (state) close(true);
         ensureStyles();
 

@@ -333,11 +333,20 @@ def test_the_panel_offers_series_type_without_a_row():
 
 def test_manage_opens_for_a_title_that_is_not_in_the_library():
     """The reported gap: the button was gated on a library row, so the one
-    control that works without one was unreachable."""
+    control that works without one was unreachable.
+
+    Manage is ALSO admin-only now (everything it saves — /metadata, /lock, /aka,
+    /library — is admin in the video blueprint's gate). Both must hold: a library
+    row is still not required, and a non-admin never gets the button. Asserted as
+    two separate properties rather than one exact line, so re-ordering the
+    condition doesn't fail this for cosmetic reasons."""
     from pathlib import Path
     js = (Path(__file__).resolve().parent.parent / "webui" / "static" / "video"
           / "video-detail.js").read_text(encoding="utf-8")
-    assert "if (window.VideoManage && (ownLibItem || d.tmdb_id))" in js
+    cond = js.split("window.VideoManage &&", 1)[1].split(")", 1)[0]
+    assert "ownLibItem || d.tmdb_id" in cond, "a tmdb-only title must still qualify"
+    assert "_isAdmin &&" in js.split("window.VideoManage &&", 1)[0][-40:], \
+        "and the button is admin-only"
     # ...and it opens in tmdb mode, passing the id the aliases are keyed by
     assert "source: 'tmdb', detail: data" in js
 

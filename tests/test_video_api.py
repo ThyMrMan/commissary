@@ -118,7 +118,12 @@ def test_download_actions_require_can_download(tmp_path):
                 # destructive siblings — reachable since Plex profiles gained
                 # video access, so they need the same gate
                 "/api/video/downloads/cancel", "/api/video/downloads/history/clear",
-                "/api/video/wishlist/remove", "/api/video/wishlist/clear",
+                # wipes the finished rows off the SHARED queue for everyone
+                "/api/video/downloads/clear",
+                # NOTE: /wishlist/remove, /youtube/wishlist/remove and
+                # /wishlist/clear are NOT here — all three are ownership-scoped in
+                # the route (see tests/test_video_wishlist_ownership.py), so a
+                # member may take back their own wishes but nobody else's.
                 # approving a pending follow IS acquisition
                 "/api/video/watchlist/approve"]:
         r = c.post(url, json={})

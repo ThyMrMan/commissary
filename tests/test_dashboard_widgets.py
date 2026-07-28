@@ -241,7 +241,10 @@ def test_policy_composes_with_allowed_pages_rather_than_replacing_it():
     """Hidden by either must mean hidden — the per-profile list still narrows."""
     init_js = _read('webui/static/init.js')
     start = init_js.index('Filter sidebar pages based on profile permissions')
-    body = init_js[start:start + 1200]
+    # Slice to the END OF THE LOOP, not a fixed character count: a comment added
+    # inside it used to push these assertions out of the window and fail for
+    # reasons that had nothing to do with the behaviour being pinned.
+    body = init_js[start:].split('\n    });', 1)[0]
     assert 'allowed_pages' in body and 'isPageHiddenByPolicy' in body
 
 

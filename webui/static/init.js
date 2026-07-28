@@ -531,6 +531,11 @@ function isPageAllowed(pageId) {
     const normalizedPageId = normalizeProfilePageId(pageId);
     if (normalizedPageId === 'help' || normalizedPageId === 'issues') return true;
     if (normalizedPageId === 'settings') return currentProfile.is_admin;
+    // Import is library MANAGEMENT — it stages files off disk and writes them
+    // into the shared music library. Admin-only, same as the video side's Import
+    // page, and hard-gated here rather than via allowed_pages so it can't be
+    // granted by accident and isn't reachable by typing /import either.
+    if (normalizedPageId === 'import') return currentProfile.is_admin;
     // Global admin policy (Settings -> Users). Composes with allowed_pages
     // below: hidden by EITHER means hidden. Checked here rather than only in
     // the nav filter so the page isn't still reachable by typing its URL.
@@ -1507,12 +1512,21 @@ function updateProfileIndicator() {
         }
     };
 
-    // Filter sidebar pages based on profile permissions
+    // Filter sidebar pages based on profile permissions.
+    // Music control surfaces that are NOT per-profile toggles, mirroring
+    // VIDEO_ADMIN_ONLY below. Import stages files off disk and writes them into
+    // the shared library, so it belongs here rather than in allowed_pages.
+    const MUSIC_ADMIN_ONLY = ['import'];
     document.querySelectorAll('.nav-button[data-page]').forEach(btn => {
         const page = btn.getAttribute('data-page');
         if (page === 'hydrabase') return; // Managed by dev mode toggle
-        if (page === 'settings') {
-            // Settings always gated by is_admin
+        if (page === 'settings' || MUSIC_ADMIN_ONLY.includes(page)) {
+            // Settings always gated by is_admin; Import is library management
+            // (it writes staged files into the shared library), so it matches the
+            // video side's Import rather than being an allowed_pages toggle.
+            // NOTE: this loop deliberately re-derives the rule instead of calling
+            // isPageAllowed() — so anything admin-only must be listed in BOTH, or
+            // a profile with allowed_pages=null (all pages) still sees the button.
             btn.style.display = currentProfile.is_admin ? '' : 'none';
         } else if (page === 'help' || page === 'issues') {
             btn.style.display = ''; // Always visible

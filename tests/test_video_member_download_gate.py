@@ -66,8 +66,8 @@ MEMBER_BLOCKED = [
     ("/api/video/downloads/cancel", {"id": 1}),
     ("/api/video/downloads/grab", {"title": "X"}),
     ("/api/video/downloads/retry", {"id": 1}),
-    ("/api/video/wishlist/remove", {"scope": "movie", "tmdb_id": 550}),
-    ("/api/video/wishlist/clear", {"kind": "movie"}),
+    # empties the finished rows off the SHARED queue for everyone
+    ("/api/video/downloads/clear", {}),
 ]
 
 
@@ -86,6 +86,27 @@ def test_searching_the_wishlist_is_the_one_that_was_open(client):
     assert c.post("/api/video/wishlist/search",
                   json={"scope": "movie", "tmdb_id": 550}).status_code == 403
     assert c.post("/api/video/wishlist/search-all", json={}).status_code == 403
+
+
+def test_clearing_the_finished_queue_is_not_a_member_s_call(client):
+    """/downloads/clear was behind no gate at all — a member could wipe the
+    admin's completed and failed rows off the shared downloads page."""
+    c, app = client
+    _as(app, is_admin=False, can_download=False)
+    assert c.post("/api/video/downloads/clear", json={}).status_code == 403
+
+
+def test_taking_back_your_own_wishes_is_no_longer_a_blanket_403(client):
+    """These three moved out of this gate and into an OWNERSHIP check in the route
+    — a member may take back what they asked for, one at a time or all at once.
+    tests/test_video_wishlist_ownership.py pins the rule itself; this only pins
+    that the blanket gate let go of them."""
+    c, app = client
+    _as(app, is_admin=False, can_download=False)
+    for path, body in (("/api/video/wishlist/remove", {}),
+                       ("/api/video/youtube/wishlist/remove", {}),
+                       ("/api/video/wishlist/clear", {"kind": "movie"})):
+        assert c.post(path, json=body).status_code != 403, path
 
 
 # ── what a member MUST still be able to do ───────────────────────────────────
@@ -168,6 +189,34 @@ def test_the_downloads_page_hides_cancel():
     js = _js("video-downloads-page.js")
     assert "function mayGrab()" in js
     assert js.count("mayGrab()") >= 5
+
+
+def test_the_downloads_page_hides_retry_and_clear():
+    """Retry is the button a failed download grows, and /downloads/retry is
+    behind can_download — for a member it only ever produced a 403 toast on
+    someone else's failure. Row, drawer and Retry-all all needed the gate."""
+    js = _js("video-downloads-page.js")
+    row = js.split("var stateBtn = active")[1][:600]
+    assert "isFail(d.status) && mayGrab()" in row
+    assert "if (mayGrab()) btns.push('<button class=\"vdpg-dr-btn vdpg-dr-accent\" type=\"button\" data-vdpg-retry=" in js
+    assert "counts.retryable >= 2 && mayGrab()" in js
+    assert "(counts.completed + counts.failed) && mayGrab()" in js
+
+
+def test_block_needs_admin_not_merely_download_rights():
+    """/downloads/blocklist is Settings-class admin — this one bounced even for a
+    member WITH can_download, so mayGrab() would have been the wrong gate."""
+    js = _js("video-downloads-page.js")
+    assert "function isAdmin()" in js
+    assert "isAdmin() &&" in js.split("var blockBtn =")[1][:200]
+
+
+def test_the_history_panel_hides_its_actions():
+    js = (_ROOT / "webui" / "static" / "video" / "video-download-history.js").read_text(encoding="utf-8")
+    assert "function mayGrab()" in js and "function isAdmin()" in js
+    # Re-download + Clear are can_download; the two Block buttons are admin.
+    assert js.count("mayGrab()") >= 3
+    assert js.count("isAdmin()") >= 3
 
 
 def test_the_ui_defers_to_the_shared_helper_not_its_own_rule():

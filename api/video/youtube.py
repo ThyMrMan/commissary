@@ -108,7 +108,9 @@ def register_routes(bp):
             followed = db.add_channel_to_watchlist(channel)
             # Wishlist only the configured recent slice (the resolve/preview may carry more).
             recent = (channel.get("videos") or [])[:count]
-            added = db.add_videos_to_wishlist(channel, recent, server_source=_server())
+            from . import acting_profile_id
+            added = db.add_videos_to_wishlist(channel, recent, server_source=_server(),
+                                              added_by_profile_id=acting_profile_id())
             if followed:   # followed channels get their full upload-date catalog in the background
                 try:
                     from core.video.youtube_enrichment import get_youtube_date_enricher
@@ -153,6 +155,10 @@ def register_routes(bp):
             if db.channel_watch_state([ch["youtube_id"]]):
                 return False          # → counted as 'skipped'
             db.add_channel_to_watchlist(ch)
+            # No added_by_profile_id: this runs in the background import job, with
+            # no request context to read one from. A bulk subscription import is
+            # bookkeeping rather than one person's wish, and an unowned row is
+            # removable only by a profile with download rights — the safe default.
             db.add_videos_to_wishlist(ch, (ch.get("videos") or [])[:count], server_source=_server())
             try:
                 from core.video.youtube_enrichment import get_youtube_date_enricher
@@ -615,7 +621,7 @@ def register_routes(bp):
     def video_youtube_wishlist_add():
         """Wish specific videos (per-video add from the channel page). Body:
         {channel: {youtube_id, title, avatar_url?}, videos: [{youtube_id, title, …}]}."""
-        from . import get_video_db
+        from . import get_video_db, acting_profile_id
         body = request.get_json(silent=True) or {}
         channel = body.get("channel") or {}
         videos = body.get("videos") or []
@@ -626,7 +632,8 @@ def register_routes(bp):
             # A manual add is deliberate — it may re-wish an already-downloaded
             # video (the user can see the ✓ downloaded marker; they want it again).
             n = db.add_videos_to_wishlist(channel, videos, server_source=_server(),
-                                          allow_downloaded=True)
+                                          allow_downloaded=True,
+                                          added_by_profile_id=acting_profile_id())
             if not n:
                 return jsonify({"success": False, "added": 0,
                                 "error": "Couldn't add — the video may be missing its id"})
@@ -637,8 +644,11 @@ def register_routes(bp):
 
     @bp.route("/youtube/wishlist/remove", methods=["POST"])
     def video_youtube_wishlist_remove():
-        """Remove wished videos. Body: {scope: 'channel'|'video', source_id}."""
-        from . import get_video_db
+        """Remove wished videos. Body: {scope: 'channel'|'video', source_id}.
+
+        Ownership-scoped for a profile without download rights, exactly like
+        /wishlist/remove — they can drop the videos they wished for and no more."""
+        from . import get_video_db, wishlist_owner_filter
         body = request.get_json(silent=True) or {}
         scope = body.get("scope")
         source_id = (body.get("source_id") or "").strip()
@@ -646,7 +656,11 @@ def register_routes(bp):
             return jsonify({"success": False, "error": "scope and source_id are required"}), 400
         try:
             db = get_video_db()
-            removed = db.remove_youtube_from_wishlist(scope, source_id)
+            owner = wishlist_owner_filter()
+            removed = db.remove_youtube_from_wishlist(scope, source_id, only_profile_id=owner)
+            if owner is not None and not removed and db.count_youtube_wishlist_rows(scope, source_id):
+                return jsonify({"success": False,
+                                "error": "You can only remove videos you added yourself."}), 403
             return jsonify({"success": True, "removed": removed, "counts": db.youtube_wishlist_counts()})
         except Exception:
             logger.exception("youtube wishlist remove failed")

@@ -69,7 +69,38 @@
         var s = STATUS[status] || STATUS.wanted;
         return '<span class="vwsh-st ' + s[1] + '"' + (tip ? ' title="' + esc(tip) + '"' : '') + '>' + s[0] + '</span>';
     }
-    function rmBtn(scope, attrs) {
+    // ── who may remove what ──────────────────────────────────────────────────
+    // The wishlist is shared. A profile with download rights manages all of it;
+    // everyone else may only take back what they themselves asked for, so every
+    // remove control is gated on the row's added_by_profile_id. Rows with none
+    // (added by automation, or before the column existed) belong to nobody and
+    // are a downloader's to clear. Courtesy only — /wishlist/remove enforces the
+    // same rule server-side and is the authority.
+    function myProfileId() {
+        var cp = (typeof currentProfile !== 'undefined') ? currentProfile : null;
+        return (cp && cp.id != null) ? +cp.id : null;
+    }
+    function mine(addedBy) {
+        var me = myProfileId();
+        return addedBy != null && me != null && +addedBy === me;
+    }
+    function mayRemove(addedBy) { return mayGrab() || mine(addedBy); }
+    // A bulk remove (a whole season / show / channel) only appears when it would
+    // do exactly what it says — every row under it is the viewer's. Otherwise
+    // they still have the per-item × on the rows that ARE theirs.
+    function mayRemoveAll(addedByList) {
+        if (mayGrab()) return true;
+        return !!(addedByList && addedByList.length) && addedByList.every(mine);
+    }
+    function showAddedBy(sh) {
+        var out = [];
+        (sh.seasons || []).forEach(function (se) {
+            (se.episodes || []).forEach(function (e) { out.push(e.added_by_profile_id); });
+        });
+        return out;
+    }
+    function rmBtn(scope, attrs, addedBy) {
+        if (!mayRemove(addedBy)) return '';
         return '<button class="vwsh-rm" type="button" title="Remove" aria-label="Remove" ' +
             'data-vwsh-rm="' + scope + '"' + attrs + '>&times;</button>';
     }
@@ -202,7 +233,7 @@
             (st === 'downloading' ? '' : pickBtn('vwsh-hunt', 'movie',
                 ' data-tmdb="' + esc(it.tmdb_id) + '" data-title="' + esc(it.title || '') +
                 '" data-year="' + esc(it.year || '') + '" data-poster="' + esc(it.poster_url || '') + '"')) +
-            rmBtn('movie', ' data-tmdb="' + esc(it.tmdb_id) + '"') + '</div>' +
+            rmBtn('movie', ' data-tmdb="' + esc(it.tmdb_id) + '"', it.added_by_profile_id) + '</div>' +
             '<div class="vwsh-movie-info"><span class="vwsh-movie-title" title="' + esc(it.title) + '">' +
             esc(it.title) + '</span>' + (meta ? '<span class="vwsh-movie-meta">' + esc(meta) + '</span>' : '') +
             libSlot('movie', it.tmdb_id, it.root_folder_id) +
@@ -262,7 +293,9 @@
                         'stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></button>') +
                     (yt ? '' : pickBtn('vwsh-szn-hunt', 'season',
                         ' data-tmdb="' + esc(sh.tmdb_id) + '" data-s="' + se.season_number + '"')) +
-                    '<button class="vwsh-szn-rm" type="button" ' + sRm + ' title="Remove">&#10005;</button>' +
+                    (mayRemoveAll((se.episodes || []).map(function (e) { return e.added_by_profile_id; }))
+                        ? '<button class="vwsh-szn-rm" type="button" ' + sRm + ' title="Remove">&#10005;</button>'
+                        : '') +
                 '</div>' +
                 '<div class="vwsh-ep-grid">' + cards + '</div>' +
             '</div>';
@@ -282,7 +315,9 @@
             : 'data-vwsh-rm="show" data-tmdb="' + esc(sh.tmdb_id) + '"';
         return '<div class="wl-orb-group" data-vwsh-group data-vwsh-tmdb="' + esc(sh.tmdb_id) + '" ' +
             'data-vwsh-source="' + (yt ? 'youtube' : 'tmdb') + '" style="' + gstyle + '">' +
-            '<button class="wl-orb-remove" type="button" ' + showRm + ' title="Remove">&#10005;</button>' +
+            (mayRemoveAll(showAddedBy(sh))
+                ? '<button class="wl-orb-remove" type="button" ' + showRm + ' title="Remove">&#10005;</button>'
+                : '') +
             '<div class="vwsh-xhead">' +
                 '<div class="vwsh-info-syn" data-vwsh-syn></div>' +
                 '<div class="vwsh-xhead-mid">' +
@@ -444,7 +479,10 @@
                 '<div class="vwsh-epc-title" title="' + esc(t) + '">' + esc(t) + '</div>' +
                 '<div class="vwsh-epc-meta"><span class="vwsh-ep-dot vwsh-ep-dot--' + st + '"></span>' + (yt ? esc(metaTxt) : metaTxt) + '</div>' +
             '</div>' +
-            (yt || st === 'downloading' ? ''
+            // built inline rather than via huntBtn(), so it needs the same
+            // mayGrab() gate — it was the one Search-now control still offering
+            // a member a grab that comes back 403.
+            (yt || st === 'downloading' || !mayGrab() ? ''
                 : '<button class="vwsh-epc-hunt" type="button" data-vwsh-hunt="episode" data-tmdb="' + esc(sh.tmdb_id) +
                   '" data-s="' + se.season_number + '" data-e="' + e.episode_number + '" title="Search now">' +
                   '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" ' +
@@ -452,7 +490,9 @@
             (yt || st === 'downloading' ? ''
                 : pickBtn('vwsh-epc-hunt', 'episode', ' data-tmdb="' + esc(sh.tmdb_id) +
                   '" data-s="' + se.season_number + '" data-e="' + e.episode_number + '"')) +
-            '<button class="vwsh-epc-rm" type="button" ' + rm + ' title="Remove">&#10005;</button>' +
+            (mayRemove(e.added_by_profile_id)
+                ? '<button class="vwsh-epc-rm" type="button" ' + rm + ' title="Remove">&#10005;</button>'
+                : '') +
         '</div>';
     }
 
@@ -477,7 +517,14 @@
         }
         // Keep the chip visible while the filter is ON even at count 0, so the
         // user can always toggle back out of the filtered view.
-        chip.hidden = state.tab === 'youtube' || (!n && !state.failingOnly);
+        //
+        // It's a fix-it hub, not a report: its whole purpose is to narrow the
+        // list down to what keeps failing so you can re-search, manually pick, or
+        // drop each one. A profile without download rights has none of those
+        // actions, so the filter leads somewhere with nothing to do — hide it
+        // rather than offer a dead end. (Client-side only, so unlike the other
+        // gated controls this one never 403s; it just goes nowhere.)
+        chip.hidden = state.tab === 'youtube' || !mayGrab() || (!n && !state.failingOnly);
         chip.classList.toggle('vwsh-failing-filter--on', state.failingOnly);
         var nn = $('[data-vwsh-failing-n]'); if (nn) nn.textContent = n ? String(n) : '';
     }
@@ -485,6 +532,9 @@
     function render(items) {
         var grid = $('[data-vwsh-grid]'); if (!grid) return;
         state.lastItems = items;                       // unfiltered — the chip toggles re-render from this
+        // The toggle is hidden without download rights, so a filter left on would
+        // be a filtered list with no way back out.
+        if (!mayGrab()) state.failingOnly = false;
         _updateFailingChip(items);
         // "⚠ Failing" filter: movies filter directly; shows keep only seasons/
         // episodes that are failing (clones — the raw items stay intact).
@@ -550,11 +600,15 @@
         var has = state.tab === 'movie' ? state.counts.movie > 0
             : state.tab === 'show' ? state.counts.show > 0
             : (state.ytVideo > 0 || state.ytChannel > 0);
+        // Clear-all is ownership-scoped server-side: it empties the tab for a
+        // profile that manages the shared wishlist, and clears just the viewer's
+        // own titles for everyone else. So it stays available to members — the
+        // confirm text below is what changes.
         btn.hidden = !has;
         // "Search all missing" — TMDB tabs only (YouTube has its own drain), and
         // only when there's something to search.
         var sa = $('[data-vwsh-searchall]');
-        if (sa) sa.hidden = state.tab === 'youtube' || !has;
+        if (sa) sa.hidden = state.tab === 'youtube' || !has || !mayGrab();
     }
 
     // ── manual acquisition (per-item 'Search now' + 'Search all missing') ─────
@@ -831,30 +885,48 @@
         if (_lastCounts) setCounts(_lastCounts);
     }
 
-    // Empty the whole current tab (movies / TV / YouTube), after a confirm.
+    // Clear the current tab (movies / TV / YouTube), after a confirm. What "all"
+    // means depends on the profile, and the server decides: a profile that manages
+    // the shared wishlist empties the tab; everyone else clears only the titles
+    // they added. The prompt has to say which, or a member reads "Remove ALL" and
+    // thinks they are about to wipe everyone's requests.
     function clearAll() {
         var kind = state.tab;
         var label = kind === 'movie' ? 'movies' : kind === 'show' ? 'TV episodes' : 'YouTube videos';
+        var scoped = !mayGrab();
         var go = function () {
             fetch('/api/video/wishlist/clear', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ kind: kind }),
-            }).then(function (r) { return r.ok ? r.json() : null; })
+            }).then(function (r) { return r.json().catch(function () { return null; }); })
                 .then(function (res) {
                     if (res && res.success) {
-                        if (typeof showToast === 'function')
-                            showToast('Cleared ' + (res.removed || 0) + ' ' + label + ' from your wishlist', 'success');
+                        if (typeof showToast === 'function') {
+                            var n = res.removed || 0;
+                            // Don't report "cleared" over a list that still has
+                            // other people's titles in it — say what was left.
+                            var msg = n
+                                ? ('Cleared ' + n + ' ' + label + (res.scoped ? ' you added' : '') +
+                                   (res.scoped && res.left ? ' — ' + res.left + ' from other people left in place' : ''))
+                                : (res.scoped
+                                    ? 'Nothing to clear — none of these ' + label + ' were added by you'
+                                    : 'Nothing to clear');
+                            showToast(msg, n ? 'success' : 'info');
+                        }
                         load();
                     } else if (typeof showToast === 'function') {
-                        showToast('Could not clear wishlist', 'error');
+                        showToast((res && res.error) || 'Could not clear wishlist', 'error');
                     }
                 }).catch(function () { if (typeof showToast === 'function') showToast('Could not clear wishlist', 'error'); });
         };
         if (typeof showConfirmDialog === 'function') {
             showConfirmDialog({
-                title: 'Clear wishlist',
-                message: 'Remove ALL ' + label + ' from your wishlist? This can’t be undone.',
-                confirmText: 'Clear all', cancelText: 'Cancel', destructive: true,
+                title: scoped ? 'Clear your wishlist items' : 'Clear wishlist',
+                message: scoped
+                    ? ('Remove the ' + label + ' YOU added from the wishlist? Titles other ' +
+                       'people asked for stay. This can’t be undone.')
+                    : ('Remove ALL ' + label + ' from your wishlist? This can’t be undone.'),
+                confirmText: scoped ? 'Clear mine' : 'Clear all', cancelText: 'Cancel', destructive: true,
             }).then(function (ok) { if (ok) go(); });
         } else { go(); }
     }
@@ -868,7 +940,12 @@
             load();
         };
         var afterYt = function () { after(); document.dispatchEvent(new CustomEvent('soulsync:video-wishlist-changed')); };
-        var fail = function () { btn.disabled = false; };
+        // Surface the server's reason: removing someone else's wish is a 403 with
+        // a sentence, and a silently re-enabled × looks like a broken button.
+        var fail = function (res) {
+            btn.disabled = false;
+            if (res && res.error && typeof showToast === 'function') showToast(res.error, 'error');
+        };
 
         if (scope === 'yt-video') {
             VideoYoutube.removeWish('video', btn.getAttribute('data-id')).then(afterYt).catch(fail); return;
@@ -894,8 +971,8 @@
         if (btn.hasAttribute('data-e')) body.episode_number = parseInt(btn.getAttribute('data-e'), 10);
         fetch('/api/video/wishlist/remove', { method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body) })
-            .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) { if (!d || !d.success) { fail(); return; } after(); })
+            .then(function (r) { return r.json().catch(function () { return null; }); })
+            .then(function (d) { if (!d || !d.success) { fail(d); return; } after(); })
             .catch(fail);
     }
 

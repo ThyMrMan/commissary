@@ -33,6 +33,36 @@ def get_video_db():
     return _video_db
 
 
+def acting_profile_id():
+    """The profile making this request, stamped onto rows it creates. None when
+    there is no profile context (background/automation callers), which is exactly
+    what marks a row as nobody's personal wish."""
+    from flask import g
+    try:
+        return int(getattr(g, "profile_id", None))
+    except (TypeError, ValueError):
+        return None
+
+
+def wishlist_owner_filter():
+    """Whose wishlist rows this request is allowed to remove.
+
+    None = no restriction (admin, or a profile with can_download): the shared
+    wishlist is theirs to manage. Otherwise the profile id it is limited to, so a
+    member can take back a title they asked for and nothing else. Lives here
+    rather than in each route file because two copies of this rule is how the
+    TMDB and YouTube wishlists end up disagreeing about who owns what."""
+    from flask import g
+    if bool(getattr(g, "is_admin", getattr(g, "profile_id", 1) == 1)):
+        return None
+    if getattr(g, "can_download", True):
+        return None
+    pid = acting_profile_id()
+    # No profile context and no download rights — own nothing rather than
+    # everything. 0 is never a real profile id, so this matches no rows.
+    return 0 if pid is None else pid
+
+
 def create_video_blueprint() -> Blueprint:
     """Build the isolated /api/video blueprint with all video sub-routes."""
     bp = Blueprint("video_api", __name__)
@@ -119,6 +149,13 @@ def create_video_blueprint() -> Blueprint:
         # ADMIN's automation (or the admin, by hand) decides whether it is
         # actually fetched. Blocking the add only meant members had no way to
         # ask, which is the opposite of the point.
+        #
+        # '/wishlist/clear', '/wishlist/remove' and '/youtube/wishlist/remove' are
+        # deliberately absent too, for a different reason: all three enforce
+        # OWNERSHIP in the route instead. A member can take back the titles they
+        # asked for — one at a time or all at once — without being able to touch
+        # anyone else's (or automation's). Gating the bulk one while leaving the
+        # per-item one open would only have meant more clicks for the same result.
         if writing and not getattr(g, "can_download", True) and _p(
                 # '/downloads/grab' also covers '/downloads/grab-pack' by prefix
                 "/api/video/downloads/grab", "/api/video/downloads/retry",
@@ -136,8 +173,9 @@ def create_video_blueprint() -> Blueprint:
                 # gets video access by default, an un-gated one would let a member
                 # cancel the admin's downloads or empty the shared wishlist.
                 "/api/video/downloads/cancel", "/api/video/downloads/history",
-                "/api/video/wishlist/remove", "/api/video/wishlist/clear",
-                "/api/video/youtube/wishlist/remove"):
+                # empties the finished rows off the SHARED queue for everyone —
+                # destructive, and it was sitting behind no gate at all
+                "/api/video/downloads/clear"):
             return jsonify({"error": "Downloads are disabled for this profile."}), 403
 
     from .dashboard import register_routes as reg_dashboard
