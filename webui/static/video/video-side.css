@@ -4572,6 +4572,32 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
 .vdl-res-head { display: flex; align-items: center; gap: 8px; font-size: 11.5px; font-weight: 700;
     color: rgba(255, 255, 255, 0.5); margin: 4px 0 10px; }
 .vdl-res-head strong { color: #fff; }
+.vdl-res-hidden { color: rgba(255, 200, 90, 0.85); font-weight: 700; }
+
+/* Manual-search result filters. Client-side over rows already fetched, so it
+   stays instant and survives a live search re-rendering underneath it. */
+.vdl-filter { display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+    padding: 8px 0 10px; }
+.vdl-filter input, .vdl-filter select { font-family: inherit; font-size: 11.5px;
+    color: rgba(255, 255, 255, 0.85); background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.13); border-radius: 6px; padding: 4px 7px; }
+.vdl-filter input:focus, .vdl-filter select:focus { outline: none; color: #fff;
+    border-color: rgba(var(--accent-rgb, 29, 185, 84), 0.6); }
+.vdl-filter-text { flex: 1 1 150px; min-width: 110px; }
+.vdl-filter-num { width: 96px; }
+.vdl-filter-sel option { background: #181818; color: #fff; }
+.vdl-filter-chk { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px;
+    color: rgba(255, 255, 255, 0.7); cursor: pointer; white-space: nowrap; }
+.vdl-filter-clear { font-family: inherit; font-size: 11.5px; cursor: pointer;
+    color: rgba(255, 255, 255, 0.55); background: none; border: none;
+    text-decoration: underline; padding: 4px 2px; }
+.vdl-filter-clear:hover { color: #fff; }
+
+/* A release whose indexer exposes a details page links to it. */
+a.vdl-r-title--link { color: inherit; text-decoration: none;
+    border-bottom: 1px dotted rgba(255, 255, 255, 0.35); }
+a.vdl-r-title--link:hover { color: rgb(var(--accent-light-rgb, 30, 215, 96));
+    border-bottom-color: currentColor; }
 .vdl-res-okn { color: #8fe7af; }
 .vdl-res-live, .vdl-res-demo { margin-left: auto; font-size: 10px; font-weight: 800; padding: 2px 8px; border-radius: 999px;
     text-transform: uppercase; letter-spacing: 0.04em; }
@@ -5063,6 +5089,28 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
 .vimp-res-title { font-size: 13.5px; font-weight: 600; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .vimp-res-meta { font-size: 11.5px; color: rgba(255, 255, 255, 0.5); margin-top: 2px; }
 .vimp-res--owned .vimp-res-meta { color: #6cd391; }
+/* Whole-folder (season pack) import. The row sits at the top of the browse list
+   and is deliberately louder than a file row — it's the shortcut that saves
+   answering "which show is this?" once per episode. */
+.vimp-row--pack { background: rgba(var(--accent-rgb, 29, 185, 84), 0.10);
+    border: 1px solid rgba(var(--accent-rgb, 29, 185, 84), 0.34); border-radius: 8px;
+    margin-bottom: 6px; }
+.vimp-row--pack:hover { background: rgba(var(--accent-rgb, 29, 185, 84), 0.18); }
+.vimp-row--pack .vimp-row-name { font-weight: 700; }
+
+.vimp-pack { padding: 12px 20px 4px; }
+.vimp-pack-head { font-size: 12.5px; color: rgba(255, 255, 255, 0.72); margin-bottom: 8px; }
+.vimp-pack-msg { font-size: 12.5px; color: rgba(255, 255, 255, 0.5); }
+.vimp-pack-list { max-height: 168px; overflow-y: auto; border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.09); }
+.vimp-pack-row { display: flex; gap: 10px; align-items: baseline; padding: 4px 10px;
+    font-size: 12px; }
+.vimp-pack-row:nth-child(odd) { background: rgba(255, 255, 255, 0.035); }
+.vimp-pack-se { flex: 0 0 auto; font-weight: 700; font-variant-numeric: tabular-nums;
+    color: rgb(var(--accent-light-rgb, 30, 215, 96)); }
+.vimp-pack-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: rgba(255, 255, 255, 0.62); }
+
 .vimp-ep { display: flex; gap: 10px; flex-wrap: wrap; padding: 12px 20px 4px; }
 .vimp-ep-field { font-size: 12px; font-weight: 600; color: rgba(255, 255, 255, 0.6); display: flex; flex-direction: column; gap: 4px; }
 .vimp-ep-field--wide { flex: 1; min-width: 140px; }

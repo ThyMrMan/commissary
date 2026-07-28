@@ -177,11 +177,51 @@ def build_strategies(scope: str, title: Any, *, year: Any = None, season: Any = 
     return out
 
 
+# Prowlarr's per-call result cap. Configurable because "how many releases exist"
+# varies enormously by title and by how many indexers are attached — a long
+# running show across a dozen trackers blows past the old hard-coded 100 before
+# the ranking gets a chance to choose.
+_DEFAULT_SEARCH_LIMIT = 200
+_SEARCH_LIMIT_KEY = "prowlarr.search_limit"
+
+
+def _search_limit() -> int:
+    try:
+        from config.settings import config_manager
+        n = int(config_manager.get(_SEARCH_LIMIT_KEY, _DEFAULT_SEARCH_LIMIT)
+                or _DEFAULT_SEARCH_LIMIT)
+    except (TypeError, ValueError, Exception):   # noqa: BLE001 - config must never break search
+        return _DEFAULT_SEARCH_LIMIT
+    # Prowlarr rejects absurd values and a tiny one silently starves the ranker.
+    return max(20, min(1000, n))
+
+
+def _safe_info_url(value: Any) -> str | None:
+    """An indexer's details page, but ONLY if it's http(s).
+
+    This string comes from a third party and is rendered as a link the user
+    clicks. A ``javascript:`` or ``data:`` URL there would execute in the page,
+    so the scheme is checked here — at the boundary where the untrusted value
+    enters — rather than trusted to whatever renders it later."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        from urllib.parse import urlparse
+        return raw if urlparse(raw).scheme in ("http", "https") else None
+    except ValueError:
+        return None
+
+
 def _project(r: Any, url: str, want_proto: str) -> dict:
     """One Prowlarr result → the slskd-shaped hit ``_evaluate_hits`` consumes."""
     size = int(getattr(r, "size", 0) or 0)
     seeders = getattr(r, "seeders", None)
     return {
+        # The indexer's own page for this release, so the title can link to where
+        # it came from. Prowlarr calls it infoUrl; not every indexer supplies one.
+        "info_url": _safe_info_url(getattr(r, "info_url", None)),
+        "publish_date": getattr(r, "publish_date", None),
         "title": r.title,
         "size_bytes": size,
         "seeders": seeders,
@@ -219,7 +259,8 @@ def prowlarr_search(scope: str, title: Any, *, year: Any = None, season: Any = N
     def _run(strat):
         st_type, q, extra = strat
         try:
-            return client._search_sync(q, cats, ids, 100, search_type=st_type, extra_params=extra)
+            return client._search_sync(q, cats, ids, _search_limit(),
+                                       search_type=st_type, extra_params=extra)
         except Exception as e:   # noqa: BLE001 - one strategy failing shouldn't sink the rest
             logger.warning("prowlarr %s search failed for %r: %s", st_type, q, e)
             return e

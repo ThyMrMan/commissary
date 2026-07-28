@@ -217,8 +217,22 @@ def test_dismiss_does_not_trigger_a_refresh(env):
 
 
 def test_place_rejects_bad_scope(env):
-    r = env["client"].post("/api/video/import/%d/place" % env["dl_id"], json={"scope": "season"})
-    assert r.status_code == 400
+    """'season' used to stand in for an unknown scope here. It is now a real one
+    (whole-folder import), so the refusal has to be tested with something that
+    genuinely isn't a scope."""
+    for bad in ("", "series", "album", None):
+        r = env["client"].post("/api/video/import/%d/place" % env["dl_id"], json={"scope": bad})
+        assert r.status_code == 400, bad
+
+
+def test_place_as_a_season_needs_an_actual_folder(env):
+    """The row here points at a single FILE. Asking to import it as a pack is a
+    different failure from an unknown scope, and must not be silently treated as
+    one — run_season_import would list a file's 'contents' and find nothing."""
+    r = env["client"].post("/api/video/import/%d/place" % env["dl_id"],
+                           json={"scope": "season", "title": "X", "media_id": 1})
+    assert r.status_code == 410
+    assert "folder" in (r.get_json().get("error") or "").lower()
 
 
 def test_dismiss_drops_row_and_can_delete_file(env):

@@ -448,7 +448,8 @@ def _member_download(dl: dict, member: dict) -> dict:
 def run_season_import(dl: dict, src_dir: str, *, fs: Any, lister: Callable,
                       prober: Callable | None = None, settings: dict | None = None,
                       library_dir: str | None = None, recycle: Callable | None = None,
-                      size_of: Callable | None = None) -> dict:
+                      size_of: Callable | None = None, force: bool = False,
+                      override: dict | None = None) -> dict:
     """Import every episode in a season/series pack. Returns a DB patch dict.
 
     Partial success is SUCCESS: a pack advertised as S01 that ships 8 of 12
@@ -457,6 +458,13 @@ def run_season_import(dl: dict, src_dir: str, *, fs: Any, lister: Callable,
     from which nothing at all could be imported is a failure — and it keeps the
     source path so the Import page can pick it up manually, same as any other
     failed import.
+
+    ``force``/``override`` drive a MANUAL placement of a whole folder: the user
+    has chosen the show, so every member is placed against that identity. The
+    season/episode numbers still come from each FILE, never from the override —
+    the whole point of a pack is that its members differ, and stamping one
+    episode number across all of them would file the entire season on top of
+    itself.
     """
     settings = organization.normalize(settings)
     members = pack_members(src_dir, lister, size_of=size_of)
@@ -466,9 +474,19 @@ def run_season_import(dl: dict, src_dir: str, *, fs: Any, lister: Callable,
 
     imported, upgraded, failed, dests = 0, 0, [], []
     for m in members:
+        member_override = None
+        if override:
+            member_override = dict(override)
+            member_override.update({"scope": "episode", "season": m["season"],
+                                    "episode": m["episode"]})
+            # The chosen show supplies the title; only the pack itself knows the
+            # per-episode title, and a stale one from the dialog would be worse
+            # than none (it names the file).
+            member_override.pop("episode_title", None)
         try:
             patch = run_import(_member_download(dl, m), m["path"], fs=fs, prober=prober,
-                               settings=settings, library_dir=library_dir, recycle=recycle)
+                               settings=settings, library_dir=library_dir, recycle=recycle,
+                               force=force, override=member_override)
         except Exception as e:      # noqa: BLE001 - one bad member must not abort the pack
             failed.append("S%02dE%02d: %s" % (m["season"], m["episode"], e))
             continue

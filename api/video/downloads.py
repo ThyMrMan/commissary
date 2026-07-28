@@ -348,6 +348,10 @@ def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None,
             # URL + protocol the grab hands to the shared torrent/usenet client.
             "download_url": hit.get("download_url"), "protocol": hit.get("protocol"),
             "indexer_id": hit.get("indexer_id"), "guid": hit.get("guid"),
+            # The indexer's own page for this release — the title links to it so
+            # you can see where a release came from before grabbing it. Already
+            # scheme-checked in prowlarr_search._safe_info_url; None for slskd.
+            "info_url": hit.get("info_url"), "publish_date": hit.get("publish_date"),
         })
     # accepted first, then quality-profile score, then availability, then bigger file.
     results.sort(key=lambda r: (r["accepted"], r["score"], r["_avail"], r["size_bytes"]), reverse=True)
@@ -359,7 +363,35 @@ def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None,
     # rejects stay visible (with their reason) for a deliberate manual override.
     accepted = [r for r in results if r["accepted"]]
     rejected = [r for r in results if not r["accepted"]]
-    return (accepted[:40] + rejected[:15])
+    return (accepted[:_max_accepted()] + rejected[:_max_rejected()])
+
+
+# How many rows a manual search returns. These were hard-coded 40/15, which is
+# what people hit when a popular title "only shows so many torrents" — the
+# ranker had more, the response threw them away. Raised now that the picker can
+# be filtered, and configurable because the right number depends on how many
+# indexers you run.
+_DEF_MAX_ACCEPTED, _DEF_MAX_REJECTED = 100, 40
+
+
+def _capped(key, default, ceiling):
+    try:
+        from config.settings import config_manager
+        n = int(config_manager.get(key, default) or default)
+    except Exception:   # noqa: BLE001 - config must never break a search
+        return default
+    return max(1, min(ceiling, n))
+
+
+def _max_accepted() -> int:
+    return _capped("video.search.max_results", _DEF_MAX_ACCEPTED, 500)
+
+
+def _max_rejected() -> int:
+    """Rejects are capped separately and much lower: the structured tv/movie
+    search casts a wide net, so without a cap the list floods with
+    wrong-episode releases and buries what you actually want."""
+    return _capped("video.search.max_rejected", _DEF_MAX_REJECTED, 200)
 
 
 def _preferred_indexer_ids_for_root_folder(db, root_folder_id) -> set:

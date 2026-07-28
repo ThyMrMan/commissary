@@ -121,9 +121,19 @@ def test_library_picker_reads_the_configured_registry():
 
 def test_library_picker_follows_the_kind_tab():
     body = _func("renderLibraryPicker")
-    assert "LIB_KEY[r.kind]" in body
+    # Keyed off the resolve dialog's kind, whatever the expression around it —
+    # a whole-folder import ('season') maps to the TV libraries, so the literal
+    # `LIB_KEY[r.kind]` this once asserted is no longer the only correct form.
+    assert "LIB_KEY[" in body and "r.kind" in body
     assert "libs.length < 2" in body            # one Library is not a choice
     assert "renderLibraryPicker()" in _func("renderModal")
+
+
+def test_a_season_pack_uses_the_tv_libraries():
+    """'season' is a show-shaped import. Passed through raw it would miss
+    LIB_KEY entirely and offer no Library picker at all."""
+    body = _func("renderLibraryPicker")
+    assert "'season'" in body and "'episode'" in body
 
 
 def test_place_sends_the_chosen_library():

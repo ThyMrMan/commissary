@@ -3484,8 +3484,16 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.5': [
-        { date: 'July 2026 · 1.8.5' },
+    '1.8.6': [
+        { date: 'July 2026 · 1.8.6' },
+        { title: 'Fixed: "Check for out-of-place episodes" threw an error', desc: 'a mistake introduced in 1.8.5. The button reported "src is not defined" and did nothing at all. One edit added a piece of code that used a value, while the edit meant to create that value never saved — so the button referred to something that was not there.' },
+        { title: 'And a check so that particular slip cannot ship again', desc: 'the older parts of the interface get no automatic linting, and a syntax check does not catch this kind of fault — the code is perfectly well-formed, it just refers to a name nothing defines. There is now a test that scans for exactly that.' },
+        { title: 'Manual import can take a whole season folder', desc: 'the automatic side has unpacked season packs since 1.8.0, but manual import could only take one file at a time — so a pack that arrived any other way had to be placed episode by episode, answering "which show is this?" on every one. Point it at the folder instead and answer once.' },
+        { title: 'It shows you what it will do first', desc: 'browsing into a folder with two or more numbered episodes offers "Import this whole folder". The Place dialog then lists every file and the episode it read from each name, before you commit. Each file keeps its own episode number — the dialog only supplies the show.' },
+        { title: 'Manual Search was quietly discarding results', desc: 'it kept the best 40 releases and 15 rejected ones, and threw the rest away after they had already been found and ranked. That is why a popular title only ever showed so many. Now 100 and 40, and both are configurable, along with how many results are asked for in the first place.' },
+        { title: 'Click a release name to see where it came from', desc: 'the title now links to the indexer\'s own page for that release, when the indexer provides one. Links open in a new tab and are checked before being shown — a tracker cannot use one to run anything inside SoulSync.' },
+        { title: 'And you can filter the results', desc: 'by name, quality, source, minimum seeders, or only those that meet your quality profile. Filtering happens instantly on results already fetched, and the header always says how many rows are being hidden so a short list is never a mystery.' },
+        { title: 'Also in 1.8.5', desc: 'the unattended background jobs stopped re-creating episode rows the clean-up had just removed, and the episode buttons no longer name a database they might not be using.' },
         { title: 'The background passes no longer undo your clean-up', desc: 'the important fix here. Two unattended jobs — the one that matches a show and the one that fills in full episode lists — always took their season numbers from TMDB, whatever a show was actually set to use. On a show using TVDB numbering they would quietly re-create the exact rows the out-of-place check had just removed. The repair looked like it worked, then reverted with nothing on screen to explain it.' },
         { title: 'It errs towards writing, not withholding', desc: 'if that check cannot be worked out for any reason, the episode list is still written. A list that should not have been written is visible and fixable; one that was never written is a silent hole in your library.' },
         { title: 'The buttons no longer name a database they might not be using', desc: '"Re-scan episodes from TMDB" said TMDB even on a show reading from TVDB. All three buttons are now worded generically, and the database in use is named in one place — under the Episode numbering box — rather than repeated in three labels that can drift apart.' },
@@ -3556,7 +3564,37 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.8.5: the repair no longer undoes itself",
+        title: "1.8.6: Manual Search opens up",
+        description: "results were being thrown away after they had already been found, a release name told you nothing about where it came from, and a long list could not be narrowed down.",
+        features: [
+            "the search kept the best 40 releases and 15 rejected ones and discarded the rest — after ranking them. That is why a popular title only ever showed so many. Now 100 and 40, both configurable, along with how many results are requested from Prowlarr in the first place",
+            "the release name links to the indexer's own page for it. Links open in a new tab, and the address is checked before it is shown — a tracker cannot use one to run anything inside SoulSync, and the tracker learns nothing about your install from the click",
+            "filter by name, quality, source, minimum seeders, or only releases that meet your quality profile. It works on results already fetched, so it is instant, and it survives a search still streaming in underneath it",
+            "the header always says how many rows are hidden, so a short list is never a mystery",
+        ],
+        usage_note: "Manual search → the filter bar sits directly above the results.",
+    },
+    {
+        title: "Manual import takes a whole season folder",
+        description: "the automatic side has unpacked season packs since 1.8.0. Manual import could only take one file, so a pack that arrived any other way had to be placed episode by episode.",
+        features: [
+            "browsing into a folder holding two or more numbered episodes offers \"Import this whole folder\". The folder becomes ONE queued item and ONE identity choice",
+            "the Place dialog lists every file and the episode it read from each name before you commit — a pack whose names parse wrongly is far cheaper to spot there than to unpick from the library afterwards",
+            "each file keeps its own episode number; the dialog only supplies the show. Applying one episode number to every file would file the whole season on top of itself",
+            "samples, extras and anything without an episode number are skipped, by the same rule the automatic import already uses",
+        ],
+        usage_note: "Import page → Add → browse into the pack folder.",
+    },
+    {
+        title: "A fix for 1.8.5",
+        description: "\"Check for out-of-place episodes\" threw \"src is not defined\" and did nothing. Mine, and it reached you because I checked the file parsed instead of clicking the button.",
+        features: [
+            "one edit added code that used a value while the edit meant to create that value never saved, so the button referred to a name nothing defined",
+            "a syntax check cannot catch this — the code is well-formed, it just refers to something that isn't there — and the older parts of the interface get no automatic linting. There is now a test that scans for exactly this shape",
+        ],
+    },
+    {
+        title: "Earlier in 1.8.5 — the repair no longer undoes itself",
         description: "1.8.4 taught SoulSync to take episode numbering from the database your media server agrees with. This closes the paths that were still ignoring that — including two unattended jobs that would quietly put the bad rows back.",
         features: [
             "the show-match pass and the full episode-list sync both took their season numbers from TMDB regardless of what a show was set to use. On a TVDB-numbered show they re-created exactly the rows the out-of-place check had just removed — unattended, so the repair appeared to work and then reverted with nothing on screen to explain it",

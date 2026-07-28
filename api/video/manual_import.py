@@ -30,7 +30,42 @@ from utils.logging_config import get_logger
 
 logger = get_logger("video_api.manual_import")
 
-_KIND_FOR_SCOPE = {"movie": "movie", "episode": "show"}
+_KIND_FOR_SCOPE = {"movie": "movie", "episode": "show", "season": "show"}
+_PACK_PREVIEW_LIMIT = 60
+
+
+def _walk_video_files(root: str):
+    """Every file under a folder, recursively — the ``lister`` shape
+    ``pack_members`` expects. Recursive because release folders routinely nest
+    (``Show.S01/Season 1/…``, or one subfolder per episode)."""
+    out = []
+    for base, _dirs, names in os.walk(root):
+        for n in names:
+            out.append(os.path.join(base, n))
+    return out
+
+
+def _pack_members_at(path: str) -> list:
+    """The importable episodes in a folder, with sizes. Same rule the automated
+    pack import uses — samples, extras and anything with no episode number are
+    already excluded there, so the two paths can never disagree about what a
+    pack contains."""
+    from core.video.importer import pack_members
+
+    def _size(p):
+        try:
+            return os.path.getsize(p)
+        except OSError:
+            return 0
+
+    try:
+        members = pack_members(path, _walk_video_files, size_of=_size)
+    except OSError:
+        logger.exception("pack scan failed for %s", path)
+        return []
+    for m in members:
+        m["size"] = _size(m["path"])
+    return members
 
 
 def _guess_scope(name: str) -> dict:
@@ -151,6 +186,7 @@ def register_routes(bp):
         itself uses), so nothing offered here can be rejected on the next step."""
         from . import get_video_db
         from core.video.importer import is_video
+        from core.video.release_parse import parse_release
 
         db = get_video_db()
         shortcuts = _browse_shortcuts(db)
@@ -190,11 +226,23 @@ def register_routes(bp):
         files.sort(key=lambda f: f["name"].lower())
         truncated = len(dirs) + len(files) > _BROWSE_LIMIT
         parent = os.path.dirname(path.rstrip(os.sep)) or None
+        # Does THIS folder look like a season pack? Computed from the names already
+        # listed, so it costs nothing extra. Only offered at 2+ numbered episodes:
+        # a folder holding one episode is just a file, and importing it "as a pack"
+        # would only take away the per-episode identity fields.
+        pack_seasons, pack_count = set(), 0
+        for f in files:
+            p = parse_release(os.path.splitext(f["name"])[0])
+            if p.get("episode") is not None and p.get("season") is not None:
+                pack_count += 1
+                pack_seasons.add(p["season"])
         return jsonify({"success": True, "path": path,
                         "parent": parent if parent and parent != path else None,
                         "dirs": dirs[:_BROWSE_LIMIT],
                         "files": files[:max(0, _BROWSE_LIMIT - len(dirs))],
-                        "shortcuts": shortcuts, "truncated": truncated})
+                        "shortcuts": shortcuts, "truncated": truncated,
+                        "pack": {"count": pack_count, "seasons": sorted(pack_seasons)}
+                                if pack_count >= 2 else None})
 
     @bp.route("/import/failed", methods=["GET"])
     def video_import_failed():
@@ -204,42 +252,88 @@ def register_routes(bp):
 
     @bp.route("/import/add", methods=["POST"])
     def video_import_add():
-        """Queue an arbitrary on-disk video file for manual placement, with no
-        prior download/grab involved. Body: {path}. Idempotent — re-adding a path
-        already queued returns the existing row instead of duplicating it."""
+        """Queue an on-disk video FILE or a whole season-pack FOLDER for manual
+        placement, with no prior download/grab involved. Body: {path}.
+        Idempotent — re-adding a path already queued returns the existing row
+        instead of duplicating it.
+
+        A folder becomes ONE row (``scope='season'``), not one row per episode:
+        the identity question — which show is this? — is asked once for the pack,
+        which is the entire reason to import a folder rather than twenty files."""
         from . import get_video_db
         from core.video.importer import is_video
 
         body = request.get_json(silent=True) or {}
         path = str(body.get("path") or "").strip()
         if not path:
-            return jsonify({"success": False, "error": "Enter a file path."}), 400
-        if not os.path.isfile(path):
-            return jsonify({"success": False, "error": "No file at that path."}), 404
-        if not is_video(path):
+            return jsonify({"success": False, "error": "Enter a file or folder path."}), 400
+
+        is_dir = os.path.isdir(path)
+        if not is_dir and not os.path.isfile(path):
+            return jsonify({"success": False, "error": "Nothing at that path."}), 404
+        if not is_dir and not is_video(path):
             return jsonify({"success": False, "error": "Not a recognized video file."}), 400
+
+        members = []
+        if is_dir:
+            members = _pack_members_at(path)
+            if not members:
+                return jsonify({"success": False,
+                                "error": "No numbered episode files in that folder. "
+                                         "A season pack needs names carrying SxxExx "
+                                         "or a season/episode number."}), 400
 
         db = get_video_db()
         for row in db.get_import_failed_video_downloads():
             if row.get("dest_path") == path:
                 return jsonify({"success": True, "id": row.get("id"), "already": True})
 
-        try:
-            size_bytes = os.path.getsize(path)
-        except OSError:
-            size_bytes = None
-        name = os.path.basename(path)
-        guess = _guess_scope(name)
+        name = os.path.basename(path.rstrip(os.sep)) or path
+        if is_dir:
+            seasons = sorted({m["season"] for m in members})
+            guess = {"scope": "season",
+                     # One season → pre-fill it. Mixed (a full-series pack) stays
+                     # blank rather than picking one arbitrarily; the files carry
+                     # their own numbers and the import uses those, not this.
+                     "season": seasons[0] if len(seasons) == 1 else None,
+                     "episode": None}
+            size_bytes = sum(m.get("size") or 0 for m in members) or None
+        else:
+            guess = _guess_scope(name)
+            try:
+                size_bytes = os.path.getsize(path)
+            except OSError:
+                size_bytes = None
+
         dl_id = db.add_video_download({
-            "kind": _KIND_FOR_SCOPE[guess["scope"]], "title": name, "release_title": name,
-            "source": "manual",
+            "kind": "show" if is_dir else _KIND_FOR_SCOPE[guess["scope"]],
+            "title": name, "release_title": name, "source": "manual",
             "filename": name, "size_bytes": size_bytes, "status": "downloading",
             "candidates": "[]", "search_ctx": json.dumps(guess), "tried_queries": "[]",
             "tried_files": "[]", "attempts": 0,
         })
         db.update_video_download(dl_id, status="import_failed",
                                   error="Added for manual placement", dest_path=path)
-        return jsonify({"success": True, "id": dl_id})
+        return jsonify({"success": True, "id": dl_id, "scope": guess["scope"],
+                        "episodes": len(members)})
+
+    @bp.route("/import/pack-preview", methods=["GET"])
+    def video_import_pack_preview():
+        """What a folder would import, before committing to it. ``?path=``.
+
+        The Place dialog shows this so the choice isn't blind: a pack whose files
+        parse to the wrong episodes is far cheaper to spot here than to unpick
+        from the library afterwards."""
+        path = str(request.args.get("path") or "").strip()
+        if not path or not os.path.isdir(path):
+            return jsonify({"success": False, "error": "Not a folder."}), 404
+        members = _pack_members_at(path)
+        return jsonify({"success": True, "count": len(members),
+                        "seasons": sorted({m["season"] for m in members}),
+                        "items": [{"season": m["season"], "episode": m["episode"],
+                                   "name": os.path.basename(m["path"])}
+                                  for m in members[:_PACK_PREVIEW_LIMIT]],
+                        "truncated": len(members) > _PACK_PREVIEW_LIMIT})
 
     @bp.route("/import/<int:dl_id>/place", methods=["POST"])
     def video_import_place(dl_id):
@@ -261,8 +355,12 @@ def register_routes(bp):
 
         body = request.get_json(silent=True) or {}
         scope = str(body.get("scope") or "").lower()
-        if scope not in ("movie", "episode"):
-            return jsonify({"success": False, "error": "Choose a movie or an episode."}), 400
+        if scope not in ("movie", "episode", "season"):
+            return jsonify({"success": False, "error": "Choose a movie, an episode "
+                                                       "or a season folder."}), 400
+        if scope == "season" and not os.path.isdir(src):
+            return jsonify({"success": False,
+                            "error": "That import isn't a folder any more."}), 410
 
         # The Place dialog sends the chosen Library as root_folder_id. With none —
         # the picker hides itself when there's only one Library for the kind — fall
@@ -284,8 +382,18 @@ def register_routes(bp):
         settings = organization.load(db)
         prober = probe if settings.get("verify_with_ffprobe", True) else None
         from core.video.recycle import discarder
-        patch = run_import(row, src, fs=real_fs(), prober=prober, settings=settings,
-                           force=True, override=override, recycle=discarder(db, settings))
+        if scope == "season":
+            # One identity choice, every episode in the folder. Each member keeps
+            # its OWN season/episode from its filename — see run_season_import.
+            from core.video.importer import run_season_import
+            patch = run_season_import(row, src, fs=real_fs(), lister=_walk_video_files,
+                                      prober=prober, settings=settings, force=True,
+                                      override=override, recycle=discarder(db, settings),
+                                      size_of=lambda p: (os.path.getsize(p)
+                                                         if os.path.exists(p) else 0))
+        else:
+            patch = run_import(row, src, fs=real_fs(), prober=prober, settings=settings,
+                               force=True, override=override, recycle=discarder(db, settings))
         try:
             db.update_video_download(dl_id, **patch)
         except Exception:
@@ -302,14 +410,14 @@ def register_routes(bp):
                           "poster_url": row.get("poster_url"),
                           "search_ctx": json.dumps({"scope": scope, "season": override.get("season"),
                                                     "episode": override.get("episode")})}
-            if settings.get("save_artwork") or settings.get("write_nfo"):
+            if scope != "season" and (settings.get("save_artwork") or settings.get("write_nfo")):
                 try:
                     from core.video.download_monitor import write_sidecars
                     from core.video.importer import real_fs
                     write_sidecars(db, sidecar_dl, patch["dest_path"], settings, real_fs())
                 except Exception:
                     logger.exception("manual place: sidecar write failed for %s", dl_id)
-            if settings.get("download_subtitles"):
+            if scope != "season" and settings.get("download_subtitles"):
                 try:
                     from core.video.download_monitor import write_subtitles_for
                     from core.video.importer import real_fs
@@ -328,7 +436,13 @@ def register_routes(bp):
             except Exception:
                 logger.exception("manual place: batch-complete notify failed for %s", dl_id)
         return jsonify({"success": ok, "status": patch.get("status"),
-                        "dest_path": patch.get("dest_path"), "error": patch.get("error")})
+                        "dest_path": patch.get("dest_path"), "error": patch.get("error"),
+                        # A pack reports what LANDED: partial success is success
+                        # (already-owned or better-quality episodes are skipped),
+                        # so a bare "done" would hide that four of twelve went in.
+                        "imported": patch.get("_pack_imported"),
+                        "total": patch.get("_pack_total"),
+                        "failed": patch.get("_pack_failed") or []})
 
     @bp.route("/import/<int:dl_id>/dismiss", methods=["POST"])
     def video_import_dismiss(dl_id):

@@ -829,6 +829,10 @@
                 return b;
             });
         }).then(function (b) {
+            // Which database the server judged against. Named in every outcome:
+            // "nothing found" and "asked the wrong one" are otherwise the same
+            // message, and telling them apart is the whole point of reporting it.
+            var src = String(b.source || 'tmdb').toUpperCase();
             if (armed) {
                 btn.removeAttribute('data-armed');
                 btn.textContent = idle;
@@ -840,8 +844,9 @@
             }
             if (!b.count) {
                 btn.textContent = idle;
-                if (note) note.textContent = 'Every episode is filed under a season TMDB lists it in.';
-                toast('No out-of-place episodes found', 'info');
+                if (note) note.textContent = 'Checked against ' + src +
+                    ': every episode is filed under a season it lists.';
+                toast('No out-of-place episodes found (checked ' + src + ')', 'info');
                 return;
             }
             btn.setAttribute('data-armed', '1');

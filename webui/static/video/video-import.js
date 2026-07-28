@@ -247,6 +247,18 @@
             return;
         }
         var rows = '';
+        // A season pack: offer the WHOLE folder in one go. Placing twelve files
+        // one at a time means answering "which show is this?" twelve times, which
+        // is the entire reason this exists. Only shown at 2+ numbered episodes.
+        if (d.pack && d.pack.count >= 2) {
+            var sn = (d.pack.seasons || []);
+            rows += '<button type="button" class="vimp-row vimp-row--pack" data-vimp-pick-folder="' +
+                esc(d.path) + '"><span class="vimp-row-ic">🗂️</span>' +
+                '<span class="vimp-row-name">Import this whole folder — ' + d.pack.count +
+                ' episodes' + (sn.length === 1 ? ' (season ' + sn[0] + ')'
+                    : sn.length > 1 ? ' (seasons ' + sn.join(', ') + ')' : '') +
+                '</span></button>';
+        }
         if (d.parent) {
             rows += '<button type="button" class="vimp-row vimp-row--dir" data-vimp-go="' +
                 esc(d.parent) + '"><span class="vimp-row-ic">↰</span>' +
@@ -284,7 +296,8 @@
         if (list) {
             var on = list.querySelector('.vimp-row--on');
             if (on) on.classList.remove('vimp-row--on');
-            var me = list.querySelector('[data-vimp-pick="' + (window.CSS && CSS.escape ? CSS.escape(path) : path) + '"]');
+            var q = (window.CSS && CSS.escape) ? CSS.escape(path) : path;
+            var me = list.querySelector('[data-vimp-pick="' + q + '"], [data-vimp-pick-folder="' + q + '"]');
             if (me) me.classList.add('vimp-row--on');
         }
     }
@@ -335,7 +348,12 @@
     function openResolve(item) {
         state.resolve = {
             item: item,
-            kind: (item.scope === 'episode' || item.kind === 'show') ? 'episode' : 'movie',
+            // 'season' = a whole FOLDER. It searches shows like an episode does,
+            // but asks for no season/episode: every file carries its own, and the
+            // dialog's numbers are deliberately not applied (see run_season_import).
+            kind: item.scope === 'season' ? 'season'
+                : ((item.scope === 'episode' || item.kind === 'show') ? 'episode' : 'movie'),
+            pack: item.scope === 'season' ? { count: null, items: [] } : null,
             query: item.title || basename(item.file) || '',
             results: [], picked: null, season: item.season || '', episode: item.episode || '',
             searching: false, rootFolderId: '',
@@ -343,6 +361,7 @@
         ensureModal();
         loadLibraries();
         renderModal();
+        if (state.resolve.kind === 'season') loadPack(state.resolve);
         runSearch();
         var input = $('[data-vimp-q]');
         if (input) { input.value = state.resolve.query; input.focus(); }
@@ -381,6 +400,7 @@
                     '<label class="vimp-ep-field vimp-ep-field--wide">Library ' +
                         '<select data-vimp-lib></select></label>' +
                 '</div>' +
+                '<div class="vimp-pack" data-vimp-pack hidden></div>' +
                 '<div class="vimp-ep" data-vimp-ep hidden>' +
                     '<label class="vimp-ep-field">Season <input type="number" min="0" data-vimp-season></label>' +
                     '<label class="vimp-ep-field">Episode <input type="number" min="0" data-vimp-episode></label>' +
@@ -412,7 +432,7 @@
     function renderLibraryPicker() {
         var r = state.resolve, row = $('[data-vimp-lib-row]'), sel = $('[data-vimp-lib]');
         if (!r || !row || !sel) return;
-        var libs = (_libs || {})[LIB_KEY[r.kind]] || [];
+        var libs = (_libs || {})[LIB_KEY[r.kind === 'season' ? 'episode' : r.kind]] || [];
         // One Library for this kind is not a choice — the backend's primary
         // fallback already lands there.
         if (libs.length < 2) { row.hidden = true; r.rootFolderId = ''; return; }
@@ -426,6 +446,47 @@
         row.hidden = false;
     }
 
+    // ── whole-folder (season pack) panel ──────────────────────────────────────
+    // Loaded once per dialog. Shows exactly which files will be imported and the
+    // episode each one parsed to — a pack whose names parse wrongly is far
+    // cheaper to catch here than to unpick from the library afterwards.
+    function packHTML(r) {
+        var p = r.pack || {};
+        if (p.error) return '<div class="vimp-pack-msg">' + esc(p.error) + '</div>';
+        if (p.count == null) return '<div class="vimp-pack-msg">Reading folder…</div>';
+        if (!p.count) return '<div class="vimp-pack-msg">No numbered episodes in this folder.</div>';
+        var rows = (p.items || []).map(function (i) {
+            return '<div class="vimp-pack-row"><span class="vimp-pack-se">S' + pad2(i.season) +
+                'E' + pad2(i.episode) + '</span><span class="vimp-pack-name">' +
+                esc(i.name) + '</span></div>';
+        }).join('');
+        return '<div class="vimp-pack-head">' + p.count + ' episode' + (p.count === 1 ? '' : 's') +
+            ' will be imported' + (p.seasons && p.seasons.length === 1
+                ? ' (season ' + p.seasons[0] + ')'
+                : (p.seasons && p.seasons.length > 1 ? ' (seasons ' + p.seasons.join(', ') + ')' : '')) +
+            '. Each file keeps its own episode number.</div>' +
+            '<div class="vimp-pack-list">' + rows + '</div>' +
+            (p.truncated ? '<div class="vimp-pack-msg">…and more.</div>' : '');
+    }
+
+    function loadPack(r) {
+        fetch('/api/video/import/pack-preview?path=' + encodeURIComponent(r.item.file || ''),
+              { headers: { Accept: 'application/json' } })
+            .then(function (res) { return res.json().catch(function () { return {}; }); })
+            .then(function (d) {
+                if (state.resolve !== r) return;      // dialog closed or moved on
+                r.pack = d && d.success
+                    ? { count: d.count, seasons: d.seasons, items: d.items, truncated: d.truncated }
+                    : { count: 0, items: [], error: (d && d.error) || 'Could not read that folder.' };
+                renderModal();
+            })
+            .catch(function () {
+                if (state.resolve !== r) return;
+                r.pack = { count: 0, items: [], error: 'Could not read that folder.' };
+                renderModal();
+            });
+    }
+
     function renderModal() {
         var r = state.resolve;
         if (!r) return;
@@ -434,7 +495,14 @@
         var tabs = document.querySelectorAll('[data-vimp-kind]');
         for (var i = 0; i < tabs.length; i++)
             tabs[i].classList.toggle('vimp-kindtab--on', tabs[i].getAttribute('data-vimp-kind') === r.kind);
+        var tabWrap = $('[data-vimp-kindtabs]');
+        if (tabWrap) tabWrap.hidden = r.kind === 'season';
         renderLibraryPicker();
+        var pk = $('[data-vimp-pack]');
+        if (pk) {
+            pk.hidden = r.kind !== 'season';
+            if (r.kind === 'season') pk.innerHTML = packHTML(r);
+        }
         var ep = $('[data-vimp-ep]');
         if (ep) ep.hidden = !(r.kind === 'episode' && r.picked);
         var sEl = $('[data-vimp-season]'); if (sEl && r.season !== '') sEl.value = r.season;
@@ -454,7 +522,7 @@
             var meta = [it.year, it.owned ? 'In library' : null].filter(Boolean).join(' · ');
             var art = it.poster
                 ? '<img class="vimp-res-img" src="' + esc(it.poster) + '" alt="" loading="lazy" onerror="this.style.visibility=\'hidden\'">'
-                : '<div class="vimp-res-ph">' + (r.kind === 'episode' ? '📺' : '🎬') + '</div>';
+                : '<div class="vimp-res-ph">' + (r.kind === 'movie' ? '🎬' : '📺') + '</div>';
             return '<button class="vimp-res' + (on ? ' vimp-res--on' : '') + (it.owned ? ' vimp-res--owned' : '') +
                 '" type="button" data-vimp-pick="' + idx + '">' + art +
                 '<span class="vimp-res-info"><span class="vimp-res-title">' + esc(it.title) + '</span>' +
@@ -466,9 +534,13 @@
         var btn = $('[data-vimp-confirm]');
         var r = state.resolve;
         if (!btn || !r) return;
-        var ok = !!r.picked && (r.kind === 'movie' ||
+        var ok = !!r.picked && (r.kind === 'movie' || r.kind === 'season' ||
             (r.kind === 'episode' && r.season !== '' && r.episode !== ''));
         btn.disabled = !ok;
+        var n = (r.pack || {}).count;
+        btn.textContent = r.kind === 'season'
+            ? (n ? 'Import ' + n + ' episode' + (n === 1 ? '' : 's') : 'Import folder')
+            : 'Place file';
     }
 
     // Normalise a /api/video/search result into the picker's shape; keep only the
@@ -511,7 +583,7 @@
             .then(function (d) {
                 if (!state.resolve || state.resolve !== r) return;
                 r.searching = false;
-                r.results = normResults((d && d.results) || [], r.kind);
+                r.results = normResults((d && d.results) || [], r.kind === 'season' ? 'episode' : r.kind);
                 renderResults();
             })
             .catch(function () { if (state.resolve === r) { r.searching = false; renderResults(); } });
@@ -536,12 +608,22 @@
             body: JSON.stringify(body),
         }).then(function (res) { return res.ok ? res.json() : res.json().catch(function () { return null; }); })
             .then(function (d) {
-                if (d && d.success) { toast('Placed “' + r.picked.title + '”', 'success'); delete state.expanded[r.item.id]; closeResolve(); load(); }
+                if (d && d.success) {
+                    // A pack's headline is what LANDED: partial success is success
+                    // (already-owned or better-quality episodes are skipped), so
+                    // "Placed X" alone would hide that 4 of 12 went in.
+                    var msg = (d.imported != null && d.total != null)
+                        ? 'Imported ' + d.imported + ' of ' + d.total + ' episodes into “' +
+                          r.picked.title + '”'
+                        : 'Placed “' + r.picked.title + '”';
+                    toast(msg, 'success');
+                    delete state.expanded[r.item.id]; closeResolve(); load();
+                }
                 else { toast((d && d.error) || 'Couldn’t place the file', 'error');
-                    if (btn) { btn.disabled = false; btn.textContent = 'Place file'; } }
+                    if (btn) { btn.disabled = false; updateConfirm(); } }
             })
             .catch(function () { toast('Couldn’t place the file', 'error');
-                if (btn) { btn.disabled = false; btn.textContent = 'Place file'; } });
+                if (btn) { btn.disabled = false; updateConfirm(); } });
     }
 
     function _dismissCall(id, del, doneMsg) {
@@ -655,6 +737,8 @@
                 if (e.target.closest('[data-vimp-add-confirm]')) { submitAddFile(); return; }
                 var go = e.target.closest('[data-vimp-go]');
                 if (go) { browseTo(go.getAttribute('data-vimp-go')); return; }
+                var pickDir = e.target.closest('[data-vimp-pick-folder]');
+                if (pickDir) { pickBrowsedFile(pickDir.getAttribute('data-vimp-pick-folder')); return; }
                 var pick = e.target.closest('[data-vimp-pick]');
                 if (pick) { pickBrowsedFile(pick.getAttribute('data-vimp-pick')); return; }
             }

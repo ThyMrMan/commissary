@@ -400,10 +400,96 @@
         var badge = !live ? '<span class="vdl-res-demo">demo data</span>'
             : done ? '<span class="vdl-res-live">● live</span>'
             : '<span class="vdl-res-searching"><span class="vdl-res-spin vdl-res-spin--sm"></span>searching…</span>';
+        // Filtering is applied at RENDER time over the full row set, which stays on
+        // the element. A live search re-renders every couple of seconds, so
+        // filtering the stored rows instead would throw away results the user
+        // hasn't asked to hide the moment a new batch arrives.
+        var f = resultsEl._filter || (resultsEl._filter = emptyFilter());
+        var shown = applyFilter(rows, f);
+        var hiddenN = rows.length - shown.length;
         resultsEl.innerHTML =
             '<div class="vdl-res-head"><strong>' + rows.length + '</strong> result' + (rows.length === 1 ? '' : 's') +
-                ' · <span class="vdl-res-okn">' + okN + ' meet your profile</span>' + badge + '</div>' +
-            rows.map(resultCardHTML).join('');
+                ' · <span class="vdl-res-okn">' + okN + ' meet your profile</span>' +
+                (hiddenN ? ' · <span class="vdl-res-hidden">' + hiddenN + ' hidden by filters</span>' : '') +
+                badge + '</div>' +
+            filterBarHTML(rows, f) +
+            (shown.length
+                ? shown.map(function (r) { return resultCardHTML(r, rows.indexOf(r)); }).join('')
+                : '<div class="vdl-res-empty">No results match these filters.</div>');
+    }
+
+    // ── result filtering ──────────────────────────────────────────────────────
+    // Client-side over the rows already fetched: no re-query, so it stays instant
+    // and can't lose a live-search batch. Index into the ORIGINAL array is what
+    // the Grab button uses, so filtering must never renumber the cards.
+    function emptyFilter() {
+        return { text: '', res: '', indexer: '', minSeed: '', okOnly: false };
+    }
+
+    function applyFilter(rows, f) {
+        var needle = String(f.text || '').toLowerCase();
+        return rows.filter(function (r) {
+            if (f.okOnly && !r.accepted) return false;
+            if (f.res && String(r.resolution || '') !== f.res) return false;
+            if (f.indexer && String(r.username || '') !== f.indexer) return false;
+            if (f.minSeed !== '' && Number(r.seeders || 0) < Number(f.minSeed)) return false;
+            if (needle && String(r.title || '').toLowerCase().indexOf(needle) < 0) return false;
+            return true;
+        });
+    }
+
+    function filterBarHTML(rows, f) {
+        function uniq(key) {
+            var seen = {}, out = [];
+            rows.forEach(function (r) {
+                var v = r[key];
+                if (v && !seen[v]) { seen[v] = 1; out.push(v); }
+            });
+            return out.sort();
+        }
+        function opts(list, cur, labels) {
+            return list.map(function (v) {
+                return '<option value="' + esc(v) + '"' + (String(cur) === String(v) ? ' selected' : '') +
+                    '>' + esc((labels && labels[v]) || v) + '</option>';
+            }).join('');
+        }
+        return '<div class="vdl-filter" data-vdl-filter>' +
+            '<input type="search" class="vdl-filter-text" data-vdl-f-text placeholder="Filter by name…" ' +
+                'value="' + esc(f.text) + '">' +
+            '<select class="vdl-filter-sel" data-vdl-f-res><option value="">Any quality</option>' +
+                opts(uniq('resolution'), f.res, RES_LABEL) + '</select>' +
+            '<select class="vdl-filter-sel" data-vdl-f-indexer><option value="">Any source</option>' +
+                opts(uniq('username'), f.indexer) + '</select>' +
+            '<input type="number" min="0" class="vdl-filter-num" data-vdl-f-seed placeholder="Min seeders" ' +
+                'value="' + esc(f.minSeed) + '">' +
+            '<label class="vdl-filter-chk"><input type="checkbox" data-vdl-f-ok' +
+                (f.okOnly ? ' checked' : '') + '> Meets profile only</label>' +
+            '<button type="button" class="vdl-filter-clear" data-vdl-f-clear>Clear</button>' +
+        '</div>';
+    }
+
+    // Delegated so it survives every live re-render (the bar is rebuilt each time).
+    function onFilterInput(e) {
+        var bar = e.target.closest('[data-vdl-filter]');
+        if (!bar) return;
+        var resultsEl = bar.parentNode;
+        var f = resultsEl._filter || (resultsEl._filter = emptyFilter());
+        if (e.target.closest('[data-vdl-f-clear]')) resultsEl._filter = emptyFilter();
+        else if (e.target.matches('[data-vdl-f-text]')) f.text = e.target.value;
+        else if (e.target.matches('[data-vdl-f-res]')) f.res = e.target.value;
+        else if (e.target.matches('[data-vdl-f-indexer]')) f.indexer = e.target.value;
+        else if (e.target.matches('[data-vdl-f-seed]')) f.minSeed = e.target.value;
+        else if (e.target.matches('[data-vdl-f-ok]')) f.okOnly = e.target.checked;
+        else return;
+        var keep = document.activeElement;
+        var sel = keep && keep.getAttribute && ['data-vdl-f-text', 'data-vdl-f-seed']
+            .filter(function (a) { return keep.hasAttribute(a); })[0];
+        var pos = sel ? keep.selectionStart : null;
+        renderResults(resultsEl, resultsEl._search, resultsEl._rows || [], true, true);
+        if (sel) {   // a re-render blows away focus mid-typing without this
+            var again = resultsEl.querySelector('[' + sel + ']');
+            if (again) { again.focus(); try { again.setSelectionRange(pos, pos); } catch (err) {} }
+        }
     }
 
     // Start a search; for Soulseek, stream results in (poll like the music side —
@@ -660,7 +746,12 @@
             '<div class="vdl-res-main">' +
                 '<div class="vdl-r-l1">' +
                     '<span class="vdl-r-q vdl-r-q--' + resKind(r.resolution) + '">' + esc(RES_LABEL[r.resolution] || r.resolution || '?') + '</span>' +
-                    '<span class="vdl-r-title" title="' + esc(r.title) + '">' + esc(r.title) + '</span>' +
+                    (r.info_url
+                        ? '<a class="vdl-r-title vdl-r-title--link" href="' + esc(r.info_url) + '" ' +
+                          'target="_blank" rel="noopener noreferrer" ' +
+                          'title="Open this release on ' + esc(r.username || 'the indexer') + '">' +
+                          esc(r.title) + '</a>'
+                        : '<span class="vdl-r-title" title="' + esc(r.title) + '">' + esc(r.title) + '</span>') +
                 '</div>' +
                 '<div class="vdl-r-l2">' + esc(meta.filter(Boolean).join('  ·  ')) + '</div>' +
                 '<div class="vdl-r-l3">' + verdict + grab + '</div>' +
@@ -1292,6 +1383,19 @@
                     year: opts.year || null,   // movies search title+year (same as the get-modal)
                     episode: (scope === 'episode' ? opts.episode : null), source: s }, []);
             });
+        });
+    }
+
+    // Filter bar events, wired ONCE at the document level. The bar is rebuilt on
+    // every live re-render, so a listener bound to the element itself would be
+    // thrown away seconds later; and the picker appears in several places (detail
+    // page, get-modal, manual-search overlay) that don't share a container.
+    if (!window._vdlFilterWired) {
+        window._vdlFilterWired = true;
+        document.addEventListener('input', onFilterInput);
+        document.addEventListener('change', onFilterInput);
+        document.addEventListener('click', function (e) {
+            if (e.target.closest('[data-vdl-f-clear]')) onFilterInput(e);
         });
     }
 
