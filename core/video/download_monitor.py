@@ -96,6 +96,26 @@ def _move(src: str, dest: str) -> None:
     atomic_verified_move(src, dest)
 
 
+def _walk_files(root: str):
+    """Every file under ``root`` as a full path — the recursive lister the season-pack
+    importer walks a pack with (same injection shape as find_completed_file's)."""
+    out = []
+    try:
+        for dirpath, _dirs, files in os.walk(str(root or "")):
+            out.extend(os.path.join(dirpath, f) for f in files)
+    except OSError:
+        return []
+    return out
+
+
+def _size_of(path: str) -> int:
+    """Byte size, 0 when unreadable — only used to tell a sample from a real episode."""
+    try:
+        return os.path.getsize(str(path))
+    except OSError:
+        return 0
+
+
 def _make_organizer(db):
     """A per-tick organizer closure: post-process a finished download into the library
     via the importer (Radarr-style parse → ffprobe-verify → templated rename →
@@ -122,9 +142,20 @@ def _make_organizer(db):
         except Exception:   # noqa: BLE001, S110 - a status blip must never wedge the import
             pass
         from core.video.recycle import discarder
-        patch = run_import(dl, src, fs=fs, prober=prober, settings=settings,
-                           library_dir=_owned_library_dir(db, dl),
-                           recycle=discarder(db, settings))
+        # A season/series grab hands us the pack FOLDER; fan it out into one
+        # per-episode import each (core.video.importer.run_season_import), which
+        # reuses this same single-file importer per member so naming, upgrades,
+        # subtitles, recycle and seeding all behave identically.
+        from core.video.client_download import _is_pack
+        if _is_pack(dl) and os.path.isdir(str(src or "")):
+            from core.video.importer import run_season_import
+            patch = run_season_import(dl, src, fs=fs, lister=_walk_files, prober=prober,
+                                      settings=settings, library_dir=_owned_library_dir(db, dl),
+                                      recycle=discarder(db, settings), size_of=_size_of)
+        else:
+            patch = run_import(dl, src, fs=fs, prober=prober, settings=settings,
+                               library_dir=_owned_library_dir(db, dl),
+                               recycle=discarder(db, settings))
         if patch.get("status") == "completed" and patch.get("dest_path"):
             if settings.get("save_artwork") or settings.get("write_nfo"):
                 write_sidecars(db, dl, patch["dest_path"], settings, fs)

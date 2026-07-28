@@ -3987,6 +3987,45 @@ class VideoDatabase:
         finally:
             conn.close()
 
+    def set_item_root_folder(self, kind: str, item_id: int, root_folder_id) -> bool:
+        """File a movie/show under a configured Library (root_folders row).
+
+        Metadata only — nothing on disk moves. It decides where FUTURE work for
+        this title goes: the wishlist drain, RSS instant-grab and upgrades all
+        resolve their destination from this column, so correcting it is how a
+        title that landed in the wrong Library starts behaving.
+
+        ``root_folder_id`` None clears the assignment, which is a real state, not
+        an error: an unassigned title falls back to the primary Library for its
+        kind (resolve_download_root), exactly as it did before Libraries existed.
+        A row is only accepted when it exists AND matches the item's kind — a
+        movie filed under a TV Library would send every future grab to the wrong
+        tree, and the failure would be silent."""
+        table = {"movie": "movies", "show": "shows"}.get(str(kind).lower())
+        if not table:
+            return False
+        rid = None
+        if root_folder_id not in (None, "", "null"):
+            try:
+                rid = int(root_folder_id)
+            except (TypeError, ValueError):
+                return False
+            row = self.get_root_folder(rid)
+            want = "movie" if table == "movies" else "show"
+            if not row or str(row.get("content_kind") or "") != want:
+                return False
+        conn = self._get_connection()
+        try:
+            cur = conn.execute(f"UPDATE {table} SET root_folder_id=? WHERE id=?",
+                               (rid, int(item_id)))
+            conn.commit()
+            return cur.rowcount > 0
+        except (sqlite3.Error, ValueError, TypeError):
+            logger.exception("set_item_root_folder failed (%s %s)", kind, item_id)
+            return False
+        finally:
+            conn.close()
+
     def set_item_poster_url(self, kind: str, item_id: int, poster_url: str) -> bool:
         """Best-effort: point a movie/show at a new poster path/URL so SoulSync shows it
         immediately (the next scan reconciles it with the server's own copy)."""

@@ -31,10 +31,20 @@ def _norm_state(status: Any) -> str:
     return "downloading"
 
 
+def _is_pack(dl: dict) -> bool:
+    """Whether this grab is a season/complete-series pack rather than one file."""
+    try:
+        from core.video.importer import _scope_of
+        return _scope_of(dl or {}) in ("season", "series")
+    except Exception:      # noqa: BLE001 - unknown scope behaves like today (single file)
+        return False
+
+
 def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
                             resolve_path: Callable[[Any], Any],
                             find_video: Callable[[Any, Any], Any],
-                            organizer: Optional[Callable] = None) -> dict:
+                            organizer: Optional[Callable] = None,
+                            find_pack: Optional[Callable[[Any, Any], Any]] = None) -> dict:
     """Next-state patch for a torrent/usenet download. ``get_status(source, ref)`` returns the
     client's status object (or None if it forgot the job), ``resolve_path`` maps its reported
     save_path to a locally-readable one, ``find_video(root, name)`` returns the main video file
@@ -78,15 +88,20 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
     # vs file 'love.island.s13e42.1080p.web.h264-skyfire[EZTVx.to].mkv'), so save_path/name misses.
     # content_path points straight at the content. Fall back to save_path + name scoping for
     # clients that don't report it (never the largest file in the shared folder).
+    # A season/series pack must hand the importer its FOLDER, not one member: the
+    # single-file locator returns the largest episode, which would import that one
+    # and quietly abandon the rest of the season. find_pack is optional so callers
+    # (and every existing test) that don't supply it keep today's behaviour exactly.
+    locate = find_pack if (find_pack and _is_pack(dl)) else find_video
     content = getattr(status, "content_path", None)
     if content:
         save = resolve_path(content)
-        src = find_video(save, None) if save else None       # already this job's own content
+        src = locate(save, None) if save else None            # already this job's own content
     else:
         reported = getattr(status, "save_path", None) or getattr(status, "incomplete_path", None)
         save = resolve_path(reported)
         name = getattr(status, "name", None)
-        src = find_video(save, name) if save else None
+        src = locate(save, name) if save else None
     if not src:
         if dl.get("dest_path"):
             return {"status": "completed", "progress": 100.0, "dest_path": dl.get("dest_path")}
@@ -164,6 +179,28 @@ def _scoped_content(root, name) -> Optional[str]:
     return None
 
 
+def find_pack_dir(root, name=None) -> Optional[str]:
+    """The FOLDER holding a season/series pack's episodes, scoped to this job.
+
+    The single-file path collapses a pack to its largest member, which would
+    import one episode and silently abandon the rest — so a pack asks for its
+    content root instead and the importer fans it out. Same scoping rule as
+    find_video_file: with a job name we only ever look inside that job's own
+    content, never the shared download folder.
+
+    A pack that turns out to be ONE file (a whole season in a single container,
+    or a mislabelled release) is handed back as that file, so the caller's normal
+    single-file import still gets a chance at it."""
+    if not root:
+        return None
+    target = _scoped_content(root, name) if name else root
+    if not target:
+        return None
+    if os.path.isdir(target):
+        return str(target)
+    return str(target) if _is_video(str(target)) else None
+
+
 def find_video_file(root, name=None) -> Optional[str]:
     """The main video file for a download. When ``name`` (the torrent/nzb job name) is given the
     search is SCOPED to that job's own content (``root/name``), so a shared download folder
@@ -181,4 +218,5 @@ def find_video_file(root, name=None) -> Optional[str]:
 def process_active_client_download(dl: dict, organizer=None) -> dict:
     """Production entry: poll the real client + resolve + find the video for one torrent/usenet row."""
     return process_client_download(dl, get_status=_get_status, resolve_path=_resolve_path,
-                                   find_video=find_video_file, organizer=organizer)
+                                   find_video=find_video_file, organizer=organizer,
+                                   find_pack=find_pack_dir)

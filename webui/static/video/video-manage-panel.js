@@ -269,6 +269,15 @@
             '<div class="vmg-field"><label>Quality profile</label>' +
                 '<select class="vmg-input" data-vmg-quality-profile>' +
                 '<option value="0">Default</option></select></div>' +
+            // Which configured Library this title is filed under. Decides where
+            // FUTURE work lands (wishlist drain, RSS instant-grab, upgrades all
+            // resolve their destination from it) — so this is the fix when a
+            // title ends up in the wrong tree. Options fill in async.
+            '<div class="vmg-field"><label>Library</label>' +
+                '<select class="vmg-input" data-vmg-library>' +
+                '<option value="">Default for ' + (isShow ? 'TV shows' : 'movies') + '</option></select>' +
+                '<div class="vmg-hint">Where new downloads and upgrades for this title go. ' +
+                    'Changing it does not move files already on disk.</div></div>' +
             // Series type (arr-parity P8, shows only): how episode releases are
             // hunted — SxxExx (standard), air date (daily), absolute number (anime).
             (d.kind === 'show'
@@ -606,6 +615,50 @@
             .catch(function () { /* picker keeps its Default option */ });
     }
 
+    // Which configured Library this title is filed under. Reads the REGISTRY
+    // (d.configured), not the live server-section discovery — the registry is
+    // what root_folder_id points at, and it is the half a non-admin can read.
+    function loadLibraries(d) {
+        var sel = state.overlay && state.overlay.querySelector('[data-vmg-library]');
+        if (!sel) return;
+        fetch('/api/video/libraries', { headers: { 'Accept': 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (res) {
+                if (!res || !sel.isConnected) return;
+                var conf = (res.configured || {});
+                var rows = (state.kind === 'show' ? conf.tv : conf.movies) || [];
+                var cur = d.root_folder_id;
+                // Keep the blank option: clearing the assignment is a real choice
+                // (falls back to the primary Library for this kind).
+                var head = '<option value=""' + (cur == null ? ' selected' : '') + '>Default for ' +
+                    (state.kind === 'show' ? 'TV shows' : 'movies') + '</option>';
+                sel.innerHTML = head + rows.map(function (l) {
+                    return '<option value="' + l.id + '"' + (String(l.id) === String(cur) ? ' selected' : '') +
+                        '>' + esc(l.label || l.path || ('Library ' + l.id)) + '</option>';
+                }).join('');
+            })
+            .catch(function () { /* picker keeps its Default option */ });
+    }
+
+    function setLibrary(sel) {
+        var raw = sel.value;
+        fetch('/api/video/detail/' + state.kind + '/' + state.id + '/library', {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ root_folder_id: raw === '' ? null : parseInt(raw, 10) }) })
+            .then(function (r) {
+                return r.json().catch(function () { return {}; }).then(function (b) {
+                    if (!r.ok) throw new Error(b.error || '');
+                    if (state.data) state.data.root_folder_id = b.root_folder_id;
+                    toast(b.root_folder_id == null
+                        ? 'Library cleared — new downloads use the default for this type'
+                        : 'Library updated — new downloads and upgrades go there', 'success');
+                });
+            })
+            .catch(function (e) {
+                toast((e && e.message) || 'Couldn’t change the Library', 'error');
+            });
+    }
+
     function setSeriesType(sel) {
         fetch('/api/video/detail/show/' + state.id + '/series-type', {
             method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -779,6 +832,8 @@
             if (qp) setQualityProfile(qp);
             var st = e.target.closest('[data-vmg-series-type]');
             if (st) setSeriesType(st);
+            var lib = e.target.closest('[data-vmg-library]');
+            if (lib) setLibrary(lib);
         });
         ov.addEventListener('keydown', function (e) {
             var msin = e.target.closest('[data-vmg-msearch-in]');
@@ -866,6 +921,7 @@
             loadGenreSuggestions(d.kind);
             loadMatches();
             loadQualityProfiles(d);
+            loadLibraries(d);
         }
         requestAnimationFrame(function () { ov.classList.add('vmg-open'); });
     }

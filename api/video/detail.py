@@ -64,6 +64,35 @@ def register_routes(bp):
                         "series_type": (db.series_type_for_tmdb(tmdb_id)
                                         if kind == "show" else None)})
 
+    @bp.route("/detail/<kind>/<int:item_id>/library", methods=["PUT"])
+    def video_set_item_library(kind, item_id):
+        """File a movie/show under one of the configured Libraries.
+        Body: {root_folder_id: int|null}.
+
+        Metadata only — this moves NOTHING on disk. It corrects where the title's
+        FUTURE work goes (wishlist drain, RSS instant-grab, upgrades all resolve
+        their destination from this column), which is the fix for something that
+        landed in the wrong Library. Files already placed stay where they are;
+        moving them is a separate, much riskier operation.
+
+        Kept out of /metadata deliberately, like /aka: that endpoint pushes edits
+        to Plex/Jellyfin and locks the field there, and a media server has no
+        concept of SoulSync's Library registry.
+
+        null clears the assignment — a real state, not an error. An unassigned
+        title falls back to the primary Library for its kind, the pre-Libraries
+        behaviour."""
+        from . import get_video_db
+        if kind not in ("movie", "show"):
+            return jsonify({"error": "bad kind"}), 400
+        body = request.get_json(silent=True) or {}
+        db = get_video_db()
+        rid = body.get("root_folder_id")
+        if not db.set_item_root_folder(kind, item_id, rid):
+            return jsonify({"error": "Unknown title, or that Library isn't valid for a "
+                                     + ("movie" if kind == "movie" else "TV show") + "."}), 400
+        return jsonify({"ok": True, "root_folder_id": (int(rid) if rid not in (None, "", "null") else None)})
+
     @bp.route("/detail/<kind>/<int:item_id>/aka", methods=["PUT"])
     def video_set_aka_titles(kind, item_id):
         """Replace a title's user "also known as" list.

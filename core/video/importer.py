@@ -394,6 +394,113 @@ def run_import(dl: dict, src_path: str, *, fs: Any, prober: Callable | None = No
             "_upgraded": plan["action"] == "upgrade"}
 
 
+# ── season packs ─────────────────────────────────────────────────────────────
+# A pack is a FOLDER of episodes, but everything above is built around one
+# download → one file. Rather than teach plan_import about packs (and fork every
+# naming / upgrade / subtitle / recycle / seeding rule in it), we fan the pack
+# out: each member file is parsed on its OWN name and handed to the very same
+# single-file importer as a synthetic per-episode download. Every behaviour the
+# episode path already has is inherited rather than reimplemented, and a pack
+# whose members are half-upgrades gets the per-episode upgrade decision for free.
+
+def pack_members(src_dir: str, lister: Callable, *, size_of: Callable | None = None) -> list:
+    """Importable episode files inside a pack, in (season, episode) order.
+
+    ``lister(dir)`` yields full paths recursively (same injection as
+    find_completed_file). Drops non-video files, samples, and anything whose name
+    carries no episode number — extras, trailers, "behind the scenes" and the
+    stray .nfo all fail that test, so they are never mistaken for an episode.
+    Specials (season 0) are kept: they are real episodes with a real destination.
+    """
+    out = []
+    for path in lister(src_dir) or []:
+        if not is_video(path):
+            continue
+        name = basename_of(path)
+        if is_sample(name, (size_of(path) if size_of else 0)):
+            continue
+        p = parse_release(name)
+        if p.get("episode") is None or p.get("season") is None:
+            continue
+        out.append({"path": path, "season": p["season"], "episode": p["episode"],
+                    "episode_end": p.get("episode_end") or p["episode"], "parsed": p})
+    out.sort(key=lambda m: (m["season"], m["episode"]))
+    return out
+
+
+def _member_download(dl: dict, member: dict) -> dict:
+    """A synthetic single-episode download row for one pack member.
+
+    release_title becomes the MEMBER's filename: the pack's own name has no
+    episode number in it, so parsing that would give every member the same (and
+    wrong) identity. search_ctx is rewritten to scope='episode' with this file's
+    numbers, which is exactly what plan_import's episode branch expects.
+    """
+    ctx = dict(_search_ctx(dl))
+    ctx.update({"scope": "episode", "season": member["season"], "episode": member["episode"]})
+    ctx.pop("air_date", None)      # a pack member is identified by numbering, not date
+    out = dict(dl)
+    out["search_ctx"] = json.dumps(ctx)
+    out["release_title"] = basename_of(member["path"])
+    return out
+
+
+def run_season_import(dl: dict, src_dir: str, *, fs: Any, lister: Callable,
+                      prober: Callable | None = None, settings: dict | None = None,
+                      library_dir: str | None = None, recycle: Callable | None = None,
+                      size_of: Callable | None = None) -> dict:
+    """Import every episode in a season/series pack. Returns a DB patch dict.
+
+    Partial success is SUCCESS: a pack advertised as S01 that ships 8 of 12
+    episodes, or one where four episodes are already in the library at better
+    quality, has still done its job. The patch reports what landed. Only a pack
+    from which nothing at all could be imported is a failure — and it keeps the
+    source path so the Import page can pick it up manually, same as any other
+    failed import.
+    """
+    settings = organization.normalize(settings)
+    members = pack_members(src_dir, lister, size_of=size_of)
+    if not members:
+        return {"status": "import_failed", "progress": 100.0, "dest_path": src_dir,
+                "error": "No episode files found in this pack"}
+
+    imported, upgraded, failed, dests = 0, 0, [], []
+    for m in members:
+        try:
+            patch = run_import(_member_download(dl, m), m["path"], fs=fs, prober=prober,
+                               settings=settings, library_dir=library_dir, recycle=recycle)
+        except Exception as e:      # noqa: BLE001 - one bad member must not abort the pack
+            failed.append("S%02dE%02d: %s" % (m["season"], m["episode"], e))
+            continue
+        if patch.get("status") == "completed":
+            imported += 1
+            if patch.get("_upgraded"):
+                upgraded += 1
+            if patch.get("dest_path"):
+                dests.append(patch["dest_path"])
+        else:
+            failed.append("S%02dE%02d: %s" % (m["season"], m["episode"],
+                                              patch.get("error") or "not imported"))
+
+    if not imported:
+        return {"status": "import_failed", "progress": 100.0, "dest_path": src_dir,
+                "error": "Nothing in the pack could be imported — " + ("; ".join(failed[:3])
+                                                                       or "no usable episodes")}
+    return {
+        "status": "completed", "progress": 100.0,
+        # The season folder, not one episode — this is what the UI links to.
+        "dest_path": os.path.dirname(dests[0]) if dests else src_dir,
+        "quality_label": dl.get("quality_label"),
+        "_upgraded": upgraded > 0,
+        # transient (underscore-stripped on write): drives the completion message
+        # and lets the caller reconcile the wishlist for exactly what landed.
+        "_pack_imported": imported,
+        "_pack_total": len(members),
+        "_pack_failed": failed,
+        "_pack_episodes": [(m["season"], m["episode"]) for m in members],
+    }
+
+
 def atomic_verified_copy(src: str, dst: str) -> None:
     """Copy ``src`` to ``dst`` without ever exposing a partial file at the
     final name, and refuse to accept a short copy.
@@ -496,4 +603,5 @@ def real_fs() -> _RealFS:
 __all__ = [
     "VIDEO_EXTS", "SUB_EXTS", "ext_of", "is_video", "is_sample", "quality_score",
     "plan_import", "plan_subs", "run_import", "real_fs",
+    "pack_members", "run_season_import",
 ]

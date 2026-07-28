@@ -3484,11 +3484,15 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.7.2': [
-        { date: 'July 2026 · 1.7.2' },
+    '1.8.0': [
+        { date: 'July 2026 · 1.8.0' },
+        { title: 'Season packs now actually finish', desc: 'you could already search for and grab a whole season — but it would download and then stop, asking to be imported by hand. SoulSync now unpacks it: every episode in the pack is renamed and filed individually, exactly as if you had downloaded them one at a time.' },
+        { title: 'A part-full pack is still a win', desc: 'a pack labelled as a full season that only ships some episodes, or one where you already own a few at better quality, imports what is useful and tells you what it did. Samples, extras and trailers are left behind.' },
+        { title: 'The hourly automation can use packs too', desc: 'when several episodes of a season are missing it can grab one pack instead of chasing them one by one. Off until you turn it on, in Settings — one pack can be tens of gigabytes and the automation runs unattended.' },
+        { title: 'Put a movie in the right Library', desc: 'Manage now has a Library box for movies and TV shows alike, so a title filed in the wrong place can be corrected. New downloads and upgrades for it go to the Library you pick; files already on disk stay where they are.' },
+        { title: 'Also in 1.7.x', desc: 'the login screen stopped chattering to parts of SoulSync you are not signed in to yet, Sign in with Plex works again with "Require login" on, and 1.7.0 was a security release worth reading if you are coming from 1.6.x.' },
         { title: 'The login screen is properly quiet now', desc: 'finishing what 1.7.1 started. The page had still been sending about seventeen requests the moment it loaded, for parts of SoulSync you are not signed in to yet. It now sends two — the only two the sign-in screen actually needs. Everything else waits until you are in.' },
         { title: 'Nothing waits longer than it should', desc: 'if SoulSync cannot work out whether you are signed in, it stops waiting after ten seconds and carries on as before. Installs without "Require login" are unaffected either way.' },
-        { title: 'Also in 1.7.1 and 1.7.0', desc: 'if you are coming from 1.6.x you are getting all of these at once. The security items at the bottom are worth reading before putting SoulSync on a public address.' },
         { title: 'Sign in with Plex works again on the login screen', desc: 'with "Require login" turned on, pressing Sign in with Plex appeared to do nothing. It was actually working the whole time — the panel showing your plex.tv code was being hidden by the lock screen, so the code never appeared. It shows now.' },
         { title: 'A much quieter login screen', desc: 'the sign-in page had been quietly firing off dozens of requests a minute to parts of SoulSync you are not signed in to yet, all of them refused. It now waits until you are signed in.' },
         { title: 'From 1.7.0 — the security release', desc: 'the items below are the security work, kept here so an upgrade from 1.6.x does not skip past them.' },
@@ -3528,7 +3532,29 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.7.2: the rest of the login-screen noise",
+        title: "1.8.0: season packs, start to finish",
+        description: "grabbing a whole season already half-worked — SoulSync could find a pack and match it correctly, then download it and stop, because the import step only knew how to place a single file. It now unpacks one.",
+        features: [
+            "every episode inside the pack is renamed and filed on its own, using the same import that a single episode goes through — so naming, quality upgrades, subtitles, the recycle bin and torrent seeding all behave exactly as they already did. Nothing about packs is a special case once they are open",
+            "a pack that ships fewer episodes than it claims, or one where you already own some at better quality, imports what is useful rather than failing. Samples, extras and trailers are recognised and left behind",
+            "the hourly automation can grab a pack when several episodes of a season are missing, instead of chasing them individually. It is OFF until you enable it: one pack can be tens of gigabytes and that job runs unattended, so an existing setup should not start spending disk because it updated",
+            "a season already downloading now blocks its own episodes from being grabbed separately — without that, the next hourly run would have fetched all of them again alongside the pack",
+        ],
+        usage_note: "Open a show, pick a season, and search it — pack results appear alongside single episodes. For the automation: Settings → season packs.",
+    },
+    {
+        title: "1.8.0: put a title in the right Library",
+        description: "the Libraries you configure decide where downloads land, but nothing let you CORRECT a title that ended up in the wrong one — for movies or TV shows. Manage now has a Library box.",
+        features: [
+            "pick the Library a movie or show belongs to, and its future downloads and upgrades go there",
+            "it does not move anything already on disk. That is a much bigger and riskier operation, and this is the small reversible half that fixes the actual problem — everything from here on going to the right place",
+            "a movie cannot be filed under a TV Library or vice versa. That mistake would have been silent, and every later grab for the title would have gone into the wrong tree",
+            "leaving it on \"Default\" is a real setting, not an empty one — the title falls back to your primary Library for its type",
+        ],
+        usage_note: "Open any movie or show → Manage → Library.",
+    },
+    {
+        title: "Earlier in 1.7.2 — the rest of the login-screen noise",
         description: "1.7.1 stopped the repeating background polling on the sign-in screen. This finishes the job — the one-off burst every module fires the instant the page loads.",
         features: [
             "about fifteen modules each fetch something once at boot — the video dashboard, libraries, scan status, issue and watchlist counts, YouTube channels, search sources. None of them can know yet whether you are signed in, because that answer only arrives with the first reply from the server, so with Require login on they all went out and were all refused. They now wait for that answer",

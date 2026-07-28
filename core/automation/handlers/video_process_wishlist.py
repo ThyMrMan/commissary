@@ -114,6 +114,16 @@ def item_key(item: Dict[str, Any], media_type: str) -> tuple:
             int(item.get("season_number") or 0), int(item.get("episode_number") or 0))
 
 
+def season_key(item: Dict[str, Any], media_type: str):
+    """The season an episode belongs to, or None for a movie. A season PACK in
+    flight covers every episode in it, so the drain checks this alongside
+    item_key — otherwise the next tick would grab each episode individually
+    while the pack carrying them is still downloading."""
+    if media_type == "movie":
+        return None
+    return ("season", str(item.get("show_tmdb_id")), int(item.get("season_number") or 0))
+
+
 def active_download_keys(active: Iterable[Dict[str, Any]]) -> set:
     """Identity keys for the movie/episode downloads already in flight, so we don't
     re-grab them. Episodes read season/episode out of the row's ``search_ctx``."""
@@ -122,17 +132,135 @@ def active_download_keys(active: Iterable[Dict[str, Any]]) -> set:
         kind = str(d.get("kind") or "").lower()
         if kind == "movie":
             keys.add(("movie", str(d.get("media_id"))))
-        elif kind == "episode":
-            ctx = d.get("search_ctx")
-            if isinstance(ctx, str):
-                try:
-                    ctx = json.loads(ctx)
-                except (ValueError, TypeError):
-                    ctx = {}
-            ctx = ctx if isinstance(ctx, dict) else {}
+            continue
+        ctx = d.get("search_ctx")
+        if isinstance(ctx, str):
+            try:
+                ctx = json.loads(ctx)
+            except (ValueError, TypeError):
+                ctx = {}
+        ctx = ctx if isinstance(ctx, dict) else {}
+        scope = str(ctx.get("scope") or "").lower()
+        # Keyed off the CONTEXT's scope, not the row's kind: the interactive grab
+        # stores kind='season' for a pack while the drain's own packs are
+        # kind='episode', and a kind-only test would miss one of them and let the
+        # drain re-grab every episode of a season already downloading.
+        if scope in ("season", "series"):
+            keys.add(("season", str(d.get("media_id")), int(ctx.get("season") or 0)))
+        elif kind == "episode" or scope == "episode":
             keys.add(("episode", str(d.get("media_id")),
                       int(ctx.get("season") or 0), int(ctx.get("episode") or 0)))
     return keys
+
+
+SEASON_PACK_MIN_EPISODES = 4      # video.season_pack_min_episodes
+
+
+def season_pack_groups(items: List[Dict[str, Any]], *,
+                       min_episodes: int = SEASON_PACK_MIN_EPISODES) -> List[Dict[str, Any]]:
+    """Seasons with enough wanted episodes to be worth one pack instead of N grabs.
+
+    Returns pseudo-items flagged ``_season_pack``, each a copy of a REPRESENTATIVE
+    member so all its routing (Library, category, quality profile, series type)
+    is the season's own — only the scope differs. ``_pack_members`` carries the
+    item keys the pack would satisfy, so the caller can drop them from the
+    per-episode pass.
+
+    Deliberately conservative about what counts:
+      • UPGRADES are excluded (``_min_rank``). Wanting a better copy of two
+        episodes must not pull a whole season; the per-episode upgrade path
+        already handles those, and a pack would mostly re-download what you have.
+      • a season needs ``min_episodes`` genuinely-missing episodes. Below that a
+        pack is usually more bytes than the episodes are worth, and packs are
+        rarer than singles so the search often comes back empty anyway.
+      • season 0 (specials) never packs — 'S00' is not a thing releases ship.
+    """
+    try:
+        min_episodes = max(2, int(min_episodes))
+    except (TypeError, ValueError):
+        min_episodes = SEASON_PACK_MIN_EPISODES
+    groups: Dict[tuple, List[Dict[str, Any]]] = {}
+    for it in items or []:
+        if it.get("_min_rank"):          # an upgrade, not a hole
+            continue
+        try:
+            season = int(it.get("season_number") or 0)
+        except (TypeError, ValueError):
+            continue
+        if season <= 0:
+            continue
+        groups.setdefault((str(it.get("show_tmdb_id")), season), []).append(it)
+    out = []
+    for (_show, _season), members in groups.items():
+        if len(members) < min_episodes:
+            continue
+        rep = dict(members[0])
+        rep["_season_pack"] = True
+        rep["_pack_members"] = [item_key(m, "episode") for m in members]
+        rep["_pack_size"] = len(members)
+        rep.pop("_min_rank", None)
+        out.append(rep)
+    return out
+
+
+def _season_packs_enabled() -> bool:
+    """Season packs are OFF by default. One pack can be tens of GB and the drain
+    runs unattended, so an existing install must not start spending disk on this
+    because it updated — the operator turns it on."""
+    try:
+        from config.settings import config_manager
+        return bool(config_manager.get("video.season_packs", False)) if config_manager else False
+    except Exception:      # noqa: BLE001 - unreadable config behaves like off
+        return False
+
+
+def _try_season_packs(todo, *, root, search, enqueue, deps, automation_id):
+    """Grab a pack per eligible season; return (remaining per-episode todo, grabs).
+
+    Never fatal and never destructive: a season whose pack search finds nothing —
+    the common case, packs are much rarer than singles — simply falls through to
+    the per-episode pass with its items untouched. Only a season we actually
+    enqueued a pack for is removed.
+    """
+    try:
+        min_eps = SEASON_PACK_MIN_EPISODES
+        try:
+            from config.settings import config_manager
+            if config_manager:
+                min_eps = config_manager.get("video.season_pack_min_episodes",
+                                             SEASON_PACK_MIN_EPISODES)
+        except Exception:   # noqa: BLE001
+            pass
+        groups = season_pack_groups(todo, min_episodes=min_eps)
+    except Exception:       # noqa: BLE001 - grouping must never break the normal drain
+        logger.exception("season pack grouping failed")
+        return todo, 0
+    if not groups:
+        return todo, 0
+
+    claimed, grabs = set(), 0
+    for pack in groups:
+        name = "%s S%02d" % (pack.get("show_title") or "?", int(pack.get("season_number") or 0))
+        try:
+            found = search(pack, "episode")
+            cands, _err = found if isinstance(found, tuple) else (found, None)
+            best = pick_best(cands or [])
+            if not best:
+                continue
+            if enqueue(pack, best, cands or [], "episode", _item_target_dir(pack, root)):
+                claimed.update(pack.get("_pack_members") or [])
+                grabs += 1
+                deps.update_progress(
+                    automation_id,
+                    log_line="Grabbed the %s season pack — covers %d wanted episode(s)"
+                             % (name, pack.get("_pack_size") or 0),
+                    log_type='success')
+        except Exception:   # noqa: BLE001 - one season failing must not stop the rest
+            logger.exception("season pack attempt failed for %s", name)
+            continue
+    if not claimed:
+        return todo, grabs
+    return [it for it in todo if item_key(it, "episode") not in claimed], grabs
 
 
 def _acceptable_titles(primary: Any, kind: str, tmdb_id: Any) -> List[str]:
@@ -172,6 +300,23 @@ def search_context(item: Dict[str, Any], media_type: str) -> Dict[str, Any]:
     if media_type == "movie":
         ctx = {"scope": "movie", "title": item.get("title"), "year": item.get("year")}
         tmdb_id, kind = item.get("tmdb_id"), "movie"
+    elif item.get("_season_pack"):
+        # One grab for a whole season. Built by season_pack_groups() from a
+        # REPRESENTATIVE member item, so every routing field it carries (Library,
+        # category, quality profile, series type, poster) is the season's own —
+        # only the scope changes. Deliberately no episode/air_date/absolute: those
+        # identify one episode and would make the pack fail its own scope gate.
+        ctx = {"scope": "season", "title": item.get("show_title"),
+               "season": item.get("season_number"),
+               "year": (str(item.get("air_date") or "")[:4] or None)}
+        stype = str(item.get("series_type") or "").strip().lower()
+        if stype in ("daily", "anime"):
+            ctx["series_type"] = stype
+        tmdb_id, kind = item.get("show_tmdb_id"), "show"
+        titles = _acceptable_titles(ctx["title"], kind, tmdb_id)
+        if len(titles) > 1:
+            ctx["titles"] = titles
+        return ctx
     else:
         ctx = {"scope": "episode", "title": item.get("show_title"),
                "season": item.get("season_number"), "episode": item.get("episode_number"),
@@ -572,12 +717,32 @@ def auto_video_process_wishlist(
                 it.get("quality_profile_id") for it in items) else None
             items = annotate_upgrades(items, cutoff_rank, cutoff_for=per_item)
         active = set(active_keys(media_type) or set())
-        todo = [it for it in items if item_key(it, media_type) not in active]
+        # A season pack already downloading claims every episode in it, so those
+        # episodes must not also be grabbed one by one while it lands.
+        todo = [it for it in items
+                if item_key(it, media_type) not in active
+                and season_key(it, media_type) not in active]
+        # Season packs (opt-in): try ONE grab for a season with several holes
+        # before falling back to per-episode. Runs first so a successful pack
+        # removes its episodes from this tick's per-episode work.
+        if media_type == "episode" and _season_packs_enabled():
+            todo, pack_grabs = _try_season_packs(
+                todo, root=root, search=search, enqueue=enqueue, deps=deps,
+                automation_id=automation_id)
+        else:
+            pack_grabs = 0
         if not todo:
+            # A season pack can claim every remaining episode, emptying todo — that
+            # is a fully successful run, not "nothing to grab", so the pack count
+            # has to survive this early return or the tick reports 0 grabbed.
+            done_msg = ('Grabbed %d season pack(s) — nothing else outstanding' % pack_grabs
+                        if pack_grabs else
+                        'Nothing new to grab (%d already in flight)' % len(active))
             deps.update_progress(automation_id, status='finished', progress=100, phase='Complete',
-                                 log_line='Nothing new to grab (%d already in flight)' % len(active),
-                                 log_type='info')
-            return {'status': 'completed', 'searched': 0, 'grabbed': 0, '_manages_own_progress': True}
+                                 log_line=done_msg,
+                                 log_type='success' if pack_grabs else 'info')
+            return {'status': 'completed', 'searched': 0, 'grabbed': pack_grabs,
+                    'season_packs': pack_grabs, '_manages_own_progress': True}
 
         grabbed = [0]
         searched = [0]
@@ -663,7 +828,10 @@ def auto_video_process_wishlist(
             else ('Searched %d %s(s), grabbed 0%s' % (searched[0], label, breakdown))
         deps.update_progress(automation_id, status='finished', progress=100, phase='Complete',
                              log_line=done, log_type='success' if grabbed[0] else 'info')
-        return {'status': 'completed', 'searched': searched[0], 'grabbed': grabbed[0],
+        return {'status': 'completed', 'searched': searched[0],
+                # season packs are grabs too — a tick that landed one pack and no
+                # singles must not report 'grabbed 0'
+                'grabbed': grabbed[0] + pack_grabs, 'season_packs': pack_grabs,
                 'noresults': noresults[0], 'rejected': rejected[0], 'notrun': notrun[0],
                 '_manages_own_progress': True}
     except Exception as e:  # noqa: BLE001
