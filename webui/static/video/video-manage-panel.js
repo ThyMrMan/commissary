@@ -289,7 +289,19 @@
                             t.charAt(0).toUpperCase() + t.slice(1) +
                             (t === 'daily' ? ' (releases by air date)' : t === 'anime' ? ' (absolute numbering)' : '') +
                             '</option>';
-                    }).join('') + '</select></div>'
+                    }).join('') + '</select></div>' +
+                  // Re-read the episode list from TMDB on demand. A show is
+                  // cascaded once and then never revisited, so episodes TMDB
+                  // gains later (a season still airing, a late-added batch)
+                  // stay invisible — and nothing else in the app forces it:
+                  // "Sync show now" reconciles against Plex, and the page's
+                  // lazy refresh skips a show that already has its art.
+                  '<div class="vmg-field"><label>Episode list</label>' +
+                      '<button class="vmg-btn-ghost" type="button" data-vmg-rescan-eps>' +
+                          'Re-scan episodes from TMDB</button>' +
+                      '<div class="vmg-hint" data-vmg-rescan-note>Pulls the full season/episode ' +
+                          'list again. Use this when TMDB lists episodes SoulSync is missing.</div>' +
+                  '</div>'
                 : '') +
             // Also known as (matching aid): extra titles the release-title gate will
             // accept for this title. TMDB's alias coverage is patchy — most visibly
@@ -659,6 +671,42 @@
             });
     }
 
+    // Re-read the episode list from TMDB. Long-running for a show with many
+    // seasons (one API call per season), so the button reports progress and the
+    // hint becomes the result — "added 12" is the answer the user actually wants,
+    // not a green tick that leaves them counting rows.
+    function rescanEpisodes(btn) {
+        if (btn.disabled) return;
+        var note = state.overlay && state.overlay.querySelector('[data-vmg-rescan-note]');
+        var orig = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'Re-scanning…';
+        if (note) note.textContent = 'Reading every season from TMDB — this can take a moment.';
+        fetch('/api/video/detail/show/' + state.id + '/rescan-episodes', {
+            method: 'POST', headers: { Accept: 'application/json' } })
+            .then(function (r) {
+                return r.json().catch(function () { return {}; }).then(function (b) {
+                    if (!r.ok || !b.ok) throw new Error(b.error || 'Re-scan failed');
+                    return b;
+                });
+            })
+            .then(function (b) {
+                var msg = b.added
+                    ? 'Added ' + b.added + ' episode' + (b.added === 1 ? '' : 's') +
+                      ' — ' + b.total + ' now known'
+                    : 'Already up to date — ' + b.total + ' episode' +
+                      (b.total === 1 ? '' : 's') + ' known';
+                if (note) note.textContent = msg;
+                toast(msg, 'success');
+                if (b.added) document.dispatchEvent(new CustomEvent('soulsync:video-episodes-changed'));
+            })
+            .catch(function (e) {
+                if (note) note.textContent = (e && e.message) || 'Re-scan failed';
+                toast((e && e.message) || 'Re-scan failed', 'error');
+            })
+            .then(function () { btn.disabled = false; btn.textContent = orig; });
+    }
+
     function setSeriesType(sel) {
         fetch('/api/video/detail/show/' + state.id + '/series-type', {
             method: 'PUT', headers: { 'Content-Type': 'application/json' },
@@ -817,6 +865,8 @@
             }
             var akaBtn = e.target.closest('[data-vmg-aka-save]');
             if (akaBtn) { saveAkaTitles(akaBtn); return; }
+            var rsc = e.target.closest('[data-vmg-rescan-eps]');
+            if (rsc) { rescanEpisodes(rsc); return; }
             var tw = e.target.closest('[data-vmg-watched]');
             if (tw) { toggle('watched', tw); return; }
             var tm = e.target.closest('[data-vmg-monitored]');

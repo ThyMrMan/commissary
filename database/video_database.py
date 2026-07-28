@@ -3987,6 +3987,20 @@ class VideoDatabase:
         finally:
             conn.close()
 
+    def show_episode_count(self, show_id: int) -> int:
+        """How many episode rows a show has (owned + known-missing). Used to
+        report what a TMDB episode re-scan actually added, so the action can say
+        'added 12' instead of claiming success and leaving you to count."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute("SELECT COUNT(*) c FROM episodes WHERE show_id=?",
+                               (int(show_id),)).fetchone()
+            return int(row["c"] if row else 0)
+        except (sqlite3.Error, ValueError, TypeError):
+            return 0
+        finally:
+            conn.close()
+
     def set_item_root_folder(self, kind: str, item_id: int, root_folder_id) -> bool:
         """File a movie/show under a configured Library (root_folders row).
 

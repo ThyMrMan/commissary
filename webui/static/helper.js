@@ -3484,8 +3484,13 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.0': [
-        { date: 'July 2026 · 1.8.0' },
+    '1.8.1': [
+        { date: 'July 2026 · 1.8.1' },
+        { title: 'Search looks past the first page of results', desc: 'it only ever read the first twenty matches TMDB returned, ordered by popularity — so a title sharing its name with something better known was simply unfindable. It now reads further down the list.' },
+        { title: 'Typing a year works instead of returning nothing', desc: 'searching "Another World 2025" used to come back completely empty, because the year was sent as part of the title. If what you type finds nothing and it ends in a year, SoulSync now searches the name on its own and puts that year\'s match at the top. Titles that genuinely end in a year, like Blade Runner 2049, are unaffected.' },
+        { title: 'Re-scan a show\'s episodes from TMDB', desc: 'a new button in Manage for TV shows. SoulSync reads a show\'s episode list once and never looks again, so episodes added to TMDB later — a season still airing, a late batch — stayed invisible with no way to ask for them. This reads every season again and tells you how many it added.' },
+        { title: 'What that button is NOT', desc: '"Sync show now" checks your Plex/Jellyfin server, so it can never find episodes your server does not have. This one asks TMDB. If a season looks short compared to TMDB, this is the button.' },
+        { title: 'Also in 1.8.0', desc: 'season packs now unpack and file every episode instead of stalling after the download, and Manage gained a Library box so a movie or show filed in the wrong place can be corrected.' },
         { title: 'Season packs now actually finish', desc: 'you could already search for and grab a whole season — but it would download and then stop, asking to be imported by hand. SoulSync now unpacks it: every episode in the pack is renamed and filed individually, exactly as if you had downloaded them one at a time.' },
         { title: 'A part-full pack is still a win', desc: 'a pack labelled as a full season that only ships some episodes, or one where you already own a few at better quality, imports what is useful and tells you what it did. Samples, extras and trailers are left behind.' },
         { title: 'The hourly automation can use packs too', desc: 'when several episodes of a season are missing it can grab one pack instead of chasing them one by one. Off until you turn it on, in Settings — one pack can be tens of gigabytes and the automation runs unattended.' },
@@ -3532,7 +3537,18 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.8.0: season packs, start to finish",
+        title: "1.8.1: finding things, and asking TMDB again",
+        description: "two reports that turned out to be three separate causes — a search that could not reach past its first page, a year that made searching worse instead of better, and an episode list nothing in the app could refresh.",
+        features: [
+            "search read ONE page of TMDB results — twenty, ordered by popularity. Any title sharing its name with something more famous was unreachable, however exactly you typed it. It now reads further down",
+            "typing a year returned NOTHING at all, because TMDB's combined search has no year field and got it as part of the title. Now, if what you typed finds nothing and ends in a year, the name is searched on its own and that year's match is floated to the top. This only happens when the original search came back empty, so a real title ending in a year — Blade Runner 2049 — is never touched",
+            "a new \"Re-scan episodes from TMDB\" button on TV shows. A show's episode list was read once and never revisited, so episodes TMDB gained afterwards were invisible with no way to ask for them. This reads every season again and reports how many it added",
+            "that is a different question from \"Sync show now\", which checks your media server and so can never discover episodes your server has not got. If a season looks short next to TMDB, the new button is the one",
+        ],
+        usage_note: "Open a show → Manage → Re-scan episodes from TMDB.",
+    },
+    {
+        title: "Earlier in 1.8.0 — season packs, start to finish",
         description: "grabbing a whole season already half-worked — SoulSync could find a pack and match it correctly, then download it and stop, because the import step only knew how to place a single file. It now unpacks one.",
         features: [
             "every episode inside the pack is renamed and filed on its own, using the same import that a single episode goes through — so naming, quality upgrades, subtitles, the recycle bin and torrent seeding all behave exactly as they already did. Nothing about packs is a special case once they are open",
@@ -3543,7 +3559,7 @@ const VERSION_MODAL_SECTIONS = [
         usage_note: "Open a show, pick a season, and search it — pack results appear alongside single episodes. For the automation: Settings → season packs.",
     },
     {
-        title: "1.8.0: put a title in the right Library",
+        title: "Earlier in 1.8.0 — put a title in the right Library",
         description: "the Libraries you configure decide where downloads land, but nothing let you CORRECT a title that ended up in the wrong one — for movies or TV shows. Manage now has a Library box.",
         features: [
             "pick the Library a movie or show belongs to, and its future downloads and upgrades go there",

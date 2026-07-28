@@ -257,7 +257,10 @@ def test_search_results_carry_kind_not_media_type():
     from pathlib import Path
     src = (Path(__file__).resolve().parent.parent / "core" / "video" / "enrichment"
            / "clients.py").read_text(encoding="utf-8")
-    body = src[src.index("    def search(self, query):"):]
+    # Anchored on the method NAME, not its full signature — search() gained a
+    # `pages` argument when it went multi-page, and pinning the exact parameter
+    # list made this fail on a change it has no opinion about.
+    body = src[src.index("    def search(self, query"):]
     body = body[:body.index("\n    def ", 10)]
     assert '"kind": "movie"' in body and '"kind": "show"' in body
     assert '"media_type"' not in body.split("out.append")[1]   # not on the OUTPUT rows

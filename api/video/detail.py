@@ -64,6 +64,53 @@ def register_routes(bp):
                         "series_type": (db.series_type_for_tmdb(tmdb_id)
                                         if kind == "show" else None)})
 
+    @bp.route("/detail/show/<int:show_id>/rescan-episodes", methods=["POST"])
+    def video_rescan_episodes(show_id):
+        """Re-read a show's FULL episode list from TMDB, right now.
+
+        Exists because nothing else could. A show is cascaded once, then
+        ``episodes_synced=1`` and the background pass only ever picks
+        ``episodes_synced=0`` — so episodes TMDB gains later never appear. The
+        page's lazy refresh is gated on ``needs`` (no logo / missing season art /
+        not-yet-synced), which an established show fails, so opening it does
+        nothing. "Sync show now" reconciles against PLEX, which by definition
+        cannot know about episodes your server hasn't got. The nightly schedule
+        refresh is behind the video-automations master switch (off by default)
+        and only covers the latest seasons.
+
+        Deliberately NOT rematch_item: that is built for pointing at a different
+        TMDB entry and clears everything derived from the old match. This only
+        re-reads episodes — it never clears artwork, locked fields, or the match
+        itself.
+
+        Season numbers come from TMDB's own season list rather than the local
+        ``seasons`` table, so a season SoulSync has never seen is picked up too.
+        Returns the before/after counts so the caller can report what landed
+        instead of just claiming success."""
+        from . import get_video_db
+        db = get_video_db()
+        before = db.show_episode_count(show_id)
+        try:
+            from core.video.enrichment.engine import get_video_enrichment_engine
+            # with_ratings=False: this is about the episode list, and the per-show
+            # OMDb call would spend the daily quota for nothing.
+            res = get_video_enrichment_engine().refresh_show_art(
+                show_id, with_ratings=False) or {}
+        except Exception:
+            logger.exception("episode re-scan failed for show %s", show_id)
+            return jsonify({"ok": False, "reason": "error",
+                            "error": "Couldn't reach TMDB — see app.log"}), 502
+        if not res.get("ok"):
+            reason = res.get("reason") or "error"
+            msg = {"not_found": "That show isn't in the library.",
+                   "no_match": "This show has no TMDB match to read episodes from.",
+                   "match_error": "Couldn't reach TMDB just now."}.get(
+                       reason, "Couldn't refresh the episode list.")
+            return jsonify({"ok": False, "reason": reason, "error": msg}), 400
+        after = db.show_episode_count(show_id)
+        return jsonify({"ok": True, "added": max(0, after - before),
+                        "total": after, "before": before})
+
     @bp.route("/detail/<kind>/<int:item_id>/library", methods=["PUT"])
     def video_set_item_library(kind, item_id):
         """File a movie/show under one of the configured Libraries.

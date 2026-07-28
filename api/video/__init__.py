@@ -99,6 +99,7 @@ def create_video_blueprint() -> Blueprint:
             admin = admin or _p("/api/video/bulk", "/api/video/monitor",
                                  "/api/video/poster/set", "/api/video/downloads/blocklist") \
                 or path.endswith(("/metadata", "/lock", "/refresh-art", "/aka", "/library",
+                                  "/rescan-episodes",
                                   # per-title acquisition settings (P2/P8) — management,
                                   # same as the metadata edits above
                                   "/quality-profile", "/series-type",

@@ -8,6 +8,8 @@ client. Keys come from video_settings.
 
 from __future__ import annotations
 
+import re
+
 from utils.logging_config import get_logger
 
 logger = get_logger("video_enrichment.clients")
@@ -569,18 +571,85 @@ class TMDBClient:
                 "rating": d.get("vote_average") or None, "overview": d.get("overview") or None,
                 "runtime_minutes": d.get("runtime"), "air_date": d.get("air_date") or None}
 
-    def search(self, query):
+    # A trailing year the user typed ("Another World 2025", "Dune (2021)").
+    SEARCH_YEAR_RE = re.compile(r"^\s*(.+?)[\s(\[]+((?:19|20)\d{2})\s*[)\]]?\s*$")
+    SEARCH_PAGES = 3        # 20 results per TMDB page
+
+    @classmethod
+    def split_search_year(cls, query):
+        """('Another World 2025') → ('Another World', 2025); no year → (query, None).
+
+        /search/multi has NO year parameter, so a typed year goes to TMDB as part
+        of the TITLE and matches nothing — searching "Another World 2025"
+        returned zero results while "Another World" returned plenty. Pulling the
+        year out of the query and using it to RANK instead is what makes the
+        natural thing users type work at all.
+
+        Only a plausible film/TV year is treated as one: '1917' and 'Blake's 7'
+        are titles, so a bare number with no title before it is left alone.
+        """
+        m = cls.SEARCH_YEAR_RE.match(str(query or ""))
+        if not m:
+            return (str(query or "").strip(), None)
+        title, year = m.group(1).strip(), int(m.group(2))
+        if not title:                     # the whole query was a year — it's a title
+            return (str(query or "").strip(), None)
+        return (title, year)
+
+    def _multi_search_raw(self, term, pages):
+        """``pages`` pages of /search/multi for ``term``, deduped, in TMDB order."""
+        import requests
+        raw, seen = [], set()
+        for page in range(1, max(1, int(pages)) + 1):
+            try:
+                r = requests.get(self.BASE + "/search/multi", params={
+                    "api_key": self.api_key, "query": term, "include_adult": "false",
+                    "page": page}, timeout=15)
+                r.raise_for_status()
+                data = r.json() or {}
+            except Exception:   # noqa: BLE001 - page 2+ failing must not lose page 1
+                logger.debug("tmdb multi-search page %s failed for %r", page, term, exc_info=True)
+                break
+            for it in (data.get("results") or []):
+                key = (it.get("media_type"), it.get("id"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                raw.append(it)
+            if page >= int(data.get("total_pages") or 1):
+                break
+        return raw
+
+    def search(self, query, pages: int | None = None):
         """Multi-search (movies / TV / people) for the in-app search page. Returns
         a flat list of {kind, tmdb_id, title, year, poster, ...} — no external IDs,
-        everything resolves back into SoulSync."""
+        everything resolves back into SoulSync.
+
+        Reads several PAGES, not one. TMDB returns 20 results a page ordered by
+        popularity, and the old single-page read meant a title sharing its name
+        with anything more popular was unreachable — a 2025 indie called 'Another
+        World' sits far below a long-running soap of the same name.
+
+        A typed year is handled as a FALLBACK, never a first move. /search/multi
+        has no year parameter, so 'Another World 2025' goes over the wire as a
+        literal title and matches nothing — but plenty of real titles END in a
+        year ('Blade Runner 2049', '9-1-1: Lone Star'), and stripping it up front
+        would wreck those. So: search exactly what was typed; only if that comes
+        back EMPTY and a trailing year was present, retry without it and float
+        that year's matches to the top. A query that works today cannot start
+        behaving differently."""
         if not self.api_key or not (query or "").strip():
             return []
-        import requests
-        r = requests.get(self.BASE + "/search/multi", params={
-            "api_key": self.api_key, "query": query, "include_adult": "false"}, timeout=15)
-        r.raise_for_status()
+        want_pages = max(1, int(pages or self.SEARCH_PAGES))
+        term_full = str(query).strip()
+        raw = self._multi_search_raw(term_full, want_pages)
+        term_bare, want_year = self.split_search_year(term_full)
+        if not raw and want_year and term_bare and term_bare != term_full:
+            raw = self._multi_search_raw(term_bare, want_pages)
+        else:
+            want_year = None    # the query as typed worked — don't re-rank it
         out = []
-        for it in ((r.json() or {}).get("results") or [])[:32]:
+        for it in raw:
             mt, tid = it.get("media_type"), it.get("id")
             if not tid:
                 continue
@@ -600,6 +669,12 @@ class TMDBClient:
                             "known_for": ", ".join([k for k in known if k][:3]) or None,
                             "department": it.get("known_for_department"),
                             "poster": (self.PROFILE + it["profile_path"]) if it.get("profile_path") else None})
+        if want_year:
+            # Float exact-year matches, keep everything else in TMDB's own
+            # popularity order below. A stable sort, and nothing is dropped: the
+            # year is a strong hint about which of several same-named titles was
+            # meant, not a filter — a wrong guess must not empty the results.
+            out.sort(key=lambda r: 0 if str(r.get("year") or "") == str(want_year) else 1)
         return out
 
     def search_companies(self, query):
