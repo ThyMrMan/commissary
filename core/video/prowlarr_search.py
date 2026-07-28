@@ -185,6 +185,24 @@ _DEFAULT_SEARCH_LIMIT = 200
 _SEARCH_LIMIT_KEY = "prowlarr.search_limit"
 
 
+# How long to wait for ONE Prowlarr search. Separate from the client's 15s
+# metadata timeout: a cold search fans out to every configured indexer and
+# several authenticate on first use, so it can take a minute even when healthy.
+_DEFAULT_SEARCH_TIMEOUT = 90
+_SEARCH_TIMEOUT_KEY = "prowlarr.search_timeout"
+
+
+def _search_timeout() -> float:
+    try:
+        from config.settings import config_manager
+        n = float(config_manager.get(_SEARCH_TIMEOUT_KEY, _DEFAULT_SEARCH_TIMEOUT)
+                  or _DEFAULT_SEARCH_TIMEOUT)
+    except Exception:   # noqa: BLE001 - config must never break search
+        return _DEFAULT_SEARCH_TIMEOUT
+    # Below ~5s nothing real completes; above a few minutes the user has given up.
+    return max(5.0, min(300.0, n))
+
+
 def _search_limit() -> int:
     try:
         from config.settings import config_manager
@@ -259,8 +277,16 @@ def prowlarr_search(scope: str, title: Any, *, year: Any = None, season: Any = N
     def _run(strat):
         st_type, q, extra = strat
         try:
+            # strict=True: a timeout or transport error must RAISE, so _run
+            # records it and the picker says what went wrong. Swallowed into an
+            # empty list it is indistinguishable from "the indexers found
+            # nothing" — the search never ran, and the UI claimed no releases
+            # exist. That is the bug where searching in Prowlarr's own UI first
+            # "fixed" it: the second query hit Prowlarr's cache and came back
+            # inside the timeout.
             return client._search_sync(q, cats, ids, _search_limit(),
-                                       search_type=st_type, extra_params=extra)
+                                       search_type=st_type, extra_params=extra,
+                                       strict=True, timeout=_search_timeout())
         except Exception as e:   # noqa: BLE001 - one strategy failing shouldn't sink the rest
             logger.warning("prowlarr %s search failed for %r: %s", st_type, q, e)
             return e

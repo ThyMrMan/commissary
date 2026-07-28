@@ -908,7 +908,7 @@
                 '<input type="checkbox" class="vdl-season-cb" data-vdl-season-all="' + sn + '">' +
                 '<span class="vdl-season-name">' + esc(s.title || ('Season ' + sn)) + '</span>' +
                 '<span class="vdl-season-meta" data-vdl-season-meta>' + total + ' eps</span>' +
-                '<button class="vdl-season-grab" type="button" data-vdl-season-grab="' + sn + '" title="Auto-grab every missing episode in this season, one at a time">Grab season</button>' +
+                '<button class="vdl-season-grab" type="button" data-vdl-season-grab="' + sn + '" title="Find a single season pack covering this season, and grab that">Grab season</button>' +
                 '<button class="vdl-season-search" type="button" data-vdl-season-search="' + sn + '" title="Search this season as a pack">⌕</button>' +
                 '<span class="vdl-season-chev" aria-hidden="true">⌄</span>' +
             '</div>' +
@@ -1135,9 +1135,7 @@
         });
     }
 
-    // ── Grab whole season (episode level) ──────────────────────────────────────
-    // Run the per-episode auto-grab for every MISSING episode, throttled — each takes
-    // the same path a manual per-episode Auto would, and each ROW shows live status.
+    // ── Grab whole season ─────────────────────────────────────────────────────
     function ensureScratch(container) {
         var s = container.querySelector('[data-vdl-grab-scratch]');
         if (!s) {
@@ -1149,31 +1147,17 @@
         return s;
     }
 
-    function autoGrabEpisode(container, st, sn, en, src) {
-        // Resolves once the search SETTLES (throttle the searches, not the grabs); the
-        // row then tracks the live download itself.
-        return new Promise(function (resolve) {
-            var epEl = _epEl(container, sn, en);
-            epSearching(epEl);
-            var panel = document.createElement('div');
-            panel.className = 'vdl-results vdl-res-noanim';
-            ensureScratch(container).appendChild(panel);
-            searchInto(container, panel,
-                { scope: 'episode', title: st.title, season: sn, episode: en, source: src },
-                [], function () {
-                    _pickAndGrab(panel).then(function (r) {
-                        if (r.ok) {
-                            epTrack(epEl, r.id);
-                            document.dispatchEvent(new CustomEvent('soulsync:video-download-started'));
-                        } else {
-                            epNoRelease(epEl);
-                        }
-                        resolve(r);
-                    });
-                });
-        });
-    }
-
+    // Grab season = find ONE season pack, not N episodes. A pack is a single
+    // release covering the whole season: one search, one grab, one torrent, and
+    // the import fans it out per episode (run_season_import) exactly as the
+    // automation does. Searching episode-by-episode fired a search and a grab per
+    // episode, which is slower, noisier on the indexers, and routinely ends up
+    // with a season assembled from a dozen mismatched sources.
+    //
+    // Packs ONLY: when no pack exists this says so rather than quietly falling
+    // back to per-episode grabbing — the per-episode Auto button on each row is
+    // still right there, and silently doing something different from what the
+    // button says is worse than doing nothing.
     function grabSeason(container, st, sn) {
         var src = (st.sources || []).filter(function (s) { return SRC_META[s]; })[0];
         if (!src) { toast('No download source configured', 'error'); return; }
@@ -1183,25 +1167,64 @@
         }
         eps.sort(function (a, b) { return a - b; });
         if (!eps.length) { toast('No missing episodes in this season', 'info'); return; }
-        // make sure the season is open so the user sees the rows light up
+
         var card = container.querySelector('.vdl-season[data-vdl-season="' + sn + '"]');
         if (card) card.classList.add('vdl-season--open');
-        eps.forEach(function (en) { epSearching(_epEl(container, sn, en)); });   // immediate feedback
         var btn = container.querySelector('[data-vdl-season-grab="' + sn + '"]');
-        if (btn) { btn.disabled = true; btn.textContent = 'Grabbing…'; }
-        toast('Grabbing ' + eps.length + ' episode' + (eps.length > 1 ? 's' : '') + ' — each row shows live status', 'info');
-        var idx = 0, active = 0, done = 0, MAX = 3;
-        function pump() {
-            while (active < MAX && idx < eps.length) {
-                active++;
-                autoGrabEpisode(container, st, sn, eps[idx++], src).then(function () {
-                    active--; done++;
-                    if (done >= eps.length) { if (btn) { btn.disabled = false; btn.textContent = 'Grab season'; } }
-                    else pump();
+        var reset = function (label) {
+            if (btn) { btn.disabled = false; btn.textContent = label || 'Grab season'; }
+        };
+        if (btn) { btn.disabled = true; btn.textContent = 'Finding pack…'; }
+        // Every missing row lights up: they are all being fetched, just as ONE
+        // release rather than one search each. Without this the only feedback is
+        // a button label, and a season grab looks like nothing happened.
+        eps.forEach(function (en) { epSearching(_epEl(container, sn, en)); });
+
+        var panel = document.createElement('div');
+        panel.className = 'vdl-results vdl-res-noanim';
+        ensureScratch(container).appendChild(panel);
+        searchInto(container, panel,
+            { scope: 'season', title: st.title, season: sn, source: src }, [], function () {
+                var rows = panel._rows || [];
+                var best = null;
+                for (var i = 0; i < rows.length; i++) {
+                    if (rows[i].accepted && rows[i].username) { best = rows[i]; break; }
+                }
+                if (!best) {
+                    reset();
+                    eps.forEach(function (en) { epNoRelease(_epEl(container, sn, en)); });
+                    toast('No season pack found for season ' + sn +
+                          ' — use Auto on individual episodes instead', 'info');
+                    return;
+                }
+                if (btn) btn.textContent = 'Grabbing pack…';
+                // A soulseek pack is a FOLDER of files and goes through grab-pack
+                // (which fans it out server-side); a torrent/usenet pack is one
+                // release and rides the normal grab, where the download monitor
+                // unpacks it on completion.
+                var isFolder = !!(best.files && best.files.length > 1);
+                var req = isFolder ? _grabPack(panel, best)
+                                   : sendGrab(buildGrabPayload(panel, best));
+                req.then(function (res) {
+                    if (res && res.ok) {
+                        document.dispatchEvent(new CustomEvent('soulsync:video-download-started'));
+                        toast(isFolder
+                            ? 'Grabbing ' + res.started + ' episode' + (res.started === 1 ? '' : 's') +
+                              ' from the pack' + (res.skipped ? ' · ' + res.skipped + ' skipped' : '')
+                            : 'Grabbing the season ' + sn + ' pack — it imports per episode when it lands',
+                            'success');
+                        reset('Pack grabbed');
+                    } else {
+                        reset();
+                        eps.forEach(function (en) { epNoRelease(_epEl(container, sn, en)); });
+                        toast((res && res.error) || 'Could not grab the season pack', 'error');
+                    }
+                }).catch(function () {
+                    reset();
+                    eps.forEach(function (en) { epNoRelease(_epEl(container, sn, en)); });
+                    toast('Could not grab the season pack', 'error');
                 });
-            }
-        }
-        pump();
+            });
     }
 
     // On (re)open, resume live tracking for any episodes of THIS show already in flight,

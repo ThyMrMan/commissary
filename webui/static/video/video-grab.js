@@ -133,30 +133,78 @@
         });
     }
 
-    // Auto-grab every listed (missing) episode in a season, 3 at a time.
+    // Grab a season as ONE PACK: a single release covering the whole season,
+    // which the import fans out per episode (run_season_import) exactly the way
+    // the automation does.
+    //
+    // This used to run the per-episode auto-grab N times. That is N searches and
+    // N grabs for one season, it hammers the indexers, and it routinely assembles
+    // a season from a dozen unrelated releases at different qualities.
+    //
+    // Packs ONLY, deliberately: when no pack exists it reports that instead of
+    // quietly reverting to per-episode grabbing. Auto on each episode row still
+    // does exactly that, and a button doing something other than what it says is
+    // worse than a button that declines.
     function season(opts, onEp) {
         opts = opts || {};
         var eps = (opts.episodes || []).slice().sort(function (a, b) { return a - b; });
         var total = eps.length;
-        if (!total) return Promise.resolve({ grabbed: 0, total: 0 });
-        var idx = 0, active = 0, grabbed = 0, MAX = 3;
-        return new Promise(function (resolve) {
-            function launch(en) {
-                active++;
-                if (onEp) onEp(en, 'searching');
-                episode({ title: opts.title, source: opts.source, season: opts.season, episode: en,
-                    mediaId: opts.mediaId, mediaSource: opts.mediaSource, year: opts.year, poster: opts.poster,
-                    rootFolderId: opts.rootFolderId })
-                    .then(function (r) {
-                        active--;
-                        if (r.ok) { grabbed++; if (onEp) onEp(en, 'grabbing'); }
-                        else if (onEp) { onEp(en, 'none'); }
-                        if (idx >= eps.length && active === 0) resolve({ grabbed: grabbed, total: total });
-                        else pump();
-                    });
+        if (!total) return Promise.resolve({ grabbed: 0, total: 0, pack: false });
+        var src = opts.source || 'soulseek';
+        if (onEp) eps.forEach(function (en) { onEp(en, 'searching'); });
+
+        var params = { scope: 'season', title: opts.title, season: opts.season, source: src,
+            root_folder_id: opts.rootFolderId || null,
+            media_id: opts.mediaId, media_source: opts.mediaSource };
+        return runSearch(params).then(function (rows) {
+            var best = bestRow(rows);
+            if (!best) {
+                if (onEp) eps.forEach(function (en) { onEp(en, 'none'); });
+                return { grabbed: 0, total: total, pack: false, error: 'no season pack found' };
             }
-            function pump() { while (active < MAX && idx < eps.length) launch(eps[idx++]); }
-            pump();
+            // A soulseek pack is a FOLDER of files (grab-pack fans it out
+            // server-side); a torrent/usenet pack is one release the download
+            // monitor unpacks on completion.
+            if (src === 'soulseek' && best.files && best.files.length > 1) {
+                return postJSON('/api/video/downloads/grab-pack', {
+                    username: best.username, files: best.files, title: opts.title,
+                    quality_label: best.quality_label, media_id: opts.mediaId,
+                    media_source: opts.mediaSource, year: opts.year, poster_url: opts.poster,
+                    root_folder_id: opts.rootFolderId || null,
+                }).then(function (res) {
+                    var ok = !!(res && res.ok);
+                    if (onEp) eps.forEach(function (en) { onEp(en, ok ? 'grabbing' : 'none'); });
+                    if (ok) document.dispatchEvent(new CustomEvent('soulsync:video-download-started'));
+                    return { grabbed: ok ? (res.started || total) : 0, total: total, pack: true,
+                             error: ok ? null : ((res && res.error) || 'grab failed') };
+                });
+            }
+            var payload = {
+                kind: 'show', title: opts.title, release_title: best.title,
+                source: src, size_bytes: best.size_bytes, quality_label: best.quality_label,
+                media_id: opts.mediaId, media_source: opts.mediaSource, year: opts.year,
+                poster_url: opts.poster, root_folder_id: opts.rootFolderId || null,
+                // scope 'season' is what makes the monitor treat the finished
+                // download as a pack and unpack it (_is_pack → run_season_import).
+                search_ctx: { scope: 'season', title: opts.title, year: opts.year,
+                    season: opts.season, episode: null }
+            };
+            if (src === 'soulseek') {
+                payload.username = best.username; payload.filename = best.filename;
+                payload.candidates = [];
+            } else {
+                payload.download_url = best.download_url; payload.protocol = best.protocol;
+                payload.indexer_id = best.indexer_id; payload.guid = best.guid;
+                payload.username = best.username; payload.filename = best.filename || best.title;
+                payload.candidates = [];
+            }
+            return postJSON('/api/video/downloads/grab', payload).then(function (res) {
+                var ok = !!(res && res.ok);
+                if (onEp) eps.forEach(function (en) { onEp(en, ok ? 'grabbing' : 'none'); });
+                if (ok) document.dispatchEvent(new CustomEvent('soulsync:video-download-started'));
+                return { grabbed: ok ? total : 0, total: total, pack: true,
+                         error: ok ? null : ((res && res.error) || 'grab failed') };
+            });
         });
     }
 

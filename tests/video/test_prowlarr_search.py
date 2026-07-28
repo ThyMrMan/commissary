@@ -58,8 +58,14 @@ def _patch(monkeypatch, per_type, configured=True):
         def is_configured(self):
             return configured
 
-        def _search_sync(self, q, cats, ids, limit, search_type="search", extra_params=None):
-            calls.append({"q": q, "type": search_type, "cats": cats, "extra": list(extra_params or [])})
+        def _search_sync(self, q, cats, ids, limit, search_type="search", extra_params=None,
+                         **kw):
+            # **kw absorbs strict/timeout: the video path asks for errors to RAISE
+            # rather than come back as an empty list (a timed-out search used to be
+            # indistinguishable from "no releases"). Recorded so it can be asserted.
+            calls.append({"q": q, "type": search_type, "cats": cats,
+                          "extra": list(extra_params or []), "limit": limit,
+                          "strict": kw.get("strict"), "timeout": kw.get("timeout")})
             return list(per_type.get(search_type, []))
 
     monkeypatch.setattr(ps, "_client", lambda: _Client())
@@ -103,7 +109,8 @@ def test_one_strategy_failing_still_returns_the_other(monkeypatch):
         def is_configured(self):
             return True
 
-        def _search_sync(self, q, cats, ids, limit, search_type="search", extra_params=None):
+        def _search_sync(self, q, cats, ids, limit, search_type="search", extra_params=None,
+                         **kw):
             if search_type == "tvsearch":
                 raise RuntimeError("indexer timeout")
             return list(good)
@@ -118,3 +125,12 @@ def test_unconfigured_returns_not_configured(monkeypatch):
     _patch(monkeypatch, {}, configured=False)
     out = ps.prowlarr_search("movie", "X", source="torrent")
     assert out["configured"] is False and out["hits"] == []
+
+
+def test_the_search_asks_for_errors_to_raise(monkeypatch):
+    """The fix for "no results until you search in Prowlarr first": without
+    strict, a timeout returns [] and the picker reports no releases exist."""
+    calls = _patch(monkeypatch, {"tvsearch": [], "search": []})
+    ps.prowlarr_search("episode", "Show", season=1, episode=2, source="torrent")
+    assert calls and all(c["strict"] is True for c in calls)
+    assert all(c["timeout"] and c["timeout"] >= 60 for c in calls)

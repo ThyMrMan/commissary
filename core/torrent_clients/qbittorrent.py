@@ -21,6 +21,14 @@ from config.settings import config_manager
 from core.torrent_clients.base import TorrentStatus, normalize_client_url
 from utils.logging_config import get_logger
 
+from core.torrent_clients import infohash
+
+# Confirming a KNOWN hash is a lookup, not a race, so this can afford to be
+# patient: qBittorrent may still be resolving magnet metadata, and the old ~5s
+# diff window is exactly what made a good add look like a rejection.
+_CONFIRM_ATTEMPTS = 30
+_CONFIRM_INTERVAL = 0.5
+
 logger = get_logger("torrent.qbittorrent")
 
 
@@ -198,7 +206,14 @@ class QBittorrentAdapter:
         if resp.text and resp.text.strip() and resp.text.strip() != 'Ok.':
             logger.warning("qBittorrent /torrents/add unexpected body: %r", resp.text[:200])
             return None
-        new_hash = self._poll_for_new_hash(before)
+        # A magnet CARRIES its info-hash, so there is nothing to discover: confirm
+        # it landed and return it. The before/after diff below is a race — qBit
+        # needs longer than the poll whenever it is resolving magnet metadata or
+        # the torrent list is large — and losing that race reported a perfectly
+        # good add as "the client didn't accept the release", which also meant
+        # nothing ever polled the download and it was never imported.
+        expected = infohash.expected_hash(url_or_magnet)
+        new_hash = self._confirm_or_poll(expected, before)
         if not new_hash:
             logger.error("qBittorrent accepted the request but no new torrent appeared — "
                          "URL may have been rejected (bad magnet, unreachable HTTPS, "
@@ -216,6 +231,27 @@ class QBittorrentAdapter:
         except Exception as e:
             logger.error("qBittorrent /torrents/info parse failed: %s", e)
             return None
+
+    def _confirm_or_poll(self, expected: Optional[str], before: set) -> Optional[str]:
+        """The added torrent's hash.
+
+        When ``expected`` is known (magnet or .torrent bytes) it only has to be
+        CONFIRMED present, which is a direct lookup rather than a race — and a
+        duplicate add, where no new hash ever appears because the torrent was
+        already there, resolves correctly instead of looking like a failure.
+
+        Falls back to the historical before/after diff when the hash can't be
+        derived (an http .torrent URL handed straight to the client)."""
+        if expected:
+            for _ in range(_CONFIRM_ATTEMPTS):
+                current = self._all_hashes()
+                if current is not None and expected in current:
+                    return expected
+                import time as _time
+                _time.sleep(_CONFIRM_INTERVAL)
+            # It genuinely never showed up — fall through to the diff, which can
+            # still catch a client that normalised the hash differently.
+        return self._poll_for_new_hash(before)
 
     def _poll_for_new_hash(self, before: set) -> Optional[str]:
         """Poll up to ~5s for a new torrent to appear (qBit takes a
@@ -260,7 +296,7 @@ class QBittorrentAdapter:
         resp = self._call('POST', '/api/v2/torrents/add', data=data, files=files)
         if not resp or not resp.ok:
             return None
-        return self._poll_for_new_hash(before)
+        return self._confirm_or_poll(infohash.from_torrent_bytes(file_bytes), before)
 
     async def get_status(self, torrent_id: str) -> Optional[TorrentStatus]:
         loop = asyncio.get_event_loop()

@@ -2827,7 +2827,12 @@
                 function (en, state) { _setEpSynthetic(en, state); });
         }).then(function (res) {
             btn.disabled = false; _btnLabel(btn, 'Grab season'); startDlTracking();
-            toast('Grabbing ' + res.grabbed + ' of ' + res.total + ' episode' + (res.total === 1 ? '' : 's'), res.grabbed ? 'success' : 'info');
+            // One PACK now, not N episodes — "grabbing 12 of 12" would describe
+            // twelve downloads that aren't happening.
+            toast(res.pack
+                ? 'Grabbing the season pack — it imports per episode when it lands'
+                : 'No season pack found — use Auto on individual episodes instead',
+                res.pack ? 'success' : 'info');
         });
     }
     function wishSeasonInline(btn) {

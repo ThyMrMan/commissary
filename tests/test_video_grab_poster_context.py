@@ -23,8 +23,14 @@ _GRAB = (_ROOT / "webui" / "static" / "video" / "video-grab.js").read_text(encod
 
 
 def _fn(src, name):
+    """The function's body, sliced to the NEXT top-level function.
+
+    Was a fixed 900-character window, which silently truncated once a function
+    grew past it — an assertion then failed because the text fell outside the
+    slice, not because the code was wrong."""
     start = src.index("function " + name)
-    return src[start:start + 900]
+    nxt = src.find("\n    function ", start + 1)
+    return src[start:nxt if nxt > 0 else len(src)]
 
 
 def test_single_episode_grab_params_carry_the_poster():
@@ -40,9 +46,10 @@ def test_season_grab_carries_the_poster():
 def test_grab_module_forwards_poster_to_the_backend():
     # episode(): the grab payload must send poster_url from opts.poster …
     assert re.search(r"poster_url:\s*opts\.poster", _GRAB)
-    # … and season() must forward opts.poster into each episode() call.
+    # season() no longer fans out into episode() — it grabs ONE pack — so the
+    # poster has to ride its own payload. Same requirement, different shape.
     body = _fn(_GRAB, "season")
-    assert "poster: opts.poster" in body
+    assert "poster_url: opts.poster" in body
 
 
 def test_show_poster_resolver_exists_and_prefers_library_art():

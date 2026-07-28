@@ -203,7 +203,10 @@ def test_inline_grab_payload_carries_the_library():
     """video-grab.js drives the detail page's per-episode/per-season buttons and
     sent no Library at all."""
     assert "root_folder_id: opts.rootFolderId" in _GRAB_JS
-    assert "rootFolderId: opts.rootFolderId" in _GRAB_JS      # season → episode fan-out
+
+    # season() builds its OWN grab payload now (one pack, no per-episode fan-out),
+    # so the Library must appear there rather than being passed down to episode().
+    assert _GRAB_JS.count("root_folder_id: opts.rootFolderId") >= 2
     assert "rootFolderId: data.root_folder_id" in _DETAIL_JS  # both call sites feed it
 
 

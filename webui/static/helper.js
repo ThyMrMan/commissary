@@ -3484,8 +3484,15 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.6': [
-        { date: 'July 2026 · 1.8.6' },
+    '1.8.7': [
+        { date: 'July 2026 · 1.8.7' },
+        { title: 'Fixed: a torrent that WAS added reported as rejected', desc: 'the grab said "the torrent client didn\'t accept the release" while the torrent sat there downloading. SoulSync worked out the new torrent\'s identity by listing the client\'s torrents before and after and spotting the difference, waiting about five seconds. qBittorrent often needs longer — resolving a magnet, or simply busy — and when the wait ran out a perfectly good add was called a failure.' },
+        { title: 'Why that mattered more than the message', desc: 'a grab recorded as failed is never watched, so when the download finished nothing imported it. The file arrived and SoulSync did not know it existed. It now works out the torrent\'s identity from the magnet or the torrent file itself, before adding it, so there is nothing to race. Re-adding something the client already has now resolves properly too, instead of looking like a rejection.' },
+        { title: 'Fixed: Manual Search finding nothing until you searched in Prowlarr first', desc: 'a first search across many indexers is slow — Prowlarr queries each one and some have to log in — and SoulSync gave up after fifteen seconds, the same short limit it uses for quick status checks. Worse, it could not tell a search that timed out from a search that found nothing, so it reported "No matching releases found". Searching in Prowlarr first made its cache answer instantly, which is why that appeared to fix it.' },
+        { title: 'Searches now get their own, much longer limit', desc: 'ninety seconds by default, adjustable. And a search that fails now says what went wrong instead of claiming there are no releases — being told nothing exists is worse than being told it was slow.' },
+        { title: 'Grab season now looks for a season pack', desc: 'it used to search for and grab every missing episode separately: a dozen searches and a dozen downloads for one season, hard on the indexers, and it often ended up assembling a season from a dozen unrelated releases at different qualities. It now finds one release covering the whole season and grabs that; the import splits it into episodes exactly as before.' },
+        { title: 'And it tells you when there isn\'t one', desc: 'if no season pack exists it says so and grabs nothing, rather than quietly going back to downloading episodes one by one. Auto on an individual episode still does that whenever you want it.' },
+        { title: 'Also in 1.8.6', desc: 'Manual Search stopped discarding results it had already ranked, release names link to the indexer page they came from, results can be filtered, and manual import can take a whole season folder.' },
         { title: 'Fixed: "Check for out-of-place episodes" threw an error', desc: 'a mistake introduced in 1.8.5. The button reported "src is not defined" and did nothing at all. One edit added a piece of code that used a value, while the edit meant to create that value never saved — so the button referred to something that was not there.' },
         { title: 'And a check so that particular slip cannot ship again', desc: 'the older parts of the interface get no automatic linting, and a syntax check does not catch this kind of fault — the code is perfectly well-formed, it just refers to a name nothing defines. There is now a test that scans for exactly that.' },
         { title: 'Manual import can take a whole season folder', desc: 'the automatic side has unpacked season packs since 1.8.0, but manual import could only take one file at a time — so a pack that arrived any other way had to be placed episode by episode, answering "which show is this?" on every one. Point it at the folder instead and answer once.' },
@@ -3564,7 +3571,29 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.8.6: Manual Search opens up",
+        title: "1.8.7: two failures that were pretending to be answers",
+        description: "both of these reported something confidently untrue: a torrent that had been added was called a rejection, and a search that never finished was called an empty result.",
+        features: [
+            "the grab said \"the torrent client didn't accept the release\" while the torrent was downloading. SoulSync identified a new torrent by listing the client's torrents before and after and spotting the difference, waiting about five seconds — and qBittorrent frequently needs longer. It now derives the torrent's identity from the magnet or the torrent file BEFORE adding it, so there is no race to lose",
+            "that mattered more than the wording: a grab recorded as failed is never watched, so the finished download was never imported. The file arrived and SoulSync did not know it existed",
+            "re-adding a torrent the client already has now resolves correctly as well — it produces no new entry to spot, so it always looked like a failure",
+            "Manual Search returned nothing until you searched for the same title in Prowlarr first. A cold search across many indexers takes longer than the fifteen seconds SoulSync allowed, and a timeout was indistinguishable from \"no releases exist\" — so it said there were none. Searching in Prowlarr warmed its cache and the next attempt answered in time",
+            "searches now get ninety seconds by default (adjustable), and a failed search says what went wrong rather than reporting an empty result",
+        ],
+    },
+    {
+        title: "Grab season fetches one pack",
+        description: "it used to search for and grab every missing episode separately — a dozen searches and a dozen downloads for one season.",
+        features: [
+            "one release covering the whole season is found and grabbed; the import splits it into episodes exactly as it already did for automatic pack downloads",
+            "kinder to indexers, faster, and it stops a season being assembled from a dozen unrelated releases at different qualities and from different groups",
+            "if no season pack exists it says so and grabs NOTHING, rather than quietly reverting to one-by-one downloads. Auto on an individual episode is still there for that",
+            "every missing episode row still lights up while it works, so a season grab does not look like nothing happened",
+        ],
+        usage_note: "Open a show → a season → Grab season.",
+    },
+    {
+        title: "Earlier in 1.8.6 — Manual Search opens up",
         description: "results were being thrown away after they had already been found, a release name told you nothing about where it came from, and a long list could not be narrowed down.",
         features: [
             "the search kept the best 40 releases and 15 rejected ones and discarded the rest — after ranking them. That is why a popular title only ever showed so many. Now 100 and 40, both configurable, along with how many results are requested from Prowlarr in the first place",

@@ -70,6 +70,15 @@ class ProwlarrIndexer:
     capabilities: Dict[str, Any] = field(default_factory=dict)
 
 
+class ProwlarrUnavailable(Exception):
+    """Prowlarr could not answer — timeout, transport error, bad HTTP, junk body.
+
+    Distinct from "the indexers returned nothing", which is a perfectly valid
+    empty result. Collapsing the two is what made a timed-out search render as
+    "No matching releases found".
+    """
+
+
 @dataclass
 class ProwlarrSearchResult:
     """One release returned by a Prowlarr search.
@@ -101,6 +110,10 @@ class ProwlarrClient:
     """Thin sync-backed async wrapper around the Prowlarr v1 API."""
 
     DEFAULT_TIMEOUT = 15
+    # Searches are not metadata calls. Prowlarr queries every configured indexer,
+    # some of which authenticate on first use, so a cold search routinely runs
+    # well past 15s — and the old shared timeout turned that into "no results".
+    DEFAULT_SEARCH_TIMEOUT = 90
 
     def __init__(self) -> None:
         self._load_config()
@@ -176,6 +189,8 @@ class ProwlarrClient:
         limit: int,
         search_type: str = "search",
         extra_params: Optional[Sequence[tuple]] = None,
+        strict: bool = False,
+        timeout: Optional[float] = None,
     ) -> List[ProwlarrSearchResult]:
         # Prowlarr's search endpoint accepts repeated params: ``categories=3000&categories=3010``.
         # ``requests`` serializes lists in that exact form when passed as tuples of pairs.
@@ -188,8 +203,12 @@ class ProwlarrClient:
             if value is not None and value != '':
                 params.append((key, value))
 
-        data = self._api_get('search', params=params)
+        data = self._api_get('search', params=params,
+                             timeout=timeout or self.DEFAULT_SEARCH_TIMEOUT,
+                             strict=strict)
         if not isinstance(data, list):
+            if strict:
+                raise ProwlarrUnavailable("Prowlarr returned no result list")
             return []
         return [self._parse_result(entry) for entry in data if isinstance(entry, dict)]
 
@@ -234,8 +253,22 @@ class ProwlarrClient:
             raw=entry,
         )
 
-    def _api_get(self, path: str, params=None) -> Optional[Any]:
+    def _api_get(self, path: str, params=None, timeout=None,
+                 strict: bool = False) -> Optional[Any]:
+        """GET a Prowlarr endpoint.
+
+        ``strict=True`` RAISES on failure instead of returning None. Callers that
+        show results to a user need this: a timeout swallowed into None becomes an
+        empty list downstream, which is indistinguishable from "the indexers found
+        nothing" — so a search that never actually ran renders as "no results".
+        That is exactly what a cold multi-indexer search looked like, until you
+        warmed Prowlarr's cache by searching in its own UI and the same query then
+        came back inside the timeout.
+
+        Default stays False so existing (music-side) callers are unchanged."""
         if not self.is_configured():
+            if strict:
+                raise ProwlarrUnavailable("Prowlarr isn't configured.")
             return None
         url = f"{self._url}/api/v1/{path.lstrip('/')}"
         try:
@@ -243,15 +276,30 @@ class ProwlarrClient:
                 url,
                 headers={'X-Api-Key': self._api_key, 'Accept': 'application/json'},
                 params=params,
-                timeout=self.DEFAULT_TIMEOUT,
+                timeout=timeout or self.DEFAULT_TIMEOUT,
             )
             if not resp.ok:
                 logger.warning("Prowlarr %s returned HTTP %s", path, resp.status_code)
+                if strict:
+                    raise ProwlarrUnavailable(
+                        "Prowlarr returned HTTP %s" % resp.status_code)
                 return None
             return resp.json()
+        except http_requests.exceptions.Timeout as e:
+            logger.error("Prowlarr request to %s timed out: %s", path, e)
+            if strict:
+                raise ProwlarrUnavailable(
+                    "the search timed out after %ss. A first search across many "
+                    "indexers can be slow; raise prowlarr.search_timeout if it "
+                    "keeps happening." % (timeout or self.DEFAULT_TIMEOUT)) from e
+            return None
         except http_requests.exceptions.RequestException as e:
             logger.error("Prowlarr request to %s failed: %s", path, e)
+            if strict:
+                raise ProwlarrUnavailable("couldn't reach Prowlarr (%s)" % e) from e
             return None
         except ValueError as e:
             logger.error("Prowlarr response to %s was not JSON: %s", path, e)
+            if strict:
+                raise ProwlarrUnavailable("Prowlarr sent a response we couldn't read") from e
             return None
