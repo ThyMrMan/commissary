@@ -303,22 +303,55 @@ def test_download_and_destructive_endpoints_stay_behind_can_download(app_db):
             ("/api/video/downloads/grab-pack", {}),      # covered by the 'grab' prefix
             ("/api/video/downloads/cancel", {}),
             ("/api/video/downloads/history/clear", {}),
-            ("/api/video/wishlist/add", {}),
             ("/api/video/wishlist/remove", {}),
             ("/api/video/wishlist/clear", {}),
             ("/api/video/watchlist/approve", {"kind": "show", "tmdb_id": 1}),
+            # 'Search now' / 'Search all' start REAL grabs from the shared
+            # wishlist and were behind no gate at all.
+            ("/api/video/wishlist/search", {"scope": "movie", "tmdb_id": 1}),
+            ("/api/video/wishlist/search-all", {}),
     ):
         assert client.post(path, json=payload).status_code == 403, path
 
 
-def test_watchlist_add_is_deliberately_not_in_the_can_download_gate():
-    """It's the one write a member is allowed — because the route files it
-    pending. If someone adds it back to the gate, members lose the feature; if
-    the route stops stamping approved, the gate is the only thing left."""
+def test_a_member_may_still_add_to_the_wishlist(app_db):
+    """The counterpart to the list above. Asking is not acquiring — and this was
+    blocked, so members could not ask for anything."""
+    client, _, persona = app_db
+    _as_member(persona)
+    r = client.post("/api/video/wishlist/add",
+                    json={"movie": {"tmdb_id": 550, "title": "Fight Club", "year": 1999}})
+    assert r.status_code == 200 and r.get_json()["success"] is True
+
+
+def test_the_two_asking_endpoints_are_deliberately_not_in_the_gate():
+    """A member may ASK for something; only a downloader may fetch it.
+
+    /watchlist/add is filed pending approval by the route itself.
+    /wishlist/add puts a title on the shared wishlist — the ADMIN's automation
+    decides whether it is ever acquired. It used to be gated, which left members
+    with no way to ask for anything at all.
+
+    Everything that ACQUIRES or destroys must stay in the gate; adding either of
+    these back removes the only thing members can do."""
     gate = _VIDEO_INIT.split('can_download", True) and _p(')[1].split("):")[0]
     assert "/api/video/watchlist/add" not in gate
-    assert "/api/video/wishlist/add" in gate
-    assert "/api/video/watchlist/approve" in gate
+    assert "/api/video/wishlist/add" not in gate
+    # …while every acquisition/destructive route stays behind it.
+    for guarded in ("/api/video/watchlist/approve", "/api/video/downloads/grab",
+                    "/api/video/downloads/retry", "/api/video/downloads/cancel",
+                    "/api/video/wishlist/remove", "/api/video/wishlist/clear",
+                    # 'Search now' / 'Search all' START GRABS and had no gate at all.
+                    "/api/video/wishlist/search"):
+        assert guarded in gate, guarded
+
+
+def test_the_wishlist_search_gate_covers_search_all_by_prefix():
+    """_p() is a startswith match, so one entry guards both — but only while the
+    paths keep that shared prefix."""
+    gate = _VIDEO_INIT.split('can_download", True) and _p(')[1].split("):")[0]
+    assert "/api/video/wishlist/search" in gate
+    assert "/wishlist/search-all".startswith("/wishlist/search")
 
 
 def test_plex_defaults_grant_video_but_never_downloads():

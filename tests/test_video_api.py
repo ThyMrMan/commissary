@@ -111,7 +111,10 @@ def test_download_actions_require_can_download(tmp_path):
     c = _client_as(tmp_path, is_admin=True, can_download=False)
     for url in ["/api/video/downloads/grab", "/api/video/downloads/grab-pack",
                 "/api/video/downloads/retry", "/api/video/youtube/download",
-                "/api/video/wishlist/add",
+                # 'Search now' / 'Search all' on the wishlist START REAL GRABS and
+                # had no gate at all — any signed-in profile could download from
+                # the shared wishlist.
+                "/api/video/wishlist/search", "/api/video/wishlist/search-all",
                 # destructive siblings — reachable since Plex profiles gained
                 # video access, so they need the same gate
                 "/api/video/downloads/cancel", "/api/video/downloads/history/clear",
@@ -120,6 +123,18 @@ def test_download_actions_require_can_download(tmp_path):
                 "/api/video/watchlist/approve"]:
         r = c.post(url, json={})
         assert r.status_code == 403, "POST %s must require can_download" % url
+
+
+def test_wishlist_add_is_allowed_without_can_download(tmp_path):
+    """The other deliberate exception. A member puts a title on the shared
+    wishlist and the ADMIN's automation decides whether it is ever fetched —
+    asking is not acquiring. It used to be gated, which left members no way to
+    ask for anything at all."""
+    c = _client_as(tmp_path, is_admin=False, can_download=False)
+    r = c.post("/api/video/wishlist/add",
+               json={"movie": {"tmdb_id": 550, "title": "Fight Club", "year": 1999}})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_json()["success"] is True
 
 
 def test_watchlist_add_is_allowed_without_can_download_but_lands_pending(tmp_path):

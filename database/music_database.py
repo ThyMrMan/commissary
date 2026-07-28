@@ -5876,7 +5876,7 @@ class MusicDatabase:
     def create_profile(self, name: str, avatar_color: str = '#6366f1',
                        pin_hash: Optional[str] = None, is_admin: bool = False,
                        avatar_url: Optional[str] = None, home_page: Optional[str] = None,
-                       allowed_pages: Optional[list] = None, can_download: bool = True,
+                       allowed_pages: Optional[list] = None, can_download: Optional[bool] = None,
                        allowed_sides: Optional[str] = None,
                        plex_account_id: Optional[int] = None, plex_username: Optional[str] = None,
                        plex_thumb: Optional[str] = None) -> Optional[int]:
@@ -5884,7 +5884,19 @@ class MusicDatabase:
         plex_account_id/plex_username/plex_thumb link this profile to a Plex
         account (bulk import or Sign in with Plex auto-provisioning) — the
         caller is responsible for checking get_profile_by_plex_id() first to
-        avoid a duplicate link (no DB-level uniqueness on plex_account_id)."""
+        avoid a duplicate link (no DB-level uniqueness on plex_account_id).
+
+        ``can_download`` unset means "match the role": ON for an admin, OFF for
+        everyone else. It used to default ON for every profile, so a standard
+        user the admin created could start downloads and cancel the admin's —
+        the permission had to be noticed and turned off to be safe. Granting is
+        a deliberate act now; the switch is still per-profile in Manage
+        Profiles. An explicit True/False is always honoured, so Plex
+        provisioning (which passes False) and any caller that means it are
+        unaffected. EXISTING profiles are untouched — this only decides what a
+        NEW one starts with."""
+        if can_download is None:
+            can_download = bool(is_admin)
         if allowed_sides not in ('music', 'video', 'both'):
             allowed_sides = None   # NULL = the shipped default (music for non-admin)
         try:

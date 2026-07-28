@@ -3484,8 +3484,15 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.7': [
-        { date: 'July 2026 · 1.8.7' },
+    '1.8.8': [
+        { date: 'July 2026 · 1.8.8' },
+        { title: 'Members could start downloads from the wishlist', desc: 'the "Search now" and "Search all" buttons on the wishlist start real downloads, and they were behind no permission check at all — so anyone signed in with access to the video side could set them off. Every other download action was already checked; these two were missed. They now need download permission, like the rest.' },
+        { title: 'And they can no longer cancel your downloads', desc: 'cancelling was already checked, but a standard profile you created started with download permission switched ON, so it inherited the ability. That default has changed.' },
+        { title: 'New profiles now match their role', desc: 'a new admin can download; a new standard user cannot, until you say so. Previously every new profile could download unless you noticed and turned it off. Existing profiles are left exactly as they are — quietly taking away something someone relies on would be its own kind of bug.' },
+        { title: 'Check who has it today', desc: 'the permission is per profile in Manage Profiles. There is also a small script, tools/audit_download_permission.py, that lists every profile and flags any non-admin who can currently start or cancel downloads.' },
+        { title: 'Adding to the wishlist works again for everyone', desc: 'the opposite problem: a profile without download permission was blocked from ADDING to the wishlist, so members had no way to ask for anything. Asking is not downloading — a member adds a title and your automation, or you, decides whether it is actually fetched.' },
+        { title: 'A clear button on the search fields', desc: 'the Library, Music Library and Purchased search boxes have an × once you type in them. Escape clears too. Whatever filtering the page already does runs exactly as if you had deleted the text by hand.' },
+        { title: 'Also in 1.8.7', desc: 'a torrent that had been added stopped reporting as rejected, Manual Search stopped returning nothing until you searched in Prowlarr first, and Grab season now fetches a single season pack.' },
         { title: 'Fixed: a torrent that WAS added reported as rejected', desc: 'the grab said "the torrent client didn\'t accept the release" while the torrent sat there downloading. SoulSync worked out the new torrent\'s identity by listing the client\'s torrents before and after and spotting the difference, waiting about five seconds. qBittorrent often needs longer — resolving a magnet, or simply busy — and when the wait ran out a perfectly good add was called a failure.' },
         { title: 'Why that mattered more than the message', desc: 'a grab recorded as failed is never watched, so when the download finished nothing imported it. The file arrived and SoulSync did not know it existed. It now works out the torrent\'s identity from the magnet or the torrent file itself, before adding it, so there is nothing to race. Re-adding something the client already has now resolves properly too, instead of looking like a rejection.' },
         { title: 'Fixed: Manual Search finding nothing until you searched in Prowlarr first', desc: 'a first search across many indexers is slow — Prowlarr queries each one and some have to log in — and SoulSync gave up after fifteen seconds, the same short limit it uses for quick status checks. Worse, it could not tell a search that timed out from a search that found nothing, so it reported "No matching releases found". Searching in Prowlarr first made its cache answer instantly, which is why that appeared to fix it.' },
@@ -3571,7 +3578,27 @@ const WHATS_NEW = {
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
     {
-        title: "1.8.7: two failures that were pretending to be answers",
+        title: "1.8.8: members can ask, not fetch",
+        description: "a permission fix. Standard and Plex users could start downloads from the wishlist, and a standard profile could cancel yours — while the one thing they SHOULD be able to do, adding to the wishlist, was blocked.",
+        features: [
+            "\"Search now\" and \"Search all\" on the wishlist start real downloads and were behind no permission check at all. Every other download action was already covered; these two were missed. They now require download permission",
+            "cancelling was already checked — but a standard profile you created started with download permission ON, so it inherited the ability. A new profile now matches its role: an admin can download, a standard user cannot until you say so",
+            "EXISTING profiles are left exactly as they are. Quietly revoking something someone relies on would be its own kind of bug — tools/audit_download_permission.py lists every profile and flags any non-admin who can currently start or cancel downloads",
+            "adding to the wishlist works for everyone again. It had been blocked for exactly the people meant to use it, so members had no way to ask for anything. Asking is not downloading: your automation, or you, still decides what is actually fetched",
+            "the buttons that would be refused are hidden for those profiles too — but that is only so nothing offers an action that fails. The server is still the check",
+        ],
+        usage_note: "Manage Profiles → per-profile 'Can download'.",
+    },
+    {
+        title: "A clear button on the search fields",
+        description: "the Library, Music Library and Purchased search boxes now have an × once there is something to clear.",
+        features: [
+            "Escape clears the field too, though only when it has text in it — so it still closes a dialog on an empty box",
+            "clearing runs whatever filtering the page already does, exactly as if you had deleted the text by hand, rather than being a second way of filtering that could behave differently",
+        ],
+    },
+    {
+        title: "Earlier in 1.8.7 — two failures pretending to be answers",
         description: "both of these reported something confidently untrue: a torrent that had been added was called a rejection, and a search that never finished was called an empty result.",
         features: [
             "the grab said \"the torrent client didn't accept the release\" while the torrent was downloading. SoulSync identified a new torrent by listing the client's torrents before and after and spotting the difference, waiting about five seconds — and qBittorrent frequently needs longer. It now derives the torrent's identity from the magnet or the torrent file BEFORE adding it, so there is no race to lose",

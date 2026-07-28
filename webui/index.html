@@ -1100,6 +1100,7 @@
                                 <div class="library-search-container">
                                     <input type="text" class="library-search-input" data-video-lib-search placeholder="Search movies...">
                                     <div class="library-search-icon">&#128269;</div>
+                                    <button type="button" class="library-search-clear" data-search-clear aria-label="Clear search" title="Clear search" hidden>&times;</button>
                                 </div>
                                 <div class="video-library-filters">
                                     <select class="library-source-filter-select" data-video-lib-sort title="Sort">
@@ -4460,6 +4461,7 @@
                             <input type="text" id="library-search-input" class="library-search-input"
                                 placeholder="Filter your library…">
                             <div class="library-search-icon">🔍</div>
+                            <button type="button" class="library-search-clear" data-search-clear aria-label="Clear search" title="Clear search" hidden>&times;</button>
                         </div>
 
                         <!-- Watchlist Filter -->
@@ -10921,6 +10923,7 @@
                             <input type="text" id="purchased-search-input" class="library-search-input"
                                 placeholder="Filter by title, artist, or album…">
                             <div class="library-search-icon">🔍</div>
+                            <button type="button" class="library-search-clear" data-search-clear aria-label="Clear search" title="Clear search" hidden>&times;</button>
                         </div>
                         <button class="btn btn--secondary purchased-collapse-all-btn hidden"
                                 id="purchased-collapse-all-btn" type="button"
@@ -12198,6 +12201,7 @@
          floating-orb animation around the SoulSync logo on the video dashboard) -->
     <script src="{{ url_for('static', filename='video/video-worker-orbs.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='config-migration.js', v=static_v) }}"></script>
+    <script src="{{ url_for('static', filename='search-clear.js', v=static_v) }}"></script>
 </body>
 
 </html>

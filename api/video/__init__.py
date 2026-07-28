@@ -113,11 +113,22 @@ def create_video_blueprint() -> Blueprint:
         # (video_watchlist.approved=0) and no acquisition path acts on it until an
         # admin clears it. The endpoint itself stamps approved from can_download,
         # so relaxing the gate here cannot start a download.
+        # /wishlist/add and /youtube/wishlist/add are deliberately ABSENT, same
+        # reasoning as /watchlist/add above: asking for something is not
+        # acquiring it. A member adds a title to the shared wishlist and the
+        # ADMIN's automation (or the admin, by hand) decides whether it is
+        # actually fetched. Blocking the add only meant members had no way to
+        # ask, which is the opposite of the point.
         if writing and not getattr(g, "can_download", True) and _p(
                 # '/downloads/grab' also covers '/downloads/grab-pack' by prefix
                 "/api/video/downloads/grab", "/api/video/downloads/retry",
-                "/api/video/youtube/download", "/api/video/wishlist/add",
-                "/api/video/youtube/wishlist/add",
+                "/api/video/youtube/download",
+                # 'Search now' / 'Search all' on the wishlist START REAL GRABS —
+                # their own docstrings say so ("the downloads page / badge shows
+                # what it grabs"). They were behind no gate at all, so any signed-in
+                # profile with video access could download from the wishlist.
+                # The prefix covers /wishlist/search-all too.
+                "/api/video/wishlist/search",
                 # approving IS acquisition — admin-only, checked in the route too
                 "/api/video/watchlist/approve",
                 # Destructive siblings of the above. These were unreachable while

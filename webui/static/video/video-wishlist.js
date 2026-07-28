@@ -75,7 +75,16 @@
     }
     // "Search now" — the manual override Sonarr users expect: skips the release
     // gate for THIS item and runs the drain's search/pick/enqueue immediately.
+    // Can THIS profile start a download? Mirrors the server's can_download gate
+    // (api/video/__init__.py) purely so the UI doesn't offer buttons that would
+    // come back 403. The server is still the authority — hiding a control is a
+    // courtesy, never a permission check.
+    function mayGrab() {
+        return (typeof canDownload !== 'function') || canDownload();
+    }
+
     function huntBtn(scope, attrs) {
+        if (!mayGrab()) return '';
         return '<button class="vwsh-hunt" type="button" title="Search now" aria-label="Search now" ' +
             'data-vwsh-hunt="' + scope + '"' + attrs + '>' +
             '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" ' +
@@ -157,6 +166,7 @@
     }
 
     function pickBtn(cls, scope, attrs) {
+        if (!mayGrab()) return '';
         return '<button class="' + cls + ' vwsh-pick" type="button" ' +
             'title="Manual search — pick a release" aria-label="Manual search" ' +
             'data-vwsh-pick="' + scope + '"' + attrs + '>' + PICK_ICON + '</button>';
@@ -246,7 +256,7 @@
                     '<div class="vwsh-szn-name">' + esc(sName) + '</div>' +
                     '<div class="vwsh-szn-count">' + n + (yt ? ' video' : ' episode') + (n === 1 ? '' : 's') + '</div>' +
                     '<div class="vwsh-szn-go">' + (yt ? 'View channel' : 'View show') + ' &rarr;</div>' +
-                    (yt ? '' : '<button class="vwsh-szn-hunt" type="button" data-vwsh-hunt="season" ' +
+                    ((yt || !mayGrab()) ? '' : '<button class="vwsh-szn-hunt" type="button" data-vwsh-hunt="season" ' +
                         'data-tmdb="' + esc(sh.tmdb_id) + '" data-s="' + se.season_number + '" title="Search this season now">' +
                         '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" ' +
                         'stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></button>') +
@@ -1002,7 +1012,11 @@
         var clearBtn = $('[data-vwsh-clear]');
         if (clearBtn) clearBtn.addEventListener('click', clearAll);
         var saBtn = $('[data-vwsh-searchall]');
-        if (saBtn) saBtn.addEventListener('click', searchAllMissing);
+        // Hidden outright rather than wired-and-refused: it grabs everything
+        // eligible on the shared wishlist, which is the last thing a member
+        // should be able to set off by accident.
+        if (saBtn && !mayGrab()) saBtn.hidden = true;
+        else if (saBtn) saBtn.addEventListener('click', searchAllMissing);
         var prev = $('[data-vwsh-prev]');
         if (prev) prev.addEventListener('click', function () { if (state.page > 1) { state.page--; load(); } });
         var next = $('[data-vwsh-next]');

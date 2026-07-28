@@ -27736,6 +27736,37 @@ body:has(.download-missing-modal[style*="display: flex"]) #helper-float-btn {
     color: rgba(255, 255, 255, 0.5);
 }
 
+/* Clear button for the library-style search fields. Hidden while the field is
+   empty (nothing to clear), so it never sits there as dead furniture. Padded on
+   the right of the input so long text can't run underneath it. */
+.library-search-clear {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.08);
+    color: rgba(255, 255, 255, 0.65);
+    font-size: 17px;
+    line-height: 1;
+    cursor: pointer;
+    transition: background 0.18s ease, color 0.18s ease;
+}
+.library-search-clear:hover { background: rgba(255, 255, 255, 0.16); color: #fff; }
+.library-search-clear:focus-visible {
+    outline: 2px solid rgba(var(--accent-rgb), 0.7);
+    outline-offset: 1px;
+}
+.library-search-clear[hidden] { display: none; }
+/* Room for the button; without it a long query slides under the ×. */
+.library-search-container .library-search-input { padding-right: 42px; }
+
 .library-search-icon {
     position: absolute;
     left: 16px;

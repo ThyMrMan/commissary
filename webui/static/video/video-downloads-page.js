@@ -7,6 +7,14 @@
  * Rows are created ONCE and patched in place so progress glides and nothing blinks.
  */
 (function () {
+
+    // Can THIS profile act on downloads? Mirrors the server's can_download gate
+    // (api/video/__init__.py). The server stays the authority — this only stops
+    // the page offering buttons that would come back 403, and stops a member
+    // cancelling or retrying the ADMIN's downloads on the shared queue.
+    function mayGrab() {
+        return (typeof canDownload !== 'function') || canDownload();
+    }
     'use strict';
 
     var URL_ACTIVE = '/api/video/downloads/active';
@@ -141,7 +149,7 @@
         }
         var act2 = el.querySelector('[data-f="act"]');
         if (act2) {
-            var wantAct = act ? '<button class="adl-row-cancel" type="button" data-vdpg-group-cancel="' + esc(key) + '" title="Cancel all in this batch">' + X_SVG + '</button>' : '';
+            var wantAct = (act && mayGrab()) ? '<button class="adl-row-cancel" type="button" data-vdpg-group-cancel="' + esc(key) + '" title="Cancel all in this batch">' + X_SVG + '</button>' : '';
             if (act2.innerHTML !== wantAct) act2.innerHTML = wantAct;
         }
         var collapsed = !!_gcollapse[key];
@@ -278,7 +286,7 @@
                   '" data-kind="' + esc(d.kind || 'movie') + '" data-source="' + esc(d.media_source || 'library') +
                   '" title="Open ' + (d.kind === 'movie' ? 'movie' : 'show') + ' page">' + OPEN_SVG + '</button>');
         var stateBtn = active
-            ? '<button class="adl-row-cancel" type="button" data-vdpg-cancel="' + d.id + '" title="Cancel">' + X_SVG + '</button>'
+            ? (mayGrab() ? '<button class="adl-row-cancel" type="button" data-vdpg-cancel="' + d.id + '" title="Cancel">' + X_SVG + '</button>' : '')
             : isFail(d.status)
                 ? '<button class="vdpg-row-retry" type="button" data-vdpg-retry="' + d.id + '" title="Retry">' + R_SVG + '</button>'
                 : '';
@@ -437,7 +445,7 @@
         var ytCh = meta.channel_id || ctx.channel_id;
         if (isYt && ytCh) btns.push('<button class="vdpg-dr-btn" type="button" data-vdpg-open-channel="' + esc(ytCh) + '">Open channel</button>');
         if (isYt && d.media_id) btns.push('<a class="vdpg-dr-btn" href="https://www.youtube.com/watch?v=' + encodeURIComponent(d.media_id) + '" target="_blank" rel="noopener">Open on YouTube</a>');
-        if (isActive(d.status)) btns.push('<button class="vdpg-dr-btn vdpg-dr-danger" type="button" data-vdpg-cancel="' + d.id + '">Cancel</button>');
+        if (isActive(d.status) && mayGrab()) btns.push('<button class="vdpg-dr-btn vdpg-dr-danger" type="button" data-vdpg-cancel="' + d.id + '">Cancel</button>');
         else if (isFail(d.status)) {
             if (d.status === 'import_failed' && canImport()) btns.push('<button class="vdpg-dr-btn vdpg-dr-accent" type="button" data-vdpg-import>Manual Import</button>');
             btns.push('<button class="vdpg-dr-btn vdpg-dr-accent" type="button" data-vdpg-retry="' + d.id + '">Retry</button>');
@@ -501,7 +509,8 @@
             }
         });
         setDownloadsBadge(counts.active);   // sidebar live count (this page's poll keeps it fresh)
-        var cancelAll = document.querySelector('[data-vdpg-cancel-all]'); if (cancelAll) cancelAll.style.display = counts.active ? '' : 'none';
+        var cancelAll = document.querySelector('[data-vdpg-cancel-all]');
+        if (cancelAll) cancelAll.style.display = (counts.active && mayGrab()) ? '' : 'none';
         var retryAll = document.querySelector('[data-vdpg-retry-all]');
         if (retryAll) retryAll.style.display = counts.retryable >= 2 ? '' : 'none';
         var clearBtn = document.querySelector('[data-vdpg-clear]'); if (clearBtn) clearBtn.style.display = (counts.completed + counts.failed) ? '' : 'none';
