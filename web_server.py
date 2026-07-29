@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.8.10"
+_SOULSYNC_BASE_VERSION = "1.8.11"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -4618,6 +4618,48 @@ def test_connection_endpoint():
         add_activity_item("", "Connection Test", f"{service.title()} connection failed", "Now")
 
     return jsonify({"success": success, "error": "" if success else message, "message": message if success else ""})
+
+
+# The search source picker needs to know which sources are set up so it can hide
+# the ones that cannot answer a search. It cannot use /api/settings/config-status:
+# that is @admin_only, so for a standard or Plex profile it 403s, the client falls
+# back to its permissive default (everything "configured") and nothing is hidden —
+# which is exactly the bug this endpoint exists to fix. Same shape as the admin
+# one, but restricted to the sources the picker can actually show and carrying
+# nothing but booleans: no keys, no URLs, no per-service settings.
+_SEARCH_PICKER_SOURCES = (
+    'spotify', 'itunes', 'deezer', 'discogs', 'hydrabase', 'amazon',
+    'musicbrainz', 'jiosaavn', 'bandcamp', 'soulseek',
+)
+
+
+@app.route('/api/search/source-status', methods=['GET'])
+def search_source_status_endpoint():
+    """Which SEARCH sources have credentials — readable by any signed-in profile.
+
+    Booleans only, and only for the sources the picker renders. A member can
+    already see which sources the picker offers, so this tells them nothing the
+    page does not; it just lets them compute it correctly instead of falling back
+    to showing every source."""
+    try:
+        from core.metadata.registry import experimental_source_rejected, experimental_status
+        result = {
+            service: {'configured': _is_service_configured(service)}
+            for service in _SEARCH_PICKER_SOURCES
+            if service in SERVICE_CONFIG_REGISTRY and not experimental_source_rejected(service)
+        }
+        result['_experimental'] = experimental_status()
+        if 'spotify' in result:
+            try:
+                meta_avail = bool(spotify_client and spotify_client.is_spotify_metadata_available())
+            except Exception:   # noqa: BLE001
+                meta_avail = False
+            result['spotify']['metadata_available'] = (
+                result['spotify']['configured'] or meta_avail)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"search source-status error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/settings/config-status', methods=['GET'])

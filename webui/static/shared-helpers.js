@@ -177,14 +177,19 @@ function visibleSourceOrder(enabledExperimental = new Set()) {
     );
 }
 
-// Fetch /api/settings/config-status and return a map { src -> bool }
+// Fetch /api/search/source-status and return a map { src -> bool }
 // covering every visible source. Sources not present in the backend
 // registry (musicbrainz / youtube_videos / soulseek) are reported as
 // configured so the picker doesn't dim always-available sources.
 async function fetchSourceConfiguredMap(enabledExperimental = new Set()) {
     const map = {};
     try {
-        const resp = await fetch('/api/settings/config-status');
+        // NOT /api/settings/config-status — that one is admin-only, so for a
+        // standard or Plex profile it 403s and we fall through to the permissive
+        // default below, marking every source configured and hiding nothing.
+        // This endpoint carries the same booleans for the picker's own sources
+        // and is readable by any signed-in profile.
+        const resp = await fetch('/api/search/source-status');
         if (resp.ok) {
             const data = await resp.json();
             // /status and config-status share the _experimental shape; trust the

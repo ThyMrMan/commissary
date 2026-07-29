@@ -3484,8 +3484,13 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.10': [
-        { date: 'July 2026 · 1.8.10' },
+    '1.8.11': [
+        { date: 'July 2026 · 1.8.11' },
+        { title: 'A correction to 1.8.9', desc: 'that release hid search sources you have not set up — but only for admins. Standard and Plex users still saw the full row. The page asked an admin-only endpoint which of your connections were configured; for anyone else it came back "not allowed", and the page treats an unanswered lookup as "assume everything is configured" and hides nothing.' },
+        { title: 'Why it failed that way round', desc: 'assuming everything is set up is the right answer when the lookup fails for an ordinary reason — a moment offline should never leave you staring at an empty picker with no way to search. It is the wrong answer for "you are not allowed to ask", and the page could not tell the two apart. It now asks a question it is allowed to ask.' },
+        { title: 'What the new lookup will tell a standard user', desc: 'only whether each of the ten SEARCH sources has credentials — nothing else. No keys, no addresses, no settings, and nothing about your Plex, Jellyfin, slskd, Tidal, Qobuz or Last.fm connections. It is the same thing the row of icons shows them anyway; they can now work it out correctly instead of being shown everything.' },
+        { title: 'The Settings page is unchanged', desc: 'the Connections indicator still reads the full admin-only picture. Only the search picker moved, and it moved to a smaller question rather than the admin gate being loosened.' },
+        { title: 'Also in 1.8.10', desc: 'a wishlist request from someone without download rights now waits for your approval instead of being fetched unattended.' },
         { title: 'A wishlist request now waits for you', desc: 'the Watchlist has worked this way since 1.6.7; the wishlist did not. A title added by someone without download rights went straight into the hourly automation and was fetched unattended. It now lands as "Awaiting approval" — visible on the wishlist immediately, so the person who asked can see they asked, while nothing goes looking for it until you say yes.' },
         { title: 'Approve or Decline on the card', desc: 'admins see both buttons with the requester\'s name. Approving a show releases every pending episode under it at once. Declining removes the request; nothing re-adds a wish on its own, so it stays gone until somebody asks again.' },
         { title: 'Every route that could fetch it is covered', desc: 'that is the part that matters — one missed path and the automation quietly downloads something nobody approved. The hourly drain, RSS matching, "Search now", "Search all missing" and the YouTube worker all read the wishlist through the same four places, and all four skip anything still waiting. Pressing a different button cannot get round it.' },
@@ -3594,6 +3599,16 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.8.11: a correction to 1.8.9",
+        description: "1.8.9 hid search sources you have not set up — but only for admins. Standard and Plex users still saw the full row, which is exactly what that change was meant to stop.",
+        features: [
+            "the page asked an admin-only endpoint which connections were configured. For anyone else it came back \"not allowed\", and an unanswered lookup is treated as \"assume everything is set up\" — so nothing was hidden",
+            "that assumption is right when the lookup fails for an ordinary reason: a moment offline should never leave you staring at an empty picker with no way to search. It is wrong for \"you are not allowed to ask\", and the page could not tell the two apart. It now asks a question it is allowed to ask",
+            "the new lookup tells a standard user only whether each of the ten SEARCH sources has credentials. No keys, no addresses, no settings, and nothing about your Plex, Jellyfin, slskd, Tidal, Qobuz or Last.fm connections",
+            "Settings → Connections is unchanged and still reads the full admin-only picture. Only the search picker moved, and it moved to a smaller question rather than the admin gate being loosened",
+        ],
+    },
     {
         title: "1.8.10: a wishlist request waits for you",
         description: "the Watchlist has needed approval since 1.6.7. The wishlist did not — a title added by someone without download rights went straight into the hourly automation and was fetched unattended.",
