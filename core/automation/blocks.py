@@ -183,6 +183,15 @@ TRIGGERS: list[dict] = [
      "has_conditions": True,
      "condition_fields": ["title", "kind"],
      "variables": ["kind", "title"]},
+    # Fires ONLY for a request awaiting admin approval — from either queue. The
+    # two 'added' triggers above fire for every add including automation's own,
+    # so they can't be used to catch "someone is waiting on me".
+    {"type": "video_request_pending", "label": "Video Request Needs Approval", "icon": "user-check", "scope": "video",
+     "description": "When someone without download rights asks for something and it is waiting for an admin to approve it",
+     "available": True,
+     "has_conditions": True,
+     "condition_fields": ["title", "kind", "queue", "requested_by"],
+     "variables": ["kind", "title", "count", "queue", "requested_by", "tmdb_id"]},
     {"type": "video_watchlist_removed", "label": "Video Watchlist Unfollow", "icon": "eye-off", "scope": "video",
      "description": "When a show, person, channel or playlist is unfollowed", "available": True,
      "has_conditions": True,

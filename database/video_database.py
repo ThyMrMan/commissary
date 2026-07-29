@@ -6261,6 +6261,13 @@ class VideoDatabase:
             # A refresh-upsert of an existing follow is not a new follow.
             if not (was and was["state"] == "follow"):
                 _publish_video_event("video_watchlist_added", {"kind": kind, "title": title})
+                # The watchlist has had an approval queue since 1.6.7 and has
+                # never been able to tell anyone about it.
+                if not approved:
+                    _publish_video_event("video_request_pending", {
+                        "kind": kind, "title": title, "count": 1,
+                        "queue": "watchlist", "tmdb_id": int(tmdb_id),
+                        "requested_by": requested_by_name})
             return True
         except Exception:
             logger.exception("add_to_watchlist failed (%s %s)", kind, tmdb_id)
@@ -6648,6 +6655,15 @@ class VideoDatabase:
             if not existed:   # a refresh-upsert is not a new wish
                 _publish_video_event("video_wishlist_item_added",
                                      {"kind": "movie", "title": title, "count": 1})
+                # ...and, separately, that somebody is waiting on an admin. Both
+                # fire: the item WAS added, so an existing subscription to the
+                # 'added' event keeps behaving as it did. This one is the signal
+                # you can actually act on.
+                if not approved:
+                    _publish_video_event("video_request_pending", {
+                        "kind": "movie", "title": title, "count": 1,
+                        "queue": "wishlist", "tmdb_id": int(tmdb_id),
+                        "requested_by": requested_by_name})
             return True
         except Exception:
             logger.exception("add_movie_to_wishlist failed (%s)", tmdb_id)
@@ -6943,6 +6959,13 @@ class VideoDatabase:
             if new_rows > 0:   # refresh-upserts of already-wished episodes don't fire
                 _publish_video_event("video_wishlist_item_added",
                                      {"kind": "episode", "title": show_title, "count": new_rows})
+                # ONE event for the whole ask, carrying the count — a 24-episode
+                # season request must not become 24 Discord messages.
+                if not approved:
+                    _publish_video_event("video_request_pending", {
+                        "kind": "episode", "title": show_title, "count": new_rows,
+                        "queue": "wishlist", "tmdb_id": int(show_tmdb_id),
+                        "requested_by": requested_by_name})
             return n
         except Exception:
             logger.exception("add_episodes_to_wishlist failed (%s)", show_tmdb_id)
@@ -8364,6 +8387,11 @@ class VideoDatabase:
             if new_rows > 0:   # refresh-upserts of already-wished videos don't fire
                 _publish_video_event("video_wishlist_item_added",
                                      {"kind": "youtube", "title": ctitle, "count": new_rows})
+                if not approved:
+                    _publish_video_event("video_request_pending", {
+                        "kind": "youtube", "title": ctitle, "count": new_rows,
+                        "queue": "wishlist", "tmdb_id": None,
+                        "requested_by": requested_by_name})
             return n
         except Exception:
             logger.exception("add_videos_to_wishlist failed (%s)", cid)

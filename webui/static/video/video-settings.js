@@ -613,6 +613,10 @@
         video_download_completed: 'Imported', video_upgrade_completed: 'Upgraded',
         video_import_failed: 'Import failed', video_download_failed: 'Failed',
         video_wishlist_item_added: 'Wishlisted', video_watchlist_added: 'Followed',
+        // The event list itself comes from the server; this map is only labels,
+        // and an unlisted event falls back to its raw key — so a new one has to
+        // be added here or the checkbox reads 'video_request_pending'.
+        video_request_pending: 'Needs approval',
     };
 
     function loadNotify() {

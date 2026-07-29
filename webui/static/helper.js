@@ -3484,8 +3484,14 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.11': [
-        { date: 'July 2026 · 1.8.11' },
+    '1.8.12': [
+        { date: 'July 2026 · 1.8.12' },
+        { title: 'Get told when someone is waiting on you', desc: 'a request that needs your approval can now send you a Discord message — or a Telegram message, or a POST to any URL you like. Settings → Notifications, add a connection, tick "Needs approval". Without it the only way to find a pending request was to go and look at the page.' },
+        { title: 'It covers the Watchlist too — which never had this', desc: 'follows have been landing in an approval queue since 1.6.7, and nothing has ever been able to tell you. If standard users have been following shows, there may be entries waiting for you right now; the Watchlist page marks them "Awaiting approval".' },
+        { title: 'Why a new alert rather than the existing one', desc: 'there was already a "Wishlisted" notification, but it fires for everything added — including your own, and everything the hourly jobs add, which can be dozens at once — and it never said who asked or whether it needed you. Subscribing to it to catch requests meant being buried in things you already knew about. The new one fires only for a request that is actually waiting.' },
+        { title: 'One message per request, not one per episode', desc: 'asking for a whole season sends a single "Breaking Bad (24 items · asked by Member)", not twenty-four separate pings. And asking again for something already requested stays quiet, so a refreshed page does not re-alert you.' },
+        { title: 'Or build your own rule', desc: 'Automations has it as a trigger — "Video Request Needs Approval" — so you can send different channels different things, filter by who asked, or by whether it was the wishlist or the watchlist.' },
+        { title: 'Also in 1.8.11', desc: 'a correction: 1.8.9 hid unconfigured search sources for admins only, and standard/Plex users still saw the full row.' },
         { title: 'A correction to 1.8.9', desc: 'that release hid search sources you have not set up — but only for admins. Standard and Plex users still saw the full row. The page asked an admin-only endpoint which of your connections were configured; for anyone else it came back "not allowed", and the page treats an unanswered lookup as "assume everything is configured" and hides nothing.' },
         { title: 'Why it failed that way round', desc: 'assuming everything is set up is the right answer when the lookup fails for an ordinary reason — a moment offline should never leave you staring at an empty picker with no way to search. It is the wrong answer for "you are not allowed to ask", and the page could not tell the two apart. It now asks a question it is allowed to ask.' },
         { title: 'What the new lookup will tell a standard user', desc: 'only whether each of the ten SEARCH sources has credentials — nothing else. No keys, no addresses, no settings, and nothing about your Plex, Jellyfin, slskd, Tidal, Qobuz or Last.fm connections. It is the same thing the row of icons shows them anyway; they can now work it out correctly instead of being shown everything.' },
@@ -3599,6 +3605,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.8.12: get told when someone is waiting on you",
+        description: "a request that needs your approval can now reach you on Discord, Telegram, or any URL you like — instead of sitting on a page until you happen to look.",
+        features: [
+            "Settings → Notifications, add a connection, tick \"🙋 Needs approval\". That is the whole setup",
+            "it covers the Watchlist as well, which never had this: follows have been landing in an approval queue since 1.6.7 with nothing able to tell you. If standard users have been following shows, entries may be waiting for you right now",
+            "there was already a \"Wishlisted\" alert, but it fires for everything added — your own, and everything the hourly jobs add, dozens at a time — and never said who asked or whether it needed you. This one fires only for a request that is actually waiting",
+            "one message per request: a whole season sends a single \"Breaking Bad (24 items · asked by Member)\", not twenty-four pings. Asking again for something already requested stays quiet",
+            "Automations has it as a trigger too — \"Video Request Needs Approval\" — so you can route by who asked, or by whether it was the wishlist or the watchlist",
+        ],
+        usage_note: "Settings → Notifications. The message names the title, how many, who asked, and which list to open.",
+    },
     {
         title: "1.8.11: a correction to 1.8.9",
         description: "1.8.9 hid search sources you have not set up — but only for admins. Standard and Plex users still saw the full row, which is exactly what that change was meant to stop.",

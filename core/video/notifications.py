@@ -32,6 +32,7 @@ EVENTS = (
     "video_download_completed", "video_upgrade_completed",
     "video_import_failed", "video_download_failed",
     "video_wishlist_item_added", "video_watchlist_added",
+    "video_request_pending",
 )
 _EVENT_LABEL = {
     "video_download_completed": "✅ Imported",
@@ -40,6 +41,13 @@ _EVENT_LABEL = {
     "video_download_failed": "❌ Download failed",
     "video_wishlist_item_added": "⭐ Wishlisted",
     "video_watchlist_added": "👁 Following",
+    # Fired ONLY when a request lands awaiting approval. Distinct from the two
+    # 'added' events above because those fire for every add — yours, and every
+    # automation add (watchlist scan, collections, RSS, import lists), which can
+    # write dozens of rows at once. Subscribing to those to catch member requests
+    # means drowning in adds you already knew about, with nothing in the payload
+    # saying which one needs you.
+    "video_request_pending": "🙋 Needs approval",
 }
 MAX_CONNECTIONS = 16
 
@@ -125,6 +133,14 @@ def format_message(event_type: str, data: Dict[str, Any]) -> str:
         bits.append(str(data["source"]))
     if data.get("error"):
         bits.append(str(data["error"])[:200])
+    # Approval requests: say how many and who, or the message can't be acted on
+    # without opening the app to find out what it's even referring to.
+    if data.get("count") and int(data.get("count") or 0) > 1:
+        bits.append("%d items" % int(data["count"]))
+    if data.get("requested_by"):
+        bits.append("asked by %s" % str(data["requested_by"])[:60])
+    if data.get("queue"):
+        bits.append("on the %s" % str(data["queue"])[:20])
     return "%s: %s%s" % (label, title, (" (" + " · ".join(bits) + ")") if bits else "")
 
 
