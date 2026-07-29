@@ -25,6 +25,9 @@ web_server = pytest.importorskip('web_server')
 
 # (method, path) for every endpoint that must be admin-only.
 GATED = [
+    # Enumerates every account on the server, including the Plex username behind
+    # each linked profile. The account picker uses /api/profiles/switchable.
+    ('GET', '/api/profiles'),
     ('GET', '/api/v1/api-keys-internal'),
     ('POST', '/api/v1/api-keys-internal/generate'),
     ('DELETE', '/api/v1/api-keys-internal/revoke/abc'),

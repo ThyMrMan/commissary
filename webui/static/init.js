@@ -640,8 +640,11 @@ async function initProfileSystem() {
             return true; // Profile already selected, skip picker
         }
 
-        // Fetch all profiles
-        const res = await fetch('/api/profiles');
+        // Only the profiles THIS browser may become — the ones it has
+        // authenticated as, plus the root admin. /api/profiles is the admin
+        // management list and is gated; using it here is what let the picker
+        // offer every Plex user's account.
+        const res = await fetch('/api/profiles/switchable');
         const data = await res.json();
         const profiles = data.profiles || [];
 
@@ -1343,18 +1346,32 @@ function showProfilePicker(profiles, canCancel = false) {
 
 async function handleProfileClick(profile) {
     // Fetch profile count — PIN only matters with multiple profiles
+    // How many profiles exist on the SERVER — the PIN rule keys on that, not on
+    // how many this browser can see. /api/profiles is admin-gated now, so asking
+    // it here would 403 for a member and silently skip the PIN dialog.
     let profileCount = 1;
     try {
-        const r = await fetch('/api/profiles');
+        const r = await fetch('/api/profiles/switchable');
         const d = await r.json();
-        profileCount = (d.profiles || []).length;
+        profileCount = d.total_profiles || (d.profiles || []).length;
     } catch (e) { }
 
     if (profile.has_pin && profileCount > 1) {
         showPinDialog(profile);
     } else {
         const wasSwitching = !!currentProfile;
-        await selectProfile(profile.id);
+        const ok = await selectProfile(profile.id);
+        // A refused switch must not reload as though it worked. The picker only
+        // lists what the server will allow, so this is the stale-page case: the
+        // profile stopped being switchable while the screen was open.
+        if (!ok) {
+            const why = _lastSelectError || {};
+            if (why.pin_required) { showPinDialog(profile); return; }
+            if (typeof showToast === 'function') {
+                showToast(why.error || 'Sign in as this profile to switch to it.', 'error');
+            }
+            return;
+        }
         if (wasSwitching) {
             window.location.reload();
             return;
@@ -1449,8 +1466,15 @@ function showPinDialog(profile) {
     input.addEventListener('keydown', handleKeydown);
 }
 
+// Why the last selectProfile() was refused, for callers that need to react
+// (PIN prompt vs "sign in as this profile"). selectProfile returns a bare
+// boolean and several callers already depend on that, so the detail rides
+// alongside rather than changing the signature.
+let _lastSelectError = null;
+
 async function selectProfile(profileId) {
     try {
+        _lastSelectError = null;
         const oldProfileId = currentProfile ? currentProfile.id : null;
         const res = await fetch('/api/profiles/select', {
             method: 'POST',
@@ -1458,6 +1482,7 @@ async function selectProfile(profileId) {
             body: JSON.stringify({ profile_id: profileId })
         });
         const data = await res.json();
+        if (!data.success) _lastSelectError = data;
         if (data.success) {
             setCurrentProfile(data.profile);
             // Join profile-scoped WebSocket room for watchlist/wishlist count updates
@@ -1505,7 +1530,8 @@ function updateProfileIndicator() {
     if (personalSettingsBtn) personalSettingsBtn.style.display = currentProfile.is_admin ? 'none' : '';
 
     indicator.onclick = async () => {
-        const res = await fetch('/api/profiles');
+        // The swap-account screen: signed-in accounts only.
+        const res = await fetch('/api/profiles/switchable');
         const data = await res.json();
         if (data.profiles && data.profiles.length > 0) {
             showProfilePicker(data.profiles, true);
@@ -2254,7 +2280,9 @@ function initProfileManagement() {
             document.getElementById('profile-manage-panel').style.display = 'none';
             // Refresh picker — keep cancel button if user already has a profile selected
             const hasCancel = !!currentProfile;
-            fetch('/api/profiles').then(r => r.json()).then(d => {
+            // Repopulating the PICKER — switchable, like every other place that
+            // feeds it. (A non-admin can reach this by closing "My Profile".)
+            fetch('/api/profiles/switchable').then(r => r.json()).then(d => {
                 showProfilePicker(d.profiles || [], hasCancel);
             });
         };
@@ -2449,6 +2477,10 @@ async function loadProfileManageList() {
         editBtn.dataset.homePage = p.home_page || '';
         editBtn.dataset.allowedPages = p.allowed_pages ? JSON.stringify(p.allowed_pages) : '';
         editBtn.dataset.canDownload = p.can_download !== false ? '1' : '0';
+        // get_all_profiles resolves this to music|video|both and never empty, so
+        // whatever lands here is the profile's real setting. Omitting it was why
+        // Side Access always opened on "Music only".
+        editBtn.dataset.allowedSides = p.allowed_sides || 'music';
         editBtn.dataset.isAdmin = p.is_admin ? '1' : '0';
         editBtn.title = 'Edit profile';
         editBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
@@ -2488,6 +2520,7 @@ async function loadProfileManageList() {
                 home_page: btn.dataset.homePage || '',
                 allowed_pages: btn.dataset.allowedPages ? JSON.parse(btn.dataset.allowedPages) : null,
                 can_download: btn.dataset.canDownload !== '0',
+                allowed_sides: btn.dataset.allowedSides || 'music',
                 is_admin: btn.dataset.isAdmin === '1'
             });
         };
@@ -2686,6 +2719,8 @@ function showProfileEditForm(profileId, currentName, currentColor, currentAvatar
     let pageCheckboxes = [];
     let canDlCheckbox = null;
     let selectedSides = null;
+    let isAdminCheckbox = null;
+    let adminNote = null;
     if (isAdmin && !isEditingAdmin) {
         // Side access — music | video | both, never nothing.
         selectedSides = (profileSettings.allowed_sides === 'video' || profileSettings.allowed_sides === 'both')
@@ -2745,6 +2780,34 @@ function showProfileEditForm(profileId, currentName, currentColor, currentAvatar
         dlLabel.appendChild(canDlCheckbox);
         dlLabel.appendChild(document.createTextNode(' Can download music'));
         form.appendChild(dlLabel);
+
+        // Promote to admin. Only shown when an admin is editing SOMEBODY ELSE —
+        // the enclosing branch already guarantees that — so you cannot demote
+        // yourself out of the screen you are standing on. The server independently
+        // requires the caller to be an admin and refuses to remove the last one.
+        const adminLabel = document.createElement('label');
+        adminLabel.className = 'profile-checkbox-label';
+        isAdminCheckbox = document.createElement('input');
+        isAdminCheckbox.type = 'checkbox';
+        isAdminCheckbox.checked = profileSettings.is_admin === true;
+        isAdminCheckbox.addEventListener('change', () => {
+            // An admin is always 'both' sides with every page, so the controls
+            // above stop meaning anything the moment this is ticked. Say so
+            // rather than leaving them looking editable but ignored.
+            const on = isAdminCheckbox.checked;
+            if (sidesRow) sidesRow.style.opacity = on ? '0.45' : '';
+            if (apContainer) apContainer.style.opacity = on ? '0.45' : '';
+            if (adminNote) adminNote.hidden = !on;
+        });
+        adminLabel.appendChild(isAdminCheckbox);
+        adminLabel.appendChild(document.createTextNode(' Administrator (full access to everything)'));
+        form.appendChild(adminLabel);
+
+        adminNote = document.createElement('div');
+        adminNote.className = 'setting-help-text';
+        adminNote.textContent = 'Admins always have both sides and every page — the settings above stop applying.';
+        adminNote.hidden = !isAdminCheckbox.checked;
+        form.appendChild(adminNote);
     }
 
     const btnRow = document.createElement('div');
@@ -2769,6 +2832,12 @@ function showProfileEditForm(profileId, currentName, currentColor, currentAvatar
             payload.allowed_pages = allChecked ? null : editablePageCheckboxes.filter(cb => cb.checked).map(cb => cb.value);
             payload.can_download = canDlCheckbox ? canDlCheckbox.checked : true;
             if (selectedSides) payload.allowed_sides = selectedSides;
+            // Only send it when it actually changed — the server refuses to remove
+            // the last admin, and posting is_admin unchanged on every save would
+            // turn that guard into an error on an edit that changed nothing else.
+            if (isAdminCheckbox && isAdminCheckbox.checked !== (profileSettings.is_admin === true)) {
+                payload.is_admin = isAdminCheckbox.checked;
+            }
         }
 
         try {
@@ -2788,6 +2857,7 @@ function showProfileEditForm(profileId, currentName, currentColor, currentAvatar
                     if (payload.allowed_pages !== undefined) currentProfile.allowed_pages = payload.allowed_pages;
                     if (payload.can_download !== undefined) currentProfile.can_download = payload.can_download;
                     if (payload.allowed_sides !== undefined) currentProfile.allowed_sides = payload.allowed_sides;
+                    if (payload.is_admin !== undefined) currentProfile.is_admin = payload.is_admin;
                     updateProfileIndicator();
                     notifyProfileContextChanged();
                 }

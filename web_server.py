@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.8.12"
+_SOULSYNC_BASE_VERSION = "1.8.13"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -558,6 +558,52 @@ def _plex_login_enabled():
         return bool(config_manager.get('security.allow_plex_login', False)) if config_manager else False
     except Exception:
         return False
+
+
+# ── which profiles has THIS browser proved it may be? ────────────────────────
+# The profile picker used to list every profile on the server and let you become
+# any of them: /api/profiles/select asked for a PIN only if the target happened
+# to have one, and a Plex-provisioned profile is created with neither PIN nor
+# password (PLEX_PROFILE_DEFAULTS). So anyone reaching the picker could enter a
+# Plex user's account without ever authenticating as them — and the same was true
+# of any local profile with no PIN, so this was never Plex-specific.
+#
+# The session now records the profiles this browser has actually authenticated
+# as. The picker shows those, and — the part that matters — /profiles/select
+# refuses the rest. Hiding a card is not a permission check.
+_AUTHORIZED_KEY = 'authorized_profile_ids'
+# The root admin is always listed and always selectable. It is the lock-out
+# hatch: an install whose admin has set no PIN and no password must not be able
+# to shut itself out of its own admin profile. This is NOT a bypass — profile 1's
+# own PIN, if it has one, is still verified below. And it is deliberately profile
+# 1 alone rather than every is_admin profile: exempting secondary admins would
+# re-open the hole for them.
+_ALWAYS_SELECTABLE = (1,)
+
+
+def _authorized_profile_ids() -> set:
+    """Profile ids this browser has authenticated as, plus the root admin."""
+    try:
+        raw = session.get(_AUTHORIZED_KEY) or []
+        ids = {int(x) for x in raw if str(x).lstrip('-').isdigit()}
+    except Exception:   # noqa: BLE001 - a corrupt cookie must not lock anyone out
+        ids = set()
+    return ids | set(_ALWAYS_SELECTABLE)
+
+
+def _authorize_profile(profile_id) -> None:
+    """Record that this browser proved it may be ``profile_id`` — called from
+    every path that actually verifies something (password login, Plex sign-in, a
+    correct PIN). Capped so a long-lived cookie can't grow without bound."""
+    try:
+        pid = int(profile_id)
+    except (TypeError, ValueError):
+        return
+    current = [int(x) for x in (session.get(_AUTHORIZED_KEY) or [])
+               if str(x).lstrip('-').isdigit()]
+    if pid in current:
+        return
+    session[_AUTHORIZED_KEY] = (current + [pid])[-24:]
 
 
 def _csrf_enabled():
@@ -5143,6 +5189,8 @@ def get_plex_signin_status():
 
         session['login_authenticated'] = True
         session['profile_id'] = matched['id']
+        # Proved they hold this Plex account — this browser may now swap to it.
+        _authorize_profile(matched['id'])
         session.pop('launch_pin_verified', None)
         return jsonify({"success": True, "is_new": is_new, "profile": {
             'id': matched['id'], 'name': matched['name'], 'is_admin': bool(matched.get('is_admin')),
@@ -28793,14 +28841,41 @@ def hydrate_beatport_bubbles():
 # --- Profile API Endpoints ---
 
 @app.route('/api/profiles', methods=['GET'])
+@admin_only
 def list_profiles():
-    """List all profiles"""
+    """Every profile — the admin management list (Manage Profiles, Settings →
+    Users).
+
+    Admin-only: it enumerates every account on the server, including the Plex
+    username behind each linked profile. The account picker must NOT use this;
+    it has /api/profiles/switchable, which returns only what this browser may
+    actually become."""
     try:
         database = get_database()
         profiles = database.get_all_profiles()
         return jsonify({'success': True, 'profiles': profiles})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/profiles/switchable', methods=['GET'])
+def list_switchable_profiles():
+    """The profiles THIS browser may switch to: the ones it has authenticated as,
+    plus the root admin (the lock-out hatch).
+
+    Public by necessity — the picker is what you see before you are anybody — but
+    it discloses only accounts you have already proven you hold, so it leaks
+    nothing. Mirrors exactly what /api/profiles/select will allow, so the picker
+    can never offer a card that is refused on click."""
+    try:
+        database = get_database()
+        allowed = _authorized_profile_ids()
+        profiles = [p for p in database.get_all_profiles() if p['id'] in allowed]
+        return jsonify({'success': True, 'profiles': profiles,
+                        # so the UI can offer "sign in as someone else" honestly
+                        'total_profiles': len(database.get_all_profiles())})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e), 'profiles': []}), 500
 
 @app.route('/api/profiles', methods=['POST'])
 def create_profile():
@@ -29099,6 +29174,22 @@ def select_profile():
                 return jsonify({'success': False, 'error': 'PIN required', 'pin_required': True}), 401
             if not database.verify_profile_pin(profile_id, pin):
                 return jsonify({'success': False, 'error': 'Invalid PIN'}), 401
+            # A correct PIN IS the proof — remember it for this browser.
+            _authorize_profile(profile_id)
+
+        # THE gate. A profile with no PIN and no password — every Plex-provisioned
+        # one, and any local profile whose owner never set one — passes the block
+        # above without proving anything, which is how the picker let anyone walk
+        # into a Plex user's account. Selecting it now requires that this browser
+        # has actually authenticated as it at some point (Plex sign-in, password,
+        # or its PIN above). The UI hides what it cannot select, but THIS is the
+        # check; the hiding is only so nothing offers an action that fails.
+        if profile_id not in _authorized_profile_ids():
+            return jsonify({
+                'success': False,
+                'error': 'Sign in as this profile to switch to it.',
+                'auth_required': True,
+            }), 403
 
         session['profile_id'] = profile_id
         # If the admin PIN was just validated, also mark launch PIN as
@@ -29227,6 +29318,7 @@ def auth_login():
         _login_limiter.record_success(_ip)
         session['login_authenticated'] = True
         session['profile_id'] = profile['id']
+        _authorize_profile(profile['id'])
         # A fresh login also clears any stale launch-PIN flag.
         session.pop('launch_pin_verified', None)
         return jsonify({'success': True, 'profile': {
@@ -29295,6 +29387,7 @@ def auth_recovery_reset():
         database.set_profile_password(profile['id'], new_password)
         session['login_authenticated'] = True
         session['profile_id'] = profile['id']
+        _authorize_profile(profile['id'])
         session.pop('launch_pin_verified', None)
         return jsonify({'success': True})
     except Exception as e:

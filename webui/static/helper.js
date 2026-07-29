@@ -3484,8 +3484,16 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.12': [
-        { date: 'July 2026 · 1.8.12' },
+    '1.8.13': [
+        { date: 'July 2026 · 1.8.13' },
+        { title: 'The account switcher showed everyone — and let you in', desc: 'the swap-account screen listed every profile on the server, and clicking one signed you into it. A profile only asked for a PIN if it happened to have one, and an account created by "Sign in with Plex" has neither PIN nor password — so anyone at that screen could walk into any Plex user\'s account. The same was true of any local profile whose owner never set a PIN.' },
+        { title: 'It now shows only the accounts signed in on this device', desc: 'and, more importantly, refuses the rest: switching to a profile this browser has not signed in as is turned down by the server, not merely hidden. Signing in — with Plex, a password, or the profile\'s PIN — adds it, and from then on you can swap between them freely.' },
+        { title: 'You cannot lock yourself out', desc: 'your admin profile is always listed and always selectable, because an install whose admin never set a PIN or password must not be able to shut itself out. Its own PIN, if it has one, is still required.' },
+        { title: 'After updating, everyone signs in once more', desc: 'existing sessions carry no record of what they signed into, so the switcher will show only the admin profile until each person signs in again. Plex users just press "Sign in with Plex" once. That is the upgrade behaving correctly, not a fault.' },
+        { title: 'The full profile list is now admin-only', desc: 'it enumerates every account on the server including the Plex username behind each one, so it is no longer readable by anyone who asks. Manage Profiles and Settings → Users still use it.' },
+        { title: 'Fixed: Side Access always showed "Music only"', desc: 'in Manage Profiles, editing anyone showed Music only selected no matter what they actually had. The setting was correct in the database and correct everywhere it was enforced — the edit form was simply never handed the value, so it fell back to the most restrictive option. Saving without noticing would have applied that fallback.' },
+        { title: 'And you can now make someone an admin', desc: 'a checkbox in the profile editor, where before it needed an API call. It only appears when you are editing someone else, so you cannot demote yourself out of the screen; the last admin still cannot be removed. Ticking it explains that Side Access and page choices stop applying, since admins always have everything.' },
+        { title: 'Also in 1.8.12', desc: 'a request needing approval can now reach you on Discord, Telegram or any URL.' },
         { title: 'Get told when someone is waiting on you', desc: 'a request that needs your approval can now send you a Discord message — or a Telegram message, or a POST to any URL you like. Settings → Notifications, add a connection, tick "Needs approval". Without it the only way to find a pending request was to go and look at the page.' },
         { title: 'It covers the Watchlist too — which never had this', desc: 'follows have been landing in an approval queue since 1.6.7, and nothing has ever been able to tell you. If standard users have been following shows, there may be entries waiting for you right now; the Watchlist page marks them "Awaiting approval".' },
         { title: 'Why a new alert rather than the existing one', desc: 'there was already a "Wishlisted" notification, but it fires for everything added — including your own, and everything the hourly jobs add, which can be dozens at once — and it never said who asked or whether it needed you. Subscribing to it to catch requests meant being buried in things you already knew about. The new one fires only for a request that is actually waiting.' },
@@ -3605,6 +3613,27 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.8.13: the account switcher let anyone in",
+        description: "the swap-account screen listed every profile on the server, and clicking one signed you into it. A profile was only asked for a PIN if it happened to have one — and an account made by \"Sign in with Plex\" has neither PIN nor password.",
+        features: [
+            "so anyone at that screen could walk into any Plex user's account without authenticating. The same applied to any local profile whose owner never set a PIN, so this was never Plex-specific",
+            "the switcher now shows only the accounts signed in on this device — and refuses the rest: switching to a profile this browser has not signed in as is turned down by the server, not merely hidden",
+            "signing in (Plex, a password, or the profile's PIN) adds it, and from then on you can swap between them freely",
+            "you cannot lock yourself out: your admin profile is always listed and selectable, since an install whose admin set no PIN or password must not be able to shut itself out. Its own PIN, if set, is still required",
+            "the full profile list is now admin-only — it enumerates every account including the Plex username behind each one",
+        ],
+        usage_note: "After updating, everyone signs in once more — existing sessions carry no record of what they signed into. That is the upgrade working, not a fault.",
+    },
+    {
+        title: "Manage Profiles: two fixes",
+        description: "Side Access lied about what a profile had, and there was no way to make someone an admin without an API call.",
+        features: [
+            "editing anyone showed \"Music only\" selected regardless of their real access. The setting was right in the database and right everywhere it was enforced — the edit form was simply never handed the value and fell back to the most restrictive option. Saving without noticing would have applied that fallback",
+            "an Administrator checkbox now sits in the profile editor. It appears only when you are editing someone else, so you cannot demote yourself out of the screen you are on, and the last admin still cannot be removed",
+            "ticking it explains that Side Access and the page choices stop applying — admins always have both sides and every page",
+        ],
+    },
     {
         title: "1.8.12: get told when someone is waiting on you",
         description: "a request that needs your approval can now reach you on Discord, Telegram, or any URL you like — instead of sitting on a page until you happen to look.",
