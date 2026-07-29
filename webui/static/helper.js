@@ -3484,8 +3484,13 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.13': [
-        { date: 'July 2026 · 1.8.13' },
+    '1.8.14': [
+        { date: 'July 2026 · 1.8.14' },
+        { title: 'Signing in now survives closing the browser', desc: 'it never did. Nothing had ever configured how long a sign-in lasts, so the browser threw it away the moment you closed it. That went unnoticed while the account picker let anyone click straight back into any profile — once 1.8.13 required actually having signed in, it meant redoing the whole Plex link every time you reopened your browser.' },
+        { title: 'Thirty days, and it renews as you use it', desc: 'keep using SoulSync and you stay signed in indefinitely; stop, and it lapses after a month. Adjustable with security.session_days if you want it shorter.' },
+        { title: 'So "Log out" had to start meaning it', desc: 'logging out only forgot which profile you were using — it kept the record of every account you had signed into on that device. That did no harm while everything vanished on browser close. With a sign-in that lasts a month it would have meant logging out on a shared computer still handing the next person your accounts. It now clears the lot.' },
+        { title: 'Nothing changes for HTTPS or plain-http installs', desc: 'the cookie is still marked Secure only when you have turned on reverse-proxy mode, exactly as before. Forcing it on a normal home install would stop the browser sending it at all — which is this same bug, permanently.' },
+        { title: 'Also in 1.8.13', desc: 'the account switcher listed every profile on the server and let you into any of them; it now shows only accounts signed in on that device. Plus two Manage Profiles fixes.' },
         { title: 'The account switcher showed everyone — and let you in', desc: 'the swap-account screen listed every profile on the server, and clicking one signed you into it. A profile only asked for a PIN if it happened to have one, and an account created by "Sign in with Plex" has neither PIN nor password — so anyone at that screen could walk into any Plex user\'s account. The same was true of any local profile whose owner never set a PIN.' },
         { title: 'It now shows only the accounts signed in on this device', desc: 'and, more importantly, refuses the rest: switching to a profile this browser has not signed in as is turned down by the server, not merely hidden. Signing in — with Plex, a password, or the profile\'s PIN — adds it, and from then on you can swap between them freely.' },
         { title: 'You cannot lock yourself out', desc: 'your admin profile is always listed and always selectable, because an install whose admin never set a PIN or password must not be able to shut itself out. Its own PIN, if it has one, is still required.' },
@@ -3613,6 +3618,17 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.8.14: signing in survives closing the browser",
+        description: "it never did. Nothing had ever configured how long a sign-in lasts, so the browser discarded it on close — invisible while the picker let anyone click back into any profile, and painful once 1.8.13 required having actually signed in.",
+        features: [
+            "a sign-in now lasts thirty days and renews as you use it: keep using SoulSync and you stay signed in, stop and it lapses after a month. Adjustable with security.session_days",
+            "Plex users no longer redo the Plex link every time they reopen their browser — the reason this surfaced at all",
+            "\"Log out\" had to start meaning it. It previously forgot only which profile you were using and kept the record of every account signed in on that device. Harmless when everything vanished on browser close; with a month-long sign-in it would have handed the next person your accounts on a shared computer. It now clears the lot",
+            "nothing changes for HTTPS or plain-http installs: the cookie is marked Secure only when reverse-proxy mode is on, exactly as before. Forcing it on a normal home install would stop the browser sending it at all — the same bug, permanently",
+        ],
+        usage_note: "Shared computer? Use Log out rather than just closing the window.",
+    },
     {
         title: "1.8.13: the account switcher let anyone in",
         description: "the swap-account screen listed every profile on the server, and clicking one signed you into it. A profile was only asked for a PIN if it happened to have one — and an account made by \"Sign in with Plex\" has neither PIN nor password.",

@@ -11,9 +11,12 @@ ERROR. These tests pin the new behaviour:
 - Non-lock OperationalErrors don't trigger the lock-specific quiet path.
 """
 
+import contextlib
 import json
 import logging
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -55,6 +58,35 @@ def manager(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ConfigManager:
 # ---------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def _count_retry_sleeps():
+    """Count ONLY the retry loop's own sleeps.
+
+    ``patch("config.settings.time.sleep")`` looks scoped but is not:
+    ``config.settings.time`` IS the stdlib time module, so patching its
+    ``sleep`` attribute replaces it process-wide. Once anything has imported
+    web_server, its background monitor threads are sitting in ``time.sleep``
+    loops, and any tick landing inside the patch window is counted as one of
+    the retry sleeps — which failed this test with 4 == 3 depending purely on
+    thread timing and test ordering.
+
+    So: record calls made on the calling thread (the retry loop), and let every
+    other thread sleep for real rather than turning their waits into spins.
+    """
+    real_sleep = time.sleep
+    mine = threading.get_ident()
+    calls: list = []
+
+    def _sleep(seconds, *a, **kw):
+        if threading.get_ident() == mine:
+            calls.append(seconds)
+            return None
+        return real_sleep(seconds, *a, **kw)
+
+    with patch("config.settings.time.sleep", side_effect=_sleep):
+        yield calls
+
+
 def _fail_n_times_then_succeed(n: int, manager: ConfigManager):
     """Patch ``_save_to_database`` so the first ``n`` calls fail (lock),
     then subsequent calls succeed."""
@@ -80,11 +112,11 @@ def test_save_succeeds_on_first_attempt_emits_no_error_logs(
 ) -> None:
     """Happy path: a successful save should not log at ERROR."""
     caplog.set_level(logging.DEBUG, logger="soulsync.config")
-    with patch("config.settings.time.sleep") as sleep_mock:
+    with _count_retry_sleeps() as retry_sleeps:
         with patch.object(manager, "_save_to_database", return_value=True) as save_mock:
             manager._save_config()
     assert save_mock.call_count == 1
-    sleep_mock.assert_not_called()
+    assert retry_sleeps == []
     error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert error_logs == []
 
@@ -95,12 +127,12 @@ def test_lock_errors_during_retries_log_at_debug_not_error(
     """Three transient locks then success should produce DEBUG noise only."""
     caplog.set_level(logging.DEBUG, logger="soulsync.config")
     stub, state = _fail_n_times_then_succeed(3, manager)
-    with patch("config.settings.time.sleep") as sleep_mock:
+    with _count_retry_sleeps() as retry_sleeps:
         with patch.object(manager, "_save_to_database", side_effect=stub):
             with patch.object(manager, "_ensure_database_exists"):
                 manager._save_config()
     assert state["calls"] == 4
-    assert sleep_mock.call_count == 3
+    assert len(retry_sleeps) == 3
     error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert error_logs == [], "transient locks should not log ERROR"
 
@@ -109,15 +141,17 @@ def test_save_uses_six_attempts_with_exponential_backoff(
     manager: ConfigManager,
 ) -> None:
     """All six attempts must run, with the documented backoff schedule."""
-    with patch("config.settings.time.sleep") as sleep_mock:
+    with _count_retry_sleeps() as retry_sleeps:
         with patch.object(manager, "_save_to_database", return_value=False) as save_mock:
             with patch("builtins.open"):  # silence the json fallback's filesystem write
                 with patch.object(Path, "mkdir"):
                     manager._save_config()
     assert save_mock.call_count == 6
     expected_delays = [0.2, 0.5, 1.0, 2.0, 4.0]
-    actual_delays = [c.args[0] for c in sleep_mock.call_args_list]
-    assert actual_delays == expected_delays
+    # retry_sleeps holds the delays the retry loop itself asked for, in order —
+    # background threads' sleeps are excluded, so this can't be perturbed by
+    # whatever else the suite has running.
+    assert retry_sleeps == expected_delays
 
 
 def test_all_retries_exhausted_logs_single_error_and_falls_back_to_json(

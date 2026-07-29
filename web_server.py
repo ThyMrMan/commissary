@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.8.13"
+_SOULSYNC_BASE_VERSION = "1.8.14"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -466,6 +466,48 @@ def _init_flask_secret_key():
         return _secrets.token_hex(32)
 
 app.secret_key = _init_flask_secret_key()
+
+# --- Session lifetime ---
+# Flask's default is a BROWSER-SESSION cookie: no Expires, so the browser throws
+# it away on close. Nothing here ever set otherwise, which meant every sign-in
+# lasted only until the window shut. That was invisible while the picker let you
+# click straight back into any profile; once switching required having actually
+# authenticated (1.8.13), it meant a Plex user redoing the whole Plex link every
+# time they reopened their browser.
+#
+# Sliding window: Flask re-sends the cookie on each request (SESSION_REFRESH_
+# EACH_REQUEST defaults on for permanent sessions), so someone who keeps using
+# SoulSync is never signed out, and one who stops is after this long.
+#
+# The Secure/SameSite flags are NOT set here — core/security/reverse_proxy.py
+# owns those, and only marks the cookie Secure when the operator has opted into
+# reverse-proxy mode. Forcing Secure on a plain-http LAN install would stop the
+# browser sending the cookie at all, which is exactly this bug but permanent.
+_SESSION_DAYS_DEFAULT = 30
+
+
+def _session_lifetime_days() -> int:
+    try:
+        raw = config_manager.get('security.session_days', _SESSION_DAYS_DEFAULT) if config_manager \
+            else _SESSION_DAYS_DEFAULT
+        return max(1, min(365, int(raw)))
+    except Exception:   # noqa: BLE001 - a bad setting must not make sessions un-storable
+        return _SESSION_DAYS_DEFAULT
+
+
+from datetime import timedelta as _timedelta
+app.permanent_session_lifetime = _timedelta(days=_session_lifetime_days())
+
+
+@app.before_request
+def _make_session_survive_a_browser_restart():
+    """Mark the session permanent so it carries an Expires date.
+
+    Guarded rather than assigned unconditionally: writing session['_permanent']
+    on every request would flag the session dirty each time, re-serialising it
+    for static assets too."""
+    if not session.permanent:
+        session.permanent = True
 
 # --- Reverse-proxy mode (opt-in, default OFF) ---
 # OFF by default → a strict no-op, so direct/LAN installs are unchanged. Only when
@@ -29460,8 +29502,15 @@ def reset_pin_via_credential():
 
 @app.route('/api/profiles/logout', methods=['POST'])
 def logout_profile():
-    """Clear session — back to profile picker"""
-    session.pop('profile_id', None)
+    """Clear the session — back to the profile picker.
+
+    session.clear(), not pop('profile_id'): it also drops login_authenticated,
+    the launch-PIN flag and — the one that matters — the list of profiles this
+    browser had authenticated as. Popping only the current profile was survivable
+    while sessions died on browser close; now that they persist, leaving that list
+    behind would mean "log out" on a shared computer still handed the next person
+    every account you had signed into."""
+    session.clear()
     return jsonify({'success': True})
 
 @app.route('/api/profiles/<int:profile_id>/set-pin', methods=['POST'])
