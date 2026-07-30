@@ -535,8 +535,16 @@
                 '<div class="vrf-show-title">' + esc(d.title || '?') + '</div>' +
                 '<div class="vrf-chips"><span class="vrf-chip vrf-chip--got">✓ already owned</span>' +
                     '<span class="vrf-chip">' + esc(d.kind || 'movie') + '</span></div>' +
-                '<p class="vrf-show-overview">The download engine never re-grabs owned items, so this ' +
-                    'wishlist row will sit forever. Approving removes the row only — files are untouched.</p>' +
+                // Why this row is dead weight depends on WHICH rule caught it: a row
+                // kept for an upgrade the engine is still chasing (include below
+                // cutoff) is not "sitting forever", and saying so would be a lie.
+                '<p class="vrf-show-overview">' +
+                    (d.reason === 'already downloaded and imported'
+                        ? 'You already have this. Approving removes the wishlist row and ends ' +
+                          'the hunt for a better copy — files are untouched.'
+                        : 'The download engine never re-grabs owned items, so this wishlist row ' +
+                          'will sit forever. Approving removes the row only — files are untouched.') +
+                '</p>' +
                 '<div class="vrf-actions">' + view + '</div>' +
             '</div></div>';
     }

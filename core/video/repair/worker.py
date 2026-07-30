@@ -239,10 +239,15 @@ class VideoRepairWorker:
             result.scanned = r.scanned or result.scanned
             result.errors = r.errors or result.errors
             result.auto_fixed = r.auto_fixed or result.auto_fixed
+            result.skipped = r.skipped or result.skipped
             state["status"] = "finished"   # music progress vocabulary: running|finished|error
             state["phase"] = "done"
+            # 'skipped' is reported so a scan that examined plenty and flagged
+            # nothing can say so — a bare "0 new findings" reads as broken.
             self._log(state, "info", f"scanned {result.scanned}, "
-                      f"{result.findings_created} new findings")
+                      f"{result.findings_created} new findings"
+                      + (f", {result.skipped} deliberately left alone"
+                         if result.skipped else ""))
         except JobCancelled:
             state["status"] = "cancelled"
             state["phase"] = "cancelled"

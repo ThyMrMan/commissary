@@ -3484,8 +3484,15 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.14': [
-        { date: 'July 2026 · 1.8.14' },
+    '1.8.15': [
+        { date: 'July 2026 · 1.8.15' },
+        { title: 'Wishlist Audit ran, found nothing, and told you nothing', desc: 'the maintenance job that clears wishlist entries for things you already have. It would run happily and leave downloaded, imported shows sitting on the wishlist. Three separate causes, all ending in a scan that reported nothing.' },
+        { title: 'Cleaning something up once made it invisible forever', desc: 'the main one. Approving a finding deletes the wishlist row it names — but the job treated a finding it had already fixed as proof it had reported that title before, and refused to raise it again. So the same show landing back on your wishlist and being downloaded again was never flagged a second time. It worked once per title, then went quiet. Dismissing a finding still silences it for good: "leave this one alone" should stick.' },
+        { title: 'Copies your server has but TMDB never matched were not counted', desc: 'the job only recognised something as owned by its TMDB id. A show in your library that never got matched looked un-owned to it — which is precisely the thing you have downloaded, imported, and can see on your server while the audit insists there is nothing to clean. It now also follows the link the wishlist row already carries to the library entry.' },
+        { title: 'And it now says when it left things alone on purpose', desc: 'a wishlist row is kept deliberately when the copy you have is below your quality cutoff — that is an upgrade the downloader is still hunting for. Correct, but the log said only "0 new findings", which reads as broken. It now reads "scanned 12, 0 new findings, 12 deliberately left alone".' },
+        { title: 'New: Include below cutoff', desc: 'if your cutoff is 4K, or set to "always chase the best", nothing you download ever counts as finished and the audit will never clean anything. Turn this on in the job\'s settings and it flags every owned row regardless of quality. It is off by default because turning it on ends the upgrade hunt for those titles.' },
+        { title: 'Nothing here touches your files', desc: 'unchanged, and worth repeating: approving a Wishlist Audit finding removes the wishlist row and nothing else.' },
+        { title: 'Also in 1.8.14', desc: 'signing in survives closing the browser — it never did before.' },
         { title: 'Signing in now survives closing the browser', desc: 'it never did. Nothing had ever configured how long a sign-in lasts, so the browser threw it away the moment you closed it. That went unnoticed while the account picker let anyone click straight back into any profile — once 1.8.13 required actually having signed in, it meant redoing the whole Plex link every time you reopened your browser.' },
         { title: 'Thirty days, and it renews as you use it', desc: 'keep using SoulSync and you stay signed in indefinitely; stop, and it lapses after a month. Adjustable with security.session_days if you want it shorter.' },
         { title: 'So "Log out" had to start meaning it', desc: 'logging out only forgot which profile you were using — it kept the record of every account you had signed into on that device. That did no harm while everything vanished on browser close. With a sign-in that lasts a month it would have meant logging out on a shared computer still handing the next person your accounts. It now clears the lot.' },
@@ -3618,6 +3625,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.8.15: Wishlist Audit never cleared anything",
+        description: "the maintenance job that removes wishlist entries for things you already have would run, report nothing, and leave downloaded and imported shows sitting there. Three separate causes, all ending in a silent scan.",
+        features: [
+            "cleaning something up once made it invisible forever — the main one. Approving a finding deletes the wishlist row it names, but the job treated an already-fixed finding as proof it had reported that title before and refused to raise it again. It worked once per title, then went quiet",
+            "copies your server has but TMDB never matched were not counted as owned, which is exactly the thing you have downloaded, imported, and can see on your server while the audit insists there is nothing to clean",
+            "it now says when it left things alone on purpose: \"scanned 12, 0 new findings, 12 deliberately left alone\" rather than a bare zero. A row below your quality cutoff is kept on purpose — that is an upgrade the downloader is still hunting",
+            "new Include below cutoff option on the job. If your cutoff is 4K, or set to \"always chase the best\", nothing you download ever counts as finished and the audit can never clean anything. Off by default, because turning it on ends the upgrade hunt for those titles",
+            "dismissing a finding still silences it permanently — only findings you actually fixed can come back",
+        ],
+        usage_note: "Approving a Wishlist Audit finding removes the wishlist row and nothing else. Your files are never touched.",
+    },
     {
         title: "1.8.14: signing in survives closing the browser",
         description: "it never did. Nothing had ever configured how long a sign-in lasts, so the browser discarded it on close — invisible while the picker let anyone click back into any profile, and painful once 1.8.13 required having actually signed in.",

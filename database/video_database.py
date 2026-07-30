@@ -5578,10 +5578,18 @@ class VideoDatabase:
 
     def repair_create_finding(self, job_id: str, finding_type: str, *, title: str,
                               severity: str = "info", entity_type=None, entity_id=None,
-                              file_path=None, description=None, details=None) -> bool:
+                              file_path=None, description=None, details=None,
+                              ignore_resolved: bool = False) -> bool:
         """Insert a finding unless an equivalent one exists in ANY status —
         same job+type and (same entity OR same non-null file_path). Returns
-        True only when a genuinely new row landed (music dedup semantics)."""
+        True only when a genuinely new row landed (music dedup semantics).
+
+        ``ignore_resolved`` drops already-FIXED findings from that dedup basis,
+        for entities that legitimately come back. A wishlist row is the case:
+        once its finding is approved the row is deleted, so an entity showing up
+        again is a genuinely NEW row (re-wished, re-added by a monitored show, a
+        failed grab put back) — not the same situation reported twice. Dismissed
+        findings still suppress: "no, leave this one alone" has to stick."""
         conn = self._get_connection()
         try:
             # Dedup basis: entity match (when the finding names one) OR same
@@ -5596,7 +5604,8 @@ class VideoDatabase:
                 dparams.append(file_path)
             if conds:
                 dup_sql = ("SELECT 1 FROM video_repair_findings WHERE job_id=? AND finding_type=? "
-                           "AND (" + " OR ".join(conds) + ") LIMIT 1")
+                           + ("AND status <> 'resolved' " if ignore_resolved else "")
+                           + "AND (" + " OR ".join(conds) + ") LIMIT 1")
                 if conn.execute(dup_sql, dparams).fetchone():
                     return False
             conn.execute(
@@ -6023,32 +6032,48 @@ class VideoDatabase:
         """Wishlist rows whose target is ALREADY OWNED, annotated with the owned
         files' resolutions — the audit job judges them against the cutoff:
         owned-below-cutoff rows are LEGITIMATE (upgrade-until keeps them for a
-        better copy); owned-at-cutoff and quality-unreadable rows are clutter."""
+        better copy); owned-at-cutoff and quality-unreadable rows are clutter.
+
+        "Owned" matches on tmdb_id OR the row's own ``library_id`` (movies.id /
+        shows.id — the same meaning the to_download queries give it). tmdb_id
+        alone missed a copy sitting in a library row that never got TMDB-matched,
+        which is exactly the row a user has downloaded, imported, and can see on
+        their server while the audit reported nothing to clean."""
         conn = self._get_connection()
         try:
             movies = conn.execute(
                 "SELECT w.id AS wishlist_id, 'movie' AS kind, w.tmdb_id, w.title, "
                 "w.poster_url, NULL AS season_number, NULL AS episode_number, "
-                "(SELECT m.id FROM movies m WHERE m.tmdb_id=w.tmdb_id AND m.has_file=1 LIMIT 1) "
-                "AS library_id, "
+                "(SELECT m.id FROM movies m WHERE (m.tmdb_id=w.tmdb_id OR m.id=w.library_id) "
+                "  AND m.has_file=1 LIMIT 1) AS library_id, "
                 "(SELECT GROUP_CONCAT(f.resolution) FROM movies m "
                 "  JOIN media_files f ON f.movie_id=m.id "
-                "  WHERE m.tmdb_id=w.tmdb_id AND m.has_file=1) AS owned_resolutions "
+                "  WHERE (m.tmdb_id=w.tmdb_id OR m.id=w.library_id) "
+                "  AND m.has_file=1) AS owned_resolutions "
                 "FROM video_wishlist w WHERE w.kind='movie' "
-                "AND w.tmdb_id IN (SELECT tmdb_id FROM movies WHERE has_file=1 "
-                "AND tmdb_id IS NOT NULL)").fetchall()
+                "AND EXISTS (SELECT 1 FROM movies m WHERE (m.tmdb_id=w.tmdb_id OR m.id=w.library_id) "
+                "  AND m.has_file=1)").fetchall()
             eps = conn.execute(
                 "SELECT w.id AS wishlist_id, 'episode' AS kind, w.tmdb_id, w.title, "
-                "w.poster_url, w.season_number, w.episode_number, w.library_id, "
+                "w.poster_url, w.season_number, w.episode_number, "
+                # the show row to link the finding at — the wishlist row's own
+                # when it has one, else whichever owns the episode.
+                "COALESCE(w.library_id, (SELECT s.id FROM shows s "
+                "  JOIN episodes e ON e.show_id=s.id "
+                "  WHERE s.tmdb_id=w.tmdb_id AND e.season_number=w.season_number "
+                "  AND e.episode_number=w.episode_number AND e.has_file=1 LIMIT 1)) "
+                "AS library_id, "
                 "(SELECT GROUP_CONCAT(f.resolution) FROM episodes e "
                 "  JOIN shows s ON e.show_id=s.id "
                 "  JOIN media_files f ON f.episode_id=e.id "
-                "  WHERE s.tmdb_id=w.tmdb_id AND e.season_number=w.season_number "
+                "  WHERE (s.tmdb_id=w.tmdb_id OR s.id=w.library_id) "
+                "  AND e.season_number=w.season_number "
                 "  AND e.episode_number=w.episode_number AND e.has_file=1) "
                 "  AS owned_resolutions "
                 "FROM video_wishlist w WHERE w.kind='episode' "
                 "AND EXISTS (SELECT 1 FROM episodes e JOIN shows s ON e.show_id=s.id "
-                "  WHERE s.tmdb_id=w.tmdb_id AND e.season_number=w.season_number "
+                "  WHERE (s.tmdb_id=w.tmdb_id OR s.id=w.library_id) "
+                "  AND e.season_number=w.season_number "
                 "  AND e.episode_number=w.episode_number AND e.has_file=1)").fetchall()
             return [dict(r) for r in movies] + [dict(r) for r in eps]
         finally:

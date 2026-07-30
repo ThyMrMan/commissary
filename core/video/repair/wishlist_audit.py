@@ -3,8 +3,13 @@
 Scan: wishlist entries whose target is ALREADY OWNED **and done** — the owned
 copy meets the quality cutoff (nothing left to chase), or its quality is
 unreadable (the upgrader can't judge it, so the drain skips it forever).
-Owned-but-BELOW-cutoff rows are deliberately NOT flagged: upgrade-until keeps
-those alive so the drain can chase a better copy.
+Owned-but-BELOW-cutoff rows are NOT flagged by default: upgrade-until keeps
+those alive so the drain can chase a better copy. ``include_below_cutoff``
+turns that off for people who read "already downloaded and imported" as
+"nothing left to do" — the common reading, and the reason the job could look
+like it did nothing at all: a 720p grab under a 1080p cutoff, or ANY grab
+under an empty 'always chase the best' cutoff, is a live upgrade watch that
+this job silently walked past. Those skips are now counted and logged.
 
 Fix (approve): remove the row. Nothing else — the owned copy is untouched.
 """
@@ -25,13 +30,16 @@ class WishlistAuditJob(VideoRepairJob):
                  "it. Rows whose owned copy sits BELOW the cutoff are left alone: "
                  "those are live upgrade watches. Owned copies whose quality "
                  "can't be read are flagged too (the upgrader can't judge them). "
-                 "Approving removes the wishlist row only — files are never "
-                 "touched.")
+                 "Turn on 'include below cutoff' to flag EVERY owned row instead — "
+                 "do that if you expect anything you've downloaded and imported to "
+                 "leave the wishlist, and accept that it also ends the upgrade "
+                 "hunt for those titles. Approving removes the wishlist row "
+                 "only — files are never touched.")
     icon = "🧹"
     default_enabled = False
     default_interval_hours = 1     # cheap DB sweep — keeps pace with the download engine
-    default_settings = {}
-    setting_options = {}
+    default_settings = {"include_below_cutoff": False}
+    setting_options = {"include_below_cutoff": [False, True]}
     auto_fix = False
     finding_types = ("stale_wishlist",)
 
@@ -53,6 +61,7 @@ class WishlistAuditJob(VideoRepairJob):
                     (profile_by_id(context.db, pid) or {}).get("cutoff_resolution"))
             return _memo[pid]
 
+        include_below = bool(context.settings.get("include_below_cutoff", False))
         rows = context.db.repair_stale_wishlist()
         context.report(total=len(rows), phase="auditing wishlist")
         valid = []
@@ -64,10 +73,19 @@ class WishlistAuditJob(VideoRepairJob):
                    if x.strip()]
             cur = max(rks, default=0)
             cutoff_rank = _cutoff_rank_for(r)
-            if cur and (not cutoff_rank or cur < cutoff_rank):
-                continue   # below the cutoff (or chasing 'always best') — a live upgrade watch
-            reason = ("already at your quality cutoff" if cur
-                      else "owned, but its quality can't be read — the upgrader can't judge it")
+            below = bool(cur) and (not cutoff_rank or cur < cutoff_rank)
+            if below and not include_below:
+                # A live upgrade watch — below the cutoff, or chasing 'always best'.
+                # Counted so a scan that flags nothing says WHY rather than just
+                # reporting zero findings against a wishlist full of owned rows.
+                result.skipped += 1
+                continue
+            if not cur:
+                reason = "owned, but its quality can't be read — the upgrader can't judge it"
+            elif below:
+                reason = "already downloaded and imported"
+            else:
+                reason = "already at your quality cutoff"
             if r["kind"] == "movie":
                 entity_id = f"m:{r['tmdb_id']}"
                 title = f"{r.get('title') or '?'} — {reason}"
@@ -79,6 +97,11 @@ class WishlistAuditJob(VideoRepairJob):
             context.create_finding(
                 finding_type="stale_wishlist", severity="info",
                 entity_type="wishlist", entity_id=entity_id,
+                # A wishlist row genuinely recurs: approving deletes it, and the
+                # same title landing there again is a NEW row to clean, not the
+                # old report repeated. Without this the first approval blinded
+                # the job to that entity for good.
+                ignore_resolved=True,
                 title=title, description="This wishlist row has nothing left to do.",
                 details={"kind": r["kind"], "tmdb_id": r["tmdb_id"], "title": r.get("title"),
                          "reason": reason,
