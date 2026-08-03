@@ -3484,8 +3484,14 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.17': [
-        { date: 'August 2026 · 1.8.17' },
+    '1.8.18': [
+        { date: 'August 2026 · 1.8.18' },
+        { title: 'Downloads sorted into category folders now import', desc: 'if your download client files finished downloads into folders — the usual "complete/Movies/…" or "complete/TV/…" — SoulSync could not find them. It looked exactly one folder below each download root, and a category layout puts the release two down, so the download simply sat there and never imported. It now looks three levels deep.' },
+        { title: 'Still bounded, so it stays quick', desc: 'the old one-level limit existed to stop a download root turning into a directory crawl, which is a fair worry. The search is capped by depth and by how many folders it will look at, so it reaches your releases without wandering. Adjustable with download_source.import_search_depth if your layout is deeper.' },
+        { title: '"Couldn\'t place the file" — when it had, in fact, placed the file', desc: 'manual import placement copied the file while your browser waited, and a large file over a network share takes minutes. If anything along the way gave up waiting, you got an error — while the server quietly finished the copy perfectly. The page then kept the item on screen as though nothing had happened, and trying again gave a different error still.' },
+        { title: 'Placement now happens in the background', desc: 'small files finish instantly and behave exactly as before. A big one hands you back the page and reports progress, so nothing can time out and misreport it. And the page never calls a placement failed without checking what actually happened first.' },
+        { title: 'Trying again is safe now', desc: 'asking a second time for something already placed says so instead of erroring, and asking while a copy is still running joins the one in flight rather than starting a second copy of the same file on top of it.' },
+        { title: 'Also in 1.8.17', desc: 'deselecting a tracker now actually stops it being used.' },
         { title: 'Deselecting a tracker now actually stops it being used', desc: 'the tracker checkboxes on each Library only ever nudged the ranking — a ticked tracker\'s releases scored higher, but every tracker was still searched. So unticking one removed a bonus and changed nothing about where downloads came from. Ticked trackers are now the only ones searched for that Library, on automatic searches as well as manual ones.' },
         { title: 'The setting never said that, because the label kept disappearing', desc: 'there was a note explaining it was only a preference, but it lived on a text box that gets hidden the moment the tracker checkboxes appear. So the one sentence describing the behaviour vanished exactly when the control it described showed up, leaving an unlabelled list of trackers that reads as "search these". Both tracker settings now carry a caption you can actually see.' },
         { title: 'Two more places were ignoring your tracker choices', desc: 'found while fixing the first. The RSS pass — the job that watches for new releases — polled every indexer even when "Restrict to indexer IDs" named a few, so a release from an excluded tracker could be picked up and grabbed unattended. And a manual search worked out which Library you had picked only AFTER searching, so it could re-order results but never limit where they came from.' },
@@ -3640,6 +3646,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.8.18: downloads in category folders finally import",
+        description: "two import fixes: a release filed under a category folder was never found, and manual placement reported failure for files it had actually placed.",
+        features: [
+            "if your download client sorts finished downloads into folders — 'complete/Movies/…' and the like — SoulSync could not find them. It looked exactly one folder below each download root, and a category layout puts the release two down, so the download sat there and never imported. It now looks three levels deep",
+            "still bounded by depth and by how many folders it will examine, so a download root can't turn into a directory crawl. Adjustable with download_source.import_search_depth for a deeper layout",
+            "manual placement copied the file while your browser waited, and a large file over a network share takes minutes — so if anything gave up waiting you got an error while the server quietly finished the copy. It now runs in the background, and the page checks what actually happened before calling anything failed",
+            "small placements still finish instantly and behave exactly as before; only a slow copy hands the page back and reports progress",
+            "trying again is safe: asking for something already placed says so, and asking mid-copy joins the one running rather than starting a second copy on top of it",
+        ],
+        usage_note: "Seen that error before? The file was probably placed. Refresh the Import page — if the item is gone, it worked.",
+    },
     {
         title: "1.8.17: deselecting a tracker now stops it being used",
         description: "the tracker checkboxes on each Library only nudged the ranking — every tracker was still searched, so unticking one changed nothing about where downloads came from.",

@@ -753,14 +753,37 @@ def _iter_paths(value) -> list:
     return []
 
 
-# Immediate subdirectories scanned per root when looking one level deeper.
-# These roots point at whole download disks; a cap keeps a mis-configured
-# root (say, / ) from turning every resolution into a directory crawl.
-_MAX_SUBDIRS_SCANNED = 100
+# Total directories examined per root while looking below it. These roots point
+# at whole download disks; a budget keeps a mis-configured root (say, / ) from
+# turning every resolution into a directory crawl.
+_MAX_SUBDIRS_SCANNED = 400
+
+# How many levels below a root to look for a release folder. Two is the case
+# that made this necessary — '<root>/complete/Movies/<release>', a client
+# sorting finished downloads into category folders — so three leaves a level of
+# headroom without inviting a deep crawl.
+_DEFAULT_SEARCH_DEPTH = 3
+_MAX_SEARCH_DEPTH = 6
+
+
+def _search_depth(config_get: Optional[Callable[..., Any]] = None) -> int:
+    """Levels below a download root to search, clamped to something sane."""
+    if config_get is None:
+        config_get = config_manager.get
+    try:
+        depth = int(config_get('download_source.import_search_depth',
+                               _DEFAULT_SEARCH_DEPTH))
+    except (TypeError, ValueError):
+        return _DEFAULT_SEARCH_DEPTH
+    return max(1, min(_MAX_SEARCH_DEPTH, depth))
 
 
 def _subdirs_of(root) -> list:
-    """Immediate subdirectories of ``root``, capped. Never recurses."""
+    """Immediate subdirectories of ``root``, capped. Never recurses.
+
+    Kept as-is for callers that genuinely want one level; the resolver uses
+    :func:`_descendant_dirs` so it can reach a release nested under category
+    folders."""
     out: list = []
     try:
         for entry in Path(root).iterdir():
@@ -773,6 +796,43 @@ def _subdirs_of(root) -> list:
                 break
     except OSError:              # root missing or unreadable — not our problem here
         return []
+    return out
+
+
+def _descendant_dirs(root, max_depth: int, budget: int) -> list:
+    """``[(depth, dir), …]`` below ``root``, BREADTH-FIRST and shallowest first.
+
+    Breadth-first is the point, not an implementation detail: the caller tries
+    each candidate in the order returned, so a release sitting directly under a
+    root must be found before a same-named folder buried three levels down. A
+    depth-first walk would happily return the deep one first.
+
+    ``budget`` caps the TOTAL directories examined for this root, so a root
+    accidentally pointed at a whole filesystem costs a bounded scan rather than
+    a crawl. Unreadable directories are skipped, never fatal.
+    """
+    out: list = []
+    frontier = [Path(root)]
+    for depth in range(1, max(1, max_depth) + 1):
+        if not frontier or len(out) >= budget:
+            break
+        nxt: list = []
+        for parent in frontier:
+            try:
+                entries = list(parent.iterdir())
+            except OSError:      # missing / permission-denied — skip this branch
+                continue
+            for entry in entries:
+                try:
+                    if not entry.is_dir():
+                        continue
+                except OSError:  # broken symlink
+                    continue
+                out.append((depth, entry))
+                nxt.append(entry)
+                if len(out) >= budget:
+                    return out
+        frontier = nxt
     return out
 
 
@@ -927,18 +987,31 @@ def resolve_reported_save_path(
         #     root's exact match above has been tried, so a precise hit never
         #     loses to a deeper guess, and still content-checked so a
         #     same-named folder in the wrong category can't be picked up.
-        #     One level only: these roots are whole download disks. Applies to
-        #     a same-named FILE too — a single-file release with no folder of
-        #     its own, sitting directly in the category folder (a bare-file
+        #     Applies to a same-named FILE too — a single-file release with no
+        #     folder of its own, sitting in a category folder (a bare-file
         #     movie/episode landing in '<root>/Movies/<name>.mkv').
-        for root in roots:
-            for sub in _subdirs_of(root):
-                candidate = sub / basename
-                if _is_dir(candidate):
-                    if _contains_expected(candidate):
+        #
+        #     This scanned ONE level, which could not reach the very layout the
+        #     line above describes: '<root>/complete/Movies/<release>' is two
+        #     levels down, so the release never resolved and the download sat
+        #     there never importing. It now descends _search_depth levels,
+        #     shallowest first ACROSS every root — depth is the outer loop — so
+        #     a match directly under one root still beats a deeper match under
+        #     an earlier one.
+        depth_limit = _search_depth(config_get)
+        per_root = [(root, _descendant_dirs(root, depth_limit, _MAX_SUBDIRS_SCANNED))
+                    for root in roots]
+        for level in range(1, depth_limit + 1):
+            for _root, descendants in per_root:
+                for depth, sub in descendants:
+                    if depth != level:
+                        continue
+                    candidate = sub / basename
+                    if _is_dir(candidate):
+                        if _contains_expected(candidate):
+                            return str(candidate)
+                    elif _is_file(candidate):
                         return str(candidate)
-                elif _is_file(candidate):
-                    return str(candidate)
 
     # 4. The roots THEMSELVES. A torrent client reports its save DIRECTORY
     #    (e.g. '/downloads'), not a per-release folder — in the shared-mount

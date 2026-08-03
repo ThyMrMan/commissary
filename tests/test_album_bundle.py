@@ -1511,15 +1511,37 @@ def test_resolve_usenet_download_path_is_also_a_list(tmp_path: Path) -> None:
     assert resolved == str(cat / "MyAlbum")
 
 
-def test_subfolder_scan_is_one_level_only(tmp_path: Path) -> None:
-    """These roots are whole download disks — a recursive walk would be a
-    performance trap. Two levels down must NOT resolve."""
+def test_subfolder_scan_reaches_a_category_layout(tmp_path: Path) -> None:
+    """This asserted ONE level and that two must not resolve — which made the
+    layout the code's own comment named ('<root>/complete/Movies/<release>')
+    unreachable, so such a download never imported. The performance concern
+    behind the old limit is real and still met, by a depth cap plus a scan
+    budget rather than by refusing to look (see the two tests below)."""
     buried = tmp_path / "complete" / "Movies" / "2024" / "Release"
     buried.mkdir(parents=True)
 
-    cfg = _cfg({'download_source.torrent_download_path': [str(tmp_path / "complete")]})
-    resolved = resolve_reported_save_path('/downloads/Release', config_get=cfg)
-    assert resolved == '/downloads/Release'      # unchanged = not resolved
+    cfg = _cfg({'download_source.torrent_download_path': [str(tmp_path)]})
+    assert resolve_reported_save_path('/downloads/Release', config_get=cfg) == str(buried)
+
+
+def test_subfolder_scan_stops_at_the_configured_depth(tmp_path: Path) -> None:
+    """Still bounded — beyond the limit it reports nothing rather than crawling,
+    so the caller's own 'not found' error surfaces with both paths logged."""
+    buried = tmp_path / "a" / "b" / "c" / "d" / "Release"
+    buried.mkdir(parents=True)
+
+    cfg = _cfg({'download_source.torrent_download_path': [str(tmp_path)],
+                'download_source.import_search_depth': 2})
+    assert resolve_reported_save_path('/downloads/Release', config_get=cfg) == '/downloads/Release'
+
+
+def test_subfolder_scan_is_budgeted(tmp_path: Path) -> None:
+    """The original worry, kept: a root accidentally pointed at a whole
+    filesystem must cost a bounded scan, not a directory crawl."""
+    for i in range(40):
+        (tmp_path / ("dir%02d" % i) / "inner").mkdir(parents=True)
+    from core.download_plugins.album_bundle import _descendant_dirs
+    assert len(_descendant_dirs(tmp_path, 3, 25)) <= 25
 
 
 def test_subfolder_scan_survives_an_unreadable_root(tmp_path: Path) -> None:

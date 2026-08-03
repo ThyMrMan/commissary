@@ -603,27 +603,56 @@
             var t = $('[data-vimp-eptitle]'); if (t && t.value.trim()) body.episode_title = t.value.trim();
         }
         var btn = $('[data-vimp-confirm]'); if (btn) { btn.disabled = true; btn.textContent = 'Placing…'; }
-        fetch('/api/video/import/' + r.item.id + '/place', {
+        var id = r.item.id;
+
+        function succeeded(d) {
+            // A pack's headline is what LANDED: partial success is success
+            // (already-owned or better-quality episodes are skipped), so
+            // "Placed X" alone would hide that 4 of 12 went in.
+            var msg = (d.imported != null && d.total != null)
+                ? 'Imported ' + d.imported + ' of ' + d.total + ' episodes into “' +
+                  r.picked.title + '”'
+                : 'Placed “' + r.picked.title + '”';
+            toast(msg, d.warning ? 'warning' : 'success');
+            if (d.warning) toast(d.warning, 'warning');
+            delete state.expanded[id]; closeResolve(); load();
+        }
+
+        function failed(msg) {
+            toast(msg || 'Couldn’t place the file', 'error');
+            // Refresh regardless: if the placement DID land, leaving the item on
+            // screen is what made a transport hiccup look like a failed import.
+            load();
+            if (btn) { btn.disabled = false; updateConfirm(); }
+        }
+
+        // The request outcome alone cannot tell a failed placement from a
+        // placement whose RESPONSE was lost — a long copy outliving a proxy
+        // timeout looks identical to an error, while the server finishes it
+        // happily. So never call it failed without asking what actually
+        // happened first.
+        function reconcile(fallbackMsg) {
+            fetch('/api/video/import/' + id + '/place/status', { headers: { Accept: 'application/json' } })
+                .then(function (res) { return res.json(); })
+                .then(function (s) {
+                    if (s && s.running) { setTimeout(function () { reconcile(fallbackMsg); }, 1500); return; }
+                    if (s && s.success) { succeeded(s); return; }
+                    failed((s && s.error) || fallbackMsg);
+                })
+                .catch(function () { failed(fallbackMsg); });
+        }
+
+        fetch('/api/video/import/' + id + '/place', {
             method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
             body: JSON.stringify(body),
         }).then(function (res) { return res.ok ? res.json() : res.json().catch(function () { return null; }); })
             .then(function (d) {
-                if (d && d.success) {
-                    // A pack's headline is what LANDED: partial success is success
-                    // (already-owned or better-quality episodes are skipped), so
-                    // "Placed X" alone would hide that 4 of 12 went in.
-                    var msg = (d.imported != null && d.total != null)
-                        ? 'Imported ' + d.imported + ' of ' + d.total + ' episodes into “' +
-                          r.picked.title + '”'
-                        : 'Placed “' + r.picked.title + '”';
-                    toast(msg, 'success');
-                    delete state.expanded[r.item.id]; closeResolve(); load();
-                }
-                else { toast((d && d.error) || 'Couldn’t place the file', 'error');
-                    if (btn) { btn.disabled = false; updateConfirm(); } }
+                // Still copying — the server took it off the request thread.
+                if (d && d.running) { reconcile('Couldn’t place the file'); return; }
+                if (d && d.success) { succeeded(d); return; }
+                reconcile((d && d.error) || 'Couldn’t place the file');
             })
-            .catch(function () { toast('Couldn’t place the file', 'error');
-                if (btn) { btn.disabled = false; updateConfirm(); } });
+            .catch(function () { reconcile('Couldn’t place the file'); });
     }
 
     function _dismissCall(id, del, doneMsg) {

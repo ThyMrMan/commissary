@@ -50,10 +50,37 @@ def test_resolve_flow_wired_to_place_and_search():
     # the picker reuses the existing TMDB search, library-owned floated to the top
     assert "/api/video/search?q=" in _JS
     assert "library first" in _JS or "owned" in _JS
-    # movie vs episode placement + the place/dismiss endpoints
+    # movie vs episode placement + the place/dismiss endpoints. Matched on the
+    # URL rather than the exact expression building it: the id was hoisted to a
+    # local so the reconcile/poll closures could share it, and pinning the
+    # spelling of that made a refactor look like an unwired endpoint.
+    assert "'/api/video/import/' + id + '/place'" in _JS
     assert "scope: r.kind" in _JS
-    assert "/api/video/import/' + r.item.id + '/place'" in _JS
     assert "/dismiss'" in _JS
+
+
+def test_a_lost_response_is_reconciled_rather_than_called_a_failure():
+    """A long copy can outlive a proxy timeout while the server finishes it
+    happily, so the request outcome alone cannot tell a failed placement from a
+    placement whose response was lost. Reported as 'couldn't place the file, but
+    the import goes fine'."""
+    assert "/place/status'" in _JS
+    assert "function reconcile" in _JS
+    # every failure route asks what actually happened before saying it failed
+    body = _JS[_JS.index("function place("):]
+    body = body[:body.index("\n    function ", 10)]
+    assert body.count("reconcile(") >= 4, body
+    assert "toast('Couldn’t place the file', 'error')" not in body, \
+        "a failure is still announced without checking the outcome first"
+
+
+def test_the_list_refreshes_even_when_a_placement_reports_failure():
+    """load() used to run only on success, so a placement that actually landed
+    stayed on screen as unplaced — which is what made the false error
+    convincing."""
+    body = _JS[_JS.index("function failed("):]
+    body = body[:body.index("\n        }", 10)]
+    assert "load()" in body
 
 
 def test_endpoints_registered_on_the_blueprint():

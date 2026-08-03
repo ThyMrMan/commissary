@@ -540,10 +540,19 @@ class ConfigManager:
                 # LISTS: a client sorting completed downloads into category
                 # folders needs one entry per category. A bare string (every
                 # config saved before this became a list) still works — see
-                # album_bundle._iter_paths. The resolver also looks ONE level
-                # inside each entry, so naming the parent folder is enough.
+                # album_bundle._iter_paths. The resolver also looks SEVERAL
+                # levels inside each entry (import_search_depth below), so
+                # naming the parent folder is enough.
                 "torrent_download_path": [],
                 "usenet_download_path": [],
+                # How many folder levels below a download root to look for a
+                # finished release. The resolver used to look exactly one, which
+                # could not reach a client sorting into category folders
+                # ('<root>/complete/Movies/<release>' is two), so such a
+                # download resolved to nothing and never imported. Clamped
+                # 1..6 — these roots can be whole download disks, and a total
+                # per-root scan budget bounds the cost either way.
+                "import_search_depth": 3,
                 # Explicit remote→local prefix mappings for non-shared / oddly
                 # mounted layouts (Sonarr/Radarr "Remote Path Mapping" style):
                 # a list of {"from": "<client path>", "to": "<soulsync path>"}.

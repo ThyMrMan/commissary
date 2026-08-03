@@ -345,9 +345,26 @@ def register_routes(bp):
         from core.video.importer import real_fs, run_import
         from core.video.mediainfo import probe
 
+        from core.video import manual_place
+
         db = get_video_db()
         row = db.get_video_download(dl_id)
-        if not row or row.get("status") != "import_failed":
+        if not row:
+            return jsonify({"success": False, "error": "Not an unplaced import."}), 404
+        # A placement already in flight — the client's first request timed out
+        # and it is asking again. Report the running job rather than starting a
+        # SECOND copy of the same file on top of the first.
+        if manual_place.is_running(dl_id):
+            return jsonify({"success": True, "running": True, "id": dl_id})
+        # Already placed. Almost always this exact bug's aftermath: a previous
+        # attempt copied the file, the connection dropped before the response
+        # arrived, and the retry lands here. Answering 404 "Not an unplaced
+        # import" made that a second, different, equally wrong error — so report
+        # the truth, which is that it is in the library.
+        if row.get("status") == "completed":
+            return jsonify({"success": True, "status": "completed",
+                            "dest_path": row.get("dest_path"), "already": True})
+        if row.get("status") != "import_failed":
             return jsonify({"success": False, "error": "Not an unplaced import."}), 404
         src = row.get("dest_path")
         if not src or not os.path.exists(src):
@@ -382,25 +399,46 @@ def register_routes(bp):
         settings = organization.load(db)
         prober = probe if settings.get("verify_with_ffprobe", True) else None
         from core.video.recycle import discarder
-        if scope == "season":
-            # One identity choice, every episode in the folder. Each member keeps
-            # its OWN season/episode from its filename — see run_season_import.
-            from core.video.importer import run_season_import
-            patch = run_season_import(row, src, fs=real_fs(), lister=_walk_video_files,
-                                      prober=prober, settings=settings, force=True,
-                                      override=override, recycle=discarder(db, settings),
-                                      size_of=lambda p: (os.path.getsize(p)
-                                                         if os.path.exists(p) else 0))
-        else:
-            patch = run_import(row, src, fs=real_fs(), prober=prober, settings=settings,
-                               force=True, override=override, recycle=discarder(db, settings))
-        try:
-            db.update_video_download(dl_id, **patch)
-        except Exception:
-            logger.exception("manual place: failed to persist import %s", dl_id)
-            return jsonify({"success": False, "error": "Couldn't save the result."}), 500
-        ok = patch.get("status") == "completed"
-        if ok:
+
+        def _place() -> dict:
+            """The actual copy + bookkeeping. Runs on a worker thread — see
+            core.video.manual_place for why it cannot stay in the request."""
+            if scope == "season":
+                # One identity choice, every episode in the folder. Each member keeps
+                # its OWN season/episode from its filename — see run_season_import.
+                from core.video.importer import run_season_import
+                patch = run_season_import(row, src, fs=real_fs(), lister=_walk_video_files,
+                                          prober=prober, settings=settings, force=True,
+                                          override=override, recycle=discarder(db, settings),
+                                          size_of=lambda p: (os.path.getsize(p)
+                                                             if os.path.exists(p) else 0))
+            else:
+                patch = run_import(row, src, fs=real_fs(), prober=prober, settings=settings,
+                                   force=True, override=override,
+                                   recycle=discarder(db, settings))
+            return _finish(patch)
+
+        def _finish(patch: dict) -> dict:
+            ok = patch.get("status") == "completed"
+            try:
+                db.update_video_download(dl_id, **patch)
+            except Exception:
+                # The file has ALREADY moved by this point, so reporting a bare
+                # failure here is the same lie the timeout used to tell. Say what
+                # actually happened: it is in the library, the record of it is not.
+                logger.exception("manual place: failed to persist import %s", dl_id)
+                if ok:
+                    return {"success": True, "status": "completed",
+                            "dest_path": patch.get("dest_path"),
+                            "warning": "Placed, but the record of it could not be saved — "
+                                       "it may still show as unplaced until the next scan."}
+                return {"success": False, "error": "Couldn't save the result."}
+            if not ok:
+                return {"success": False, "status": patch.get("status"),
+                        "dest_path": patch.get("dest_path"), "error": patch.get("error"),
+                        "imported": patch.get("_pack_imported"),
+                        "total": patch.get("_pack_total"),
+                        "failed": patch.get("_pack_failed") or []}
             # Write NFO + artwork sidecars for the chosen identity (best-effort), then
             # refresh the server + DB the same way the auto-download path does
             # (batch-complete → scan chain), so the manually-placed title shows up
@@ -435,14 +473,55 @@ def register_routes(bp):
                 notify_batch_complete({"completed": 1, "manual": True})
             except Exception:
                 logger.exception("manual place: batch-complete notify failed for %s", dl_id)
-        return jsonify({"success": ok, "status": patch.get("status"),
-                        "dest_path": patch.get("dest_path"), "error": patch.get("error"),
-                        # A pack reports what LANDED: partial success is success
-                        # (already-owned or better-quality episodes are skipped),
-                        # so a bare "done" would hide that four of twelve went in.
-                        "imported": patch.get("_pack_imported"),
-                        "total": patch.get("_pack_total"),
-                        "failed": patch.get("_pack_failed") or []})
+            return {"success": True, "status": patch.get("status"),
+                    "dest_path": patch.get("dest_path"), "error": patch.get("error"),
+                    # A pack reports what LANDED: partial success is success
+                    # (already-owned or better-quality episodes are skipped),
+                    # so a bare "done" would hide that four of twelve went in.
+                    "imported": patch.get("_pack_imported"),
+                    "total": patch.get("_pack_total"),
+                    "failed": patch.get("_pack_failed") or []}
+
+        # Off the request thread, then wait briefly. A small file or a
+        # same-filesystem move finishes inside the grace period and answers in
+        # this very request, exactly as before — only a genuinely slow copy
+        # switches the client to polling, and that is the one that used to time
+        # out and report a failure for a placement that had actually worked.
+        manual_place.start(dl_id, _place)
+        snap = manual_place.wait(dl_id, manual_place.DEFAULT_GRACE_SECONDS)
+        if snap.get("running"):
+            return jsonify({"success": True, "running": True, "id": dl_id})
+        if snap.get("error"):
+            return jsonify({"success": False, "error": snap["error"]}), 500
+        return jsonify(snap.get("result") or
+                       {"success": False, "error": "Couldn't place the file."})
+
+    @bp.route("/import/<int:dl_id>/place/status", methods=["GET"])
+    def video_import_place_status(dl_id):
+        """Where a placement got to. The client polls this after a slow one, and
+        falls back to it whenever a request fails — the answer distinguishes a
+        placement that worked from one that did not, which the request outcome
+        on its own cannot."""
+        from . import get_video_db
+        from core.video import manual_place
+
+        snap = manual_place.state(dl_id)
+        if snap and snap.get("running"):
+            return jsonify({"success": True, "running": True, "id": dl_id})
+        if snap and snap.get("error"):
+            return jsonify({"success": False, "running": False, "error": snap["error"]})
+        if snap and snap.get("result") is not None:
+            return jsonify({"running": False, **snap["result"]})
+        # Nothing in memory — a restart, or a job already reaped. The DB row is
+        # the durable record, so answer from that rather than inventing a failure.
+        row = get_video_db().get_video_download(dl_id)
+        if not row:
+            return jsonify({"success": False, "running": False,
+                            "error": "Not an unplaced import."}), 404
+        placed = row.get("status") == "completed"
+        return jsonify({"success": placed, "running": False,
+                        "status": row.get("status"),
+                        "dest_path": row.get("dest_path") if placed else None})
 
     @bp.route("/import/<int:dl_id>/dismiss", methods=["POST"])
     def video_import_dismiss(dl_id):
