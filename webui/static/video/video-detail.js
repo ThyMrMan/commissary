@@ -637,6 +637,19 @@
             html += '<button class="vd-manage-btn" type="button" data-vd-act="manage" title="' + mTitle + '">' +
                 '<span class="vd-manage-ic">✎</span> Manage</button>';
         }
+        // Rename Files — the per-title naming panel: template + variables +
+        // a preview of every current → proposed name before anything moves.
+        // Library rows with files only; the endpoints are admin-only like the
+        // rest of the /organization/* management surface.
+        var renameId = (ownLibItem && _isAdmin && (d.kind === 'movie' || d.kind === 'show') &&
+                        (d.owned || d.episode_owned))
+            ? (d.source !== 'tmdb' ? d.id : d.library_id) : null;
+        if (renameId != null && window.VideoRename) {
+            html += '<button class="vd-manage-btn" type="button" data-vd-act="rename"' +
+                ' data-vd-rename-id="' + esc(renameId) + '"' +
+                ' title="Rename this title’s files on disk from a naming template">' +
+                '<span class="vd-manage-ic">✎</span> Rename Files</button>';
+        }
         // Synchronize — a deep scan scoped to THIS show: re-reads it from the
         // server and reconciles episodes (adds + removals) without waiting for
         // a full library scan. Library shows only (needs a local row).
@@ -768,6 +781,18 @@
         var tmdbId = data.tmdb_id || ((data.source === 'tmdb' && currentId) ? currentId : null);
         if (tmdbId == null) return;
         VideoManage.open({ kind: data.kind, id: tmdbId, source: 'tmdb', detail: data });
+    }
+
+    // Rename Files — the per-title naming panel. Library row only: renaming acts
+    // on files this install actually owns, so a TMDB-only title has nothing to do.
+    function openRenamePanel(btn) {
+        if (!window.VideoRename || !data) return;
+        var id = btn && btn.getAttribute('data-vd-rename-id');
+        if (id == null || id === '') {
+            id = (data.source !== 'tmdb') ? ((data.id != null) ? data.id : currentId) : data.library_id;
+        }
+        if (id == null || id === '') return;
+        VideoRename.open({ kind: data.kind, id: id, title: data.title || '' });
     }
 
     // Manage Poster — open the poster manager for this item (library id + tmdb id).
@@ -2635,6 +2660,7 @@
             else if (which === 'poster') openPosterModal();
             else if (which === 'manage') openManagePanel();
             else if (which === 'sync-show') syncShowNow(act);
+            else if (which === 'rename') openRenamePanel(act);
             else if (which === 'watched-toggle') toggleWatchedState(act);
             else if (which === 'yt-follow') toggleYtFollow();
             else if (which === 'yt-pl-follow') toggleYtPlaylistFollowHero();

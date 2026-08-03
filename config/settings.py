@@ -816,6 +816,13 @@ class ConfigManager:
             "youtube": {
                 "cookies_browser": "",      # "", "chrome", "firefox", "edge", "brave", "opera", "safari"
                 "download_delay": 3,        # seconds between sequential downloads
+                # What lands in the library. "mp3" re-encodes YouTube's audio to
+                # MP3 320 (universally compatible, but a lossy->lossy transcode
+                # of a ~130-160kbps Opus source, so bigger AND slightly worse).
+                # "original" keeps the stream YouTube served, never re-encoding:
+                # an m4a/AAC stream passes through untouched, a webm/Opus one is
+                # remuxed to .opus with -acodec copy. Neither downloads video.
+                "audio_format": "mp3",      # "mp3" | "original"
             },
             "hydrabase": {
                 "url": "",

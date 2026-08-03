@@ -5849,8 +5849,16 @@ class VideoDatabase:
                                 "title": r["title"], "year": r["year"]})
         return out
 
-    def repair_owned_movie_files(self) -> list:
-        """Every owned movie with each of its files (quality/runtime checks)."""
+    def repair_owned_movie_files(self, movie_id=None) -> list:
+        """Every owned movie with each of its files (quality/runtime checks).
+
+        ``movie_id`` narrows it to one title — the per-title rename preview on
+        the movie page. None (the default) is every owned movie, exactly as
+        every existing caller expects."""
+        where, args = "m.has_file=1", []
+        if movie_id is not None:
+            where += " AND m.id=?"
+            args.append(int(movie_id))
         conn = self._get_connection()
         try:
             rows = conn.execute(
@@ -5858,14 +5866,22 @@ class VideoDatabase:
                 "f.id AS file_id, f.relative_path, f.size_bytes, f.resolution, f.quality, "
                 "f.video_codec, f.audio_codec, f.release_source, f.runtime_seconds "
                 "FROM movies m JOIN media_files f ON f.movie_id = m.id "
-                "WHERE m.has_file=1 ORDER BY m.title COLLATE NOCASE, f.size_bytes DESC").fetchall()
+                f"WHERE {where} ORDER BY m.title COLLATE NOCASE, f.size_bytes DESC",
+                args).fetchall()
             return [dict(r) for r in rows]
         finally:
             conn.close()
 
-    def rename_owned_episode_files(self) -> list:
+    def rename_owned_episode_files(self, show_id=None) -> list:
         """Every owned episode file with the show/episode context the naming
-        templates need (mass rename, P7)."""
+        templates need (mass rename, P7).
+
+        ``show_id`` narrows it to one series — the per-show rename preview on
+        the show page. None (the default) is the whole library, unchanged."""
+        where, args = "e.has_file=1", []
+        if show_id is not None:
+            where += " AND s.id=?"
+            args.append(int(show_id))
         conn = self._get_connection()
         try:
             rows = conn.execute(
@@ -5880,8 +5896,9 @@ class VideoDatabase:
                 "f.video_codec, f.release_source "
                 "FROM episodes e JOIN shows s ON s.id = e.show_id "
                 "JOIN media_files f ON f.episode_id = e.id "
-                "WHERE e.has_file=1 "
-                "ORDER BY s.title COLLATE NOCASE, e.season_number, e.episode_number").fetchall()
+                f"WHERE {where} "
+                "ORDER BY s.title COLLATE NOCASE, e.season_number, e.episode_number",
+                args).fetchall()
             return [dict(r) for r in rows]
         finally:
             conn.close()

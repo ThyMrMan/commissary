@@ -66,6 +66,57 @@ def _episode_fields(row: Dict[str, Any]) -> Dict[str, Any]:
             "codec": row.get("video_codec")}
 
 
+# What each $token means, for the rename panel's variable list. The NAMES are
+# derived from organization.py at call time rather than repeated here — a token
+# added there but not described here is a test failure, not a silently missing
+# row in the UI.
+TOKEN_HELP = {
+    # episodes
+    "series": "Show title",
+    "season": "Season number, zero-padded (01)",
+    "seasonraw": "Season number, unpadded (1)",
+    "episode": "Episode number, zero-padded. A multi-episode file renders its "
+               "whole span (01-E02)",
+    "episodetitle": "Episode title",
+    "airdate": "Air date, YYYY-MM-DD — for daily shows",
+    "tvdbid": "TheTVDB id",
+    # movies
+    "title": "Movie title",
+    "titlefirst": "First letter of the title, for A/B/C… folders",
+    "edition": "Edition (Director's Cut, Extended…)",
+    "tmdbid": "TMDB id",
+    "imdbid": "IMDb id",
+    # both
+    "year": "Release year",
+    "quality": "Quality label (1080p, 2160p…)",
+    "resolution": "Resolution",
+    "source": "Release source (BluRay, WEB-DL…)",
+    "codec": "Video codec, uppercased (H264, HEVC…)",
+}
+
+
+def tokens_for(kind: str, sample_row: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
+    """The $variables available for ``kind``, each with its meaning and — when a
+    real file is passed — the value it would take for THIS title.
+
+    Names come from organization.py's own value builders, so the list cannot
+    drift from what the template engine actually substitutes.
+    """
+    from core.video import organization
+    if kind == "movie":
+        fields = _movie_fields(sample_row or {})
+        values = organization._movie_values(fields)
+    else:
+        fields = _episode_fields(sample_row or {})
+        values = organization._episode_values(fields)
+    out = []
+    for name in sorted(values):
+        out.append({"token": "$" + name,
+                    "description": TOKEN_HELP.get(name, ""),
+                    "example": str(values.get(name) or "")})
+    return out
+
+
 def _base_dir_of(path: str, base_dirs: List[str]) -> Optional[str]:
     """The configured base dir this local path lives under (deepest match)."""
     norm = os.path.normpath(path)
@@ -104,18 +155,37 @@ def _inverse_reroot(new_local: str, old_local: str, stored: str) -> str:
     return stored_base + nl[len(local_base):]
 
 
-def preview(progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, Any]:
+def preview(progress: Optional[Callable[[int, int], None]] = None, *,
+            scope: Optional[tuple] = None,
+            template: Optional[str] = None) -> Dict[str, Any]:
     """Every file whose on-disk name differs from the current template.
     {status, entries: [{key, kind, title, current, proposed, reason?}],
     unresolved: int}.
 
     ``progress(done, total)`` is called as files are scanned so a background
-    caller can report a live count. Pure read — never mutates."""
+    caller can report a live count. Pure read — never mutates.
+
+    ``scope`` narrows the scan to one title: ``('show', show_id)`` or
+    ``('movie', movie_id)``. None is the whole library, as before.
+
+    ``template`` renders against a one-off template instead of the saved one,
+    for the per-title panel where you type a name and watch the result. It is
+    NEVER written back to settings — the global template is untouched.
+    """
     from api.video import get_video_db
     from core.video import organization
     from core.video.path_resolver import resolve_video_file_path, video_base_dirs
     db = get_video_db()
     settings = organization.load(db)
+    kind_scope = (scope or (None,))[0]
+    scope_id = scope[1] if scope else None
+    if template and str(template).strip():
+        # Shallow copy: the override applies to the kind being previewed and the
+        # stored settings object is left alone (organization.load returns a fresh
+        # dict, but copying makes that independence explicit rather than assumed).
+        settings = dict(settings)
+        key = "movie_template" if kind_scope == "movie" else "episode_template"
+        settings[key] = str(template)
     base_dirs = video_base_dirs(db)
     entries: List[Dict[str, Any]] = []
     unresolved = 0
@@ -142,8 +212,13 @@ def preview(progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, 
             dir_map[sdir] = os.path.dirname(local)
         return local
 
-    movies = db.repair_owned_movie_files()
-    episodes = db.rename_owned_episode_files()
+    if kind_scope == "movie":
+        movies, episodes = db.repair_owned_movie_files(movie_id=scope_id), []
+    elif kind_scope == "show":
+        movies, episodes = [], db.rename_owned_episode_files(show_id=scope_id)
+    else:
+        movies = db.repair_owned_movie_files()
+        episodes = db.rename_owned_episode_files()
     total = len(movies) + len(episodes)
     done = 0
 
@@ -225,25 +300,36 @@ def preview_state() -> Dict[str, Any]:
     return _snapshot()
 
 
-def apply(keys: Optional[List[str]] = None) -> Dict[str, Any]:
+def apply(keys: Optional[List[str]] = None, *,
+          scope: Optional[tuple] = None,
+          template: Optional[str] = None) -> Dict[str, Any]:
     """Perform the renames from a fresh preview (optionally only the picked
-    ``keys``). Collision-safe; DB stored paths follow each move."""
+    ``keys``). Collision-safe; DB stored paths follow each move.
+
+    ``scope`` and ``template`` MUST match the ones the caller previewed with.
+    The plan is recomputed here rather than trusted from the client — so
+    without forwarding them, a per-show apply would rebuild the plan from the
+    whole library and the GLOBAL template, and rename files the user never saw
+    a preview of. ``keys`` narrows the result but is not a substitute: it can
+    only filter a plan, and the proposed name inside that plan comes from the
+    template used to build it.
+    """
     global _running
     with _lock:
         if _running:
             return {"status": "skipped", "reason": "already_running"}
         _running = True
     try:
-        return _apply_inner(set(keys) if keys else None)
+        return _apply_inner(set(keys) if keys else None, scope=scope, template=template)
     finally:
         with _lock:
             _running = False
 
 
-def _apply_inner(keys) -> Dict[str, Any]:
+def _apply_inner(keys, *, scope=None, template=None) -> Dict[str, Any]:
     from api.video import get_video_db
     db = get_video_db()
-    plan = preview()
+    plan = preview(scope=scope, template=template)
     renamed = skipped = 0
     failures: List[Dict[str, str]] = []
     for e in plan["entries"]:

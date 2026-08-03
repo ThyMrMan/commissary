@@ -548,6 +548,79 @@ def register_routes(bp):
             return jsonify({"success": False, "error": "A rename run is already in progress."}), 409
         return jsonify({"success": True, **res})
 
+    # ── per-title rename (the show/movie page panel) ─────────────────────────
+    # The library-wide job above scans everything on a worker; one title is
+    # small enough to answer inline, and deliberately does NOT touch that job's
+    # shared state — running a preview for one show must not clobber a
+    # library-wide scan someone left open on the Tools page.
+    def _rename_scope(body):
+        """('show'|'movie', id) from a request body, or None if it names nothing."""
+        kind = str((body or {}).get("kind") or "").lower()
+        if kind not in ("show", "movie"):
+            return None
+        try:
+            return (kind, int((body or {}).get("id")))
+        except (TypeError, ValueError):
+            return None
+
+    @bp.route("/organization/rename/tokens", methods=["GET"])
+    def video_rename_tokens():
+        """The $variables usable in a template, with the value each would take
+        for this title. Also returns the saved template as the starting point."""
+        from core.video import organization
+        from core.video.mass_rename import tokens_for
+        from . import get_video_db
+        db = get_video_db()
+        kind = str(request.args.get("kind") or "show").lower()
+        if kind not in ("show", "movie"):
+            return jsonify({"success": False, "error": "kind must be show or movie"}), 400
+        try:
+            title_id = int(request.args.get("id"))
+        except (TypeError, ValueError):
+            title_id = None
+        rows = (db.repair_owned_movie_files(movie_id=title_id) if kind == "movie"
+                else db.rename_owned_episode_files(show_id=title_id))
+        settings = organization.load(db)
+        tmpl_key = "movie_template" if kind == "movie" else "episode_template"
+        return jsonify({
+            "success": True,
+            "kind": kind,
+            "template": settings.get(tmpl_key) or organization.DEFAULTS[tmpl_key],
+            "default_template": organization.DEFAULTS[tmpl_key],
+            "file_count": len(rows),
+            "tokens": tokens_for(kind, rows[0] if rows else None),
+        })
+
+    @bp.route("/organization/rename/preview/title", methods=["POST"])
+    def video_rename_preview_title():
+        """Preview one title's renames against a typed template.
+        Body: {kind: 'show'|'movie', id, template?}. The template is used for
+        this preview only — the saved one is never modified."""
+        from core.video.mass_rename import preview
+        body = request.get_json(silent=True) or {}
+        scope = _rename_scope(body)
+        if scope is None:
+            return jsonify({"success": False, "error": "A show or movie id is required."}), 400
+        res = preview(scope=scope, template=body.get("template"))
+        return jsonify({"success": True, **res})
+
+    @bp.route("/organization/rename/apply/title", methods=["POST"])
+    def video_rename_apply_title():
+        """Apply one title's renames. Body: {kind, id, template?, keys?}.
+
+        The scope and template are re-sent and the plan recomputed here — the
+        client's proposed paths are never trusted, and applying with a template
+        other than the previewed one would rename to names nobody saw."""
+        from core.video.mass_rename import apply as apply_renames
+        body = request.get_json(silent=True) or {}
+        scope = _rename_scope(body)
+        if scope is None:
+            return jsonify({"success": False, "error": "A show or movie id is required."}), 400
+        res = apply_renames(body.get("keys"), scope=scope, template=body.get("template"))
+        if res.get("status") == "skipped":
+            return jsonify({"success": False, "error": "A rename run is already in progress."}), 409
+        return jsonify({"success": True, **res})
+
     @bp.route("/downloads/blocklist", methods=["GET"])
     def video_downloads_blocklist():
         """The release blocklist — exact remote files that will never be re-picked."""

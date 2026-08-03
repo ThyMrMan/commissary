@@ -1574,6 +1574,7 @@ async function loadSettingsData() {
         // Populate YouTube settings
         document.getElementById('youtube-cookies-browser').value = settings.youtube?.cookies_browser || '';
         document.getElementById('youtube-download-delay').value = settings.youtube?.download_delay ?? 3;
+        document.getElementById('youtube-audio-format').value = settings.youtube?.audio_format || 'mp3';
         // Show the cookies.txt paste box only in "custom" mode. We never echo the
         // stored cookie back to the UI (it's secret + lives in a file, not config);
         // if one is already saved, say so via placeholder so a blank save won't wipe it.
@@ -4940,6 +4941,9 @@ async function saveSettings(quiet = false) {
         youtube: {
             cookies_browser: document.getElementById('youtube-cookies-browser').value,
             download_delay: parseInt(document.getElementById('youtube-download-delay').value) || 3,
+            // "mp3" (transcode to MP3 320) or "original" (keep YouTube's stream,
+            // no re-encode). Anything else is coerced back to mp3 server-side.
+            audio_format: document.getElementById('youtube-audio-format')?.value || 'mp3',
             // Raw cookies.txt blob — backend validates, writes it to a file, and stores
             // only the path (never echoed back). Blank = keep any already-saved file.
             cookies_paste: document.getElementById('youtube-cookies-paste')?.value || '',

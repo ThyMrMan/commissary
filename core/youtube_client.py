@@ -52,6 +52,42 @@ def _resolve_cookie_opts() -> dict:
     return build_youtube_cookie_opts(mode, cookiefile, cookiefile_exists=exists)
 
 
+# Settings → YouTube → Audio format. "mp3" is the long-standing behaviour.
+AUDIO_FORMATS = ("mp3", "original")
+
+# Every container an audio-only YouTube grab can land in, for locating the
+# finished file. Ordered mp3-first so the common case resolves immediately.
+AUDIO_OUTPUT_EXTS = ('.mp3', '.m4a', '.opus', '.ogg', '.webm', '.aac', '.flac', '.wav')
+
+
+def _resolve_audio_format() -> str:
+    """The configured output format, falling back to 'mp3' for anything unknown."""
+    from config.settings import config_manager
+    value = str(config_manager.get('youtube.audio_format', 'mp3') or 'mp3').strip().lower()
+    return value if value in AUDIO_FORMATS else 'mp3'
+
+
+def build_audio_postprocessors(audio_format: str) -> list:
+    """yt-dlp postprocessors for the configured output format.
+
+    'mp3'      -> FFmpegExtractAudio re-encodes to MP3 320. Universally playable,
+                  but YouTube serves Opus at roughly 130-160kbps, so this is a
+                  lossy->lossy transcode: bigger file, slightly worse sound.
+    'original' -> preferredcodec 'best', which yt-dlp reads as "do not convert".
+                  An m4a/AAC stream is left completely alone (its extension is in
+                  FFmpegExtractAudioPP.COMMON_AUDIO_EXTS, so the PP returns
+                  early); a webm/Opus one is rewrapped to .opus with
+                  '-acodec copy'. No re-encode either way.
+                  preferredquality is deliberately omitted — it only applies to
+                  an encoder, and passing it with 'copy' would be meaningless.
+    """
+    if audio_format == 'original':
+        return [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'best'}]
+    return [{'key': 'FFmpegExtractAudio',
+             'preferredcodec': 'mp3',
+             'preferredquality': '320'}]
+
+
 @dataclass
 class YouTubeSearchResult:
     """YouTube search result with metadata parsing"""
@@ -218,17 +254,18 @@ class YouTubeClient(DownloadSourcePlugin):
             )
 
         # Configure yt-dlp options with bot detection bypass
+        self.audio_format = _resolve_audio_format()
         self.download_opts = {
+            # 'bestaudio' compiles to `vcodec == 'none'` — video streams are
+            # excluded from selection entirely. The '/best' half is the fallback
+            # for the rare video offering no audio-only format at all; that one
+            # IS muxed, and ffmpeg strips the video off it.
             'format': 'bestaudio/best',
             'outtmpl': str(self.download_path / '%(title)s.%(ext)s'),
             'quiet': True,
             'no_warnings': True,
             'extract_flat': False,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '320',
-            }],
+            'postprocessors': build_audio_postprocessors(self.audio_format),
             'progress_hooks': [self._progress_hook],  # Track download progress
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
             'age_limit': None,  # Don't skip age-restricted
@@ -328,6 +365,11 @@ class YouTubeClient(DownloadSourcePlugin):
         _cookie_opts = _resolve_cookie_opts()
         self.download_opts.update(_cookie_opts)
 
+        # Output format — rebuilt rather than mutated so switching back to mp3
+        # drops the 'best' passthrough instead of leaving both codecs set.
+        self.audio_format = _resolve_audio_format()
+        self.download_opts['postprocessors'] = build_audio_postprocessors(self.audio_format)
+
         # Reload download path
         new_path = Path(config_manager.get('soulseek.download_path', './downloads'))
         if new_path != self.download_path:
@@ -336,7 +378,9 @@ class YouTubeClient(DownloadSourcePlugin):
             self.download_opts['outtmpl'] = str(self.download_path / '%(title)s.%(ext)s')
             logger.info(f"YouTube download path updated to: {self.download_path}")
 
-        logger.info(f"YouTube settings reloaded (delay={self._download_delay}s, cookies={'enabled' if _cookie_opts else 'disabled'})")
+        logger.info(f"YouTube settings reloaded (delay={self._download_delay}s, "
+                    f"audio={self.audio_format}, "
+                    f"cookies={'enabled' if _cookie_opts else 'disabled'})")
 
     async def check_connection(self) -> bool:
         """
@@ -706,7 +750,13 @@ class YouTubeClient(DownloadSourcePlugin):
             size=file_size,
             bitrate=bitrate,
             duration=duration_ms,
-            quality="mp3",  # We always convert to MP3
+            # What this candidate will BE once downloaded, not what YouTube is
+            # streaming — in mp3 mode everything is transcoded to MP3, so 'mp3'
+            # is the honest answer whatever the source codec is. In 'original'
+            # mode the source codec IS the delivered codec, so claiming mp3
+            # would misreport the file to the quality ranker and to the library
+            # scanner that later reads the real file.
+            quality=self._delivered_quality_label(best_audio),
             free_upload_slots=999,  # YouTube always available
             upload_speed=999999,  # High speed indicator
             queue_length=0,  # No queue for YouTube
@@ -882,6 +932,30 @@ class YouTubeClient(DownloadSourcePlugin):
         # Sort by audio bitrate (tbr = total bitrate, abr = audio bitrate)
         audio_formats.sort(key=lambda f: f.get('abr', f.get('tbr', 0)), reverse=True)
         return audio_formats[0]
+
+    def _delivered_quality_label(self, best_audio: Optional[Dict]) -> str:
+        """The format a candidate will be delivered in — 'mp3', 'opus' or 'aac'.
+
+        Feeds core.quality.model, which scores opus 65 / aac 60 / mp3 50 and
+        matches quality-profile targets by format name. That has a consequence
+        worth stating: under 'original', a profile targeting MP3 320 no longer
+        matches a YouTube candidate, because the file genuinely will not be an
+        MP3. Reporting 'mp3' regardless would hide that until the library
+        scanner read the finished file and disagreed.
+
+        Unknown/absent codec falls back to 'mp3' rather than 'unknown' so a
+        candidate is never dropped for lack of a label.
+        """
+        if self.audio_format != 'original':
+            return 'mp3'
+        acodec = str((best_audio or {}).get('acodec') or '').lower()
+        if 'opus' in acodec:
+            return 'opus'
+        if 'mp4a' in acodec or 'aac' in acodec:
+            return 'aac'
+        if 'mp3' in acodec:
+            return 'mp3'
+        return 'mp3'
 
     def _format_quality_string(self, audio_format: Optional[Dict]) -> str:
         """Format quality info string"""
@@ -1065,6 +1139,41 @@ class YouTubeClient(DownloadSourcePlugin):
     # Legacy worker stub kept temporarily for legacy comment context —
     # see _download_sync below for the actual yt-dlp invocation that
     # the engine's BackgroundDownloadWorker now drives.
+    @staticmethod
+    def _final_download_path(ydl, info: dict) -> Optional[str]:
+        """Where the finished audio actually landed.
+
+        The old code assumed ``prepare_filename(info)`` with '.mp3' forced onto
+        it, which is only true while every download is transcoded to MP3. The
+        extract-audio postprocessor rewrites ``filepath`` on each entry of
+        ``info['requested_downloads']`` as it converts or remuxes, so that is the
+        authoritative answer — and it is right for mp3, m4a and opus alike.
+
+        Falls back to probing the known audio extensions against the download
+        template's stem, for the case where yt-dlp hands back an info dict
+        without requested_downloads.
+        """
+        for entry in (info or {}).get('requested_downloads') or []:
+            path = entry.get('filepath')
+            if path and os.path.exists(path):
+                return str(path)
+
+        direct = (info or {}).get('filepath')
+        if direct and os.path.exists(direct):
+            return str(direct)
+
+        try:
+            base = Path(ydl.prepare_filename(info))
+        except Exception:   # noqa: BLE001 - the probe below is the whole point
+            return None
+        if base.exists():
+            return str(base)
+        for ext in AUDIO_OUTPUT_EXTS:
+            candidate = base.with_suffix(ext)
+            if candidate.exists():
+                return str(candidate)
+        return None
+
     def _download_sync(self, youtube_url: str, title: str) -> Optional[str]:
         """
         Synchronous download method (runs in thread pool executor).
@@ -1106,8 +1215,15 @@ class YouTubeClient(DownloadSourcePlugin):
                                 'youtube': { 'player_client': ['web_creator'] }
                             }
                     elif attempt >= 2:
-                        logger.info(f"Retry {attempt + 1}/{max_retries} with 'best' format (video fallback)")
-                        download_opts['format'] = 'best'
+                        # Last try with nothing clever attached: no cookies, no
+                        # forced player client. The format stays 'bestaudio/best'.
+                        # This branch used to set format='best' — a MUXED
+                        # video+audio stream, downloaded in full so ffmpeg could
+                        # throw the video away. That was redundant as well as
+                        # wasteful: the '/best' half of 'bestaudio/best' already
+                        # is that fallback, applied automatically and only when a
+                        # video genuinely offers no audio-only format.
+                        logger.info(f"Retry {attempt + 1}/{max_retries} without cookies or client override")
                         download_opts.pop('cookiesfrombrowser', None)
                         download_opts.pop('cookiefile', None)
                         download_opts.pop('extractor_args', None)
@@ -1117,13 +1233,12 @@ class YouTubeClient(DownloadSourcePlugin):
                     with yt_dlp.YoutubeDL(download_opts) as ydl:
                         info = ydl.extract_info(youtube_url, download=True)
 
-                        # Get final filename (will be MP3 after ffmpeg conversion)
-                        filename = Path(ydl.prepare_filename(info)).with_suffix('.mp3')
+                        filename = self._final_download_path(ydl, info)
 
-                        if filename.exists():
-                            return str(filename)
+                        if filename:
+                            return filename
                         else:
-                            logger.error(f"Download completed but file not found: {filename}")
+                            logger.error("Download completed but no output file was found for: %s", title)
                             if attempt < max_retries - 1:
                                 continue  # Retry
                             return None

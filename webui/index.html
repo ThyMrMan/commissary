@@ -7819,6 +7819,21 @@
                                             Seconds between YouTube downloads to avoid bot detection. Default: 3
                                         </div>
                                     </div>
+                                    <div class="form-group">
+                                        <label>YouTube Audio Format:</label>
+                                        <select id="youtube-audio-format">
+                                            <option value="mp3">MP3 320 — convert everything (most compatible)</option>
+                                            <option value="original">Original — keep YouTube's audio, never re-encode</option>
+                                        </select>
+                                        <div class="setting-help-text">
+                                            YouTube serves Opus at roughly 130&ndash;160kbps. Converting that to MP3 320
+                                            is a lossy-to-lossy transcode: a bigger file that sounds slightly worse.
+                                            <strong>Original</strong> keeps the stream as-is (.m4a or .opus) &mdash; smaller and
+                                            better, and every part of SoulSync reads those formats. Note that a quality
+                                            profile targeting MP3 will stop matching YouTube, because the file genuinely
+                                            will not be an MP3. Neither option ever downloads the music video.
+                                        </div>
+                                    </div>
                                 </div>
 
                             </div>
@@ -12154,6 +12169,7 @@
     <script src="{{ url_for('static', filename='video/video-poster-modal.js', v=static_v) }}"></script>
     <!-- Manage panel (per-item metadata editor slide-over; "Manage" on detail pages) -->
     <script src="{{ url_for('static', filename='video/video-manage-panel.js', v=static_v) }}"></script>
+    <script src="{{ url_for('static', filename='video/video-rename-panel.js', v=static_v) }}"></script>
     <!-- Library Maintenance (jobs & findings on the video Tools page) -->
     <script src="{{ url_for('static', filename='video/video-repair.js', v=static_v) }}"></script>
     <!-- Issues (report on items via the Manage sidebar; triage on the Issues page) -->

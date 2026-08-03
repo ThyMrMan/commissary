@@ -44,12 +44,18 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
                             resolve_path: Callable[[Any], Any],
                             find_video: Callable[[Any, Any], Any],
                             organizer: Optional[Callable] = None,
-                            find_pack: Optional[Callable[[Any, Any], Any]] = None) -> dict:
+                            find_pack: Optional[Callable[[Any, Any], Any]] = None,
+                            settled: Optional[Callable[[dict, str], bool]] = None) -> dict:
     """Next-state patch for a torrent/usenet download. ``get_status(source, ref)`` returns the
     client's status object (or None if it forgot the job), ``resolve_path`` maps its reported
     save_path to a locally-readable one, ``find_video(root, name)`` returns the main video file
     for THIS job — scoped to its own content (``name`` = the torrent/nzb job name), never the
-    largest file in a shared download folder."""
+    largest file in a shared download folder.
+
+    ``settled(dl, path)`` is the guard against importing a file something is still
+    writing. 100% means the BYTES are in; it does not mean the client has finished
+    putting them where we are about to read them. Passing None keeps the old
+    behaviour (import as soon as a file is visible)."""
     ref = dl.get("client_ref")
     if not ref:
         return {"_missing": True}
@@ -106,6 +112,19 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
         if dl.get("dest_path"):
             return {"status": "completed", "progress": 100.0, "dest_path": dl.get("dest_path")}
         return {"progress": 100.0}   # complete but the file isn't visible yet — keep polling
+    # Visible is not the same as finished. qBittorrent's 'moving' (relocating from
+    # the incomplete folder to the complete one) reports progress 1.0, and the
+    # adapter maps it to 'queued' — which normalises to 'downloading' here, so the
+    # `state != completed AND pct < 100` guard above lets it straight through and
+    # the import reads a file mid-copy. The same is true of usenet par2 repair and
+    # unrar, which write into the folder well after the download hits 100%.
+    # State alone cannot fix this: the adapter deliberately lumps 'moving' and
+    # 'checkingDL' in with 'queuedUP' (done, merely queued to seed), and refusing
+    # to import on 'queued' would strand every seed-queued torrent at 100% forever
+    # — the exact bug the comment above was written to prevent. So the gate is the
+    # filesystem itself: hold until the bytes stop changing.
+    if settled is not None and not settled(dl, src):
+        return {"progress": 100.0}   # still being written — keep polling
     if organizer is not None:
         return organizer(dl, src)
     return {"status": "completed", "progress": 100.0, "dest_path": src}
@@ -215,8 +234,73 @@ def find_video_file(root, name=None) -> Optional[str]:
     return _largest_video(root)
 
 
+# ── the settle gate ──────────────────────────────────────────────────────────
+# How many CONSECUTIVE identical readings of the content mean "nothing is writing
+# to this any more". Two is the minimum that can mean anything (one reading proves
+# nothing), and at the monitor's 3s poll that costs one extra tick.
+_SETTLE_READS = 2
+
+# download id -> (path, snapshot, consecutive_matches). Module-level because the
+# monitor calls process_* once per tick with no memory between calls — the same
+# shape as this module's sibling `_stall` map in download_monitor.
+_settle_state: dict = {}
+_SETTLE_STATE_CAP = 512
+
+
+def _snapshot(path: str):
+    """Size/count/mtime fingerprint, reusing the music side's tested helper.
+
+    mtime is what makes this work for torrents specifically: a pre-allocated or
+    sparse file already has its FINAL size on the first byte written, so size
+    alone cannot tell a finished file from one still being filled in.
+    """
+    try:
+        from core.download_plugins.album_bundle import snapshot_incomplete_path
+        return snapshot_incomplete_path(path)
+    except Exception:   # noqa: BLE001 - unreadable reads as "not settled", never as done
+        return None
+
+
+def content_has_settled(dl: dict, path: str, *, snapshot=_snapshot,
+                        required: int = _SETTLE_READS) -> bool:
+    """True once ``path`` has read identical ``required`` times in a row.
+
+    An unreadable path, an empty directory, or a path that changed since the last
+    tick all reset the count — a client that has just created the destination
+    folder and not yet copied into it must not look the same as one that has
+    finished. Errs toward waiting: the cost of being wrong here is a corrupt
+    file in the library, the cost of waiting is one 3-second tick.
+    """
+    key = str(dl.get("id") or dl.get("client_ref") or path)
+    current = snapshot(path)
+    prior_path, prior_snap, matches = _settle_state.get(key, (None, None, 0))
+
+    if current is None or current[1] <= 0:
+        _settle_state[key] = (path, None, 0)
+        return False
+    if path == prior_path and current == prior_snap:
+        matches += 1
+    else:
+        matches = 1
+    _settle_state[key] = (path, current, matches)
+
+    if matches >= required:
+        _settle_state.pop(key, None)     # done with this download
+        return True
+    if len(_settle_state) > _SETTLE_STATE_CAP:
+        # Downloads that vanish mid-settle would otherwise leak an entry each.
+        for stale in list(_settle_state)[:len(_settle_state) - _SETTLE_STATE_CAP]:
+            _settle_state.pop(stale, None)
+    return False
+
+
+def forget_settle_state(dl_id) -> None:
+    """Drop a download's settle progress (cancelled, failed, retried elsewhere)."""
+    _settle_state.pop(str(dl_id), None)
+
+
 def process_active_client_download(dl: dict, organizer=None) -> dict:
     """Production entry: poll the real client + resolve + find the video for one torrent/usenet row."""
     return process_client_download(dl, get_status=_get_status, resolve_path=_resolve_path,
                                    find_video=find_video_file, organizer=organizer,
-                                   find_pack=find_pack_dir)
+                                   find_pack=find_pack_dir, settled=content_has_settled)

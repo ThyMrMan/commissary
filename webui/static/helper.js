@@ -3484,8 +3484,16 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.15': [
-        { date: 'July 2026 · 1.8.15' },
+    '1.8.16': [
+        { date: 'August 2026 · 1.8.16' },
+        { title: 'Rename a show or film’s files from its own page', desc: 'a Rename Files button on any show or movie you own. It shows the naming template, every $variable you can use — each with the value it takes for that title, so $episodetitle reads "Pilot" rather than a generic legend — and a live list of every file with its current name and the name it would get. Nothing moves until you confirm.' },
+        { title: 'Type a name and watch it update', desc: 'edit the template and the preview re-renders as you type; click a variable to insert it. The template you type here is a one-off for that rename — your saved naming template in Settings is not changed.' },
+        { title: 'It was already possible, just not findable', desc: 'the rename engine existed but only ran across your entire library from the Tools page, with no way to see the variables or aim it at one title. Same engine underneath: sidecars still travel with the file, a name that is already taken is skipped rather than overwritten, and the database follows the move.' },
+        { title: 'Torrents are no longer imported while still being written', desc: 'reaching 100% means the bytes are in, not that the client has finished putting them where SoulSync is about to read. qBittorrent reports 100% while "moving" a finished download from the incomplete folder to the complete one, and the import could read a file mid-copy. Usenet repair and unpack have the same shape — both write long after the download says it is done.' },
+        { title: 'It now waits for the writing to stop', desc: 'the import holds until the file reads identically twice in a row, about three seconds apart. Checking the download state alone could not fix this: clients report "moving" and "finished, queued to seed" as the same thing, and refusing to import on that would strand every seeding torrent at 100% forever.' },
+        { title: 'YouTube: the last download retry no longer fetches the video', desc: 'the music downloader has always taken audio only — but its third retry deliberately switched to a combined video+audio stream, downloading the whole video so ffmpeg could throw the picture away. That fallback was redundant as well as wasteful, and it is gone.' },
+        { title: 'And you can now keep YouTube’s original audio', desc: 'Settings → Downloads → YouTube Audio Format. MP3 320 stays the default, but YouTube serves Opus at roughly 130–160kbps, so converting it is a lossy-to-lossy transcode: a bigger file that sounds slightly worse. "Original" keeps the stream untouched — smaller and better. Note that a quality profile targeting MP3 will stop matching YouTube if you switch, because the file genuinely will not be an MP3.' },
+        { title: 'Also in 1.8.15', desc: 'the Wishlist Audit maintenance job would run and clear nothing.' },
         { title: 'Wishlist Audit ran, found nothing, and told you nothing', desc: 'the maintenance job that clears wishlist entries for things you already have. It would run happily and leave downloaded, imported shows sitting on the wishlist. Three separate causes, all ending in a scan that reported nothing.' },
         { title: 'Cleaning something up once made it invisible forever', desc: 'the main one. Approving a finding deletes the wishlist row it names — but the job treated a finding it had already fixed as proof it had reported that title before, and refused to raise it again. So the same show landing back on your wishlist and being downloaded again was never flagged a second time. It worked once per title, then went quiet. Dismissing a finding still silences it for good: "leave this one alone" should stick.' },
         { title: 'Copies your server has but TMDB never matched were not counted', desc: 'the job only recognised something as owned by its TMDB id. A show in your library that never got matched looked un-owned to it — which is precisely the thing you have downloaded, imported, and can see on your server while the audit insists there is nothing to clean. It now also follows the link the wishlist row already carries to the library entry.' },
@@ -3625,6 +3633,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.8.16: rename files from a show's own page",
+        description: "plus two download fixes: torrents are no longer imported while the client is still writing them, and the YouTube downloader's last retry no longer fetches the music video.",
+        features: [
+            "a Rename Files button on any show or movie you own — the naming template, every $variable with the value it takes for THAT title, and a live preview of every file's current and proposed name. Nothing moves until you confirm",
+            "the template you type is a one-off for that rename; your saved template in Settings is untouched. Same engine as the library-wide rename, so sidecars travel with the file and an occupied name is skipped rather than overwritten",
+            "torrents now wait until the file stops changing before importing. Reaching 100% means the bytes are in, not that the client has finished moving them — qBittorrent reports 100% while relocating a finished download, and usenet repair and unpack both write after that point",
+            "the YouTube music downloader's third retry used to switch to a combined video+audio stream and discard the picture. It always took audio only otherwise; that one wasteful fallback is gone",
+            "new YouTube Audio Format setting: keep YouTube's original audio instead of transcoding to MP3 320. Smaller and better, since converting Opus to MP3 is lossy-to-lossy — but a quality profile targeting MP3 will stop matching YouTube if you switch",
+        ],
+        usage_note: "Rename Files is admin-only, and appears on titles you actually own.",
+    },
     {
         title: "1.8.15: Wishlist Audit never cleared anything",
         description: "the maintenance job that removes wishlist entries for things you already have would run, report nothing, and leave downloaded and imported shows sitting there. Three separate causes, all ending in a silent scan.",
