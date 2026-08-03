@@ -541,6 +541,14 @@ body[data-side="video"] .dashboard-header-sweep {
 /* Preferred trackers: pick real indexers by name. The value on the wire is
    still comma-separated Prowlarr ids — which is exactly what nobody could
    look up, hence the picker. */
+/* Caption above the tracker checkboxes. Deliberately a visible element rather
+   than a title= on the input: the input is switched to type=hidden the moment
+   the picker renders, so anything explanatory attached to it disappears exactly
+   when the checkboxes it describes appear. */
+.library-tracker-label { display: block; margin: 10px 0 5px; }
+.library-tracker-label strong { display: block; font-size: 12px; color: rgba(255, 255, 255, 0.82); }
+.library-tracker-label span { display: block; margin-top: 2px; font-size: 11px; line-height: 1.45;
+    color: rgba(255, 255, 255, 0.45); }
 .library-tracker-picker { display: flex; flex-wrap: wrap; gap: 6px; }
 .library-tracker { display: inline-flex; align-items: center; gap: 7px; padding: 5px 10px;
     border-radius: 999px; cursor: pointer; font-size: 12.5px; font-weight: 600;

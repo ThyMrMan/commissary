@@ -82,6 +82,46 @@ def _indexer_ids() -> List[int]:
     return [int(p) for p in (x.strip() for x in raw.split(",")) if p.isdigit()]
 
 
+# Sentinel for "the caller asked for specific trackers, and none of them survive
+# the global allowlist". Distinct from [] (= no restriction, search everything),
+# which is what an empty list has always meant here.
+_NO_INDEXERS = "no_indexers"
+
+
+def effective_indexer_ids(restrict_to=None):
+    """Which Prowlarr indexers a search may actually use.
+
+    Two independent restrictions, ANDed:
+      * the global ``prowlarr.indexer_ids`` allowlist (Settings → Indexers), and
+      * ``restrict_to`` — the Library's own tracker selection, for grabs filed
+        into that Library.
+
+    Either being empty/None means "that one imposes no restriction", so with
+    neither set the result is ``[]`` and Prowlarr searches every enabled indexer,
+    exactly as before.
+
+    When both are set the result is their INTERSECTION. If that intersection is
+    empty the two settings contradict each other — the Library asks for trackers
+    the global allowlist forbids. Returning ``[]`` there would read as "no
+    restriction" and quietly search EVERY indexer, which is the opposite of what
+    both settings asked for, so this returns the ``_NO_INDEXERS`` sentinel and
+    the caller reports the misconfiguration instead of guessing.
+    """
+    allowed = [int(i) for i in (_indexer_ids() or [])]
+    wanted = []
+    for i in (restrict_to or []):
+        try:
+            wanted.append(int(i))
+        except (TypeError, ValueError):
+            continue
+    if not wanted:
+        return allowed
+    if not allowed:
+        return wanted
+    both = [i for i in wanted if i in set(allowed)]
+    return both if both else _NO_INDEXERS
+
+
 def _imdb_num(imdb_id: Any) -> Optional[str]:
     """Newznab wants the imdb id as digits, no ``tt`` prefix ('tt0111161' → '0111161')."""
     s = str(imdb_id or "").strip()
@@ -258,16 +298,26 @@ def _project(r: Any, url: str, want_proto: str) -> dict:
 def prowlarr_search(scope: str, title: Any, *, year: Any = None, season: Any = None,
                     episode: Any = None, source: str = "torrent", imdb_id: Any = None,
                     tmdb_id: Any = None, tvdb_id: Any = None, air_date: Any = None,
-                    absolute: Any = None, series_type: Any = None) -> dict:
+                    absolute: Any = None, series_type: Any = None,
+                    indexer_ids: Any = None) -> dict:
     """Search Prowlarr for a video release with the multi-strategy (structured + text)
     approach. ``source`` picks the protocol to keep (``torrent`` | ``usenet``). Returns
-    ``{configured, error?, hits:[...]}`` — the hit shape ``_evaluate_hits`` consumes."""
+    ``{configured, error?, hits:[...]}`` — the hit shape ``_evaluate_hits`` consumes.
+
+    ``indexer_ids`` restricts this ONE search to specific Prowlarr indexers — the
+    Library's own tracker selection. It narrows the global allowlist, never widens
+    it. None/empty leaves the global setting in sole charge."""
     client = _client()
     if not client.is_configured():
         return {"configured": False, "hits": []}
     want_proto = "usenet" if str(source or "").lower() == "usenet" else "torrent"
     cats = _categories(scope)
-    ids = _indexer_ids()
+    ids = effective_indexer_ids(indexer_ids)
+    if ids is _NO_INDEXERS:
+        return {"configured": True, "hits": [],
+                "error": "This library's chosen trackers are all excluded by the global "
+                         "'Restrict to indexer IDs' setting, so there is nothing left to "
+                         "search. Widen one of the two."}
     strategies = build_strategies(scope, title, year=year, season=season, episode=episode,
                                   imdb_id=imdb_id, tmdb_id=tmdb_id, tvdb_id=tvdb_id,
                                   air_date=air_date, absolute=absolute, series_type=series_type)

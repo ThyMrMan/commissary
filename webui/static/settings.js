@@ -5850,22 +5850,48 @@ async function loadProwlarrIndexers() {
             return;
         }
         const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        // The cards used to be read-only, sitting under a text box that wanted
+        // the very ids they were displaying — you could see #3 but had to type
+        // it. They now toggle the restrict field directly. The text box stays
+        // VISIBLE and in sync rather than being hidden: a control whose only
+        // explanation lives on an element that gets hidden is exactly how the
+        // per-Library picker came to be misread as something it wasn't.
+        const selected = new Set(_restrictIndexerIds());
         const rows = data.indexers.map(idx => {
             const protoClass = idx.protocol === 'usenet' ? 'ind-indexer-card-proto-usenet' : 'ind-indexer-card-proto-torrent';
             const protoLabel = idx.protocol === 'usenet' ? 'Usenet' : 'Torrent';
             const privacyHTML = idx.privacy ? `<span class="ind-indexer-card-privacy">${esc(idx.privacy)}</span>` : '';
             const disabledClass = idx.enable ? '' : ' ind-indexer-card-disabled';
-            return `<div class="ind-indexer-card${disabledClass}">
+            const onClass = selected.has(String(idx.id)) ? ' ind-indexer-card-on' : '';
+            return `<label class="ind-indexer-card${disabledClass}${onClass}" title="Tick to restrict searches to this indexer">
+                <input type="checkbox" data-prowlarr-indexer="${esc(idx.id)}"${selected.has(String(idx.id)) ? ' checked' : ''}>
                 <span class="ind-indexer-card-id">#${esc(idx.id)}</span>
                 <span class="ind-indexer-card-name">${esc(idx.name)}</span>
                 ${privacyHTML}
                 <span class="ind-indexer-card-proto ${protoClass}">${protoLabel}</span>
-            </div>`;
+            </label>`;
         }).join('');
         listEl.innerHTML = rows;
+        listEl.onchange = (e) => {
+            const cb = e.target.closest('[data-prowlarr-indexer]');
+            if (!cb) return;
+            const picked = [];
+            listEl.querySelectorAll('[data-prowlarr-indexer]').forEach(c => {
+                if (c.checked) picked.push(c.getAttribute('data-prowlarr-indexer'));
+            });
+            const field = document.getElementById('prowlarr-indexer-ids');
+            if (field) field.value = picked.join(',');
+            cb.closest('.ind-indexer-card').classList.toggle('ind-indexer-card-on', cb.checked);
+        };
     } catch (e) {
         listEl.innerHTML = `<em style="color:#f44336;">Failed to load indexers: ${e.message}</em>`;
     }
+}
+
+/** Ids currently in the restrict field, as strings — the picker's checked state. */
+function _restrictIndexerIds() {
+    const field = document.getElementById('prowlarr-indexer-ids');
+    return String((field && field.value) || '').split(',').map(s => s.trim()).filter(Boolean);
 }
 
 async function loadHiFiInstances() {

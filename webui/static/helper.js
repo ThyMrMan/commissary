@@ -3484,8 +3484,15 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.16': [
-        { date: 'August 2026 · 1.8.16' },
+    '1.8.17': [
+        { date: 'August 2026 · 1.8.17' },
+        { title: 'Deselecting a tracker now actually stops it being used', desc: 'the tracker checkboxes on each Library only ever nudged the ranking — a ticked tracker\'s releases scored higher, but every tracker was still searched. So unticking one removed a bonus and changed nothing about where downloads came from. Ticked trackers are now the only ones searched for that Library, on automatic searches as well as manual ones.' },
+        { title: 'The setting never said that, because the label kept disappearing', desc: 'there was a note explaining it was only a preference, but it lived on a text box that gets hidden the moment the tracker checkboxes appear. So the one sentence describing the behaviour vanished exactly when the control it described showed up, leaving an unlabelled list of trackers that reads as "search these". Both tracker settings now carry a caption you can actually see.' },
+        { title: 'Two more places were ignoring your tracker choices', desc: 'found while fixing the first. The RSS pass — the job that watches for new releases — polled every indexer even when "Restrict to indexer IDs" named a few, so a release from an excluded tracker could be picked up and grabbed unattended. And a manual search worked out which Library you had picked only AFTER searching, so it could re-order results but never limit where they came from.' },
+        { title: 'You can tick the indexers instead of typing their numbers', desc: 'Settings → Indexers listed your indexers with their IDs, above a box asking you to type those same IDs in by hand. The list is now clickable and fills the box for you. The box stays visible and in sync rather than being hidden — that is the mistake that caused the confusion above.' },
+        { title: 'How the two settings combine', desc: 'the global "Restrict to indexer IDs" is the outer limit; a Library\'s own choice narrows it further and can never widen it. If you pick trackers a Library is globally barred from, nothing is left to search — rather than quietly falling back to searching everything, SoulSync now tells you the two settings contradict each other.' },
+        { title: 'Worth a look after updating', desc: 'if you have ticked trackers on a Library expecting a preference, that selection now binds. A Library whose ticked trackers have no results will come up empty instead of falling back to the others.' },
+        { title: 'Also in 1.8.16', desc: 'renaming files from a show\'s own page, plus two download fixes.' },
         { title: 'Rename a show or film’s files from its own page', desc: 'a Rename Files button on any show or movie you own. It shows the naming template, every $variable you can use — each with the value it takes for that title, so $episodetitle reads "Pilot" rather than a generic legend — and a live list of every file with its current name and the name it would get. Nothing moves until you confirm.' },
         { title: 'Type a name and watch it update', desc: 'edit the template and the preview re-renders as you type; click a variable to insert it. The template you type here is a one-off for that rename — your saved naming template in Settings is not changed.' },
         { title: 'It was already possible, just not findable', desc: 'the rename engine existed but only ran across your entire library from the Tools page, with no way to see the variables or aim it at one title. Same engine underneath: sidecars still travel with the file, a name that is already taken is skipped rather than overwritten, and the database follows the move.' },
@@ -3633,6 +3640,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.8.17: deselecting a tracker now stops it being used",
+        description: "the tracker checkboxes on each Library only nudged the ranking — every tracker was still searched, so unticking one changed nothing about where downloads came from.",
+        features: [
+            "ticked trackers are now the only ones searched for that Library, on automatic searches as well as manual ones",
+            "the setting never said otherwise because the note explaining it lived on a text box that gets hidden the moment the checkboxes appear — so the explanation vanished exactly when the control showed up. Both tracker settings now carry a caption you can see",
+            "two more places were ignoring your choices: the RSS pass polled every indexer even when Restrict to indexer IDs named a few, and manual search resolved the picked Library only after searching",
+            "Settings → Indexers: the indexer list is clickable now and fills the Restrict box for you, instead of listing IDs you had to type in by hand",
+            "the global Restrict setting is the outer limit and a Library narrows it, never widens it. Pick trackers a Library is globally barred from and SoulSync says the two contradict each other rather than quietly searching everything",
+        ],
+        usage_note: "If you ticked trackers expecting a preference, that selection now binds — a Library whose trackers have no results will come up empty rather than falling back.",
+    },
     {
         title: "1.8.16: rename files from a show's own page",
         description: "plus two download fixes: torrents are no longer imported while the client is still writing them, and the YouTube downloader's last retry no longer fetches the music video.",

@@ -3443,6 +3443,23 @@ body.helper-mode-active #dashboard-activity-feed:hover {
     border-color: rgba(255, 255, 255, 0.1);
 }
 
+/* The cards are selectable now — ticking one restricts searches to it and
+   writes its id into the Restrict field above, which stays visible and in
+   sync so the two never disagree about what is selected. */
+.ind-indexer-card {
+    cursor: pointer;
+}
+
+.ind-indexer-card input[type="checkbox"] {
+    margin: 0;
+    flex: 0 0 auto;
+}
+
+.ind-indexer-card-on {
+    background: rgba(var(--accent-rgb), 0.16);
+    border-color: rgba(var(--accent-rgb), 0.45);
+}
+
 .ind-indexer-card-id {
     font-family: 'SF Mono', Monaco, monospace;
     font-size: 11px;

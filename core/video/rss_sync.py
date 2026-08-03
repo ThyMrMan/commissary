@@ -44,12 +44,21 @@ def is_running() -> bool:
 def fetch_recent_releases(limit: int = _FETCH_LIMIT) -> Optional[List[Dict[str, Any]]]:
     """The indexers' latest releases (movies + TV categories), projected into
     the shared hit shape. None = Prowlarr not configured; [] = nothing/errors."""
-    from core.video.prowlarr_search import _MOVIE_CATS, _TV_CATS, _client, _project
+    from core.video.prowlarr_search import (_MOVIE_CATS, _TV_CATS, _client, _project,
+                                            effective_indexer_ids)
     client = _client()
     if not client.is_configured():
         return None
     try:
-        results = client._search_sync("", _MOVIE_CATS + _TV_CATS, [], limit)
+        # The global 'Restrict to indexer IDs' allowlist applies here too. This
+        # passed a hardcoded [] — so the RSS pass polled EVERY indexer even when
+        # the setting named a few, and releases from an excluded tracker could be
+        # matched and grabbed unattended. No per-Library restriction at this
+        # level: the feed is fetched once for the whole library and each item's
+        # own Library filter is applied in _rank, once we know which item a
+        # release is for.
+        results = client._search_sync("", _MOVIE_CATS + _TV_CATS,
+                                      effective_indexer_ids() or [], limit)
     except Exception as e:   # noqa: BLE001 - a feed hiccup is a skipped tick, not a crash
         logger.warning("rss: recent-releases fetch failed: %s", e)
         return []
@@ -241,12 +250,19 @@ def _rank(pool: List[Dict[str, Any]], item: Dict[str, Any], media_type: str) -> 
         _preferred_indexer_ids_for_item, search_context)
     from core.video.quality_profile import load_for_item
     ctx = search_context(item, media_type)
+    # The item's Library restricts which trackers may supply it. The search path
+    # enforces that at Prowlarr; here the pool is already fetched, so it is
+    # enforced by dropping releases from trackers this Library did not pick.
+    # A hit with no indexer_id cannot be shown to come from an allowed tracker,
+    # so it goes too — under an explicit restriction, unprovable means excluded.
+    restrict = _preferred_indexer_ids_for_item(item)
+    if restrict:
+        pool = [h for h in pool if h.get("indexer_id") in restrict]
     cands = _evaluate_hits(pool, load_for_item(get_video_db(), item), ctx["scope"],
                            ctx.get("season"), ctx.get("episode"),
                            want_year=ctx.get("year"),
                            want_title=ctx.get("titles") or ctx.get("title"),
-                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"),
-                           preferred_indexer_ids=_preferred_indexer_ids_for_item(item))
+                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"))
     for c in cands:
         c["source"] = "usenet" if str(c.get("protocol") or "") == "usenet" else "torrent"
     # Full ranked list, not just accepted: rejected candidates ride along into

@@ -499,13 +499,20 @@ def _category_for_item(item: Dict[str, Any], media_type: str) -> Optional[str]:
 
 
 def _preferred_indexer_ids_for_item(item: Dict[str, Any]) -> set:
-    """The item's own Library's preferred tracker(s), if any — a SOFT ranking
-    signal (see ``_evaluate_hits``' ``preferred_indexer_ids``), never a search
-    filter. An item with no Library yet (root_folder_id unset) has no
-    preference — this deliberately does NOT fall back to the primary
-    Library's preference the way ``_item_target_dir``/``_category_for_item``
-    fall back for destination/category, since a tracker nudge inherited from
-    an unrelated 'primary' Library would be a surprising default."""
+    """The trackers this item's Library is RESTRICTED to, if any.
+
+    This used to be a soft +25 ranking nudge while every indexer was still
+    searched, which meant unticking a tracker in Settings → Libraries removed a
+    bonus but never stopped the tracker being used — reported as "it still tries
+    to grab from a tracker I deselected". It is now a search filter: only the
+    ticked trackers are queried for grabs into that Library.
+
+    An item with no Library yet (root_folder_id unset) has no restriction — this
+    deliberately does NOT fall back to the primary Library's selection the way
+    ``_item_target_dir``/``_category_for_item`` fall back for destination and
+    category. Inheriting a RESTRICTION from an unrelated 'primary' Library could
+    silently narrow a search to trackers the user never chose for this item, and
+    an over-narrow search looks identical to "no releases exist"."""
     root_folder = _root_folder_for_item(item)
     raw = (root_folder or {}).get("preferred_indexer_ids") or ""
     out = set()
@@ -537,10 +544,14 @@ def _search_one_source(source: str, item: Dict[str, Any], media_type: str):
         hits = res.get("hits") or []
     elif source in ("torrent", "usenet"):
         from core.video.prowlarr_search import prowlarr_search
+        # THE unattended path — the wishlist drain. This is where a deselected
+        # tracker was still being searched, because the Library's selection only
+        # ever reached the ranking step.
         pres = prowlarr_search(ctx["scope"], ctx["title"], year=ctx.get("year"),
                                season=ctx.get("season"), episode=ctx.get("episode"), source=source,
                                air_date=ctx.get("air_date"), absolute=ctx.get("absolute"),
-                               series_type=ctx.get("series_type"))
+                               series_type=ctx.get("series_type"),
+                               indexer_ids=_preferred_indexer_ids_for_item(item))
         if not pres.get("configured"):
             return None, "Prowlarr not configured"
         if pres.get("error"):
@@ -551,8 +562,7 @@ def _search_one_source(source: str, item: Dict[str, Any], media_type: str):
     cands = _evaluate_hits(hits, profile, ctx["scope"], ctx.get("season"), ctx.get("episode"),
                            want_year=ctx.get("year"),
                            want_title=ctx.get("titles") or ctx.get("title"),
-                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"),
-                           preferred_indexer_ids=_preferred_indexer_ids_for_item(item))
+                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"))
     for c in cands:
         c["source"] = source
     return cands, None

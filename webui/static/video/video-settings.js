@@ -236,11 +236,26 @@
         // save". The value is still ids on the wire; the picker just supplies them.
         var indexerIdsInput = document.createElement('input');
         indexerIdsInput.type = 'text';
-        indexerIdsInput.placeholder = 'Preferred trackers (blank = no preference)';
-        indexerIdsInput.title = 'Prowlarr indexer(s) that rank higher for grabs into this library — a soft nudge, not a search filter.';
+        indexerIdsInput.placeholder = 'Trackers (blank = search all of them)';
+        indexerIdsInput.title = 'Prowlarr indexer(s) this library may be grabbed from. Blank searches every indexer.';
         indexerIdsInput.value = (configured && configured.preferred_indexer_ids) || '';
         indexerIdsInput.setAttribute('data-lib-indexer-ids', '');
         fields.appendChild(indexerIdsInput);
+
+        // A VISIBLE label and explanation, not a tooltip on the input. The input
+        // is switched to type=hidden as soon as the checkbox picker renders, and
+        // a hidden input shows neither tooltip nor placeholder — so the previous
+        // wording vanished precisely when the checkboxes appeared, which is how
+        // a list of trackers with no caption came to read as a search filter it
+        // was not. Now it IS a filter, and the caption says so where it is read.
+        var trackerLabel = document.createElement('div');
+        trackerLabel.className = 'library-tracker-label';
+        trackerLabel.setAttribute('data-lib-trackers-label', '');
+        trackerLabel.innerHTML = '<strong>Trackers to search for this library</strong>' +
+            '<span>Tick the trackers this library may be grabbed from. Only those are ' +
+            'searched — automatic searches included. Leave every box unticked to search ' +
+            'all of them.</span>';
+        fields.appendChild(trackerLabel);
 
         var trackerBox = document.createElement('div');
         trackerBox.className = 'library-tracker-picker';
@@ -282,7 +297,7 @@
                 // usable rather than hiding the setting entirely.
                 box.innerHTML = '<div class="library-tracker-empty">Connect Prowlarr to pick trackers ' +
                     'by name. Until then this field takes indexer IDs.</div>';
-                input.placeholder = 'Preferred trackers (indexer IDs, e.g. 1,3 — blank = no preference)';
+                input.placeholder = 'Trackers to search (indexer IDs, e.g. 1,3 — blank = all)';
                 return;
             }
             // The picker owns the value from here, so the raw id box is redundant.

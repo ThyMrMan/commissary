@@ -250,12 +250,8 @@ def _parse_text(hit) -> str:
     return title
 
 
-_PREFERRED_INDEXER_SCORE = 25   # between prefer_repack's +10 and prefer_hdr's +30
-
-
 def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None, want_year=None,
-                   want_title=None, blocked_users=None, want_date=None, want_absolute=None,
-                   preferred_indexer_ids=None) -> list:
+                   want_title=None, blocked_users=None, want_date=None, want_absolute=None) -> list:
     """Parse → evaluate → rank a list of raw indexer hits against the quality profile.
     Shared by the mock search and the live slskd start/poll endpoints.
 
@@ -265,10 +261,13 @@ def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None,
     Sonarr behaviour) but are never `accepted`, so every auto-picker skips them; a manual
     grab of one is a deliberate user override.
 
-    ``preferred_indexer_ids`` (multi-library torrent preferences) = the calling
-    title's Library's preferred Prowlarr indexer id(s), a SOFT ranking nudge —
-    same shape as every other ``prefer_*`` signal (never a hard requirement, so
-    a Library with no hits from its preferred tracker never comes up empty)."""
+    There is deliberately no tracker signal here. A Library's tracker selection
+    used to arrive as ``preferred_indexer_ids`` and add a score bonus while every
+    indexer was still searched — which is why unticking a tracker changed the
+    ranking but never stopped it being used. It is now a restriction applied at
+    SEARCH time (``prowlarr_search(indexer_ids=…)``, and a pool filter for the
+    RSS pass), so by the time hits reach this function they can only have come
+    from a permitted tracker and a bonus would apply to all of them equally."""
     from core.video.custom_formats import format_score, load_formats
     from core.video.quality_eval import evaluate_release
     from core.video.release_parse import parse_release
@@ -309,10 +308,6 @@ def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None,
             if floor and verdict["accepted"] and fscore < floor:
                 verdict = {**verdict, "accepted": False,
                            "rejected": "Format score %d is below your minimum %d" % (fscore, floor)}
-        # Per-Library preferred tracker (multi-library torrent preferences) — a
-        # soft nudge, same shape as every prefer_* signal in quality_eval.py.
-        if preferred_indexer_ids and hit.get("indexer_id") in preferred_indexer_ids:
-            verdict = {**verdict, "score": verdict["score"] + _PREFERRED_INDEXER_SCORE}
         user = hit.get("username")
         is_blocked = bool(user and user in blocked_users) or (user, hit.get("filename")) in blocked
         if user and user in blocked_users:
@@ -989,8 +984,14 @@ def register_routes(bp):
             raw, live = sres["hits"], True
         elif source in ("torrent", "usenet"):
             from core.video.prowlarr_search import prowlarr_search
+            # Resolved BEFORE the search now, not after: the Library's trackers
+            # restrict which indexers are queried, so a manual search into a
+            # Library honours the same selection the unattended drain does.
+            restrict = _preferred_indexer_ids_for_root_folder(
+                get_video_db(), _root_folder_id_for_grab(get_video_db(), body))
             pres = prowlarr_search(scope, title, year=body.get("year"),
-                                   season=want_season, episode=want_episode, source=source)
+                                   season=want_season, episode=want_episode, source=source,
+                                   indexer_ids=restrict)
             if not pres.get("configured"):
                 return jsonify({"scope": scope, "results": [],
                                 "error": "Prowlarr isn't configured — set its URL + key on Settings → Downloads."})
@@ -1000,12 +1001,10 @@ def register_routes(bp):
         else:
             raw = mock_search(scope, title, year=body.get("year"), season=want_season,
                               episode=want_episode, season_end=season_end, source=source)
-        preferred = _preferred_indexer_ids_for_root_folder(get_video_db(), _root_folder_id_for_grab(get_video_db(), body))
         _ep_hints = _episode_hints(get_video_db(), body, want_season, want_episode)
         return jsonify({"scope": scope, "live": live,
                         "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=_want_titles(get_video_db(), body),
-                                                 want_date=_ep_hints[0], want_absolute=_ep_hints[1],
-                                                 preferred_indexer_ids=preferred)})
+                                                 want_date=_ep_hints[0], want_absolute=_ep_hints[1])})
 
     @bp.route("/downloads/search/start", methods=["POST"])
     def video_downloads_search_start():
@@ -1040,17 +1039,18 @@ def register_routes(bp):
             # Prowlarr is synchronous — like the old mock, results come back in one shot
             # (no polling id), so the client renders immediately.
             from core.video.prowlarr_search import prowlarr_search
+            restrict = _preferred_indexer_ids_for_root_folder(
+                get_video_db(), _root_folder_id_for_grab(get_video_db(), body))
             pres = prowlarr_search(scope, title, year=body.get("year"),
-                                   season=want_season, episode=want_episode, source=source)
+                                   season=want_season, episode=want_episode, source=source,
+                                   indexer_ids=restrict)
             if not pres.get("configured"):
                 return jsonify({"error": "Prowlarr isn't configured — set its URL + key on Settings → Downloads."})
             if pres.get("error"):
                 return jsonify({"error": "Prowlarr: " + str(pres["error"])})
-            preferred = _preferred_indexer_ids_for_root_folder(get_video_db(), _root_folder_id_for_grab(get_video_db(), body))
             return jsonify({"id": None, "live": True, "complete": True,
                             "results": _evaluate_hits(pres["hits"], profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=_want_titles(get_video_db(), body),
-                                                 want_date=_ep_hints[0], want_absolute=_ep_hints[1],
-                                                 preferred_indexer_ids=preferred)})
+                                                 want_date=_ep_hints[0], want_absolute=_ep_hints[1])})
         # remaining mock sources (e.g. youtube placeholder) resolve in one shot
         raw = mock_search(scope, title, year=body.get("year"), season=want_season,
                           episode=want_episode, season_end=season_end, source=source)
