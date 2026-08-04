@@ -395,8 +395,52 @@
                 fill(document.querySelector('[data-video-lib-group="movies"]'), d.movies || [], cfg.movies);
                 fill(document.querySelector('[data-video-lib-group="tv"]'), d.tv || [], cfg.tv);
                         status('');
+                probeLibraries();
             })
             .catch(function () { status('Could not load libraries'); });
+    }
+
+    // A destination the server can't write to is the one failure that looks
+    // like nothing at all: the grab succeeds, the import fails, and the folder
+    // just stays empty. Ask the server whether each Library actually works and
+    // say so on the row, rather than leaving it to be found in app.log.
+    function probeLibraries() {
+        fetch('/api/video/libraries/probe', { headers: { 'Accept': 'application/json' } })
+            // Admin-only. A non-admin on this page simply gets no badges
+            // instead of a console error and a page that looks broken.
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+                if (!d || !d.success) return;
+                var byPath = {};
+                Object.keys(d.configured || {}).forEach(function (kind) {
+                    (d.configured[kind] || []).forEach(function (e) {
+                        byPath[String(e.path || '')] = e;
+                    });
+                });
+                document.querySelectorAll('[data-video-lib-group] .library-editor-row')
+                    .forEach(function (row) {
+                        var input = row.querySelector('[data-lib-path]');
+                        applyLibraryProbe(row, input ? byPath[input.value.trim()] : null);
+                    });
+            })
+            .catch(function () { /* the probe is advisory; never break the page over it */ });
+    }
+
+    function applyLibraryProbe(row, probe) {
+        var head = row.querySelector('.checkbox-label');
+        if (!head) return;
+        var badge = row.querySelector('.video-lib-write-badge');
+        // An unconfigured row has no path to test, and a writable one is the
+        // expected state — decorating it would bury the row that needs
+        // attention. Only the broken case gets a badge.
+        if (!probe || probe.writable) { if (badge) badge.remove(); return; }
+        if (!badge) {
+            badge = document.createElement('span');
+            badge.className = 'video-lib-write-badge';
+            head.appendChild(badge);
+        }
+        badge.textContent = 'NOT WRITABLE';
+        badge.title = probe.detail || '';
     }
 
     function save(silent) {
@@ -414,6 +458,9 @@
                     reconcileIds(m, d.configured.movies);
                     reconcileIds(t, d.configured.tv);
                 }
+                // Re-probe: the paths may have just changed, and a stale badge
+                // is worse than none — it would vouch for an untested folder.
+                probeLibraries();
                 status('Saved'); if (!silent) toast('Libraries saved', 'success');
             })
             .catch(function () { status('Save failed'); if (!silent) toast('Could not save libraries', 'error'); });

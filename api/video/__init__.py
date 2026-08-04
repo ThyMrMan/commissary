@@ -109,6 +109,12 @@ def create_video_blueprint() -> Blueprint:
                    # the indexer inventory is Settings-class data (and indexer
                    # URLs leaking to the browser was a real bug once)
                    "/api/video/downloads/indexers",
+                   # the write probe returns filesystem paths and touches the
+                   # disk. /libraries itself is admin only on WRITE (its GET is
+                   # the tab bar), so this needs naming here or it would inherit
+                   # that GET's openness — and non-admins are deliberately not
+                   # shown library paths at all.
+                   "/api/video/libraries/probe",
                    "/api/video/enrichment/config", "/api/video/enrichment/priority",
                    "/api/video/notifications",   # P11: GETs return webhook URLs/bot tokens
                    "/api/video/backups")         # P10: restore/download the whole database

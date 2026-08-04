@@ -3484,8 +3484,11 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.9.4': [
-        { date: 'August 2026 · 1.9.4' },
+    '1.9.5': [
+        { date: 'August 2026 · 1.9.5' },
+        { title: 'Video Libraries are checked for writability too', desc: '1.9.4 added this to Music Libraries, after an album imported into a folder the server had no permission to write to and reported every track as imported. The video side has the same destinations, the same failure and the same silence — a grab lands, the import fails, and the Library folder just stays empty. Settings → Libraries now marks any Library the server cannot write into with <strong>NOT WRITABLE</strong>, and hovering it explains what to check.' },
+        { title: 'One probe, both sides', desc: 'the check moved to a shared module rather than being written twice — a copy that drifts is how two pages end up disagreeing about whether the same folder works. It tests by creating and removing a folder, not by reading permission bits, because bits give the wrong answer under container UID remapping, NFS root-squash and ACLs, which is exactly where this breaks. Two Libraries pointing at the same folder probe it once.' },
+        { title: 'Also in 1.9.4', desc: 'a failed import can no longer report itself as a success, and Music Libraries gained the same writability check.' },
         { title: 'Fixed: imports that failed reported themselves as successful', desc: 'the one that matters. Post-processing catches any error, re-queues the file and returns quietly so a download can be retried later — but a manual import has nothing watching it, so it read that quiet return as success. A user imported an eleven-track album into a folder the server had no permission to write to: every track logged <em>Permission denied</em>, every track notified "Track Imported", and not one file moved. A failed import now says so, <strong>and says why</strong> — the permission error appears in the UI instead of only in app.log.' },
         { title: 'Music Libraries are checked for writability', desc: 'the failure above was invisible until someone read the log, because a destination the server cannot write to looks exactly like a destination nothing has been sent to yet. Settings → Paths & Organization now marks any Music Library the server cannot write into with <strong>NOT WRITABLE</strong>, and hovering it explains what to check. It tests by creating and removing a folder, not by reading permission bits — bits are the wrong answer under container UID remapping, NFS root-squash and ACLs, which is where this actually goes wrong.' },
         { title: 'If you see NOT WRITABLE', desc: 'the folder exists but the user SoulSync runs as cannot create anything inside it. Compare the folder\'s owner with the PUID/PGID your container runs as — on Unraid, shares are usually <em>nobody:users</em> (99:100) while the image defaults to 1000:1000. A folder created by a different user or another container is the usual cause. Note that video working on the same base folder proves nothing: permissions are per-folder.' },
@@ -3681,6 +3684,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.5: the writability check reaches video Libraries",
+        description: "1.9.4 gave Music Libraries a check for destinations the server cannot write into. Video has the same destinations and the same failure mode — a grab succeeds, the import fails, and the Library folder stays empty — so it now has the same check.",
+        features: [
+            "Settings → Libraries marks any video Library the server cannot write into with NOT WRITABLE, with the reason on hover",
+            "the check is one shared module used by both sides rather than two copies that drift apart — a folder cannot be judged working on one page and broken on the other",
+            "it creates and removes a folder instead of reading permission bits, which give the wrong answer under container UID remapping, NFS root-squash and ACLs",
+            "two Libraries pointing at the same folder probe it once, rather than creating and removing a folder there twice per page load",
+            "the endpoint is admin-only: it returns filesystem paths, which the Library tab bar's own payload deliberately withholds from non-admins",
+        ],
+        usage_note: "NOT WRITABLE means the folder exists but the user SoulSync runs as cannot create anything inside it. Compare the folder's owner against your container's PUID/PGID — Unraid shares are usually nobody:users (99:100) while the image defaults to 1000:1000. One Library working does not vouch for another; permissions are per-folder.",
+    },
     {
         title: "1.9.4: a failed import can no longer call itself a success",
         description: "an import that could not write to its destination reported every track as imported. The files never moved. This release makes that failure impossible to miss — and adds a check so you can see the problem in Settings before an import runs into it.",

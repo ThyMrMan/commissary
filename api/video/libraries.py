@@ -64,6 +64,50 @@ def register_routes(bp):
             logger.exception("Failed to list video libraries")
             return jsonify({"error": "Failed to list video libraries"}), 500
 
+    @bp.route("/libraries/probe", methods=["GET"])
+    def video_libraries_probe():
+        """Can the server write into each configured Library?
+
+        A Library the server cannot write to is indistinguishable from one
+        nothing has been grabbed into yet — the grab fails, the folder stays
+        empty, and the reason is only in the log. Same failure the music side
+        hit, same probe.
+
+        Separate from the /libraries GET because that one is open to any
+        video-side profile (the tab bar and the destination picker need it)
+        and deliberately withholds filesystem paths from non-admins. This
+        returns paths and touches the disk, so it is admin-only — enforced in
+        the blueprint's gate, alongside the other Settings-class endpoints.
+        """
+        from . import get_video_db
+        try:
+            from core.destination_probe import probe_destination_writable
+            from core.video.sources import resolve_video_server
+            server = resolve_video_server()
+            configured = (get_video_db().list_libraries(server)
+                          if server else {"movies": [], "tv": []})
+            out = {}
+            # Probe each distinct path ONCE: two Libraries can legitimately
+            # share a root, and probing it twice would create and remove two
+            # folders in it for one page load.
+            seen = {}
+            for kind, entries in (configured or {}).items():
+                rows = []
+                for e in (entries or []):
+                    path = e.get("path")
+                    key = str(path or "")
+                    if key not in seen:
+                        seen[key] = probe_destination_writable(path)
+                    rows.append({"id": e.get("id"), "label": e.get("label"),
+                                 "server_title": e.get("server_title"),
+                                 "path": path, **seen[key]})
+                out[kind] = rows
+            return jsonify({"success": True, "server": server, "configured": out})
+        except Exception:
+            logger.exception("Failed to probe video libraries")
+            return jsonify({"success": False, "error": "Failed to probe libraries",
+                            "configured": {}}), 500
+
     @bp.route("/server", methods=["GET"])
     def video_server_status():
         """Which server the video side uses + which of Plex/Jellyfin are configured

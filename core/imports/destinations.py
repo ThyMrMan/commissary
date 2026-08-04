@@ -31,6 +31,11 @@ from typing import Any, Optional, Tuple
 
 from utils.logging_config import get_logger
 
+# Re-exported: this module is where music-side callers look for anything about
+# where a file goes, but the probe itself is shared with the video Libraries and
+# belongs to neither side.
+from core.destination_probe import probe_destination_writable
+
 logger = get_logger("imports.destinations")
 
 
@@ -86,55 +91,6 @@ def _library_containing(path, libs) -> Optional[dict]:
         except ValueError:
             continue    # different drives on Windows
     return best
-
-
-def probe_destination_writable(path) -> dict:
-    """Can we actually file music into ``path``? ``{status, writable, detail}``.
-
-    Written because a live install imported an entire album into a folder the
-    container could not write to: every track raised ``PermissionError`` on the
-    artist folder, and nothing surfaced until someone read app.log.
-
-    It CREATES AND REMOVES A DIRECTORY rather than calling ``os.access``.
-    ``os.access`` answers from the permission bits alone, which is the wrong
-    answer under exactly the conditions that break imports — container UID
-    remapping, NFS root-squash, ACLs, read-only mounts. And a directory is the
-    right probe, not a file: the failure being caught is ``mkdir`` of the
-    artist folder, and a share can permit file creation while denying it.
-    """
-    p = str(path or '').strip()
-    if not p:
-        return {"status": "unset", "writable": False, "detail": "No path configured"}
-    try:
-        if not os.path.exists(p):
-            return {"status": "missing", "writable": False,
-                    "detail": "Folder does not exist on the server"}
-        if not os.path.isdir(p):
-            return {"status": "not_a_directory", "writable": False,
-                    "detail": "Path exists but is not a folder"}
-    except OSError as e:
-        return {"status": "unknown", "writable": False, "detail": str(e)}
-
-    probe = None
-    try:
-        import tempfile
-        probe = tempfile.mkdtemp(prefix=".soulsync-write-test-", dir=p)
-        return {"status": "ok", "writable": True, "detail": "Writable"}
-    except PermissionError:
-        return {"status": "unwritable", "writable": False,
-                "detail": "Permission denied — the server cannot create folders here. "
-                          "Check the folder's owner against the user SoulSync runs as "
-                          "(PUID/PGID)."}
-    except OSError as e:
-        return {"status": "unwritable", "writable": False, "detail": str(e)}
-    finally:
-        # Never leave the probe behind; a stray dot-folder in someone's music
-        # library is a bug report of its own.
-        if probe:
-            try:
-                os.rmdir(probe)
-            except OSError as e:     # noqa: BLE001
-                logger.warning("Could not remove the write probe %s: %s", probe, e)
 
 
 def resolve_music_library(context: Optional[dict], libraries=None) -> Optional[dict]:
