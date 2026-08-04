@@ -296,6 +296,42 @@ def _resolve_album_bundle_source(config_manager: Any) -> str:
     return first if first in _ALBUM_BUNDLE_SOURCES else ''
 
 
+def _pinned_album_bundle(pinned) -> tuple:
+    """Translate a user-picked release into ``(source, plugin_kwargs)``.
+
+    ``pinned`` is what the album source picker put on the batch:
+    ``{'source', 'title', 'token'}`` for Prowlarr-backed releases, or
+    ``{'source': 'soulseek', 'username', 'folder_path'}`` for a Soulseek
+    folder. Returns ``('', None)`` for anything unusable so the caller
+    falls straight back to the configured source — a malformed pin must
+    degrade to today's behaviour, never wedge the batch.
+
+    Soulseek deliberately gets no ``preferred_tracks``: given a username
+    and folder_path its album flow browses the folder itself, so the
+    whole track list never has to survive a round trip through the
+    browser.
+    """
+    if not isinstance(pinned, dict):
+        return '', None
+    source = str(pinned.get('source') or '').strip().lower()
+    if source not in _ALBUM_BUNDLE_SOURCES:
+        return '', None
+
+    if source == 'soulseek':
+        username = str(pinned.get('username') or '').strip()
+        folder_path = str(pinned.get('folder_path') or '').strip()
+        if not username or not folder_path:
+            return '', None
+        return source, {'preferred_source': {'username': username,
+                                             'folder_path': folder_path}}
+
+    token = str(pinned.get('token') or '').strip()
+    if not token:
+        return '', None
+    return source, {'preferred_release': {'token': token,
+                                          'title': str(pinned.get('title') or '')}}
+
+
 @dataclass
 class MasterDeps:
     """Bundle of cross-cutting deps the master worker needs."""
@@ -880,13 +916,19 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
             batch_private_album_bundle = bool(batch.get('album_bundle_private_staging'))
             batch_playlist_folder_mode = batch.get('playlist_folder_mode', False)
             batch_playlist_name = batch.get('playlist_name', 'Unknown Playlist')
+            batch_pinned_release = batch.get('pinned_release')
 
         # Album-bundle sources download a whole release into private staging,
         # then the normal per-track workers claim those staged files. Run this
         # only after analysis has found missing tracks; otherwise an already
         # owned album would still trigger a release download.
         _bundle_state = _BatchStateAccessImpl()
-        _album_bundle_source = _resolve_album_bundle_source(deps.config_manager)
+        # A release the user picked from the album source picker wins over the
+        # configured source outright. _resolve_album_bundle_source answers
+        # "which source may claim a whole album unattended?" — a question that
+        # stops being relevant once a human has named the release they want.
+        _pin_source, _pin_kwargs = _pinned_album_bundle(batch_pinned_release)
+        _album_bundle_source = _pin_source or _resolve_album_bundle_source(deps.config_manager)
         if _album_bundle_source and _album_bundle_source != 'soulseek':
             if _album_bundle_dispatch.try_dispatch(
                 batch_id=batch_id,
@@ -897,6 +939,7 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                 plugin_resolver=deps.download_orchestrator.client,
                 state=_bundle_state,
                 source_override=_album_bundle_source,
+                plugin_kwargs=_pin_kwargs,
             ):
                 return
 
@@ -1025,8 +1068,18 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
         # exact source into the bundle downloader so we keep the richer
         # tracklist-aware scoring instead of doing a weaker second pick.
         _bundle_state = _BatchStateAccessImpl()
-        _album_bundle_source = _resolve_album_bundle_source(deps.config_manager)
+        _album_bundle_source = _pin_source or _resolve_album_bundle_source(deps.config_manager)
         if _album_bundle_source == 'soulseek':
+            # A user-picked folder outranks the pre-flight pick — both express
+            # "use this exact folder", but only one of them was chosen by a
+            # person. Soulseek needs no track list with it: given a username +
+            # folder_path it browses the folder itself.
+            _soulseek_kwargs = _pin_kwargs or (
+                {
+                    'preferred_source': preflight_source,
+                    'preferred_tracks': preflight_tracks,
+                } if preflight_source and preflight_tracks else None
+            )
             if _album_bundle_dispatch.try_dispatch(
                 batch_id=batch_id,
                 is_album=batch_is_album,
@@ -1036,10 +1089,7 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                 plugin_resolver=deps.download_orchestrator.client,
                 state=_bundle_state,
                 source_override=_album_bundle_source,
-                plugin_kwargs={
-                    'preferred_source': preflight_source,
-                    'preferred_tracks': preflight_tracks,
-                } if preflight_source and preflight_tracks else None,
+                plugin_kwargs=_soulseek_kwargs,
             ):
                 return
 

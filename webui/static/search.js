@@ -515,7 +515,8 @@ function initializeSearchModeToggle() {
                 placeholder: '💿',
                 name: album.name,
                 meta: `${album.artist} • ${album.release_date ? album.release_date.substring(0, 4) : 'N/A'}`,
-                onClick: () => handleEnhancedSearchAlbumClick(album)
+                onClick: () => handleEnhancedSearchAlbumClick(album),
+                onSources: (btn) => _openSourcesForAlbum(album, btn),
             })
         );
 
@@ -530,7 +531,8 @@ function initializeSearchModeToggle() {
                 placeholder: '🎶',
                 name: album.name,
                 meta: `${album.artist} • ${album.release_date ? album.release_date.substring(0, 4) : 'N/A'}`,
-                onClick: () => handleEnhancedSearchAlbumClick(album)
+                onClick: () => handleEnhancedSearchAlbumClick(album),
+                onSources: (btn) => _openSourcesForAlbum(album, btn),
             })
         );
 
@@ -549,7 +551,12 @@ function initializeSearchModeToggle() {
                     meta: `${track.artist} • ${track.album}`,
                     duration: duration,
                     onClick: () => handleEnhancedSearchTrackClick(track),
-                    onPlay: () => streamEnhancedSearchTrack(track)
+                    onPlay: () => streamEnhancedSearchTrack(track),
+                    onSources: (btn) => openManualSearchFor({
+                        name: track.name,
+                        artist: track.artist,
+                        album: track.album,
+                    }, btn),
                 };
             }
         );
@@ -779,6 +786,29 @@ function initializeSearchModeToggle() {
     }
 
     // renderCompactSection now lives in shared-helpers.js.
+
+    // "Choose a release" for an album. Deliberately NOT the track picker:
+    // picking a track-level candidate for an album would import one file named
+    // after the album. This chooses the release, stashes it against the same
+    // virtual playlist id the album flow uses, then hands off to the normal
+    // album modal — so the pick rides the existing download path rather than
+    // forking a second one.
+    async function _openSourcesForAlbum(album, btn) {
+        const virtualPlaylistId = `enhanced_search_album_${album.id}`;
+        const label = btn ? btn.innerHTML : null;
+        if (btn) { btn.disabled = true; btn.innerHTML = '…'; }
+        try {
+            await openAlbumSourcePicker(album.name, album.artist, (pin) => {
+                setPendingAlbumPin(virtualPlaylistId, pin);
+                handleEnhancedSearchAlbumClick(album);
+            });
+        } catch (err) {
+            console.error('Album source picker failed:', err);
+            if (typeof showToast === 'function') showToast('Could not open the release picker', 'error');
+        } finally {
+            if (btn) { btn.disabled = false; if (label !== null) btn.innerHTML = label; }
+        }
+    }
 
     async function handleEnhancedSearchAlbumClick(album) {
         console.log(`💿 Enhanced search album clicked: ${album.name} by ${album.artist}`);

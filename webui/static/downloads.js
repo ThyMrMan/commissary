@@ -2799,6 +2799,14 @@ async function startMissingTracksProcess(playlistId) {
             requestBody.is_album_download = _isAlbumContext; // false for single track search results
             requestBody.album_context = process.album;   // Full Spotify album object
             requestBody.artist_context = process.artist; // Full Spotify artist object
+            // A release the user chose in the album source picker, if any.
+            // Consumed once — leaving it set would silently re-pin a stale
+            // release on the next download of the same album.
+            if (_pendingAlbumPins[playlistId]) {
+                requestBody.pinned_release = _pendingAlbumPins[playlistId];
+                delete _pendingAlbumPins[playlistId];
+                console.log(`📌 [Album] Pinned release from ${requestBody.pinned_release.source}`);
+            }
             console.log(`🎵 [${_isAlbumContext ? 'Album' : 'Single Track'}] Sending context: ${process.album?.name} by ${process.artist?.name}`);
         } else {
             // For playlists/wishlists, use the virtual playlist name
@@ -3342,6 +3350,187 @@ async function openManualSearchFor(track, btnEl) {
 }
 window.openManualSearchFor = openManualSearchFor;
 
+// ── Album source picker ─────────────────────────────────────────────────────
+// The track picker can't serve albums: picking a track-level candidate for an
+// album would import ONE file named after the album. So albums get their own
+// picker over the AlbumResult lists the plugins already return, and the choice
+// is carried as `pinned_release` into the batch the normal album flow starts.
+//
+// `onPicked(pin)` receives the pin (or null for "choose automatically") and is
+// what actually kicks off the download — this function only chooses.
+async function openAlbumSourcePicker(album, artist, onPicked) {
+    const existing = document.getElementById('album-sources-overlay');
+    if (existing) existing.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'album-sources-overlay';
+    overlay.className = 'candidates-modal-overlay';
+    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+    overlay.innerHTML = `
+        <div class="candidates-modal">
+            <div class="candidates-modal-header">
+                <div>
+                    <h2 class="candidates-modal-title">Choose a release</h2>
+                    <div class="candidates-modal-subtitle">${escapeHtml(album)} — ${escapeHtml(artist)}</div>
+                </div>
+                <button class="candidates-modal-close" id="album-sources-close">&#x2715;</button>
+            </div>
+            <div class="candidates-modal-body">
+                <div class="candidates-release-note">
+                    Only sources that index whole albums appear here. Picking one downloads
+                    <strong>that exact release</strong> instead of letting SoulSync guess, then the
+                    normal per-track matching imports the tracks you're missing from it.
+                </div>
+                <div class="candidates-manual-search-status" id="album-sources-status">Searching…</div>
+                <div id="album-sources-groups"></div>
+                <div class="album-sources-footer">
+                    <button class="candidates-manual-search-btn" id="album-sources-auto">
+                        Let SoulSync choose
+                    </button>
+                </div>
+            </div>
+        </div>`;
+    document.body.appendChild(overlay);
+    // rAF alone doesn't fire in a non-compositing tab; the timeout is the
+    // fallback that keeps the panel from being built but never revealed.
+    const reveal = () => overlay.classList.add('visible');
+    requestAnimationFrame(reveal);
+    setTimeout(reveal, 50);
+
+    const close = () => overlay.remove();
+    overlay.querySelector('#album-sources-close').addEventListener('click', close);
+    overlay.querySelector('#album-sources-auto').addEventListener('click', () => {
+        close();
+        onPicked(null);
+    });
+
+    const groupsHost = overlay.querySelector('#album-sources-groups');
+    const statusEl = overlay.querySelector('#album-sources-status');
+    const sourceMeta = {};
+    let found = 0;
+
+    const groupFor = (sourceId, label) => {
+        const domId = 'album-src-' + String(sourceId).replace(/[^a-zA-Z0-9_-]/g, '');
+        let g = groupsHost.querySelector('#' + domId);
+        if (g) return g;
+        g = document.createElement('div');
+        g.id = domId;
+        g.className = 'candidates-source-group';
+        g.innerHTML = `
+            <div class="candidates-source-group-header">
+                <span class="candidates-source-group-name">${escapeHtml(label || sourceId)}</span>
+                <span class="candidates-source-group-count" data-count="0">0</span>
+            </div>
+            <div class="album-sources-list"></div>`;
+        groupsHost.appendChild(g);
+        return g;
+    };
+
+    const setCount = (g, text, isError) => {
+        const c = g.querySelector('.candidates-source-group-count');
+        if (!c) return;
+        c.textContent = text;
+        if (isError) c.classList.add('candidates-source-group-count-error');
+    };
+
+    const addRows = (sourceId, candidates) => {
+        const g = groupFor(sourceId, (sourceMeta[sourceId] || {}).label);
+        const list = g.querySelector('.album-sources-list');
+        candidates.forEach(c => {
+            const row = document.createElement('div');
+            row.className = 'album-source-row' + (c.pinnable ? '' : ' album-source-row-unpinnable');
+            const bits = [];
+            if (c.quality) bits.push(escapeHtml(String(c.quality).toUpperCase()));
+            if (c.track_count) bits.push(`${c.track_count} track${c.track_count !== 1 ? 's' : ''}`);
+            if (c.total_size) bits.push(_candidatesFmtSize(c.total_size));
+            if (c.seeders !== null && c.seeders !== undefined) bits.push(`${c.seeders} seeders`);
+            if (c.indexer) bits.push(escapeHtml(c.indexer));
+            row.innerHTML = `
+                <div class="album-source-row-main">
+                    <div class="album-source-row-title">${escapeHtml(c.title || '(untitled)')}</div>
+                    <div class="album-source-row-meta">${bits.join(' • ')}</div>
+                </div>
+                <button class="album-source-pick-btn">${c.pinnable ? 'Use this' : 'Use this source'}</button>`;
+            row.querySelector('.album-source-pick-btn').addEventListener('click', () => {
+                close();
+                // An unpinnable source has no download_album_to_staging, so the
+                // most we can honestly promise is "get it from here" — say so
+                // rather than implying we pinned a release we can't pin.
+                onPicked(c.pinnable
+                    ? {source: c.source, token: c.token, title: c.title,
+                       username: c.username, folder_path: c.folder_path}
+                    : null);
+            });
+            list.appendChild(row);
+        });
+        found += candidates.length;
+        const n = list.children.length;
+        setCount(g, `${n} release${n !== 1 ? 's' : ''}`, false);
+        statusEl.textContent = `${found} release${found !== 1 ? 's' : ''} so far…`;
+    };
+
+    try {
+        const resp = await fetch('/api/downloads/album/sources', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({album: album, artist: artist}),
+        });
+        if (!resp.ok) {
+            let msg = 'Search failed';
+            try { const p = await resp.json(); if (p && p.error) msg = p.error; } catch (_) {}
+            statusEl.textContent = msg;
+            return;
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+            const {value, done} = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, {stream: true});
+            let end;
+            while ((end = buffer.indexOf('\n')) >= 0) {
+                const line = buffer.slice(0, end).trim();
+                buffer = buffer.slice(end + 1);
+                if (!line) continue;
+                let msg;
+                try { msg = JSON.parse(line); } catch (_) { continue; }
+                if (msg.type === 'header') {
+                    (msg.available_sources || []).forEach(s => { sourceMeta[s.id] = s; });
+                } else if (msg.type === 'source_results') {
+                    if (msg.candidates && msg.candidates.length) {
+                        addRows(msg.source, msg.candidates);
+                    } else {
+                        setCount(groupFor(msg.source, (sourceMeta[msg.source] || {}).label),
+                                 'no releases', false);
+                    }
+                } else if (msg.type === 'source_error') {
+                    setCount(groupFor(msg.source, (sourceMeta[msg.source] || {}).label),
+                             'failed', true);
+                } else if (msg.type === 'done') {
+                    statusEl.textContent = found === 0
+                        ? 'No source has this album as a single release — "Let SoulSync choose" still downloads it track by track.'
+                        : `${found} release${found !== 1 ? 's' : ''}`;
+                }
+            }
+        }
+    } catch (err) {
+        console.error('Album source search failed:', err);
+        statusEl.textContent = 'Search request failed';
+    }
+}
+window.openAlbumSourcePicker = openAlbumSourcePicker;
+
+// A release chosen in the picker has to survive until the download modal's
+// start button fires, which is a separate user action. Keyed by the virtual
+// playlist id the album flow already uses, so re-picking overwrites cleanly
+// and an abandoned pick can't attach itself to a different album.
+const _pendingAlbumPins = {};
+function setPendingAlbumPin(virtualPlaylistId, pin) {
+    if (pin) _pendingAlbumPins[virtualPlaylistId] = pin;
+    else delete _pendingAlbumPins[virtualPlaylistId];
+}
+window.setPendingAlbumPin = setPendingAlbumPin;
+
 async function showCandidatesModal(taskId) {
     try {
         const resp = await fetch(`/api/downloads/task/${encodeURIComponent(taskId)}/candidates`);
@@ -3413,24 +3602,27 @@ function _renderCandidatesModal(data) {
     const errorMsg = data.error_message || '';
     const downloadMode = data.download_mode || 'soulseek';
     const availableSources = Array.isArray(data.available_sources) ? data.available_sources : [];
-    // Hybrid mode shows the dropdown; everything else implies a single source.
-    const isHybrid = downloadMode === 'hybrid';
+    // The dropdown used to appear only in hybrid mode. Now that the source
+    // list is every CONFIGURED source rather than only the ones in the
+    // fallback chain (see _list_available_download_sources), a user in
+    // single-source mode can also have several to search — so the picker is
+    // driven by how many there actually are, not by the mode name.
+    const multiSource = availableSources.length > 1;
 
     let tableRows = '';
     if (candidates.length === 0) {
         tableRows = `<tr><td colspan="7" style="text-align:center; color: rgba(255,255,255,0.5); padding: 30px;">
             No candidates were found during search.</td></tr>`;
     } else {
-        // Auto-candidates only show source badges in hybrid mode (where the
-        // user can't infer source from the dropdown).
+        // Source badges only earn their space when more than one source is in play.
         candidates.forEach((c, i) => {
-            tableRows += _renderCandidateRow(c, i, 'candidates-row-auto', isHybrid);
+            tableRows += _renderCandidateRow(c, i, 'candidates-row-auto', multiSource);
         });
     }
 
     // ----- Manual search bar -----
     let sourceControl;
-    if (isHybrid && availableSources.length > 0) {
+    if (multiSource) {
         const optionsHtml = ['<option value="all">All sources</option>']
             .concat(availableSources.map(s =>
                 `<option value="${escapeHtml(s.id)}">${escapeHtml(s.label)}</option>`
@@ -3438,7 +3630,7 @@ function _renderCandidatesModal(data) {
             .join('');
         sourceControl = `<select class="candidates-manual-source" id="candidates-manual-source">${optionsHtml}</select>`;
     } else {
-        // Single-source mode — render a small static label, not a dropdown.
+        // Exactly one source configured — a static label, not a one-item dropdown.
         const onlySrc = availableSources[0];
         const label = onlySrc ? onlySrc.label : (downloadMode || 'configured source');
         sourceControl = `<span class="candidates-manual-source-label">Searching ${escapeHtml(label)}</span>`;
@@ -3506,13 +3698,13 @@ function _renderCandidatesModal(data) {
     });
 
     // Wire manual search controls.
-    _wireManualSearch(overlay, data.task_id, trackName, isHybrid);
+    _wireManualSearch(overlay, data.task_id, trackName, multiSource, availableSources);
 }
 
 // Manual-search wiring — input/button/dropdown. Kept separate from
 // _renderCandidatesModal so the existing render path stays readable and
 // any future refactor can lift this into its own module.
-function _wireManualSearch(overlay, taskId, trackName, isHybrid) {
+function _wireManualSearch(overlay, taskId, trackName, multiSource, availableSources) {
     const input = overlay.querySelector('#candidates-manual-search-input');
     const button = overlay.querySelector('#candidates-manual-search-btn');
     const hint = overlay.querySelector('#candidates-manual-search-hint');
@@ -3540,38 +3732,91 @@ function _wireManualSearch(overlay, taskId, trackName, isHybrid) {
         }
     };
 
-    const _renderTableShell = (query) => {
+    // Per-source metadata, so a results block can label itself and know
+    // whether the source searches releases or tracks. Sources not in the
+    // list (a stream can name one the list didn't) fall back to their id.
+    const sourceMeta = {};
+    (availableSources || []).forEach(s => { if (s && s.id) sourceMeta[s.id] = s; });
+    const _meta = (id) => sourceMeta[id] || { id: id, label: id, release_level: false };
+
+    const _renderTableShell = () => {
         resultsContainer.innerHTML = `
             <div class="candidates-manual-search-status" id="candidates-manual-search-status">Searching...</div>
-            <div class="candidates-table-wrapper" style="display: none;" id="candidates-manual-table-wrapper">
+            <div id="candidates-manual-groups"></div>
+            <div id="candidates-manual-releases" class="candidates-release-section" style="display: none;">
+                <div class="candidates-release-note">
+                    <strong>Full releases.</strong> These sources index whole albums, not single
+                    tracks. Picking one downloads the entire release and keeps only the track that
+                    matches — if the release doesn't actually contain it, the download fails rather
+                    than importing the wrong file.
+                </div>
+            </div>`;
+    };
+
+    // Find-or-create a results block for one source. Track-level sources
+    // stack in arrival order; release-level ones are corralled into the
+    // section at the bottom that explains what picking them does.
+    const _groupFor = (sourceId) => {
+        const meta = _meta(sourceId);
+        const domId = `candidates-group-${String(sourceId).replace(/[^a-zA-Z0-9_-]/g, '')}`;
+        let group = resultsContainer.querySelector(`#${domId}`);
+        if (group) return group;
+
+        const host = meta.release_level
+            ? resultsContainer.querySelector('#candidates-manual-releases')
+            : resultsContainer.querySelector('#candidates-manual-groups');
+        if (!host) return null;
+        if (meta.release_level) host.style.display = '';
+
+        group = document.createElement('div');
+        group.id = domId;
+        group.className = 'candidates-source-group';
+        // With one source configured the header just repeats what the search
+        // bar already says, so it only earns its space when grouping means
+        // something. The count element still exists (hidden) so the empty /
+        // failed markers below have somewhere to write.
+        group.innerHTML = `
+            <div class="candidates-source-group-header"${multiSource ? '' : ' style="display:none;"'}>
+                <span class="candidates-source-group-name">${escapeHtml(meta.label || sourceId)}</span>
+                <span class="candidates-source-group-count" data-count="0">0</span>
+            </div>
+            <div class="candidates-table-wrapper">
                 <table class="candidates-table">
                     <thead><tr>
                         <th>#</th><th>File</th><th>Quality</th><th>Size</th><th>Duration</th><th>User</th><th></th>
                     </tr></thead>
-                    <tbody id="candidates-manual-tbody"></tbody>
+                    <tbody></tbody>
                 </table>
             </div>`;
+        host.appendChild(group);
+        return group;
     };
 
-    const _appendRows = (newCandidates, query) => {
+    const _appendRows = (sourceId, newCandidates) => {
         if (!newCandidates || newCandidates.length === 0) return;
+        const group = _groupFor(sourceId);
+        if (!group) return;
+        const tbody = group.querySelector('tbody');
+        if (!tbody) return;
+
         const startIdx = currentResults.length;
         currentResults = currentResults.concat(newCandidates);
 
-        const wrapper = resultsContainer.querySelector('#candidates-manual-table-wrapper');
-        const tbody = resultsContainer.querySelector('#candidates-manual-tbody');
-        const statusEl = resultsContainer.querySelector('#candidates-manual-search-status');
-        if (!tbody || !wrapper) return;
-
         let rowsHtml = '';
         newCandidates.forEach((c, i) => {
-            rowsHtml += _renderCandidateRow(c, startIdx + i, 'candidates-row-manual', isHybrid);
+            // The group header already names the source, so the per-row badge
+            // would just repeat it.
+            rowsHtml += _renderCandidateRow(c, startIdx + i, 'candidates-row-manual', false);
         });
         tbody.insertAdjacentHTML('beforeend', rowsHtml);
-        wrapper.style.display = '';
-        if (statusEl) {
-            statusEl.textContent = `${currentResults.length} result${currentResults.length !== 1 ? 's' : ''} so far...`;
+
+        const countEl = group.querySelector('.candidates-source-group-count');
+        if (countEl) {
+            const n = tbody.querySelectorAll('tr').length;
+            countEl.dataset.count = String(n);
+            countEl.textContent = `${n} result${n !== 1 ? 's' : ''}`;
         }
+        _setStatus(`${currentResults.length} result${currentResults.length !== 1 ? 's' : ''} so far...`);
 
         // Wire newly-appended buttons
         tbody.querySelectorAll('.candidates-download-btn').forEach(btn => {
@@ -3583,6 +3828,26 @@ function _wireManualSearch(overlay, taskId, trackName, isHybrid) {
                 if (c) downloadCandidate(taskId, c, trackName);
             });
         });
+    };
+
+    // A source that answered with nothing is worth showing — "Qobuz: 0" is a
+    // real answer to "who has this?", and silence looks like a hang.
+    const _noteEmptySource = (sourceId) => {
+        const group = _groupFor(sourceId);
+        if (!group) return;
+        const countEl = group.querySelector('.candidates-source-group-count');
+        if (countEl && countEl.dataset.count === '0') countEl.textContent = 'no results';
+    };
+
+    const _noteSourceError = (sourceId, message) => {
+        const group = _groupFor(sourceId);
+        if (!group) return;
+        const countEl = group.querySelector('.candidates-source-group-count');
+        if (countEl) {
+            countEl.textContent = 'failed';
+            countEl.classList.add('candidates-source-group-count-error');
+            countEl.title = message || 'Search failed';
+        }
     };
 
     const _setStatus = (text) => {
@@ -3609,7 +3874,7 @@ function _wireManualSearch(overlay, taskId, trackName, isHybrid) {
         const originalLabel = button.textContent;
         button.textContent = 'Searching...';
         currentResults = [];
-        _renderTableShell(q);
+        _renderTableShell();
 
         try {
             const resp = await fetch(`/api/downloads/task/${encodeURIComponent(taskId)}/manual-search`, {
@@ -3647,17 +3912,24 @@ function _wireManualSearch(overlay, taskId, trackName, isHybrid) {
                     try { msg = JSON.parse(line); } catch (_) { continue; }
 
                     if (msg.type === 'source_results') {
-                        _appendRows(msg.candidates || [], q);
+                        if (msg.candidates && msg.candidates.length) {
+                            _appendRows(msg.source, msg.candidates);
+                        } else {
+                            _noteEmptySource(msg.source);
+                        }
                     } else if (msg.type === 'source_error') {
                         errors.push(`${msg.source}: ${msg.error}`);
+                        _noteSourceError(msg.source, msg.error);
                     } else if (msg.type === 'done') {
                         if (currentResults.length === 0) {
+                            // Keep the per-source blocks. "Nothing anywhere" and
+                            // "three sources errored, the rest had nothing" are
+                            // different answers, and wiping the container to a
+                            // single line threw away the one that tells you which.
                             const errorNote = errors.length
-                                ? `<div class="candidates-manual-search-empty-note">${errors.length} source${errors.length !== 1 ? 's' : ''} failed</div>`
+                                ? ` — ${errors.length} source${errors.length !== 1 ? 's' : ''} failed`
                                 : '';
-                            resultsContainer.innerHTML = `
-                                <div class="candidates-manual-search-empty">No manual search results for "${escapeHtml(q)}"</div>
-                                ${errorNote}`;
+                            _setStatus(`No results for "${q}"${errorNote}`);
                         } else {
                             _setStatus(`${currentResults.length} result${currentResults.length !== 1 ? 's' : ''}`);
                         }

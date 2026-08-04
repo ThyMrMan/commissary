@@ -743,6 +743,14 @@ function renderCompactSection(sectionId, listId, countId, items, mapItem) {
                </div>`
             : '';
 
+        // Opt-in "search every source" action. Only rendered when the caller
+        // supplies onSources, so the other consumers of this helper
+        // (artist-detail, library) are untouched.
+        const sourcesHtml = config.onSources
+            ? `<button class="enh-item-sources-btn"
+                       title="Search every configured source and pick which copy to download">🔍</button>`
+            : '';
+
         elem.innerHTML = `
             ${imageHtml}
             <div class="enh-item-info">
@@ -750,6 +758,7 @@ function renderCompactSection(sectionId, listId, countId, items, mapItem) {
                 <div class="enh-item-meta">${escapeHtml(config.meta)}</div>
             </div>
             ${durationHtml}
+            ${sourcesHtml}
             ${badgeHtml}
         `;
 
@@ -764,6 +773,16 @@ function renderCompactSection(sectionId, listId, countId, items, mapItem) {
                 playBtn.addEventListener('click', (e) => {
                     e.stopPropagation(); // Don't trigger main onClick
                     config.onPlay();
+                });
+            }
+        }
+
+        if (config.onSources) {
+            const srcBtn = elem.querySelector('.enh-item-sources-btn');
+            if (srcBtn) {
+                srcBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();   // the card's own onClick starts an auto-download
+                    config.onSources(srcBtn);
                 });
             }
         }

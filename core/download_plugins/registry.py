@@ -61,12 +61,22 @@ class PluginSpec:
     setup (e.g. SoulseekClient calls ``_setup_client`` after init,
     Deezer reads ARL from config). ``aliases`` lets the registry
     accept multiple historical names (e.g. ``deezer_dl`` is the
-    legacy alias for ``deezer``)."""
+    legacy alias for ``deezer``).
+
+    ``release_level`` marks a source whose search returns whole
+    RELEASES rather than individual tracks — torrent and usenet hits
+    are one Prowlarr result per album, projected into a single
+    TrackResult each (see ``torrent.py::_project_results``). Consumers
+    that present per-track choices must handle these separately: a
+    release can't be dispatched down the per-track path, it goes
+    through the album-bundle flow. The flag lives here so nothing has
+    to hardcode the source names a third time."""
 
     name: str
     factory: Callable[[], DownloadSourcePlugin]
     display_name: str
     aliases: Tuple[str, ...] = field(default_factory=tuple)
+    release_level: bool = False
 
 
 class DownloadPluginRegistry:
@@ -164,6 +174,32 @@ class DownloadPluginRegistry:
             except Exception:
                 continue
 
+    def searchable_plugins(self) -> Iterator[Tuple[str, DownloadSourcePlugin]]:
+        """Yield (name, plugin) for every source a USER-DRIVEN search may
+        query — the same "initialized and configured" test as
+        ``configured_plugins``, deliberately given its own name because it
+        answers a different question.
+
+        ``configured_plugins`` is about DISPATCH: which sources the
+        automatic cascade is allowed to download from, which the user
+        constrains through ``download_source.mode`` / ``hybrid_order``.
+        This one is about DISCOVERY: when the user asks "what does anyone
+        have?", the answer should not be filtered by the fallback order
+        they set up for unattended grabs. A source they connected but left
+        out of the chain still works; it was only ever invisible.
+
+        Keeping them as separate methods means a future per-source
+        "don't search this one" opt-out has an obvious home that can't
+        accidentally disable downloads too."""
+        yield from self.configured_plugins()
+
+    def is_release_level(self, name: str) -> bool:
+        """True when this source searches at the RELEASE level (torrent,
+        usenet) rather than the track level. Unknown names are False —
+        every track-level source predates the flag."""
+        spec = self.get_spec(name)
+        return bool(spec and spec.release_level)
+
 
 def build_default_registry() -> DownloadPluginRegistry:
     """Construct the registry with SoulSync's eight built-in download
@@ -192,7 +228,11 @@ def build_default_registry() -> DownloadPluginRegistry:
                                  aliases=('deezer_dl',)))
     registry.register(PluginSpec(name='lidarr',    factory=LidarrDownloadClient,   display_name='Lidarr'))
     registry.register(PluginSpec(name='soundcloud',factory=SoundcloudClient,       display_name='SoundCloud'))
-    registry.register(PluginSpec(name='torrent',   factory=TorrentDownloadPlugin,  display_name='Torrent (Prowlarr)'))
-    registry.register(PluginSpec(name='usenet',    factory=UsenetDownloadPlugin,   display_name='Usenet (Prowlarr)'))
+    # Prowlarr-backed sources search at the RELEASE level — one hit per
+    # album, not per track. See PluginSpec.release_level.
+    registry.register(PluginSpec(name='torrent',   factory=TorrentDownloadPlugin,  display_name='Torrent (Prowlarr)',
+                                 release_level=True))
+    registry.register(PluginSpec(name='usenet',    factory=UsenetDownloadPlugin,   display_name='Usenet (Prowlarr)',
+                                 release_level=True))
 
     return registry

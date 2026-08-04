@@ -582,6 +582,8 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
         artist_name: str,
         staging_dir: str,
         progress_callback=None,
+        *,
+        preferred_release: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """One-shot album download: search Prowlarr for the whole
         release, pick the best torrent, fetch it, extract if needed,
@@ -592,6 +594,18 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
         ``progress_callback`` is called with a dict on each state
         change so the batch UI can show download progress without
         waiting for the whole thing.
+
+        ``preferred_release`` is a release the USER picked from the album
+        source picker — ``{'token': <candidate-store token>, 'title': str}``.
+        When present, the Prowlarr search and ``pick_best_album_release``
+        heuristic are both skipped: the user has already answered the
+        question they exist to guess at. Only a token from our own
+        candidate store is accepted (same trust boundary as ``download()``
+        — an indexer URL from the client is a P0-03 violation, not a
+        convenience), so an expired or forged token fails the grab rather
+        than silently falling back to a heuristic pick the user didn't ask
+        for. Mirrors the ``preferred_source``/``preferred_tracks`` kwargs
+        the Soulseek album flow already accepts from album pre-flight.
 
         Returns ``{'success': bool, 'files': [paths], 'error': str|None}``.
         """
@@ -613,46 +627,63 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
                 except Exception as cb_exc:
                     logger.debug("[Torrent album] progress callback failed: %s", cb_exc)
 
-        # Phase 1: search Prowlarr for the album.
-        query = f"{artist_name} {album_name}".strip()
-        _emit('searching', query=query)
-        try:
-            search_results = run_async(self._prowlarr.search(
-                query, categories=DEFAULT_MUSIC_CATEGORIES,
-                indexer_ids=_parse_indexer_id_filter(),
-            ))
-        except Exception as e:
-            result['error'] = f'Prowlarr search failed: {e}'
-            return result
+        # Phase 1: decide WHICH release. A user pick skips straight past the
+        # search + heuristic; otherwise search Prowlarr and score.
+        if preferred_release:
+            release_title = str(preferred_release.get('title') or '').strip() or album_name
+            download_url = get_candidate_store().resolve(
+                str(preferred_release.get('token') or ''))
+            if not download_url:
+                # Do NOT quietly fall back to a heuristic pick here: the user
+                # named a release, and silently grabbing a different one is a
+                # worse outcome than saying the choice went stale. No
+                # `fallback` flag, so the batch fails visibly.
+                result['error'] = ('That release is no longer available to grab '
+                                   '— re-run the source search and pick again')
+                return result
+            logger.info("[Torrent album] Using user-picked release '%s'", release_title)
+            _emit('queued', release=release_title)
+        else:
+            query = f"{artist_name} {album_name}".strip()
+            _emit('searching', query=query)
+            try:
+                search_results = run_async(self._prowlarr.search(
+                    query, categories=DEFAULT_MUSIC_CATEGORIES,
+                    indexer_ids=_parse_indexer_id_filter(),
+                ))
+            except Exception as e:
+                result['error'] = f'Prowlarr search failed: {e}'
+                return result
 
-        candidates = [r for r in search_results
-                      if r.protocol == 'torrent' and (r.magnet_uri or r.download_url)]
-        if not candidates:
-            # Album isn't available on this source. Mark the failure as
-            # fallback-eligible so the dispatch returns to the per-track flow
-            # instead of hard-failing the batch — in hybrid mode that lets the
-            # next configured source take over. Without this flag a torrent-first
-            # hybrid would get stuck at "searching" forever when Prowlarr
-            # returns nothing, never trying the other sources.
-            result['error'] = f'No torrent results found for "{query}"'
-            result['fallback'] = True
-            return result
+            candidates = [r for r in search_results
+                          if r.protocol == 'torrent' and (r.magnet_uri or r.download_url)]
+            if not candidates:
+                # Album isn't available on this source. Mark the failure as
+                # fallback-eligible so the dispatch returns to the per-track flow
+                # instead of hard-failing the batch — in hybrid mode that lets the
+                # next configured source take over. Without this flag a torrent-first
+                # hybrid would get stuck at "searching" forever when Prowlarr
+                # returns nothing, never trying the other sources.
+                result['error'] = f'No torrent results found for "{query}"'
+                result['fallback'] = True
+                return result
 
-        picked = pick_best_album_release(
-            candidates, _guess_quality_from_title, album_name=album_name,
-        )
-        if picked is None:
-            # No candidate matched the requested album (or none passed filtering).
-            # Fall back to the per-track flow rather than downloading a wrong
-            # album (#730) — per-track searches each track individually.
-            result['error'] = 'No torrent candidate matched the requested album'
-            result['fallback'] = True
-            return result
+            picked = pick_best_album_release(
+                candidates, _guess_quality_from_title, album_name=album_name,
+            )
+            if picked is None:
+                # No candidate matched the requested album (or none passed filtering).
+                # Fall back to the per-track flow rather than downloading a wrong
+                # album (#730) — per-track searches each track individually.
+                result['error'] = 'No torrent candidate matched the requested album'
+                result['fallback'] = True
+                return result
 
-        download_url = picked.magnet_uri or picked.download_url
-        logger.info("[Torrent album] Picked '%s' (size=%.1fMB seeders=%s indexer=%s)",
-                    picked.title, picked.size / 1_048_576, picked.seeders, picked.indexer_name)
-        _emit('queued', release=picked.title, size=picked.size, seeders=picked.seeders)
+            release_title = picked.title
+            download_url = picked.magnet_uri or picked.download_url
+            logger.info("[Torrent album] Picked '%s' (size=%.1fMB seeders=%s indexer=%s)",
+                        picked.title, picked.size / 1_048_576, picked.seeders, picked.indexer_name)
+            _emit('queued', release=picked.title, size=picked.size, seeders=picked.seeders)
 
         # Phase 2: hand to adapter. Fetch the .torrent server-side first —
         # the client often can't reach Prowlarr itself (split containers).
@@ -673,10 +704,10 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
         # take down the whole download) and always emits a terminal
         # 'failed' state on failure paths so the UI doesn't freeze on
         # the last 'downloading' emit.
-        _emit('downloading', release=picked.title)
+        _emit('downloading', release=release_title)
         save_path = poll_album_download(
             get_status=lambda: run_async(adapter.get_status(torrent_id)),
-            title=picked.title,
+            title=release_title,
             emit=_emit,
             # Torrent adapters flip to 'seeding' on completion (files
             # on disk, share-ratio progress) — both states count as
@@ -704,7 +735,7 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
             return result
 
         # Phase 4: extract + walk + copy to staging.
-        _emit('staging', release=picked.title)
+        _emit('staging', release=release_title)
         # Resolve the client-reported path to one this process can read,
         # content-checked against the torrent's on-disk NAME (the release
         # folder) so an existing-but-wrong mount can't win, and walk just

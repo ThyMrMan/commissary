@@ -40433,6 +40433,38 @@ div.artist-hero-badge {
     transform: translateY(-50%) scale(1.05);
 }
 
+/* "Search every source" on a compact result row. Sits left of the play
+   button so the two don't overlap, and stays visible (not hover-only) —
+   clicking the row itself starts an automatic download, so the deliberate
+   choice needs to be discoverable without hunting for it. */
+.enh-item-sources-btn {
+    flex: 0 0 auto;
+    margin-left: 8px;
+    padding: 5px 10px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 14px;
+    color: rgba(255, 255, 255, 0.75);
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+.enh-item-sources-btn:hover {
+    background: rgba(var(--accent-rgb), 0.75);
+    border-color: rgba(var(--accent-rgb), 0.9);
+    color: #ffffff;
+}
+.enh-item-sources-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+/* The play button is absolutely positioned at right: 0 of the duration
+   block; reserve room so the sources button doesn't sit under it. */
+.enh-compact-item.track-item .enh-item-sources-btn {
+    margin-right: 4px;
+}
+
 .enh-item-play-btn:active {
     transform: translateY(-50%) scale(0.95);
 }
@@ -45415,6 +45447,120 @@ div.artist-hero-badge {
     text-align: center;
     font-style: italic;
 }
+/* Manual-search results grouped per source. Each source gets its own block
+   so "who actually has this?" is answerable at a glance, including the
+   sources that answered with nothing. */
+.candidates-source-group {
+    margin-bottom: 14px;
+}
+.candidates-source-group-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 4px 2px 6px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    margin-bottom: 6px;
+}
+.candidates-source-group-name {
+    color: rgba(255, 255, 255, 0.85);
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+    text-transform: uppercase;
+}
+.candidates-source-group-count {
+    color: rgba(255, 255, 255, 0.45);
+    font-size: 11px;
+    white-space: nowrap;
+}
+.candidates-source-group-count-error {
+    color: rgba(255, 120, 120, 0.8);
+}
+
+/* Release-level sources (torrent / usenet) index whole albums, so their
+   results are corralled below the track-level ones behind a note that says
+   what picking one actually does. */
+.candidates-release-section {
+    margin-top: 16px;
+    padding-top: 12px;
+    border-top: 1px dashed rgba(255, 255, 255, 0.15);
+}
+.candidates-release-note {
+    color: rgba(255, 200, 130, 0.8);
+    font-size: 11.5px;
+    line-height: 1.5;
+    background: rgba(255, 180, 80, 0.06);
+    border: 1px solid rgba(255, 180, 80, 0.18);
+    border-radius: 6px;
+    padding: 9px 11px;
+    margin-bottom: 10px;
+}
+.candidates-release-note strong {
+    color: rgba(255, 210, 150, 0.95);
+}
+
+/* Album source picker — one row per release, grouped by source. */
+.album-sources-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.album-source-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 9px 11px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 7px;
+}
+.album-source-row:hover {
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.16);
+}
+/* A source with no album-bundle flow can be chosen, but only as a source —
+   it can't be pinned to this exact release. Dimmed so the difference reads. */
+.album-source-row-unpinnable {
+    opacity: 0.75;
+}
+.album-source-row-main {
+    min-width: 0;
+}
+.album-source-row-title {
+    color: rgba(255, 255, 255, 0.9);
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.album-source-row-meta {
+    color: rgba(255, 255, 255, 0.45);
+    font-size: 11px;
+    margin-top: 3px;
+}
+.album-source-pick-btn {
+    flex: 0 0 auto;
+    padding: 6px 12px;
+    background: rgba(var(--accent-rgb), 0.75);
+    border: none;
+    border-radius: 14px;
+    color: #fff;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+}
+.album-source-pick-btn:hover {
+    background: rgba(var(--accent-rgb), 0.95);
+}
+.album-sources-footer {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    text-align: center;
+}
+
 .candidates-source-badge {
     display: inline-block;
     background: rgba(255, 255, 255, 0.08);

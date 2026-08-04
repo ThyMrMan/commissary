@@ -90,6 +90,57 @@ def test_default_registry_registers_all_sources():
     assert set(registry.names()) == expected
 
 
+def test_only_prowlarr_backed_sources_are_release_level():
+    """Torrent and usenet search at the RELEASE level — one indexer hit per
+    album, not per track. The picker groups and explains those separately, so
+    the flag has to live on the registry entry rather than being re-derived
+    (and eventually forgotten) at each consumer."""
+    from core.download_plugins.registry import build_default_registry
+
+    registry = build_default_registry()
+    release_level = {n for n in registry.names() if registry.is_release_level(n)}
+    assert release_level == {'torrent', 'usenet'}
+
+
+def test_is_release_level_is_false_for_names_it_has_never_heard_of():
+    """A stream can name a source the registry doesn't have. Guessing "maybe
+    it's a release source" would silently bury its results under the
+    whole-album heading."""
+    from core.download_plugins.registry import build_default_registry
+
+    registry = build_default_registry()
+    assert registry.is_release_level('not_a_source') is False
+    assert registry.is_release_level('') is False
+
+
+def test_searchable_plugins_is_not_narrowed_by_the_dispatch_chain():
+    """``searchable_plugins`` answers "what can the user look in?" and must
+    stay independent of ``download_source.mode`` / ``hybrid_order``, which
+    only order the unattended download cascade. Pinning it to
+    ``configured_plugins`` is the whole contract: connected == searchable."""
+    from core.download_plugins.registry import (
+        DownloadPluginRegistry, PluginSpec,
+    )
+
+    class _Stub:
+        def __init__(self, configured):
+            self._configured = configured
+
+        def is_configured(self):
+            return self._configured
+
+    registry = DownloadPluginRegistry()
+    for name, configured in (('alpha', True), ('beta', False), ('gamma', True)):
+        registry.register(PluginSpec(name=name,
+                                     factory=lambda c=configured: _Stub(c),
+                                     display_name=name.title()))
+    registry.initialize()
+
+    assert {n for n, _ in registry.searchable_plugins()} == {'alpha', 'gamma'}
+    assert {n for n, _ in registry.searchable_plugins()} == \
+           {n for n, _ in registry.configured_plugins()}
+
+
 def test_deezer_dl_alias_is_registered_against_deezer_spec():
     """Legacy ``deezer_dl`` source-name string used in config + per-
     source dispatch must keep resolving — frontend, settings,

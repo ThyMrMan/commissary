@@ -3484,10 +3484,15 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.19': [
-        { date: 'August 2026 · 1.8.19' },
+    '1.9.0': [
+        { date: 'August 2026 · 1.9.0' },
+        { title: 'Every source you have connected is now searchable', desc: 'the source list behind manual search was filtered by your download mode: in Hybrid it offered only the sources in your fallback chain, and in single-source mode it offered exactly one. But that setting is about which source the AUTOMATIC cascade downloads from — it was never a statement that the others do not work. A source you had connected and could download from was simply invisible unless you also re-ordered your fallback chain to see it. Every configured source is now offered; your chain order still leads the list, it just no longer excludes.' },
+        { title: 'Choose a release for a whole album', desc: 'a new button on album and single/EP results. It asks every source that indexes whole albums what it has, shows you the releases side by side — format, track count, size, seeders — and downloads the exact one you choose instead of guessing for you. Your pick overrides your configured download source: choosing a torrent release while running Soulseek-only does what you would expect, because the mode setting was only ever answering "what may claim a whole album unattended?".' },
+        { title: 'Whole-album sources are kept separate from track results', desc: 'torrent and usenet index releases, not tracks, so a hit from them is an entire album. Those results now sit under their own heading in the track picker with a note saying what picking one actually does: the full release downloads, the matching track is kept, and if the release turns out not to contain it the download fails rather than importing the wrong file.' },
+        { title: 'Results are grouped by source', desc: 'so you can see that one source has it in FLAC while another only has a low-bitrate rip — instead of one merged list that hides which of your sources is actually serving you well. Sources that came back with nothing say so, and one that errored is marked rather than silently missing: "who has this?" is only answered properly if the zeroes are visible too.' },
+        { title: 'A search that finds nothing now tells you where it looked', desc: 'it used to replace the whole panel with one line. "Nothing anywhere" and "three sources failed, the rest genuinely do not have it" are different answers, and only one of them means you should stop looking.' },
+        { title: 'Also in 1.8.19', desc: 'searching every source by hand and picking a track, on Search, album rows and the wishlist.' },
         { title: 'Search every source yourself and pick what downloads', desc: 'a new button on the Search page, on album tracks and on each wishlist row. It searches every download source you have configured, shows you what each one is offering, and lets you choose the copy you want. Until now the only route to a track was to add it to the wishlist and wait for the automation to have a go.' },
-        { title: 'Results are grouped by source', desc: 'so you can see that one source has it in FLAC while another only has a low-bitrate rip — instead of one merged list that hides which of your sources is actually serving you well.' },
         { title: 'Picking by hand keeps every safety net', desc: 'your choice goes down the same path an automatic download does, so the fingerprint check and the quality quarantine still apply. It also tells the auto-retry to leave your choice alone: it tries the file you picked and reports back, rather than quietly going off and grabbing something else if it fails.' },
         { title: 'Where the button is', desc: 'Search results get "Sources" next to Stream and Download. Album tracks get it whether you own them or not — for a missing track it is a way to fill the gap, for one you own it is a way to swap in a better copy. And every wishlist row gets one, which is the useful one when something has been sitting there not downloading.' },
         { title: 'It gives you a way out, not an explanation', desc: 'worth being straight about: this lets you rescue a stuck item by hand, but it still does not tell you why it was stuck. If something has been on your wishlist a long time, check the Ignored list first — removing a track or cancelling its download quietly stops the automation re-adding it for thirty days, and that is invisible from the wishlist itself.' },
@@ -3652,6 +3657,19 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.0: every source is searchable, and albums get a release picker",
+        description: "1.8.19 let you search your sources by hand for a track. This opens that up — every source you have connected is now offered, not just the ones in your fallback chain — and gives albums their own picker so you choose the release instead of SoulSync guessing.",
+        features: [
+            "your download mode filtered which sources manual search would even offer: Hybrid showed only your fallback chain, single-source showed exactly one. That setting governs the AUTOMATIC cascade — it was never a claim that your other sources don't work. Every configured source is now searchable; your chain order still leads the list, it just no longer excludes",
+            "albums and singles get a Sources button of their own. It asks every source that indexes whole albums what it has — format, track count, size, seeders — and downloads the exact release you pick",
+            "an album pick overrides your configured download source, because 'which source may claim a whole album unattended' stops being the right question once you have named the release you want",
+            "torrent and usenet index releases, not tracks, so in the track picker their results now sit under their own heading with a note saying what picking one does: the whole release downloads, the matching track is kept, and if it isn't in there the download fails rather than importing the wrong file",
+            "sources that returned nothing say so, and one that errored is marked — 'who has this?' is only answered properly when the zeroes are visible too",
+            "a search that finds nothing now shows where it looked, instead of collapsing to a single line: 'nothing anywhere' and 'three sources failed' should not look identical",
+        ],
+        usage_note: "Two sources can show you albums but can't be pinned to a specific release — Amazon and Lidarr have no whole-album download flow. Their rows say 'Use this source' and are dimmed, so the picker isn't claiming precision it doesn't have.",
+    },
     {
         title: "1.8.19: search every source yourself and pick",
         description: "the only route to a track used to be adding it to the wishlist and waiting for the automation to have a go. Now you can search all your download sources directly and choose the copy you want.",

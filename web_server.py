@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.8.19"
+_SOULSYNC_BASE_VERSION = "1.9.0"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -8354,60 +8354,86 @@ def _serialize_candidate(c, source_override: str = None) -> dict:
     return {}
 
 
+def _auto_cascade_chain() -> list:
+    """The canonical source names the UNATTENDED download cascade walks, in
+    order. Hybrid mode uses the resolved chain; single-source mode is a
+    one-element chain. Used to annotate the search source list, never to
+    restrict it."""
+    if not download_orchestrator:
+        return []
+    try:
+        if config_manager.get('download_source.mode', 'soulseek') == 'hybrid':
+            return list(download_orchestrator._resolve_source_chain())
+        mode = config_manager.get('download_source.mode', 'soulseek')
+        spec = download_orchestrator.registry.get_spec(mode)
+        return [spec.name] if spec else ([mode] if mode else [])
+    except Exception:   # noqa: BLE001 - an annotation must never break the search
+        logger.debug("[Search] could not resolve the auto-cascade chain", exc_info=True)
+        return []
+
+
 def _list_available_download_sources() -> tuple:
-    """Return ``(download_mode, available_sources)`` for the current
-    download configuration. ``download_mode`` is the value of
-    ``download_source.mode`` (one of 'soulseek'/'youtube'/.../'hybrid').
-    ``available_sources`` is a list of ``{id, label}`` dicts — the
-    sources the manual-search dropdown should offer.
+    """Return ``(download_mode, available_sources)`` — every source a
+    user-driven search may query.
 
-    In single-source mode: returns just that one source if it's
-    initialized + configured (the user picked it, so we expose it
-    even if is_configured() doesn't fully approve — they may still
-    want to retry).
+    ``download_mode`` is ``download_source.mode`` ('soulseek'/'youtube'/
+    .../'hybrid'). ``available_sources`` is a list of
+    ``{id, label, in_chain, chain_position, release_level}`` dicts.
 
-    In hybrid mode: filters ``hybrid_order`` down to sources that are
-    BOTH initialized and ``is_configured()`` — same gate hybrid-mode
-    fallback already uses.
+    This used to return only the sources in the active mode: in hybrid
+    mode just ``hybrid_order``, otherwise the single configured mode. That
+    conflated two different questions. ``hybrid_order`` says which sources
+    the AUTOMATIC cascade tries and in what order — a dispatch preference
+    for unattended grabs. It was never a statement that the other sources
+    are unusable, yet it silently hid them from manual search, so a source
+    the user had connected and could download from was unreachable unless
+    they also re-ordered their fallback chain. Now every configured source
+    is offered and ``in_chain`` / ``chain_position`` merely ANNOTATE which
+    ones the cascade would have used, so the UI can still show that
+    ordering without enforcing it.
     """
     if not download_orchestrator:
         return 'soulseek', []
 
     download_mode = config_manager.get('download_source.mode', 'soulseek')
-    sources = []
+    registry = getattr(download_orchestrator, 'registry', None)
+    if registry is None:
+        return download_mode, []
+
+    chain = _auto_cascade_chain()
+    chain_index = {name: i for i, name in enumerate(chain)}
 
     def _make_entry(name: str) -> dict:
-        spec = download_orchestrator.registry.get_spec(name) if hasattr(download_orchestrator, 'registry') else None
+        spec = registry.get_spec(name)
         return {
             'id': name,
             'label': spec.display_name if spec else name.title(),
+            'in_chain': name in chain_index,
+            'chain_position': chain_index.get(name),
+            # Torrent/usenet return whole releases, not tracks — the picker
+            # groups and dispatches those differently.
+            'release_level': registry.is_release_level(name),
         }
 
-    if download_mode == 'hybrid':
-        hybrid_order = config_manager.get('download_source.hybrid_order',
-                                          ['hifi', 'youtube', 'soulseek']) or []
-        seen = set()
-        for raw_name in hybrid_order:
-            spec = download_orchestrator.registry.get_spec(raw_name) if hasattr(download_orchestrator, 'registry') else None
-            canonical = spec.name if spec else raw_name
-            if canonical in seen:
-                continue
-            client = download_orchestrator.client(canonical)
-            if not client:
-                continue
-            try:
-                if not client.is_configured():
-                    continue
-            except Exception:
-                continue
-            seen.add(canonical)
-            sources.append(_make_entry(canonical))
-    else:
-        # Single-source mode — just expose the configured mode (the user
-        # picked it, so they expect manual search to hit that source).
-        client = download_orchestrator.client(download_mode)
-        if client:
-            sources.append(_make_entry(download_mode))
+    sources = [_make_entry(name) for name, _plugin in registry.searchable_plugins()]
+
+    # Chain members first in their cascade order, then everything else
+    # alphabetically by label — the user's stated preference still leads,
+    # it just no longer excludes.
+    sources.sort(key=lambda s: (
+        0 if s['in_chain'] else 1,
+        s['chain_position'] if s['chain_position'] is not None else 0,
+        s['label'].lower(),
+    ))
+
+    # A single-source mode the user picked is offered even when
+    # is_configured() disagrees — they chose it, they may be mid-setup, and
+    # a retry attempt failing loudly beats the source vanishing silently.
+    if download_mode != 'hybrid' and not any(s['id'] == download_mode for s in sources):
+        spec = registry.get_spec(download_mode)
+        canonical = spec.name if spec else download_mode
+        if download_orchestrator.client(canonical):
+            sources.insert(0, _make_entry(canonical))
 
     return download_mode, sources
 
@@ -8937,6 +8963,196 @@ def manual_search_for_task(task_id):
         logger.error(f"[Manual Search] {e}")
         import traceback
         traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+# Sources whose album flow can be pinned to a specific release. Mirrors
+# ``core.downloads.master._ALBUM_BUNDLE_SOURCES`` — kept as its own constant
+# so the endpoint validates input without importing the worker.
+_PINNABLE_ALBUM_SOURCES = frozenset(('torrent', 'usenet', 'soulseek'))
+
+_RELEASE_TOKEN_SEP = '||'
+
+
+def _normalize_pinned_release(raw):
+    """Validate a picked release from the client into the small dict the
+    album-bundle dispatch understands, or ``None``.
+
+    Whitelist, not passthrough: a rejected pin degrades to "choose
+    automatically", which is exactly today's behaviour, so a malformed or
+    hostile payload can never wedge a download. Note what is NOT accepted —
+    a download URL. Prowlarr-backed picks carry only the opaque
+    candidate-store token minted during the search, and the plugin resolves
+    it server-side; that keeps indexer API keys off the wire (P0-03) and
+    means a forged token simply fails to resolve.
+    """
+    if not isinstance(raw, dict):
+        return None
+    source = str(raw.get('source') or '').strip().lower()
+    if source not in _PINNABLE_ALBUM_SOURCES:
+        return None
+    if source == 'soulseek':
+        username = str(raw.get('username') or '').strip()
+        folder_path = str(raw.get('folder_path') or '').strip()
+        if not username or not folder_path:
+            return None
+        return {'source': source, 'username': username,
+                'folder_path': folder_path,
+                'title': str(raw.get('title') or '')[:300]}
+    token = str(raw.get('token') or '').strip()
+    if not token:
+        return None
+    return {'source': source, 'token': token,
+            'title': str(raw.get('title') or '')[:300]}
+
+
+def _serialize_album_candidate(album, source: str):
+    """Project an ``AlbumResult`` into the shape the album picker renders and
+    can hand back as a pin.
+
+    The pinning key differs by source and that's inherent, not incidental:
+    a Prowlarr release IS a single downloadable artifact (one token), while a
+    Soulseek "album" is a peer's folder (username + path) that has to be
+    browsed at grab time. Both are carried so the picker doesn't have to
+    special-case sources it doesn't know about.
+    """
+    if album is None:
+        return None
+    tracks = list(getattr(album, 'tracks', None) or [])
+    entry = {
+        'source': source,
+        'title': getattr(album, 'album_title', '') or '',
+        'artist': getattr(album, 'artist', None),
+        'track_count': getattr(album, 'track_count', 0) or 0,
+        'total_size': getattr(album, 'total_size', 0) or 0,
+        'quality': getattr(album, 'dominant_quality', '') or '',
+        'year': getattr(album, 'year', None),
+        'username': getattr(album, 'username', '') or '',
+        'folder_path': getattr(album, 'album_path', '') or '',
+        'token': None,
+        'pinnable': False,
+    }
+    # Prowlarr-backed sources encode "<token>||<release title>" into the
+    # projected track's filename (see torrent.py::_project_results). That
+    # token is the only handle on the release the browser may hold.
+    if source in ('torrent', 'usenet') and tracks:
+        filename = str(getattr(tracks[0], 'filename', '') or '')
+        if _RELEASE_TOKEN_SEP in filename:
+            entry['token'] = filename.split(_RELEASE_TOKEN_SEP, 1)[0]
+        seeders = None
+        meta = getattr(tracks[0], '_source_metadata', None) or {}
+        if isinstance(meta, dict):
+            seeders = meta.get('seeders')
+            entry['indexer'] = meta.get('indexer')
+            entry['grabs'] = meta.get('grabs')
+        entry['seeders'] = seeders
+        entry['pinnable'] = bool(entry['token'])
+    elif source == 'soulseek':
+        entry['pinnable'] = bool(entry['username'] and entry['folder_path'])
+    return entry
+
+
+@app.route('/api/downloads/album/sources', methods=['POST'])
+def album_source_candidates():
+    """Search every configured source for a whole ALBUM and stream what each
+    one has, so the user can choose the release instead of the app guessing.
+
+    The per-track picker (``/task/<id>/manual-search``) can't answer this: a
+    track-level pick for an album would import one file named after the album.
+    So this streams the ``AlbumResult`` list every plugin already returns from
+    ``search()`` — the half the track picker discards. Only five sources
+    produce album results at all (amazon, torrent, usenet, lidarr, soulseek),
+    which is precisely the set where "pick a release" is a meaningful question.
+
+    Same NDJSON event shape as the track picker (``header`` /
+    ``source_results`` / ``source_error`` / ``done``) so one frontend renderer
+    serves both.
+
+    Body: ``{artist, album}``. Candidates carry ``pinnable`` — false means the
+    source can show you what it has but can't be pinned to that exact release
+    (no ``download_album_to_staging``), so choosing it pins the SOURCE only.
+    """
+    dl_err = check_download_permission()
+    if dl_err:
+        return dl_err
+    try:
+        data = request.get_json(silent=True) or {}
+        album = str(data.get('album') or '').strip()
+        artist = str(data.get('artist') or '').strip()
+        if len(album) < 2:
+            return jsonify({"error": "An album name is required."}), 400
+
+        query = f"{artist} {album}".strip()
+        download_mode, available_sources = _list_available_download_sources()
+        source = str(data.get('source') or 'all').strip().lower()
+        valid_ids = {s['id'] for s in available_sources}
+        if source != 'all':
+            if source not in valid_ids:
+                return jsonify({"error": f"Source '{source}' is not configured or available"}), 400
+            sources_to_query = [source]
+        else:
+            sources_to_query = list(valid_ids)
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _search_one(src_name: str):
+            client = download_orchestrator.client(src_name) if download_orchestrator else None
+            if not client:
+                return src_name, [], None
+            try:
+                result = run_async(client.search(query))
+                # (tracks, albums) — the ALBUMS half is what this endpoint is for.
+                albums = result[1] if isinstance(result, tuple) and len(result) > 1 else []
+                return src_name, list(albums or []), None
+            except Exception as exc:
+                logger.warning("[Album Sources] %s search failed for %r: %s",
+                               src_name, query, exc)
+                return src_name, [], str(exc)
+
+        def _generate():
+            yield json.dumps({
+                "type": "header",
+                "album": album,
+                "artist": artist,
+                "query": query,
+                "download_mode": download_mode,
+                "available_sources": available_sources,
+                "sources_queried": sources_to_query,
+            }) + "\n"
+
+            if not sources_to_query:
+                yield json.dumps({"type": "done", "total": 0}) + "\n"
+                return
+
+            total = 0
+            max_workers = min(8, max(1, len(sources_to_query)))
+            with ThreadPoolExecutor(max_workers=max_workers,
+                                    thread_name_prefix='album-sources') as executor:
+                futures = [executor.submit(_search_one, name) for name in sources_to_query]
+                for future in as_completed(futures):
+                    src_name, albums, error = future.result()
+                    if error is not None:
+                        yield json.dumps({"type": "source_error", "source": src_name,
+                                          "error": error}) + "\n"
+                        continue
+                    serialized = [s for s in
+                                  (_serialize_album_candidate(a, src_name) for a in albums)
+                                  if s]
+                    total += len(serialized)
+                    yield json.dumps({"type": "source_results", "source": src_name,
+                                      "candidates": serialized}) + "\n"
+
+            logger.info("[Album Sources] query=%r sources=%s results=%d",
+                        query, sources_to_query, total)
+            yield json.dumps({"type": "done", "total": total}) + "\n"
+
+        return Response(
+            _generate(),
+            mimetype='application/x-ndjson',
+            headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+        )
+    except Exception as e:
+        logger.exception("[Album Sources] %s", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -23105,6 +23321,11 @@ def start_missing_tracks_process(playlist_id):
     skip_acoustid = bool(data.get('skip_acoustid', False))
     # Blocklist override (Phase 2b): set by the modal's "download anyway" confirm.
     ignore_blocklist = bool(data.get('ignore_blocklist', False))
+    # A release the user chose in the album source picker. Normalised (not
+    # trusted) here: only the fields the dispatch reads survive, and the
+    # download URL never appears — Prowlarr-backed picks carry an opaque
+    # candidate-store token the plugin resolves server-side (P0-03).
+    pinned_release = _normalize_pinned_release(data.get('pinned_release'))
 
     if not tracks:
         return jsonify({"success": False, "error": "No tracks provided"}), 400
@@ -23205,6 +23426,10 @@ def start_missing_tracks_process(playlist_id):
             'is_album_download': is_album_download,
             'album_context': album_context,
             'artist_context': artist_context,
+            # User-picked release from the album source picker; read by the
+            # master worker's album-bundle dispatch. None = pick automatically,
+            # exactly as before.
+            'pinned_release': pinned_release,
             'wing_it': wing_it,
             'skip_acoustid': skip_acoustid,  # #797 per-request AcoustID bypass
             'batch_source': _downloads_history.detect_sync_source(playlist_id),

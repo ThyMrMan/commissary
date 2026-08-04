@@ -74,13 +74,22 @@ def is_eligible(
     is_album: bool,
     album_name: str,
     artist_name: str,
+    user_picked: bool = False,
 ) -> bool:
     """Pure predicate: does this batch even qualify for the album
     flow? Separate from the resolution+run step so tests can pin
-    the gate logic without standing up a plugin."""
+    the gate logic without standing up a plugin.
+
+    ``user_picked`` relaxes the MODE check only. The mode gate exists to
+    stop an unattended batch claiming a whole release from a source the
+    user didn't nominate for that job — reasonable when the app is
+    guessing, backwards once the user has personally chosen a release
+    from this exact source. Everything else still has to hold: it must
+    be an album, and we still need both names for staging + matching.
+    """
     if not is_album:
         return False
-    if (mode or '').lower() not in ('torrent', 'usenet', 'soulseek'):
+    if not user_picked and (mode or '').lower() not in ('torrent', 'usenet', 'soulseek'):
         return False
     if not (album_name or '').strip():
         return False
@@ -116,8 +125,13 @@ def try_dispatch(
     album_name = (album_context or {}).get('name') or ''
     artist_name = (artist_context or {}).get('name') or ''
 
+    # A pinned release means the user opened the album source picker and chose
+    # this exact release from this exact source, so the mode gate doesn't apply.
+    user_picked = bool((plugin_kwargs or {}).get('preferred_release'))
+
     if not is_eligible(mode=mode, is_album=is_album,
-                       album_name=album_name, artist_name=artist_name):
+                       album_name=album_name, artist_name=artist_name,
+                       user_picked=user_picked):
         return False
 
     album_name = album_name.strip()
