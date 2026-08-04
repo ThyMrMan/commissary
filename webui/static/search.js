@@ -1305,6 +1305,14 @@ function displaySearchResults(results) {
                         <button class="download-button" onclick="event.stopPropagation(); startDownload(${index})">
                             ⬇ Download
                         </button>
+                        <button class="search-sources-button"
+                                onclick="event.stopPropagation(); openManualSearchFor({name: this.dataset.msName, artist: this.dataset.msArtist, album: this.dataset.msAlbum}, this)"
+                                data-ms-name="${escapeHtml(result.title || '')}"
+                                data-ms-artist="${escapeHtml(result.artist || '')}"
+                                data-ms-album="${escapeHtml(result.album || '')}"
+                                title="Search every configured source for this and pick which copy to download">
+                            🔍 Sources
+                        </button>
                     </div>
                 </div>
                 <div class="result-details">

@@ -3484,8 +3484,14 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.8.18': [
-        { date: 'August 2026 · 1.8.18' },
+    '1.8.19': [
+        { date: 'August 2026 · 1.8.19' },
+        { title: 'Search every source yourself and pick what downloads', desc: 'a new button on the Search page, on album tracks and on each wishlist row. It searches every download source you have configured, shows you what each one is offering, and lets you choose the copy you want. Until now the only route to a track was to add it to the wishlist and wait for the automation to have a go.' },
+        { title: 'Results are grouped by source', desc: 'so you can see that one source has it in FLAC while another only has a low-bitrate rip — instead of one merged list that hides which of your sources is actually serving you well.' },
+        { title: 'Picking by hand keeps every safety net', desc: 'your choice goes down the same path an automatic download does, so the fingerprint check and the quality quarantine still apply. It also tells the auto-retry to leave your choice alone: it tries the file you picked and reports back, rather than quietly going off and grabbing something else if it fails.' },
+        { title: 'Where the button is', desc: 'Search results get "Sources" next to Stream and Download. Album tracks get it whether you own them or not — for a missing track it is a way to fill the gap, for one you own it is a way to swap in a better copy. And every wishlist row gets one, which is the useful one when something has been sitting there not downloading.' },
+        { title: 'It gives you a way out, not an explanation', desc: 'worth being straight about: this lets you rescue a stuck item by hand, but it still does not tell you why it was stuck. If something has been on your wishlist a long time, check the Ignored list first — removing a track or cancelling its download quietly stops the automation re-adding it for thirty days, and that is invisible from the wishlist itself.' },
+        { title: 'Also in 1.8.18', desc: 'downloads filed into category folders now import, and manual placement stopped reporting failures for files it had placed.' },
         { title: 'Downloads sorted into category folders now import', desc: 'if your download client files finished downloads into folders — the usual "complete/Movies/…" or "complete/TV/…" — SoulSync could not find them. It looked exactly one folder below each download root, and a category layout puts the release two down, so the download simply sat there and never imported. It now looks three levels deep.' },
         { title: 'Still bounded, so it stays quick', desc: 'the old one-level limit existed to stop a download root turning into a directory crawl, which is a fair worry. The search is capped by depth and by how many folders it will look at, so it reaches your releases without wandering. Adjustable with download_source.import_search_depth if your layout is deeper.' },
         { title: '"Couldn\'t place the file" — when it had, in fact, placed the file', desc: 'manual import placement copied the file while your browser waited, and a large file over a network share takes minutes. If anything along the way gave up waiting, you got an error — while the server quietly finished the copy perfectly. The page then kept the item on screen as though nothing had happened, and trying again gave a different error still.' },
@@ -3646,6 +3652,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.8.19: search every source yourself and pick",
+        description: "the only route to a track used to be adding it to the wishlist and waiting for the automation to have a go. Now you can search all your download sources directly and choose the copy you want.",
+        features: [
+            "a Sources button on the Search page, on album tracks, and on every wishlist row — it queries every configured download source and shows what each one is offering",
+            "results are grouped by source, so you can see one has it in FLAC while another only has a low-bitrate rip, rather than a merged list that hides which source is serving you well",
+            "picking by hand keeps every safety net: your choice goes down the same path an automatic download does, so the fingerprint check and quality quarantine still apply, and the auto-retry leaves your choice alone instead of quietly grabbing something else",
+            "album tracks get it whether you own them or not — fill a gap, or swap in a better copy",
+            "the wishlist placement is the useful one when something has been sitting there refusing to download",
+        ],
+        usage_note: "It gives you a way out, not an explanation. If something has been stuck a while, check the wishlist's Ignored list — removing a track or cancelling its download stops the automation re-adding it for thirty days, invisibly.",
+    },
     {
         title: "1.8.18: downloads in category folders finally import",
         description: "two import fixes: a release filed under a category folder was never found, and manual placement reported failure for files it had actually placed.",

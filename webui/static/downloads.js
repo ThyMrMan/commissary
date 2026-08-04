@@ -1640,6 +1640,10 @@ async function selectWishlistCategory(category) {
                 // Sort tracks by track number
                 albumData.tracks.sort((a, b) => a.trackNumber - b.trackNumber);
 
+                // Carried onto each row's manual-search button so the picker can
+                // be opened straight from the row without a second lookup.
+                const safeArtistNameForTracks = escapeHtml(albumData.artistName || '');
+                const safeAlbumNameForTracks = escapeHtml(albumData.albumName || '');
                 const tracksListHTML = albumData.tracks.map(track => {
                     const safeTrackId = escapeHtml(track.spotifyTrackId || '');
                     const safeTrackName = escapeHtml(track.name || 'Unknown Track');
@@ -1651,6 +1655,13 @@ async function selectWishlistCategory(category) {
                             <span class="wishlist-checkbox-custom"></span>
                         </label>
                         <span class="wishlist-album-track-name">${safeTrackName}</span>
+                        <button class="wishlist-manual-search-btn" data-manual-search-track="${safeTrackId}"
+                                data-ms-name="${safeTrackName}"
+                                data-ms-artist="${safeArtistNameForTracks}"
+                                data-ms-album="${safeAlbumNameForTracks}"
+                                title="Search every source for this track and pick one yourself">
+                            🔍
+                        </button>
                         <button class="wishlist-delete-btn wishlist-delete-btn-small" data-track-id="${safeTrackId}" title="Remove from wishlist">
                             🗑️
                         </button>
@@ -1866,6 +1877,21 @@ function _attachWishlistDelegation(container) {
         if (albumDelBtn) {
             e.stopPropagation();
             removeAlbumFromWishlist(albumDelBtn.dataset.albumId, e);
+            return;
+        }
+
+        // Per-track manual search — checked BEFORE the delete button, since
+        // both live in the same row and a mis-ordered match here would delete
+        // the track instead of searching for it.
+        const msBtn = target.closest('[data-manual-search-track]');
+        if (msBtn) {
+            e.stopPropagation();
+            openManualSearchFor({
+                id: msBtn.dataset.manualSearchTrack || '',
+                name: msBtn.dataset.msName || '',
+                artist: msBtn.dataset.msArtist || '',
+                album: msBtn.dataset.msAlbum || '',
+            }, msBtn);
             return;
         }
 
@@ -3279,6 +3305,42 @@ function _ensureCandidatesClickListener(statusEl) {
         }
     });
 }
+
+/**
+ * Open the multi-source picker for a track nothing has downloaded yet.
+ *
+ * The picker itself already searched every configured source — it just needed
+ * an existing failed download to hang off, which is why the only route to a
+ * track used to be the wishlist. This creates that task first (no automatic
+ * search runs, so nothing races the choice) and then opens the SAME modal, so
+ * a manual pick still goes through /download-candidate and keeps the AcoustID
+ * and quality checks rather than routing around them.
+ *
+ * `track` accepts either Spotify's nested shape or the flat
+ * {name/title, artist, album} that search and wishlist rows carry.
+ */
+async function openManualSearchFor(track, btnEl) {
+    const label = btnEl ? btnEl.innerHTML : null;
+    if (btnEl) { btnEl.disabled = true; btnEl.innerHTML = '…'; }
+    try {
+        const resp = await fetch('/api/downloads/manual-search/task', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ track_info: track }),
+        });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok || !data || !data.task_id) {
+            const msg = (data && data.error) || 'Could not open the search';
+            if (typeof showToast === 'function') showToast(msg, 'error');
+            return;
+        }
+        await showCandidatesModal(data.task_id);
+    } catch (err) {
+        if (typeof showToast === 'function') showToast('Could not open the search', 'error');
+    } finally {
+        if (btnEl) { btnEl.disabled = false; if (label !== null) btnEl.innerHTML = label; }
+    }
+}
+window.openManualSearchFor = openManualSearchFor;
 
 async function showCandidatesModal(taskId) {
     try {

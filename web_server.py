@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.8.18"
+_SOULSYNC_BASE_VERSION = "1.8.19"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -8662,6 +8662,91 @@ def _resolve_link_track_query(source: str, track_id: str):
     if not query:
         return None, f"Could not read the track title from {source.title()}"
     return query, None
+
+
+@app.route('/api/downloads/manual-search/task', methods=['POST'])
+def create_manual_search_task():
+    """Open the multi-source picker for a track NOTHING has tried to download yet.
+
+    The picker already exists and already searches every configured source —
+    but only ``/api/downloads/task/<task_id>/manual-search``, i.e. only for a
+    download that has already run and failed. There was no way to say "search
+    all my sources for this and let me choose", so the only route to a track was
+    to add it to the wishlist and wait for the drain to pick it up.
+
+    This creates the task the picker needs WITHOUT running an automatic search,
+    parked in 'not_found' — the state ``/download-candidate`` accepts. The client
+    then drives the existing manual-search and download-candidate endpoints
+    unchanged, which is the point: there stays exactly ONE download path, so a
+    manual pick keeps the AcoustID check, the quality quarantine and every other
+    post-download safety net rather than quietly routing around them.
+
+    Body: {track_info: {...}} — Spotify-shaped track metadata (id, name,
+    artists, album, duration_ms), or the flat {name, artist, album} a search
+    result carries. Returns {task_id, query} for the picker to open with.
+    """
+    dl_err = check_download_permission()
+    if dl_err:
+        return dl_err
+    try:
+        import uuid as _uuid
+        data = request.get_json(silent=True) or {}
+        raw = data.get('track_info') or data
+        name = str(raw.get('name') or raw.get('title') or '').strip()
+        if not name:
+            return jsonify({"error": "A track name is required."}), 400
+
+        # Normalise to the shape download-candidate reconstructs its Track from.
+        artists = raw.get('artists')
+        if not artists:
+            single = raw.get('artist') or raw.get('artist_name')
+            artists = [{'name': str(single)}] if single else []
+        elif isinstance(artists, list):
+            artists = [a if isinstance(a, dict) else {'name': str(a)} for a in artists]
+        album = raw.get('album')
+        if album is not None and not isinstance(album, dict):
+            album = {'name': str(album)}
+
+        track_info = {
+            'id': raw.get('id') or raw.get('spotify_track_id') or '',
+            'name': name,
+            'artists': artists,
+            'album': album or {},
+            'duration_ms': raw.get('duration_ms') or 0,
+        }
+
+        task_id = _uuid.uuid4().hex
+        with tasks_lock:
+            download_tasks[task_id] = {
+                'task_id': task_id,
+                # The state the picker and /download-candidate both require. It
+                # is honest as well as convenient: nothing has been found for
+                # this track, because nothing has looked yet.
+                'status': 'not_found',
+                'error_message': 'Awaiting a manual pick',
+                'status_change_time': time.time(),
+                'track_info': track_info,
+                # No batch — this track belongs to no album run, and every
+                # batch-bookkeeping branch in /download-candidate is guarded on
+                # `batch_id and batch_id in download_batches`.
+                'batch_id': None,
+                'track_index': None,
+                'used_sources': set(),
+                'progress': 0,
+                '_manual_search_task': True,
+            }
+
+        artist_label = artists[0]['name'] if artists else ''
+        return jsonify({
+            "success": True,
+            "task_id": task_id,
+            "query": (artist_label + ' ' + name).strip(),
+            "track_info": {"name": name, "artist": artist_label,
+                           "album": (album or {}).get('name', '')},
+        })
+    except Exception as e:
+        logger.exception("Failed to create a manual-search task")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/downloads/task/<task_id>/manual-search', methods=['POST'])

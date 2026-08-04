@@ -22171,6 +22171,29 @@ body:has(.download-missing-modal[style*="display: flex"]) #helper-float-btn {
     font-size: 14px;
 }
 
+/* Per-track "search every source" on a wishlist row — the manual way out for a
+   track the drain has not managed to fetch. Sits left of the bin, same size. */
+.wishlist-manual-search-btn {
+    background: none; border: none; cursor: pointer;
+    padding: 6px 8px; font-size: 14px; border-radius: 5px;
+    color: rgba(255, 255, 255, 0.4); transition: all 0.15s;
+}
+.wishlist-manual-search-btn:hover {
+    color: rgb(var(--accent-rgb, 88 101 242));
+    background: rgba(var(--accent-rgb, 88 101 242), 0.12);
+}
+.wishlist-manual-search-btn[disabled] { opacity: 0.5; cursor: default; }
+
+/* Search page: a third action beside Stream / Download. */
+.search-sources-button {
+    background: rgba(var(--accent-rgb, 88 101 242), 0.14);
+    border: 1px solid rgba(var(--accent-rgb, 88 101 242), 0.35);
+    color: inherit; border-radius: 7px; padding: 6px 12px;
+    font-size: 0.82rem; cursor: pointer; transition: background 0.15s;
+}
+.search-sources-button:hover { background: rgba(var(--accent-rgb, 88 101 242), 0.26); }
+.search-sources-button[disabled] { opacity: 0.5; cursor: default; }
+
 /* Album header delete button */
 .wishlist-album-header {
     position: relative;
@@ -61983,6 +62006,21 @@ tr:hover .enhanced-track-actions-group { opacity: 1; }
     transition: all 0.15s; padding: 0;
 }
 .enhanced-tbp-btn:hover { color: #f1c40f; background: rgba(241,196,15,0.1); }
+
+/* "Search every source and let me pick" — same footprint as its row-mates so
+   it reads as one more track action rather than a bolted-on control. */
+.enhanced-manual-search-btn {
+    background: none; border: none; cursor: pointer;
+    width: 24px; height: 24px; border-radius: 5px;
+    display: flex; align-items: center; justify-content: center;
+    color: rgba(255,255,255,0.35); font-size: 13px;
+    transition: all 0.15s; padding: 0;
+}
+.enhanced-manual-search-btn:hover {
+    color: rgb(var(--accent-rgb, 88 101 242));
+    background: rgba(var(--accent-rgb, 88 101 242), 0.12);
+}
+.enhanced-manual-search-btn[disabled] { opacity: 0.5; cursor: default; }
 .enhanced-tbp-btn.to-buy { color: #f1c40f; }
 .enhanced-tbp-btn.purchased { color: #2ecc71; }
 .enhanced-tbp-btn.purchased:hover { color: #2ecc71; background: rgba(46,204,113,0.1); }

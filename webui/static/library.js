@@ -4907,8 +4907,12 @@ function _buildTrackRow(track, album, admin) {
         const actionsTd = document.createElement('td');
         actionsTd.className = 'col-track-actions';
         if (track._missingExpected) {
+            // A track the album should have but the library doesn't. This is
+            // exactly where "search every source and let me pick" belongs —
+            // previously the only route to it was the wishlist and a wait.
             actionsTd.innerHTML = `
                 <div class="enhanced-track-actions-group visible">
+                    <button class="enhanced-manual-search-btn" data-action="manual-search" title="Search every source for this track and pick one yourself">&#128269;</button>
                     <button class="enhanced-missing-manage-btn" data-action="manage-missing" title="Manage this missing album track">Manage</button>
                 </div>
             `;
@@ -4921,6 +4925,7 @@ function _buildTrackRow(track, album, admin) {
             actionsTd.innerHTML = `
                 <div class="enhanced-track-actions-group">
                     <button class="enhanced-tbp-btn${tbpCls}" title="${tbpTitle}">${tbpIcon}</button>
+                    <button class="enhanced-manual-search-btn" data-action="manual-search" title="Search every source for this track and pick a different copy">&#128269;</button>
                     <button class="enhanced-source-info-btn" title="View download source info">ℹ</button>
                     <button class="enhanced-reidentify-btn" title="Re-identify — file this track under a different release">&#8644;</button>
                     <button class="enhanced-redownload-btn" title="Redownload this track">&#8635;</button>
@@ -5127,6 +5132,21 @@ function _attachTableDelegation(table, album) {
         if (target.closest('.enhanced-tbp-btn')) {
             e.stopPropagation();
             _toggleTrackToBePurchased(track.id, target.closest('.enhanced-tbp-btn'));
+            return;
+        }
+
+        // Search every source for this track and pick a copy by hand. Works for
+        // a missing track (nothing to play yet) and an owned one (swap in a
+        // better copy) — both open the same picker.
+        const msBtn = target.closest('.enhanced-manual-search-btn');
+        if (msBtn) {
+            e.stopPropagation();
+            openManualSearchFor({
+                name: track.title || track.name || '',
+                artist: (album && album.artist_name) || track.artist_name || '',
+                album: (album && album.title) || '',
+                duration_ms: track.duration || 0,
+            }, msBtn);
             return;
         }
 
