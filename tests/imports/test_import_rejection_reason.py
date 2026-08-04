@@ -23,6 +23,32 @@ def test_clean_import_returns_none():
     assert import_rejection_reason({'is_album': True, 'track_info': {}}) is None
 
 
+def test_post_process_exception_is_a_rejection():
+    """The hole this guard originally left open. #764 covered the DELIBERATE
+    rejections (quarantine, race guard) but assumed unexpected errors would
+    propagate. They don't — the outer handler logs, re-queues for retry and
+    returns — so a PermissionError creating the album folder was reported as a
+    successful import."""
+    reason = import_rejection_reason({
+        '_post_process_error': "[Errno 13] Permission denied: '/media/music/IVE'"})
+    assert reason is not None
+    assert 'Permission denied' in reason
+    assert '/media/music/IVE' in reason
+
+
+def test_a_specific_rejection_outranks_the_generic_error():
+    """The flags above describe precisely-worded outcomes; an exception raised
+    afterwards must not downgrade "AcoustID verification failed" to a stack
+    message the user can do nothing with."""
+    reason = import_rejection_reason({
+        '_acoustid_quarantined': True,
+        '_acoustid_failure_msg': 'fingerprint mismatch',
+        '_post_process_error': 'disk full',
+    })
+    assert 'AcoustID' in reason
+    assert 'disk full' not in reason
+
+
 def test_integrity_failure_detected():
     reason = import_rejection_reason({'_integrity_failure_msg': 'duration drift 12s'})
     assert reason is not None

@@ -45532,6 +45532,23 @@ div.artist-hero-badge {
     font-weight: 700;
     letter-spacing: 0.6px;
 }
+/* A library the server cannot write to. Deliberately styled louder than the
+   DEFAULT badge beside it: this one means every import into this library will
+   fail, and the folder just stays empty if it goes unnoticed. There is no
+   matching "writable" badge — the working state is the expectation, and
+   decorating it would bury the one row that needs attention. */
+.music-lib-write-badge {
+    flex: 0 0 auto;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: rgba(220, 76, 70, 0.22);
+    border: 1px solid rgba(220, 76, 70, 0.6);
+    color: #ffb4b0;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    cursor: help;   /* the reason is in the title attribute */
+}
 /* Push the row controls to the right edge, away from the name. */
 .music-library-row-actions {
     display: flex;

@@ -564,6 +564,46 @@ def test_a_failed_single_track_says_so_rather_than_reporting_an_import(tmp_path)
     assert activity[0][1] == "Track Import Failed"
 
 
+def test_a_post_process_exception_is_not_reported_as_an_import(tmp_path):
+    """Reported from a live install: every track of "I've IVE" logged
+    ``PermissionError: [Errno 13] Permission denied:
+    '/media/completed/listening/music/IVE'`` and every track still notified
+    "Track Imported".
+
+    ``post_process_matched_download`` catches everything, re-queues the file
+    for retry and RETURNS NORMALLY so the download monitor can try again. The
+    manual-import routes have no monitor — they saw a clean return and counted
+    a success, so the files stayed in the download folder while the UI said
+    they had landed. The failure is now carried on the context the same way
+    every other terminal outcome already is.
+    """
+    f = tmp_path / "11.flac"
+    _touch(f)
+    activity = []
+    runtime = _single_match_runtime(activity)
+    runtime.post_process_matched_download = lambda key, context, path: context.update(
+        _post_process_error="[Errno 13] Permission denied: "
+                            "'/media/completed/listening/music/IVE'")
+
+    payload, status = album_process(
+        runtime,
+        {
+            "album": {"id": "a1", "name": "I'VE IVE", "artist": "IVE"},
+            "matches": [{
+                "staging_file": {"full_path": str(f), "filename": "11.flac"},
+                "track": {"name": "Shine With Me", "track_number": 11},
+            }],
+        },
+    )
+
+    assert status == 200
+    assert payload["processed"] == 0
+    assert activity[0][1] == "Track Import Failed"
+    # The reason has to reach the user — "failed" alone sends them to the logs
+    # for something the app already knows.
+    assert any("Permission denied" in str(e) for e in payload.get("errors", [])), payload
+
+
 def test_album_process_requires_album_and_matches():
     payload, status = album_process(ImportRouteRuntime(logger=_FakeLogger()), {"album": {}, "matches": []})
 

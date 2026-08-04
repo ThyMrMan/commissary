@@ -3484,8 +3484,13 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.9.3': [
-        { date: 'August 2026 · 1.9.3' },
+    '1.9.4': [
+        { date: 'August 2026 · 1.9.4' },
+        { title: 'Fixed: imports that failed reported themselves as successful', desc: 'the one that matters. Post-processing catches any error, re-queues the file and returns quietly so a download can be retried later — but a manual import has nothing watching it, so it read that quiet return as success. A user imported an eleven-track album into a folder the server had no permission to write to: every track logged <em>Permission denied</em>, every track notified "Track Imported", and not one file moved. A failed import now says so, <strong>and says why</strong> — the permission error appears in the UI instead of only in app.log.' },
+        { title: 'Music Libraries are checked for writability', desc: 'the failure above was invisible until someone read the log, because a destination the server cannot write to looks exactly like a destination nothing has been sent to yet. Settings → Paths & Organization now marks any Music Library the server cannot write into with <strong>NOT WRITABLE</strong>, and hovering it explains what to check. It tests by creating and removing a folder, not by reading permission bits — bits are the wrong answer under container UID remapping, NFS root-squash and ACLs, which is where this actually goes wrong.' },
+        { title: 'If you see NOT WRITABLE', desc: 'the folder exists but the user SoulSync runs as cannot create anything inside it. Compare the folder\'s owner with the PUID/PGID your container runs as — on Unraid, shares are usually <em>nobody:users</em> (99:100) while the image defaults to 1000:1000. A folder created by a different user or another container is the usual cause. Note that video working on the same base folder proves nothing: permissions are per-folder.' },
+        { title: 'Your Music Library Folder repairs itself on start-up', desc: '1.9.3 fixed editing that field, but only from the next save onwards — anyone already caught by the 1.9.2 bug stayed broken, with the field showing the right path and imports still going somewhere else, and no reason to ever re-save. SoulSync now re-aligns the two when it starts, keeps your label, and writes the old path to the log so you can find anything already misfiled.' },
+        { title: 'Also in 1.9.3', desc: 'the Music Library Folder regression, honest per-track import messages, and Deep Scan learning about libraries.' },
         { title: 'Fixed: changing your Music Library Folder did nothing', desc: 'a 1.9.2 regression, and the worst kind — nothing looked broken. Music Library Folder and the first entry under Music Libraries are the same setting shown twice, and the importer reads the entry. Editing the folder in Settings left the entry on the old path, so downloads kept landing where you had moved away from while Settings insisted otherwise. Saving Settings now moves the library with it. <strong>If an album went missing after updating to 1.9.2, look at the first path under Music Libraries — that is where it went.</strong>' },
         { title: 'Fixed: "Album Imported (1/1 tracks)" on an 11-track album', desc: 'the Import page submits an album one track per request, so that message fired once per track and each one claimed to be the whole album. An eleven-track import looked like it had found a single file. It now says "Track Imported — <em>track</em> — <em>album</em>", and a track that failed says so instead of announcing an import that did not happen.' },
         { title: 'Deep Scan now covers every Music Library', desc: 'it only ever looked at the one original folder, so anything in a second library was invisible to it. It now scans them all — and scores each one separately, which is the part that matters.' },
@@ -3676,6 +3681,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.4: a failed import can no longer call itself a success",
+        description: "an import that could not write to its destination reported every track as imported. The files never moved. This release makes that failure impossible to miss — and adds a check so you can see the problem in Settings before an import runs into it.",
+        features: [
+            "post-processing swallows errors on purpose so a download can be retried later, and returns quietly. A manual import has nothing watching it, so it counted that quiet return as a success — an eleven-track album reported eleven imports and moved zero files",
+            "a failed import now reports the actual reason, so \"Permission denied: /media/completed/listening/music/IVE\" reaches you instead of sitting in app.log",
+            "Music Libraries the server cannot write into are marked NOT WRITABLE in Settings, with the reason on hover",
+            "the check creates and removes a folder rather than reading permission bits — bits give the wrong answer under container UID remapping, NFS root-squash and ACLs, which is exactly where this breaks. It probes with a folder, not a file, because creating the artist folder is the step that fails",
+            "the Music Library Folder / default library mismatch from 1.9.2 now repairs itself when SoulSync starts, instead of waiting for a settings save you have no reason to perform",
+        ],
+        usage_note: "NOT WRITABLE means the folder exists but the user SoulSync runs as cannot create anything in it. Compare the folder's owner against your container's PUID/PGID — Unraid shares are usually nobody:users (99:100) and the image defaults to 1000:1000. Video working on the same base folder does not rule this out; permissions are per-folder.",
+    },
     {
         title: "1.9.3: fixes for 1.9.2, and Deep Scan learns about libraries",
         description: "one real regression from 1.9.2 — changing your Music Library Folder quietly did nothing — plus an import message that made a full album look like it had imported one track, and Deep Scan finally knowing that more than one library exists.",

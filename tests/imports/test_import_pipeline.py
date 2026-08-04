@@ -375,6 +375,59 @@ def test_scan_order_fallback_used_for_album_bundle_download(tmp_path, monkeypatc
     assert library_calls[0]["track_number"] == 7
 
 
+def test_post_process_records_an_unexpected_failure_on_the_context(tmp_path, monkeypatch):
+    """A live install hit ``PermissionError`` creating the artist folder under
+    the music library, and every track still reported "Track Imported".
+
+    This handler deliberately swallows exceptions so the download monitor can
+    retry, which means the ONLY way a caller can learn the import failed is the
+    context flag. Reproduced where it really happened: building the final path
+    creates the destination folders, so that is what raises.
+    """
+    source_path = tmp_path / "source.flac"
+    source_path.write_bytes(b"audio")
+
+    _wire_post_process_common(
+        monkeypatch, tmp_path, tmp_path / "out.flac",
+        track_number=1, is_album_download=False)
+
+    def _denied(*_a, **_kw):
+        raise PermissionError(
+            13, "Permission denied", "/media/completed/listening/music/IVE")
+
+    monkeypatch.setattr(import_pipeline, "build_final_path_for_track", _denied)
+
+    runtime = types.SimpleNamespace(automation_engine=None, on_download_completed=None,
+                                    web_scan_manager=None, repair_worker=None)
+    context = {"track_info": {}, "original_search_result": {"title": "Track", "album": "Album"}}
+
+    # Must NOT raise — the retry path depends on returning normally.
+    import_pipeline.post_process_matched_download("ctx-perm", context, str(source_path), runtime)
+
+    assert context.get('_post_process_error'), \
+        "the failure has to be visible to the caller, or it gets counted as an import"
+    assert "Permission denied" in context['_post_process_error']
+    assert import_pipeline.import_rejection_reason(context) is not None
+
+
+def test_a_clean_post_process_records_no_failure(tmp_path, monkeypatch):
+    """Guards the other direction: if the flag were set on the happy path,
+    every successful import would start reporting as failed."""
+    source_path = tmp_path / "source.flac"
+    source_path.write_bytes(b"audio")
+    _wire_post_process_common(
+        monkeypatch, tmp_path, tmp_path / "out.flac",
+        track_number=1, is_album_download=False)
+
+    runtime = types.SimpleNamespace(automation_engine=None, on_download_completed=None,
+                                    web_scan_manager=None, repair_worker=None)
+    context = {"track_info": {}, "original_search_result": {"title": "Track", "album": "Album"}}
+    import_pipeline.post_process_matched_download("ctx-ok", context, str(source_path), runtime)
+
+    assert context.get('_post_process_error') is None
+    assert import_pipeline.import_rejection_reason(context) is None
+
+
 def test_scan_order_fallback_not_used_for_plain_download(tmp_path, monkeypatch):
     """A plain (non-bundle) download lands in a SHARED flat directory that
     can hold unrelated in-flight downloads at the same time — the

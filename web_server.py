@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.9.3"
+_SOULSYNC_BASE_VERSION = "1.9.4"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -41178,6 +41178,35 @@ def music_libraries_save():
     except Exception as e:
         logger.error(f"Error saving music libraries: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/music/libraries/probe', methods=['GET'])
+@admin_only
+def music_libraries_probe():
+    """Can the server actually write to each Music Library?
+
+    Deliberately NOT folded into the list endpoint: that one is un-gated and
+    called by every destination picker, and this touches the filesystem once
+    per library. Admin-only because it creates (and removes) a directory.
+
+    Reports per library rather than a single verdict — the whole point is to
+    say WHICH destination is broken.
+    """
+    try:
+        from core.imports.destinations import probe_destination_writable
+        libs = get_database().list_music_libraries() or []
+        if not libs:
+            fallback = config_manager.get('soulseek.transfer_path', './Transfer')
+            libs = [{"id": None, "label": "Music Library", "path": fallback}]
+        results = []
+        for lib in libs:
+            probe = probe_destination_writable(lib.get('path'))
+            results.append({"id": lib.get('id'), "label": lib.get('label'),
+                            "path": lib.get('path'), **probe})
+        return jsonify({"success": True, "libraries": results})
+    except Exception as e:
+        logger.error(f"Error probing music libraries: {e}")
+        return jsonify({"success": False, "error": str(e), "libraries": []}), 500
 
 
 @app.route('/api/import/browse', methods=['GET'])

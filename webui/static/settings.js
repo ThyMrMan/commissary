@@ -3977,9 +3977,54 @@ async function loadMusicLibraries() {
         }
         const data = libsResp.ok ? await libsResp.json() : null;
         renderMusicLibraries(data && data.libraries);
+        probeMusicLibraries();
     } catch (err) {
         console.error('Could not load music libraries:', err);
     }
+}
+
+// A destination the server can't write to is the one failure that looks like
+// nothing at all: the import reports an error per track and the folder simply
+// stays empty. Ask the server whether each library actually works and say so
+// on the row, instead of leaving it to be discovered in app.log.
+async function probeMusicLibraries() {
+    const host = document.getElementById('music-libraries-list');
+    if (!host || !host.querySelector('.music-library-row')) return;
+    try {
+        const resp = await fetch('/api/music/libraries/probe');
+        // Admin-only. A non-admin viewing Settings just gets no badges rather
+        // than a console error and a broken-looking page.
+        if (!resp.ok) return;
+        const data = await resp.json().catch(() => null);
+        if (!data || !data.success) return;
+        const byPath = new Map((data.libraries || []).map(l => [String(l.path || ''), l]));
+        host.querySelectorAll('.music-library-row').forEach(row => {
+            const path = row.querySelector('.music-lib-path')?.value || '';
+            _applyMusicLibraryProbe(row, byPath.get(path));
+        });
+    } catch (err) {
+        console.error('Could not probe music libraries:', err);
+    }
+}
+
+function _applyMusicLibraryProbe(row, probe) {
+    const head = row.querySelector('.music-library-row-head');
+    if (!head) return;
+    let badge = row.querySelector('.music-lib-write-badge');
+    if (!probe) { if (badge) badge.remove(); return; }
+    if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'music-lib-write-badge';
+        // Before the action buttons, so it reads as part of the row's identity
+        // rather than as another control.
+        head.insertBefore(badge, head.querySelector('.music-library-row-actions'));
+    }
+    badge.classList.toggle('is-bad', !probe.writable);
+    // A writable library is the expected state — don't decorate it. Only the
+    // broken case earns attention.
+    badge.textContent = probe.writable ? '' : 'NOT WRITABLE';
+    badge.title = probe.detail || '';
+    badge.style.display = probe.writable ? 'none' : '';
 }
 
 async function saveMusicLibraries() {
@@ -3997,6 +4042,9 @@ async function saveMusicLibraries() {
             return;
         }
         renderMusicLibraries(data.libraries);
+        // Re-probe: the paths just changed, so a stale badge would be worse
+        // than none — it would vouch for a folder nobody has tested.
+        probeMusicLibraries();
         // The server mirrors the default library's path back onto
         // soulseek.transfer_path; reflect that here so the field above doesn't
         // sit showing the old value until a reload.

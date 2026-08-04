@@ -292,7 +292,12 @@ def import_rejection_reason(context: dict) -> str | None:
     (quarantine or race-guard), else ``None`` for a clean import.
 
     ``post_process_matched_download`` signals these outcomes by setting context
-    flags and returning normally — it only raises on unexpected errors. The
+    flags and returning normally. It does NOT raise on unexpected errors
+    either: its outer handler logs them, re-queues the file for retry and
+    returns — so an exception is invisible to the caller unless it is recorded
+    here too. A PermissionError creating the album folder used to be reported
+    as "Track Imported" for that reason: the file was still in the download
+    folder and the UI said it had landed. The
     download path reads those flags in
     ``post_process_matched_download_with_verification`` and marks the task
     failed, but the MANUAL-import routes call ``post_process_matched_download``
@@ -313,6 +318,12 @@ def import_rejection_reason(context: dict) -> str | None:
         return "rejected by audio guard (incomplete or silent audio)"
     if context.get('_race_guard_failed'):
         return "source file disappeared before import completed"
+    # Checked LAST on purpose: the flags above describe deliberate, precisely
+    # worded outcomes, and an exception raised after one of them shouldn't
+    # replace that wording. This is the catch-all for everything the pipeline
+    # did not anticipate — most often a filesystem permission or disk error.
+    if context.get('_post_process_error'):
+        return f"import failed: {context['_post_process_error']}"
     return None
 
 
@@ -1346,6 +1357,18 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
         pp_logger.info(traceback.format_exc())
         logger.error(f"\nCRITICAL ERROR in post-processing for {context_key}: {e}")
         traceback.print_exc()
+
+        # Tell the CALLER it failed. This handler returns normally so the
+        # download monitor can retry, but a manual import has no monitor — it
+        # just saw a clean return and counted a success, so the file sat in the
+        # download folder while the UI said "Track Imported". Recorded on the
+        # context because that is how every other terminal outcome is already
+        # reported (see `import_rejection_reason`), rather than adding a second
+        # signalling mechanism the two paths could disagree about.
+        try:
+            context['_post_process_error'] = str(e) or e.__class__.__name__
+        except Exception:   # noqa: BLE001 - context is always a dict here; never mask `e`
+            pass
 
         source_exists = os.path.exists(file_path) if file_path else False
         if source_exists:

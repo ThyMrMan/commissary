@@ -731,6 +731,11 @@ class MusicDatabase:
             )
             self._seed_music_root_folder(cursor)
 
+            # ...and repair the folder/library mismatch 1.9.2 could leave
+            # behind, which otherwise persists until the user happens to save
+            # Settings again.
+            self._reconcile_default_music_library(cursor)
+
             # Which library a wishlist track is destined for. NULL = the
             # default library, i.e. exactly where it would have gone before.
             self._add_wishlist_root_folder_column(cursor)
@@ -1733,6 +1738,61 @@ class MusicDatabase:
                 logger.info("Seeded the first Music Library from soulseek.transfer_path: %s", path)
         except Exception as e:  # noqa: BLE001
             logger.error(f"Error seeding the default music root folder: {e}")
+
+    def _reconcile_default_music_library(self, cursor):
+        """Re-align the default Music Library with ``soulseek.transfer_path``.
+
+        Settings → Music Library Folder and the first row of Music Libraries are
+        one setting shown twice, and both write paths maintain that: saving
+        Settings syncs the row, saving the library list mirrors back to the
+        config key. So on a healthy install this is a no-op.
+
+        It exists for the installs 1.9.2 broke. There, editing the folder left
+        the row on the old path, and 1.9.3's fix only heals on the NEXT settings
+        save — which the user has no reason to perform, because the field
+        already shows the value they want. Their imports would keep landing on
+        the stale path indefinitely while the UI insisted otherwise. Repairing
+        the invariant at startup is what makes the fix reach them.
+
+        The config key wins because it is the only side that can hold an edit
+        the other never saw; drift in the opposite direction has no producer.
+        """
+        try:
+            try:
+                from config.settings import config_manager
+                path = str(config_manager.get('soulseek.transfer_path', '') or '').strip()
+            except Exception:   # noqa: BLE001 - config unavailable during early init
+                return
+            if not path:
+                return
+            cursor.execute(
+                "SELECT id, path FROM music_root_folders ORDER BY sort_order, id LIMIT 1")
+            row = cursor.fetchone()
+            # An empty table is the seeder's business, not ours — seeding
+            # deliberately does not resurrect a destination the user removed.
+            if row is None or row[1] == path:
+                return
+            # A second library already points here; promote it rather than
+            # duplicating the path and violating UNIQUE.
+            cursor.execute("SELECT id FROM music_root_folders WHERE path=? AND id<>?",
+                           (path, row[0]))
+            dupe = cursor.fetchone()
+            if dupe:
+                cursor.execute("UPDATE music_root_folders SET sort_order = sort_order + 1")
+                cursor.execute("UPDATE music_root_folders SET sort_order = 0 WHERE id=?",
+                               (dupe[0],))
+                logger.warning(
+                    "Music Library Folder (%s) did not match the default library (%s) — "
+                    "made the existing library at that path the default. Imports since "
+                    "the mismatch began went to %s.", path, row[1], row[1])
+                return
+            cursor.execute("UPDATE music_root_folders SET path=? WHERE id=?", (path, row[0]))
+            logger.warning(
+                "Music Library Folder (%s) did not match the default library (%s) — "
+                "repaired. Anything imported since the mismatch began is under %s.",
+                path, row[1], row[1])
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Error reconciling the default music library: {e}")
 
     def _add_wishlist_root_folder_column(self, cursor):
         """Which Music Library a wishlist track should be filed into.
