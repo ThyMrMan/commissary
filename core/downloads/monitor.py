@@ -89,9 +89,20 @@ def _remaining_fallback_sources(exhausted):
     the next attempt (see task_worker: exhausted_download_sources).
     """
     orch = download_orchestrator
-    if orch is None or getattr(orch, 'mode', None) != 'hybrid':
+    if orch is None:
         return []
-    chain = getattr(orch, 'hybrid_order', None) or []
+    # A one-entry chain has nothing to fall back TO, which is what the old
+    # `mode != 'hybrid'` check was really asking.
+    #
+    # Accepts either attribute deliberately. The real orchestrator sets both
+    # to the same list in `_load_source_chain`, but plenty of callers and test
+    # doubles construct a lighter object carrying only `hybrid_order` — and
+    # reading just `source_chain` turned those into "no fallback available",
+    # silently failing a track that should have moved to the next source.
+    chain = (getattr(orch, 'source_chain', None)
+             or getattr(orch, 'hybrid_order', None) or [])
+    if len(chain) < 2:
+        return []
     blocked = {str(s).lower() for s in exhausted}
     return [s for s in chain if str(s).lower() not in blocked]
 

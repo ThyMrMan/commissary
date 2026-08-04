@@ -70,27 +70,32 @@ class DownloadOrchestrator:
         if self._init_failures:
             logger.warning(f"Download clients failed to initialize: {', '.join(self._init_failures)}")
 
-        # Load mode from config
-        self.mode = config_manager.get('download_source.mode', 'soulseek')
-        self.hybrid_primary = config_manager.get('download_source.hybrid_primary', 'soulseek')
-        self.hybrid_secondary = config_manager.get('download_source.hybrid_secondary', 'youtube')
-        self.hybrid_order = config_manager.get('download_source.hybrid_order', ['hifi', 'youtube', 'soulseek'])
+        self._load_source_chain()
+        logger.info("Download Orchestrator initialized — sources: %s",
+                    " → ".join(self.source_chain))
 
-        logger.info(f"Download Orchestrator initialized - Mode: {self.mode}")
-        if self.mode == 'hybrid':
-            logger.info(
-                "Hybrid source order: order=%s primary=%s secondary=%s",
-                " → ".join(self.hybrid_order) if self.hybrid_order else "default",
-                self.hybrid_primary,
-                self.hybrid_secondary,
-            )
+    def _load_source_chain(self):
+        """Resolve the ordered source list (see core.downloads.source_chain).
+
+        ``mode`` is kept as a DERIVED property rather than a stored one so the
+        many existing readers of ``orchestrator.mode`` keep working while the
+        chain is the single truth. 'hybrid' now literally means "more than one
+        source is listed".
+        """
+        from core.downloads.source_chain import resolve_chain, DEFAULT_CHAIN
+        self.source_chain = (resolve_chain(config_manager.get, self._normalize_source_name)
+                             or list(DEFAULT_CHAIN))
+        self.mode = 'hybrid' if len(self.source_chain) > 1 else self.source_chain[0]
+        # Retained for the handful of callers still reading them directly;
+        # both are now views onto the chain, so they cannot disagree with it.
+        self.hybrid_order = list(self.source_chain)
+        self.hybrid_primary = self.source_chain[0]
+        self.hybrid_secondary = (self.source_chain[1] if len(self.source_chain) > 1
+                                 else self.source_chain[0])
 
     def reload_settings(self):
         """Reload settings from config (call after settings change)"""
-        self.mode = config_manager.get('download_source.mode', 'soulseek')
-        self.hybrid_primary = config_manager.get('download_source.hybrid_primary', 'soulseek')
-        self.hybrid_secondary = config_manager.get('download_source.hybrid_secondary', 'youtube')
-        self.hybrid_order = config_manager.get('download_source.hybrid_order', ['hifi', 'youtube', 'soulseek'])
+        self._load_source_chain()
 
         # Reload underlying client configs (SLSKD URL, API key, etc.)
         soulseek = self.client('soulseek')
@@ -282,31 +287,21 @@ class DownloadOrchestrator:
         return spec.name if spec else None
 
     def _resolve_source_chain(self) -> List[str]:
-        """Order the configured sources for hybrid mode. Prefers
-        ``hybrid_order`` config; falls back to legacy
-        primary/secondary pair when no order set. Normalizes alias
-        names through the registry so legacy ``deezer_dl`` config
-        values resolve correctly to the canonical ``deezer`` plugin."""
-        if self.hybrid_order:
-            chain = []
-            seen = set()
-            for raw in self.hybrid_order:
-                canonical = self._normalize_source_name(raw)
-                if canonical and canonical not in seen:
-                    chain.append(canonical)
-                    seen.add(canonical)
+        """The ordered sources for this orchestrator.
+
+        Re-derived from ``hybrid_order`` rather than returning the cached
+        ``source_chain``, because callers (and tests) legitimately assign that
+        attribute directly and expect the chain to follow. The cleaning and
+        alias resolution are shared with ``core.downloads.source_chain`` so
+        there is still only one implementation of what a chain is.
+        """
+        from core.downloads.source_chain import clean_sources
+        chain = clean_sources(self.hybrid_order, self._normalize_source_name)
+        if chain:
             return chain
-        primary = self._normalize_source_name(self.hybrid_primary) or 'soulseek'
-        secondary = self._normalize_source_name(self.hybrid_secondary) or 'soulseek'
-        if secondary == primary:
-            secondary = next(
-                (name for name in self.registry.names() if name != primary),
-                'soulseek',
-            )
-        chain = [primary, secondary]
-        if not chain:
-            chain = ['soulseek']
-        return chain
+        pair = clean_sources([self.hybrid_primary, self.hybrid_secondary],
+                             self._normalize_source_name)
+        return pair or ['soulseek']
 
     async def search(self, query: str, timeout: int = None, progress_callback=None,
                      exclude_sources=None) -> Tuple[List[TrackResult], List[AlbumResult]]:

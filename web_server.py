@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.9.5"
+_SOULSYNC_BASE_VERSION = "1.9.6"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -3896,6 +3896,25 @@ def handle_settings():
                     get_database().sync_default_quality_profile_from_config()
                 except Exception as _qp_sync_err:
                     logger.error(f"Default quality profile sync failed: {_qp_sync_err}")
+
+            # Keep the collapsed source list in step with whatever the Sources
+            # UI just wrote. `download_source.sources` is the stored form now
+            # (see core.downloads.source_chain); the legacy mode/order/pair
+            # keys are still written so a downgrade — and any consumer not yet
+            # converted — reads the same configuration rather than a stale one.
+            if isinstance(new_settings.get('download_source'), dict):
+                _ds = new_settings['download_source']
+                if any(k in _ds for k in ('sources', 'mode', 'hybrid_order',
+                                          'hybrid_primary', 'hybrid_secondary')):
+                    try:
+                        from core.downloads.source_chain import resolve_chain, store_chain
+                        # Resolve from what was just saved, then write it back
+                        # in the collapsed form. Reading through resolve_chain
+                        # means the UI can keep sending whichever shape it
+                        # sends and the derivation stays in one place.
+                        store_chain(resolve_chain(config_manager.get))
+                    except Exception as _chain_err:
+                        logger.error(f"Download source chain sync failed: {_chain_err}")
 
             # Music Library Folder and the DEFAULT Music Library are the same
             # setting shown in two places, and the import pipeline reads the
@@ -8370,17 +8389,17 @@ def _serialize_candidate(c, source_override: str = None) -> dict:
 
 def _auto_cascade_chain() -> list:
     """The canonical source names the UNATTENDED download cascade walks, in
-    order. Hybrid mode uses the resolved chain; single-source mode is a
-    one-element chain. Used to annotate the search source list, never to
-    restrict it."""
+    order. Used to annotate the search source list, never to restrict it.
+
+    Single-source is not a special case: it is a one-entry chain. This used to
+    branch on ``download_source.mode`` and re-derive the chain itself, which
+    made it one more place that could disagree with the orchestrator about
+    what was configured — the exact duplication the collapsed source list
+    removes."""
     if not download_orchestrator:
         return []
     try:
-        if config_manager.get('download_source.mode', 'soulseek') == 'hybrid':
-            return list(download_orchestrator._resolve_source_chain())
-        mode = config_manager.get('download_source.mode', 'soulseek')
-        spec = download_orchestrator.registry.get_spec(mode)
-        return [spec.name] if spec else ([mode] if mode else [])
+        return list(download_orchestrator._resolve_source_chain())
     except Exception:   # noqa: BLE001 - an annotation must never break the search
         logger.debug("[Search] could not resolve the auto-cascade chain", exc_info=True)
         return []

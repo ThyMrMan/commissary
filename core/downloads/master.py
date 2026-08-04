@@ -261,38 +261,25 @@ def _resolve_soulseek_client(download_orchestrator: Any) -> Any:
 
 
 def _soulseek_album_preflight_enabled(config_manager: Any) -> bool:
-    mode = config_manager.get('download_source.mode', 'hybrid')
-    if mode == 'soulseek':
-        return True
-    if mode != 'hybrid':
-        return False
-    order = config_manager.get('download_source.hybrid_order', ['hifi', 'youtube', 'soulseek'])
-    if order:
-        return order[0] == 'soulseek'
-    primary = config_manager.get('download_source.hybrid_primary', '')
-    return primary == 'soulseek'
+    """Preflight only matters when Soulseek is the source that would claim
+    the album — i.e. when it heads the chain."""
+    from core.downloads.source_chain import primary_source
+    return primary_source(config_manager.get) == 'soulseek'
 
 
 def _resolve_album_bundle_source(config_manager: Any) -> str:
     """Return the album-bundle source for this batch.
 
-    In single-source mode, the active source may own the whole album if
-    it supports album bundles. In hybrid mode, only the first source in
-    the configured order may claim the whole album; later sources remain
-    per-track fallback.
-    """
-    mode = (config_manager.get('download_source.mode', 'soulseek') or 'soulseek').lower()
-    if mode in _ALBUM_BUNDLE_SOURCES:
-        return mode
-    if mode != 'hybrid':
-        return ''
+    Only the FIRST source in the chain may claim a whole album; later
+    entries stay per-track fallback. Letting a fallback claim the release
+    would hand the album to a source the user ranked below the one that
+    just failed a single track.
 
-    order = config_manager.get('download_source.hybrid_order', ['hifi', 'youtube', 'soulseek'])
-    first = ''
-    if order:
-        first = str(order[0] or '').lower()
-    else:
-        first = str(config_manager.get('download_source.hybrid_primary', '') or '').lower()
+    A one-entry chain is the old single-source mode and needs no special
+    case: its only entry is also its first.
+    """
+    from core.downloads.source_chain import primary_source
+    first = primary_source(config_manager.get)
     return first if first in _ALBUM_BUNDLE_SOURCES else ''
 
 

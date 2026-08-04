@@ -121,7 +121,12 @@ def try_dispatch(
     BatchStateAccess shim. Injecting these keeps the module
     dependency-light + unit-testable.
     """
-    mode = (source_override or config_get('download_source.mode', 'soulseek') or 'soulseek').lower()
+    # The chain's FIRST entry is the one allowed to claim a whole album; a
+    # one-entry chain is the old single-source mode. `source_override` still
+    # wins — that is the caller having already resolved a specific source
+    # (a pinned release, or the master worker's own bundle resolution).
+    from core.downloads.source_chain import primary_source
+    mode = (str(source_override or '').lower() or primary_source(config_get))
     album_name = (album_context or {}).get('name') or ''
     artist_name = (artist_context or {}).get('name') or ''
 

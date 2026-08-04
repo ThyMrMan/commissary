@@ -3484,8 +3484,13 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.9.5': [
-        { date: 'August 2026 · 1.9.5' },
+    '1.9.6': [
+        { date: 'August 2026 · 1.9.6' },
+        { title: 'Your download sources are one ordered list now', desc: 'they were four settings that all described the same thing — a mode, a hybrid order, and a legacy primary/secondary pair left over from when there were only two. Whether a source was used, and in what order, depended on which of the four a given piece of code happened to read. They are now a single ordered list: the first entry is preferred, the rest are fallbacks, and "hybrid" simply means you listed more than one.' },
+        { title: 'Why that was worth doing', desc: 'the settings could genuinely disagree. Album downloads defaulted the mode to <em>hybrid</em> while the album-bundle dispatcher defaulted the same setting to <em>soulseek</em>, so one install could take two different views of its own configuration depending on which path a download took. There is one derivation now, and every consumer asks it the same question.' },
+        { title: 'Nothing to reconfigure', desc: 'your existing settings are read exactly as before — including installs old enough to still be on the primary/secondary pair — so an install that never opens Settings behaves identically. Saving Settings once writes the new collapsed form. The old keys are still written alongside it, so downgrading to 1.9.5 finds its configuration intact.' },
+        { title: 'Dead Soulseek-era search code removed', desc: 'the Search page still carried a single-source result renderer from before the multi-source picker replaced it in 1.9.0 — 134 lines that nothing called, including its own Download button wired to the old one-click path.' },
+        { title: 'Also in 1.9.5', desc: 'video Libraries gained the writability check that Music Libraries got in 1.9.4.' },
         { title: 'Video Libraries are checked for writability too', desc: '1.9.4 added this to Music Libraries, after an album imported into a folder the server had no permission to write to and reported every track as imported. The video side has the same destinations, the same failure and the same silence — a grab lands, the import fails, and the Library folder just stays empty. Settings → Libraries now marks any Library the server cannot write into with <strong>NOT WRITABLE</strong>, and hovering it explains what to check.' },
         { title: 'One probe, both sides', desc: 'the check moved to a shared module rather than being written twice — a copy that drifts is how two pages end up disagreeing about whether the same folder works. It tests by creating and removing a folder, not by reading permission bits, because bits give the wrong answer under container UID remapping, NFS root-squash and ACLs, which is exactly where this breaks. Two Libraries pointing at the same folder probe it once.' },
         { title: 'Also in 1.9.4', desc: 'a failed import can no longer report itself as a success, and Music Libraries gained the same writability check.' },
@@ -3684,6 +3689,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.6: download sources become one ordered list",
+        description: "four settings described the same thing — a mode, a hybrid order, and a legacy primary/secondary pair — and which one won depended on which piece of code was reading. They collapse into a single ordered list of sources.",
+        features: [
+            "the first source in the list is preferred and the rest are fallbacks; \"hybrid\" now just means you listed more than one, rather than being a separate mode you also had to set",
+            "the settings could disagree with each other: album downloads defaulted the mode to 'hybrid' while the album-bundle dispatcher defaulted the same setting to 'soulseek', so one install could take two views of its own configuration depending on the path a download took",
+            "your existing configuration is read exactly as before — including installs still on the pre-hybrid_order primary/secondary pair — so nothing needs reconfiguring",
+            "the old keys keep being written alongside the new one, so downgrading to 1.9.5 still finds its configuration",
+            "removed 134 lines of dead Soulseek-era search rendering that nothing had called since the multi-source picker replaced it in 1.9.0",
+        ],
+        usage_note: "Settings → Downloads still edits the same list you already had. Saving once writes the collapsed form; until you do, the legacy keys are read and behaviour is unchanged.",
+    },
     {
         title: "1.9.5: the writability check reaches video Libraries",
         description: "1.9.4 gave Music Libraries a check for destinations the server cannot write into. Video has the same destinations and the same failure mode — a grab succeeds, the import fails, and the Library folder stays empty — so it now has the same check.",
