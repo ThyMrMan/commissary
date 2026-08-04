@@ -3858,27 +3858,38 @@ function collectMusicPaths() { return collectPathList('music-paths-list') || [];
 // carry ↑/↓ rather than being sorted for you.
 let _musicLibraryProfiles = [];
 
+// Deliberately reuses the VIDEO Libraries editor's classes
+// (.library-editor-row / -fields, video/video-side.css — loaded app-wide) so
+// the two library editors are literally the same widget rather than two things
+// that merely resemble each other and drift apart on the next tweak. Only the
+// music-specific bits (the default marker, the field hooks) carry their own
+// class names.
 function _musicLibraryRowHtml(lib) {
     const profileOptions = ['<option value="">Global quality profile</option>']
         .concat(_musicLibraryProfiles.map(p =>
             `<option value="${escapeHtml(String(p.id))}"${String(lib.quality_profile_id || '') === String(p.id) ? ' selected' : ''}>${escapeHtml(p.name)}</option>`
         )).join('');
     return `
-        <div class="music-library-row" data-lib-id="${escapeHtml(String(lib.id || ''))}">
-            <div class="music-library-row-top">
+        <div class="library-editor-row music-library-row" data-lib-id="${escapeHtml(String(lib.id || ''))}">
+            <div class="music-library-row-head">
+                <span class="music-lib-title">${escapeHtml(lib.label || lib.path || 'New library')}</span>
+                <span class="music-library-row-actions">
+                    <button class="music-lib-up" title="Move up (the first library is the default)">↑</button>
+                    <button class="music-lib-down" title="Move down">↓</button>
+                    <button class="music-lib-remove" title="Remove this library">✕</button>
+                </span>
+            </div>
+            <div class="library-editor-fields">
                 <input type="text" class="music-lib-label" placeholder="Label (e.g. Main, Archive)"
                        value="${escapeHtml(lib.label || '')}">
-                <input type="text" class="music-lib-path" placeholder="/music or C:\\Music"
+                <input type="text" class="music-lib-path" placeholder="Destination folder, e.g. /music"
                        value="${escapeHtml(lib.path || '')}">
-                <button class="test-button music-lib-up" title="Move up (the first library is the default)">↑</button>
-                <button class="test-button music-lib-down" title="Move down">↓</button>
-                <button class="test-button music-lib-remove" title="Remove this library">✕</button>
-            </div>
-            <div class="music-library-row-bottom">
                 <input type="text" class="music-lib-template"
-                       placeholder="Naming template — blank inherits the global one"
+                       placeholder="Naming template (blank = the global one)"
+                       title="Overrides the global file-naming template for files filed into this library."
                        value="${escapeHtml(lib.naming_template || '')}">
-                <select class="music-lib-profile">${profileOptions}</select>
+                <select class="music-lib-profile"
+                        title="Overrides the global quality profile for files filed into this library.">${profileOptions}</select>
             </div>
         </div>`;
 }
@@ -3887,6 +3898,7 @@ function renderMusicLibraries(libs) {
     const host = document.getElementById('music-libraries-list');
     if (!host) return;
     const rows = (libs || []);
+    host.classList.add('library-editor-list');
     host.innerHTML = rows.length
         ? rows.map(_musicLibraryRowHtml).join('')
         : '<div class="settings-hint">No libraries configured — downloads go to your Music Library Folder above.</div>';
@@ -3906,12 +3918,25 @@ function _markFirstMusicLibrary() {
             badge = document.createElement('span');
             badge.className = 'music-lib-default-badge';
             badge.textContent = 'DEFAULT';
-            row.querySelector('.music-library-row-top').prepend(badge);
+            row.querySelector('.music-lib-title').after(badge);
         } else if (i !== 0 && badge) {
             badge.remove();
         }
     });
 }
+
+// The row heading names the library, so it has to follow the label field —
+// otherwise renaming one leaves the heading showing the old name until reload,
+// which reads as "it didn't save".
+document.addEventListener('input', (e) => {
+    if (!e.target.classList || !e.target.classList.contains('music-lib-label')) return;
+    const row = e.target.closest('.music-library-row');
+    const title = row && row.querySelector('.music-lib-title');
+    if (title) {
+        const path = row.querySelector('.music-lib-path');
+        title.textContent = e.target.value.trim() || (path && path.value.trim()) || 'New library';
+    }
+});
 
 function addMusicLibraryRow() {
     const host = document.getElementById('music-libraries-list');

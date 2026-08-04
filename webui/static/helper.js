@@ -3484,8 +3484,14 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.9.2': [
-        { date: 'August 2026 · 1.9.2' },
+    '1.9.3': [
+        { date: 'August 2026 · 1.9.3' },
+        { title: 'Fixed: changing your Music Library Folder did nothing', desc: 'a 1.9.2 regression, and the worst kind — nothing looked broken. Music Library Folder and the first entry under Music Libraries are the same setting shown twice, and the importer reads the entry. Editing the folder in Settings left the entry on the old path, so downloads kept landing where you had moved away from while Settings insisted otherwise. Saving Settings now moves the library with it. <strong>If an album went missing after updating to 1.9.2, look at the first path under Music Libraries — that is where it went.</strong>' },
+        { title: 'Fixed: "Album Imported (1/1 tracks)" on an 11-track album', desc: 'the Import page submits an album one track per request, so that message fired once per track and each one claimed to be the whole album. An eleven-track import looked like it had found a single file. It now says "Track Imported — <em>track</em> — <em>album</em>", and a track that failed says so instead of announcing an import that did not happen.' },
+        { title: 'Deep Scan now covers every Music Library', desc: 'it only ever looked at the one original folder, so anything in a second library was invisible to it. It now scans them all — and scores each one separately, which is the part that matters.' },
+        { title: 'Why separately, and not all at once', desc: 'Deep Scan relocates files it cannot find in the database, and refuses when the untracked share of a folder is implausibly large — the signature of a database out of sync rather than a pile of new arrivals. Pooling libraries defeats that: a library you just added is 100% untracked by definition, and measured against an existing large library that share falls under the threshold. Adding a library full of music you already own would have moved all of it into Staging. Scored per library, it is left alone.' },
+        { title: 'Smaller Deep Scan fixes alongside', desc: 'a moved file now keeps its folder structure relative to the library it came from rather than the first one; a library that is not mounted is skipped instead of being read as "every file in it has vanished"; and if any library trips the out-of-sync guard, no stale database rows are deleted anywhere — the database does not record which library a row belongs to, so a bad reading taints all of it.' },
+        { title: 'Also in 1.9.2', desc: 'music gained more than one library.' },
         { title: 'Music can have more than one library', desc: 'music has had exactly one output folder since the beginning — everything you downloaded went to the Music Library Folder and nowhere else, while the video side has been able to file a film into whichever library you chose for years. Settings → Paths & Organization now has a <strong>Music Libraries</strong> list: add as many as you like, and the first one is the default destination.' },
         { title: 'Nothing changes until you add a second one', desc: 'your existing library becomes the first entry automatically, so an install that never opens the new setting writes files to exactly where it wrote them yesterday. There is no migration to run and nothing to configure.' },
         { title: 'Each library can name files its own way', desc: 'and use its own quality profile. Leave both blank — which is how they start — and the library inherits your global settings. A library profile governs the whole pipeline for files going there, not just search ranking: the quality gate, the fingerprint check, deep verify, replace-lower, downsampling.' },
@@ -3670,6 +3676,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.3: fixes for 1.9.2, and Deep Scan learns about libraries",
+        description: "one real regression from 1.9.2 — changing your Music Library Folder quietly did nothing — plus an import message that made a full album look like it had imported one track, and Deep Scan finally knowing that more than one library exists.",
+        features: [
+            "Music Library Folder and the first entry under Music Libraries are the same setting shown twice, and the importer reads the entry. Editing the folder left the entry on the old path, so downloads kept landing where you'd moved away from. Saving Settings now moves the library with it",
+            "if an album went missing after updating to 1.9.2, the first path under Music Libraries is where it actually went",
+            "the Import page submits an album one track per request, so \"Album Imported (1/1 tracks)\" fired once per track and each claimed to be the whole album. It now names the track, and a failure says so rather than announcing an import that didn't happen",
+            "Deep Scan scans every Music Library, and scores each one separately — pooling them would defeat its own safety guard, because a library you just added is 100% untracked by definition and adding one full of music you already own would have relocated all of it",
+            "a relocated file keeps its structure relative to its own library; an unmounted library is skipped rather than read as \"everything vanished\"; and one library tripping the out-of-sync guard now stops stale-row deletion everywhere",
+        ],
+        usage_note: "Worth checking after updating: Settings → Paths & Organization → Music Libraries. If the first path isn't your Music Library Folder, that mismatch is the 1.9.2 bug — saving Settings once realigns them.",
+    },
     {
         title: "1.9.2: music can have more than one library",
         description: "music has had exactly one output folder since the beginning, while the video side has been able to file a title into whichever library you picked for years. Music now has the same: a list of labelled destinations, each with its own naming and quality settings if you want them.",

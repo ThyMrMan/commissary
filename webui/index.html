@@ -8916,7 +8916,13 @@
                                     saved and then quietly write nowhere your media server can see.
                                 </div>
 
-                                <div id="music-libraries-list"></div>
+                                <!-- Wrapped in .form-group like the video Libraries editor
+                                     (index.html ~6723): that wrapper is what styles the inputs
+                                     inside it. Without it the rows render as raw white browser
+                                     inputs while everything around them is dark. -->
+                                <div class="form-group video-library-selectors">
+                                    <div id="music-libraries-list" class="library-editor-list"></div>
+                                </div>
 
                                 <div class="form-actions" style="margin-top: 8px;">
                                     <button class="test-button" onclick="addMusicLibraryRow()">+ Add Library</button>

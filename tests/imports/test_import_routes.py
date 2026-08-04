@@ -486,6 +486,8 @@ def test_album_process_posts_valid_files_and_records_side_effects(tmp_path):
     # explicit user match — quality profile has no veto (#1017)
     assert context["_skip_quarantine_check"] == ["quality", "bit_depth"]
     assert path == str(good_file)
+    # Two matches in one request really is an album-level import, so the album
+    # wording is right here. The per-track case is covered below.
     assert activity == [("", "Album Imported", "Album by Artist (1/2 tracks)", "Now")]
     assert refresh_calls == ["refresh"]
     assert automation.events == [
@@ -503,6 +505,63 @@ def test_album_process_posts_valid_files_and_records_side_effects(tmp_path):
             },
         ),
     ]
+
+
+def _single_match_runtime(activity):
+    return ImportRouteRuntime(
+        resolve_album_artist_context=lambda album, source="": {"name": "IVE"},
+        build_album_import_context=lambda album, track, **kwargs: {"album": album, "track": track, **kwargs},
+        post_process_matched_download=lambda key, context, path: None,
+        add_activity_item=lambda *args: activity.append(args),
+        refresh_import_suggestions_cache=lambda: None,
+        automation_engine=_FakeAutomationEngine(),
+        is_active_media_server_ready=lambda: (True, ""),
+        logger=_FakeLogger(),
+    )
+
+
+def test_a_single_track_import_does_not_claim_the_album_imported(tmp_path):
+    """The Import page submits an album ONE TRACK PER REQUEST, so this handler
+    almost always sees a single match. Reporting each one as "Album Imported —
+    (1/1 tracks)" made an 11-track album look like it had imported with one
+    file found, which is alarming and false. Name the track instead."""
+    f = tmp_path / "01.flac"
+    _touch(f)
+    activity = []
+    payload, status = album_process(
+        _single_match_runtime(activity),
+        {
+            "album": {"id": "a1", "name": "I'VE IVE", "artist": "IVE"},
+            "matches": [{
+                "staging_file": {"full_path": str(f), "filename": "01.flac"},
+                "track": {"name": "Kitsch", "track_number": 1},
+            }],
+        },
+    )
+    assert status == 200 and payload["processed"] == 1
+    assert len(activity) == 1
+    verb, detail = activity[0][1], activity[0][2]
+    assert verb == "Track Imported"
+    assert "Kitsch" in detail and "I'VE IVE" in detail
+    assert "1/1" not in detail
+
+
+def test_a_failed_single_track_says_so_rather_than_reporting_an_import(tmp_path):
+    """The old message said "Album Imported" even when nothing imported —
+    processed was simply 0 inside a string nobody reads that closely."""
+    activity = []
+    payload, status = album_process(
+        _single_match_runtime(activity),
+        {
+            "album": {"id": "a1", "name": "I'VE IVE", "artist": "IVE"},
+            "matches": [{
+                "staging_file": {"full_path": str(tmp_path / "gone.flac"), "filename": "gone.flac"},
+                "track": {"name": "Kitsch", "track_number": 1},
+            }],
+        },
+    )
+    assert status == 200 and payload["processed"] == 0
+    assert activity[0][1] == "Track Import Failed"
 
 
 def test_album_process_requires_album_and_matches():

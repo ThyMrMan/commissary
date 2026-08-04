@@ -263,6 +263,57 @@ def test_a_fresh_db_seeds_one_library_from_the_existing_transfer_path(tmp_path, 
     assert template is None
 
 
+# ── the two-places-one-setting trap ──────────────────────────────────────────
+def test_editing_the_music_library_folder_moves_the_default_library(db):
+    """Music Library Folder and the first library row are the SAME setting shown
+    twice, and the import pipeline reads the row. A 1.9.2 regression: editing
+    the folder in Settings left the row on the old path, so downloads kept
+    landing where the user had moved away from while the field said otherwise.
+    A silent wrong-destination is worse than an error — nothing looks broken."""
+    db.save_music_libraries([{'path': '/media/OLD', 'label': 'Music Library'}])
+    assert destinations.resolve_music_destination(
+        {}, libraries=db.list_music_libraries())[0] == '/media/OLD'
+
+    db.sync_default_music_library('/media/completed/listening/music')
+
+    assert destinations.resolve_music_destination(
+        {}, libraries=db.list_music_libraries())[0] == '/media/completed/listening/music'
+
+
+def test_the_sync_moves_the_path_and_leaves_the_users_label_alone(db):
+    db.save_music_libraries([{'path': '/media/OLD', 'label': 'My Big Library'}])
+    db.sync_default_music_library('/media/NEW')
+    row = db.list_music_libraries()[0]
+    assert row['path'] == '/media/NEW'
+    assert row['label'] == 'My Big Library'
+
+
+def test_the_sync_promotes_an_existing_library_instead_of_duplicating_it(db):
+    """path is UNIQUE. Pointing the folder field at a library the user already
+    added has to make THAT one the default, not fail on the constraint."""
+    db.save_music_libraries([{'path': '/a', 'label': 'Main'}, {'path': '/b', 'label': 'Archive'}])
+    db.sync_default_music_library('/b')
+    assert [(x['label'], x['path']) for x in db.list_music_libraries()] == \
+           [('Archive', '/b'), ('Main', '/a')]
+
+
+def test_the_sync_creates_the_row_when_there_is_none(db):
+    """An install whose seed ran before a transfer path was configured has an
+    empty table; the first save must establish it rather than no-op."""
+    db.save_music_libraries([])
+    assert db.list_music_libraries() == []
+    db.sync_default_music_library('/media/first')
+    assert [x['path'] for x in db.list_music_libraries()] == ['/media/first']
+
+
+@pytest.mark.parametrize('junk', ['', '   ', None])
+def test_the_sync_ignores_an_empty_path(db, junk):
+    """A blank field must never blank out where music goes."""
+    db.save_music_libraries([{'path': '/media/keep'}])
+    assert db.sync_default_music_library(junk) is False
+    assert [x['path'] for x in db.list_music_libraries()] == ['/media/keep']
+
+
 def test_seeding_never_resurrects_a_library_the_user_removed(db):
     """Seeding only ever fills an EMPTY table. Re-adding transfer_path on every
     startup would undo a deliberate removal."""

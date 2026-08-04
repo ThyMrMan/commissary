@@ -561,7 +561,23 @@ def album_process(runtime: ImportRouteRuntime, data: Dict[str, Any]) -> tuple[Di
                 runtime.logger.error("Import processing error: %s", err_msg)
 
         if runtime.add_activity_item:
-            runtime.add_activity_item("", "Album Imported", f"{album_name} by {artist_name} ({processed}/{len(matches)} tracks)", "Now")
+            # The Import page submits an album ONE TRACK PER REQUEST (see
+            # processImportAlbumTrack), so this handler almost always sees a
+            # single match. Reporting that as "Album Imported … (1/1 tracks)"
+            # for each track reads as "the whole 11-track album imported and
+            # only found one file" — which is alarming and wrong. Say what
+            # actually happened: name the track for a single-match call, and
+            # keep the album wording only when a caller really did submit the
+            # whole tracklist at once.
+            if len(matches) == 1:
+                _one = (matches[0].get("track") or {}).get("name") or "Unknown Track"
+                _label = "Track Imported" if processed else "Track Import Failed"
+                runtime.add_activity_item(
+                    "", _label, f"{_one} — {album_name} by {artist_name}", "Now")
+            else:
+                runtime.add_activity_item(
+                    "", "Album Imported",
+                    f"{album_name} by {artist_name} ({processed}/{len(matches)} tracks)", "Now")
 
         if processed > 0:
             _emit_import_completed(

@@ -15755,6 +15755,65 @@ class MusicDatabase:
         """
         return [lib['path'] for lib in self.list_music_libraries() if lib.get('path')]
 
+    def sync_default_music_library(self, path) -> bool:
+        """Point the DEFAULT Music Library at ``path`` (Settings → Music Library
+        Folder).
+
+        The folder field and the first library row are the same setting shown
+        in two places, and the import pipeline reads the LIBRARY. Editing the
+        field alone used to leave the row on the old path, so downloads kept
+        landing where the user had moved away from while the UI insisted
+        otherwise — a silent wrong-destination, which is worse than an error.
+
+        Creates the row when the table is empty (an install whose seed ran
+        before a transfer path was configured). Renaming a library the user
+        labelled is deliberately avoided — only the path moves.
+        """
+        p = str(path or '').strip()
+        if not p:
+            return False
+        conn = None
+        try:
+            conn = self._get_connection()
+            row = conn.execute(
+                "SELECT id, path FROM music_root_folders ORDER BY sort_order, id LIMIT 1"
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT OR IGNORE INTO music_root_folders (path, label, sort_order) "
+                    "VALUES (?, ?, 0)", (p, 'Music Library'))
+                conn.commit()
+                logger.info("Created the default Music Library from the configured folder: %s", p)
+                return True
+            if row['path'] == p:
+                return False
+            # A row already pointing here (a second library the user added) would
+            # break the UNIQUE(path); make this one the default instead of
+            # creating a duplicate.
+            dupe = conn.execute(
+                "SELECT id FROM music_root_folders WHERE path=? AND id<>?",
+                (p, row['id'])).fetchone()
+            if dupe:
+                conn.execute("UPDATE music_root_folders SET sort_order = sort_order + 1")
+                conn.execute("UPDATE music_root_folders SET sort_order = 0 WHERE id=?",
+                             (dupe['id'],))
+                conn.commit()
+                logger.info("Made the existing Music Library at %s the default", p)
+                return True
+            conn.execute("UPDATE music_root_folders SET path=? WHERE id=?", (p, row['id']))
+            conn.commit()
+            logger.info("Default Music Library moved to the configured folder: %s -> %s",
+                        row['path'], p)
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Error syncing the default music library: {e}")
+            if conn:
+                conn.rollback()
+            return False
+        finally:
+            if conn:
+                conn.close()
+
     def save_music_libraries(self, entries) -> list:
         """Replace the Music Library list with ``entries`` (each:
         ``{id?, path, label?, naming_template?, quality_profile_id?}``).

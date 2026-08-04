@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.9.2"
+_SOULSYNC_BASE_VERSION = "1.9.3"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -3896,6 +3896,20 @@ def handle_settings():
                     get_database().sync_default_quality_profile_from_config()
                 except Exception as _qp_sync_err:
                     logger.error(f"Default quality profile sync failed: {_qp_sync_err}")
+
+            # Music Library Folder and the DEFAULT Music Library are the same
+            # setting shown in two places, and the import pipeline reads the
+            # LIBRARY. Without this, editing the folder here left the library
+            # row pointing at the old path and downloads kept landing there —
+            # the field said one thing and the files went somewhere else.
+            # The reverse direction is handled in /api/music/libraries.
+            if isinstance(new_settings.get('soulseek'), dict) and \
+                    'transfer_path' in new_settings['soulseek']:
+                try:
+                    get_database().sync_default_music_library(
+                        new_settings['soulseek']['transfer_path'])
+                except Exception as _lib_sync_err:
+                    logger.error(f"Default music library sync failed: {_lib_sync_err}")
 
             logger.info("Settings saved successfully via Web UI.")
             
@@ -19197,35 +19211,84 @@ def _run_soulsync_full_refresh():
         _db_update_error_callback(f"Full refresh failed: {e}")
 
 
+def _music_scan_roots() -> list:
+    """The folders a standalone deep scan owns: every configured Music Library,
+    default first, as ``[(label, resolved_path), …]``.
+
+    Falls back to ``soulseek.transfer_path`` when no libraries exist, which is
+    every install before Music Libraries and any whose table is empty.
+    Non-existent roots are dropped — an unmounted library must not be read as
+    "every file in it has vanished".
+    """
+    out, seen = [], set()
+
+    def _add(label, raw):
+        p = str(raw or '').strip()
+        if not p:
+            return
+        resolved = docker_resolve_path(p)
+        key = os.path.normcase(os.path.abspath(resolved))
+        if key in seen or not os.path.isdir(resolved):
+            return
+        seen.add(key)
+        out.append((label, resolved))
+
+    try:
+        for lib in get_database().list_music_libraries():
+            _add(lib.get('label') or 'Music Library', lib.get('path'))
+    except Exception as e:   # noqa: BLE001 - fall back rather than skip the scan
+        logger.warning("[SoulSync Deep Scan] Could not read music libraries: %s", e)
+    if not out:
+        _add('Music Library', config_manager.get('soulseek.transfer_path', './Transfer'))
+    return out
+
+
 def _run_soulsync_deep_scan():
     """Deep scan for SoulSync standalone mode.
 
-    1. Scans the output folder for all audio files
+    1. Scans EVERY configured Music Library for audio files
     2. Compares against soulsync DB records (by file_path)
     3. Untracked files → moved to import folder for auto-import processing
     4. Stale DB records (file gone) → removed from DB
+
+    Step 3 is evaluated PER LIBRARY, and that isn't tidiness — it's the safety
+    property. The guard blocks the move when the untracked share of a folder is
+    implausibly large, which is the signature of a desynced DB rather than a
+    batch of new arrivals. Pooling every library into one set defeats it: a
+    newly-added library is 100% untracked by definition, and beside an existing
+    large library that share stays under the threshold — so adding a library
+    full of music you already own would relocate all of it into Staging. Scored
+    per library, that new library trips the guard and is left alone.
     """
     try:
         import shutil
-        transfer_path = docker_resolve_path(config_manager.get('soulseek.transfer_path', './Transfer'))
         staging_path = docker_resolve_path(config_manager.get('import.staging_path', './Staging'))
 
-        if not os.path.isdir(transfer_path):
-            _db_update_error_callback(f"Output folder not found: {transfer_path}")
+        roots = _music_scan_roots()
+        if not roots:
+            _db_update_error_callback(
+                "No Music Library folder found — check Settings → Paths & Organization.")
             return
 
-        logger.info(f"[SoulSync Deep Scan] Starting — Transfer: {transfer_path}")
+        logger.info("[SoulSync Deep Scan] Starting — %d librar%s: %s",
+                    len(roots), 'y' if len(roots) == 1 else 'ies',
+                    ', '.join(f"{lbl} ({p})" for lbl, p in roots))
         _db_update_phase_callback('scanning')
 
-        # Phase 1: Collect all audio files in Transfer
+        # Phase 1: Collect audio files per library (so a move stays relative to
+        # the library the file came from, and the guard can score each one).
         audio_extensions = {'.mp3', '.flac', '.ogg', '.opus', '.m4a', '.aac', '.wav', '.wma', '.aiff', '.aif', '.ape'}
+        files_by_root = {}
         transfer_files = set()
-        for root, _dirs, files in os.walk(transfer_path):
-            for filename in files:
-                if os.path.splitext(filename)[1].lower() in audio_extensions:
-                    transfer_files.add(os.path.join(root, filename))
-
-        logger.info(f"[SoulSync Deep Scan] Found {len(transfer_files)} audio files in Transfer")
+        for label, root_path in roots:
+            found = set()
+            for root, _dirs, files in os.walk(root_path):
+                for filename in files:
+                    if os.path.splitext(filename)[1].lower() in audio_extensions:
+                        found.add(os.path.join(root, filename))
+            files_by_root[root_path] = (label, found)
+            transfer_files |= found
+            logger.info("[SoulSync Deep Scan] %s: %d audio files", label, len(found))
 
         # Phase 2: Get all soulsync file paths from DB
         db = get_database()
@@ -19253,34 +19316,44 @@ def _run_soulsync_deep_scan():
             plan_standalone_deep_scan, BLOCK_TRANSFER_PERMANENT, BLOCK_DESYNC,
         )
         never_move = bool(config_manager.get('import.transfer_is_permanent', False))
-        plan = plan_standalone_deep_scan(transfer_files, db_paths, never_move=never_move)
-        untracked = plan['untracked']
-        move_blocked = plan['move_blocked']
-        block_reason = plan['block_reason']
 
-        # Phase 4: Move untracked files to Staging for auto-import — unless guarded.
+        # Phase 4: per library — plan, then move untracked files to Staging
+        # unless that library's own guard blocks it. See the docstring for why
+        # this is scored per library rather than over the pooled set.
         moved_count = 0
         blocked_count = 0
-        if untracked and move_blocked:
-            blocked_count = len(untracked)
-            if block_reason == BLOCK_TRANSFER_PERMANENT:
-                warn = (f"Deep scan: {blocked_count} file(s) in Transfer aren't in the database, "
-                        f"but Transfer is marked your permanent library — nothing was moved.")
-            else:  # BLOCK_DESYNC
-                pct = round(100 * blocked_count / max(1, len(transfer_files)))
-                warn = (f"Deep scan STOPPED to protect your library: {blocked_count} of "
-                        f"{len(transfer_files)} files in Transfer ({pct}%) aren't in the database. "
-                        f"That usually means the database is out of sync with disk, not that you "
-                        f"have {blocked_count} new files — so NOTHING was moved. Re-sync/import "
-                        f"before scanning, or enable 'Transfer is my permanent library'.")
-            logger.warning(f"[SoulSync Deep Scan] {warn}")
-            add_activity_item("", "SoulSync Deep Scan — move blocked", warn, "Now")
-        elif untracked and os.path.isdir(staging_path):
+        any_desync_block = False
+        for root_path, (label, found) in files_by_root.items():
+            plan = plan_standalone_deep_scan(found, db_paths, never_move=never_move)
+            untracked = plan['untracked']
+            if not untracked:
+                continue
+            if plan['move_blocked']:
+                n = len(untracked)
+                blocked_count += n
+                if plan['block_reason'] == BLOCK_TRANSFER_PERMANENT:
+                    warn = (f"Deep scan: {n} file(s) in {label} aren't in the database, but your "
+                            f"library is marked permanent — nothing was moved.")
+                else:  # BLOCK_DESYNC
+                    any_desync_block = True
+                    pct = round(100 * n / max(1, len(found)))
+                    warn = (f"Deep scan STOPPED to protect {label}: {n} of {len(found)} files "
+                            f"({pct}%) aren't in the database. That usually means the database is "
+                            f"out of sync with disk — or that this library was just added and has "
+                            f"never been imported — not that you have {n} new files. NOTHING was "
+                            f"moved. Import them, or enable 'Transfer is my permanent library'.")
+                logger.warning(f"[SoulSync Deep Scan] {warn}")
+                add_activity_item("", "SoulSync Deep Scan — move blocked", warn, "Now")
+                continue
+            if not os.path.isdir(staging_path):
+                continue
             _db_update_phase_callback('moving_untracked')
             for file_path in untracked:
                 try:
-                    # Preserve relative folder structure from Transfer
-                    rel_path = os.path.relpath(file_path, transfer_path)
+                    # Relative to the library this file came from — with several
+                    # libraries, a path relative to the wrong root escapes
+                    # Staging via '..' or collapses two libraries together.
+                    rel_path = os.path.relpath(file_path, root_path)
                     dest_path = os.path.join(staging_path, rel_path)
                     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                     shutil.move(file_path, dest_path)
@@ -19288,8 +19361,8 @@ def _run_soulsync_deep_scan():
                 except Exception as e:
                     logger.error(f"[SoulSync Deep Scan] Could not move {os.path.basename(file_path)}: {e}")
 
-            # Clean up empty directories in Transfer after moving files
-            for root, dirs, _files in os.walk(transfer_path, topdown=False):
+            # Clean up empty directories left behind in THIS library
+            for root, dirs, _files in os.walk(root_path, topdown=False):
                 for d in dirs:
                     dir_path = os.path.join(root, d)
                     try:
@@ -19312,10 +19385,15 @@ def _run_soulsync_deep_scan():
         # every file — don't delete rows. Also independently skip when the stale share
         # is implausibly large (storage unreachable / remount), mirroring the orphan guard.
         from core.library.stale_guard import is_implausible_stale_removal
-        if move_blocked and block_reason == BLOCK_DESYNC:
+        # Any library tripping the desync guard taints the whole DB<->disk
+        # mapping, not just its own rows: os.path.exists may be lying about
+        # everything (unmounted volume, wrong container paths), and the DB
+        # doesn't record which library a row belongs to. Conservative by
+        # design — skipping a cleanup costs nothing, deleting real rows does.
+        if any_desync_block:
             if stale_track_ids:
                 logger.warning(f"[SoulSync Deep Scan] Skipping removal of {stale_count} 'stale' "
-                               f"records — move was blocked for desync, mapping is unreliable.")
+                               f"records — a library was blocked for desync, mapping is unreliable.")
             stale_track_ids = []
             stale_count = 0
         elif is_implausible_stale_removal(stale_count, len(db_paths)):

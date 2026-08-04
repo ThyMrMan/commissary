@@ -45501,63 +45501,67 @@ div.artist-hero-badge {
 }
 
 /* ── Music Libraries (Settings → Paths & Organization) ───────────────────────
-   Where finished music can be filed. Row ORDER decides the default
-   destination, so the first row is marked rather than left to be inferred. */
-.music-library-row {
-    padding: 10px 11px;
-    margin-bottom: 8px;
-    border: 1px solid rgba(255, 255, 255, 0.10);
-    border-radius: 8px;
-    background: rgba(255, 255, 255, 0.03);
-}
-.music-library-row.music-library-default {
-    border-color: rgba(var(--accent-rgb), 0.45);
-    background: rgba(var(--accent-rgb), 0.06);
-}
-.music-library-row-top,
-.music-library-row-bottom {
+   Structure and spacing come from .library-editor-row / -fields in
+   video/video-side.css — the SAME editor the video Libraries use, so the two
+   stay identical instead of drifting apart. Only what's music-specific lives
+   here: the row heading and the default marker.
+
+   Row ORDER decides the default destination, so the first row says so rather
+   than leaving it to be inferred from position. */
+.music-library-row-head {
     display: flex;
     align-items: center;
     gap: 8px;
+    padding: 2px 0;
 }
-.music-library-row-bottom {
-    margin-top: 8px;
+.music-lib-title {
+    color: rgba(255, 255, 255, 0.82);
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 .music-lib-default-badge {
     flex: 0 0 auto;
-    padding: 2px 7px;
+    padding: 1px 6px;
     border-radius: 4px;
-    background: rgba(var(--accent-rgb), 0.85);
-    color: #fff;
-    font-size: 9.5px;
+    background: rgba(var(--accent-rgb), 0.22);
+    border: 1px solid rgba(var(--accent-rgb), 0.5);
+    color: rgba(255, 255, 255, 0.9);
+    font-size: 9px;
     font-weight: 700;
     letter-spacing: 0.6px;
 }
-.music-library-row input[type="text"],
-.music-library-row select {
-    flex: 1 1 auto;
-    min-width: 0;
+/* Push the row controls to the right edge, away from the name. */
+.music-library-row-actions {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
 }
-.music-lib-label {
-    flex: 0 1 190px !important;
+.music-library-row-actions button {
+    padding: 2px 7px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 5px;
+    background: rgba(255, 255, 255, 0.05);
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 11px;
+    line-height: 1.4;
+    cursor: pointer;
 }
-.music-lib-profile {
-    flex: 0 1 240px !important;
+.music-library-row-actions button:hover {
+    background: rgba(255, 255, 255, 0.12);
+    color: #fff;
 }
-.music-library-row .test-button {
-    flex: 0 0 auto;
-    padding: 5px 9px;
-}
-
-@media (max-width: 820px) {
-    .music-library-row-top,
-    .music-library-row-bottom {
-        flex-wrap: wrap;
-    }
-    .music-lib-label,
-    .music-lib-profile {
-        flex: 1 1 100% !important;
-    }
+/* The fields block is shared with video, and the .form-group wrapper already
+   gives these text inputs the identical treatment the video editor's get.
+   The quality-profile select is DELIBERATELY left to `#settings-page select`
+   (custom arrow, slightly larger text): that's how every other dropdown in
+   Settings looks, and the video editor has no select to match instead. Making
+   this one dropdown resemble the text inputs would make it the odd one out on
+   the page it actually lives on. Only the width is set, so it fills the column
+   like the inputs above it. */
+.music-library-row .library-editor-fields select {
+    width: 100%;
 }
 
 /* Album source picker — one row per release, grouped by source. */
