@@ -3484,8 +3484,12 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.9.8': [
-        { date: 'August 2026 · 1.9.8' },
+    '1.9.9': [
+        { date: 'August 2026 · 1.9.9' },
+        { title: 'Auto-Import will actually import things now', desc: 'the confidence threshold defaulted to 90%, which sounds strict and was in fact close to unreachable. The score is a <em>product</em> of three fractions — how sure we are which album this is, how well the track titles agree, and what fraction of the tracklist is present — so it falls away much faster than a percentage suggests. A perfectly tagged album with slightly imperfect identification scored about 83% and was refused. The default is now 45%.' },
+        { title: 'It has not been made careless', desc: 'the same arithmetic is what keeps it safe. A folder holding 3 of 12 tracks scores about 12%; an album whose titles disagree with the release it was matched to scores about 14%; a folder the app could not confidently identify scores about 26%. All three are still refused, comfortably. What changed is that a complete, correctly identified folder no longer waits for you to confirm what the matcher already got right.' },
+        { title: 'Where to change it', desc: 'Import → Auto-Import, the confidence slider. Your own setting always wins over the default — this only moves the value used when you have never touched it.' },
+        { title: 'Also in 1.9.8', desc: 'the source picker became the default search action, failed batch tracks gained a Sources button, torrent results name their tracker, and the Torrent Client category is respected again.' },
         { title: 'Clicking a search result now asks you which source', desc: 'the multi-source picker arrived in 1.9.0, but clicking a track still opened the old analyse-and-grab modal — so the picker was there and almost nobody met it. Searching every source and choosing is the point of the search page, and it is now what a click does. The automatic download is still one click away as <strong>Auto</strong>, deliberately quieter, for when you would rather not choose.' },
         { title: 'Failed tracks in a batch download can be picked by hand', desc: 'Begin Analysis runs unattended across a whole playlist — it cannot stop and ask you about track 34 of 60 — so anything it could not place just sat there marked failed. Those rows now carry a <strong>🔍 Sources</strong> button that opens the picker for that one track. The picker could always reach them (the status cell has been clickable all along), but nothing said so, which made the wishlist the only route anyone found.' },
         { title: 'Torrent results say which tracker they came from', desc: 'Prowlarr hides many indexers behind one "torrent" source, which is no help when you are choosing between two releases. Every torrent and usenet result in the picker now names its tracker, and — when the indexer publishes one — links straight to that release\'s page so you can check the comments, freeleech status or file list before committing. The link opens in a new tab, so clicking it never navigates you away mid-download.' },
@@ -3699,6 +3703,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.9: Auto-Import's threshold was set to a value it could not reach",
+        description: "the default confidence was 90%. That reads as \"only import when very sure\", but the score is a product of three fractions, so 90% was close to unattainable — even a perfectly tagged album usually fell short. The default is now 45%.",
+        features: [
+            "the score is identification × title agreement × how much of the tracklist is present, so it decays far faster than a percentage implies",
+            "a tagged album with slightly imperfect identification scored ~0.83 and was refused; the only reason tagged albums imported at all was a separate \"any one track matched very strongly\" bypass",
+            "what 90% really gated was untagged folders, whose titles come from filenames and top out around 0.5 per track",
+            "still refused at the new default: a folder with 3 of 12 tracks (~0.12), an album whose titles disagree with what it matched (~0.14), and anything the app could not confidently identify (~0.26)",
+            "the default now lives in one constant that the settings screen reads, so the number shown can never be one the worker would not use",
+        ],
+        usage_note: "Import → Auto-Import has the slider. A value you have set yourself always wins; this only changes the default for installs that never touched it. If you want the old behaviour, set it to 90%.",
+    },
     {
         title: "1.9.8: the source picker is finally the default",
         description: "the multi-source picker shipped in 1.9.0, but clicking a search result still ran the old automatic download — so the feature existed and almost nobody met it. Clicking now opens the picker, and batch downloads gain a per-track escape hatch.",

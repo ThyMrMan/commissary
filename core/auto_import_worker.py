@@ -25,6 +25,27 @@ from utils.logging_config import get_logger
 
 logger = get_logger("auto_import")
 
+
+# How confident the matcher must be before a folder imports unattended.
+#
+# Read this alongside how the number is BUILT (see `_match_tracks`):
+#
+#     overall = identification_confidence * avg_track_confidence * coverage
+#
+# It is a product of three fractions, not a percentage, so it falls away much
+# faster than "90% sure" suggests. At the old default of 0.9 even a perfectly
+# tagged album with slightly imperfect identification scored ~0.83 and was
+# refused — the threshold was effectively unreachable, and the only reason
+# tagged albums imported at all is the separate "any track matched ≥ 0.8"
+# escape hatch below it. What 0.9 actually gated was untagged folders, whose
+# titles come from filenames and top out around 0.5 per track.
+#
+# 0.45 keeps the discrimination that matters — a folder holding 3 of 12 tracks
+# scores ~0.12, and a wrong album whose titles disagree ~0.14, both still well
+# clear of the line — while letting a correctly identified, complete folder
+# import without a human confirming what the matcher already got right.
+DEFAULT_CONFIDENCE_THRESHOLD = 0.45
+
 AUDIO_EXTENSIONS = {'.mp3', '.flac', '.ogg', '.opus', '.m4a', '.aac', '.wav', '.wma', '.aiff', '.aif', '.ape'}
 DISC_FOLDER_RE = re.compile(r'^(?:disc|cd|disk)\s*(\d+)$', re.IGNORECASE)
 
@@ -605,9 +626,10 @@ class AutoImportWorker:
         self._register_active(candidate, status='identifying')
         logger.info(f"[Auto-Import] Processing folder: {candidate.name} ({len(candidate.audio_files)} files)")
 
-        threshold = 0.9
+        threshold = DEFAULT_CONFIDENCE_THRESHOLD
         if self._config_manager:
-            threshold = self._config_manager.get('auto_import.confidence_threshold', 0.9)
+            threshold = self._config_manager.get('auto_import.confidence_threshold',
+                                                 DEFAULT_CONFIDENCE_THRESHOLD)
 
         auto_process = True
         if self._config_manager:

@@ -77,7 +77,10 @@ export function AutoImportPanel({
   useEffect(() => {
     const settings = settingsQuery.data;
     if (!settings) return;
-    setConfidence(Math.round((settings.confidence_threshold ?? 0.9) * 100));
+    // Matches DEFAULT_CONFIDENCE_THRESHOLD in core/auto_import_worker.py. Only
+    // reached if the API omits the field — it normally sends the server's own
+    // default, so these cannot disagree in practice.
+    setConfidence(Math.round((settings.confidence_threshold ?? 0.45) * 100));
     setInterval(settings.scan_interval ?? 60);
     setQualityProfileId(settings.quality_profile_id ?? null);
   }, [settingsQuery.data]);
@@ -203,9 +206,17 @@ export function AutoImportPanel({
           <div className={styles.autoImportSettingsRow} id="auto-import-settings-row">
             <div className={styles.autoImportSetting}>
               <span>Confidence:</span>
+              {/* Floor is 25, not 50: the default is 45 (see
+                  DEFAULT_CONFIDENCE_THRESHOLD in core/auto_import_worker.py),
+                  and a slider that cannot reach its own default shows one
+                  value while the worker uses another — and silently RAISES
+                  the threshold the first time you touch it. 25 still sits
+                  well above the scores that must never auto-import: a folder
+                  with a quarter of its tracks (~0.12) or a wrong-album match
+                  (~0.14). */}
               <RangeInput
                 label="Confidence"
-                min={50}
+                min={25}
                 max={100}
                 value={confidence}
                 onValueChange={setConfidence}

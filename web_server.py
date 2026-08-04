@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.9.8"
+_SOULSYNC_BASE_VERSION = "1.9.9"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -41494,12 +41494,19 @@ def auto_import_settings():
             return None
         return profile_id if profile_id > 0 else None
 
+    from core.auto_import_worker import (
+        DEFAULT_CONFIDENCE_THRESHOLD as _AUTO_IMPORT_DEFAULT_CONFIDENCE,
+    )
+
     if request.method == 'GET':
         return jsonify({
             "success": True,
             "enabled": config_manager.get('auto_import.enabled', False),
             "scan_interval": config_manager.get('auto_import.scan_interval', 60),
-            "confidence_threshold": config_manager.get('auto_import.confidence_threshold', 0.9),
+            # Default from the worker, so the settings screen never shows a
+            # number the worker would not actually use.
+            "confidence_threshold": config_manager.get(
+                'auto_import.confidence_threshold', _AUTO_IMPORT_DEFAULT_CONFIDENCE),
             "auto_process": config_manager.get('auto_import.auto_process', True),
             # Per-context quality profile override (see core/auto_import_worker.py
             # _process_matches) — None/0 means "use the app-wide default profile",
