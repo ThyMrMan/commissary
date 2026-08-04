@@ -1838,3 +1838,170 @@
     width: 100%;
   }
 }
+
+/* ── Folder picker ──────────────────────────────────────────────────────────
+   Choosing which folder the import scan reads. Files left where a download
+   client put them used to have to be moved into the one configured Import
+   folder by hand; this points the scan at them instead. */
+.folderPickerOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+}
+
+.folderPickerPanel {
+  display: flex;
+  flex-direction: column;
+  width: min(640px, 100%);
+  max-height: min(680px, 90vh);
+  padding: 18px 20px 16px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  background: #16181d;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+
+.folderPickerHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.folderPickerHeader h2 {
+  margin: 0;
+  font-size: 16px;
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.folderPickerClose {
+  padding: 4px 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 15px;
+  cursor: pointer;
+}
+
+.folderPickerClose:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+
+.folderPickerShortcuts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.folderPickerShortcut {
+  padding: 4px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.8);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.folderPickerShortcut:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+}
+
+/* The full path can be long; wrap rather than truncate — knowing WHICH of two
+   similarly-named folders you're about to scan is the whole point. */
+.folderPickerPath {
+  margin-bottom: 10px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.28);
+  color: rgba(255, 255, 255, 0.65);
+  font-family: monospace;
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+
+.folderPickerList {
+  flex: 1;
+  min-height: 120px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.folderPickerRow {
+  display: block;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.85);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.folderPickerRow:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.folderPickerEmpty,
+.folderPickerStatus {
+  padding: 10px;
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 12px;
+  text-align: center;
+}
+
+.folderPickerError {
+  padding: 9px 11px;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  border-radius: 6px;
+  background: rgba(239, 68, 68, 0.08);
+  color: rgba(252, 165, 165, 0.95);
+  font-size: 12px;
+}
+
+.folderPickerFooter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.folderPickerCount {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 11.5px;
+}
+
+.folderPickerActions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 8px;
+}
+
+@media (max-width: 640px) {
+  .folderPickerFooter {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .folderPickerActions {
+    justify-content: flex-end;
+  }
+}

@@ -18,8 +18,11 @@ const EMPTY_STAGING_FILES: ImportStagingFile[] = [];
 export function useImportStaging() {
   const queryClient = useQueryClient();
   const clearFinishedJobs = useImportWorkflowStore((state) => state.clearFinishedJobs);
+  // Empty = the configured Import folder, so an install that never opens the
+  // folder picker behaves exactly as it did before.
+  const scanPath = useImportWorkflowStore((state) => state.scanPath);
   const stagingQuery = useQuery({
-    ...importStagingFilesQueryOptions(),
+    ...importStagingFilesQueryOptions(scanPath),
   });
 
   // A large staging folder (whole-library migration, #947) is scanned in the background; the

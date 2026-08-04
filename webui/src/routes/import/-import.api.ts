@@ -8,6 +8,7 @@ import type {
   ImportAlbumMatchPayload,
   ImportAlbumSearchPayload,
   ImportAutoImportResultsPayload,
+  ImportBrowsePayload,
   ImportAutoImportSettingsPayload,
   ImportAutoImportStatusPayload,
   ImportProcessPayload,
@@ -30,16 +31,39 @@ export const IMPORT_QUERY_KEY = ['import'] as const;
 // responses actually arrive and the bar advances. Scoped to import only.
 const IMPORT_REQUEST_TIMEOUT_MS = 300_000; // 5 min/track
 
-export async function fetchImportStagingFiles(): Promise<ImportStagingFilesPayload> {
-  return readJson<ImportStagingFilesPayload>(apiClient.get('import/staging/files'));
+// The staging endpoints scan the configured Import folder unless told otherwise.
+// An empty scanPath means exactly that, so the default call is byte-identical to
+// what it was before folder browsing existed.
+function scanParams(scanPath?: string) {
+  return scanPath ? { searchParams: { path: scanPath } } : undefined;
 }
 
-export async function fetchImportStagingGroups(): Promise<ImportStagingGroupsPayload> {
-  return readJson<ImportStagingGroupsPayload>(apiClient.get('import/staging/groups'));
+export async function fetchImportStagingFiles(
+  scanPath?: string,
+): Promise<ImportStagingFilesPayload> {
+  return readJson<ImportStagingFilesPayload>(
+    apiClient.get('import/staging/files', scanParams(scanPath)),
+  );
+}
+
+export async function fetchImportStagingGroups(
+  scanPath?: string,
+): Promise<ImportStagingGroupsPayload> {
+  return readJson<ImportStagingGroupsPayload>(
+    apiClient.get('import/staging/groups', scanParams(scanPath)),
+  );
 }
 
 export async function fetchImportStagingSuggestions(): Promise<ImportAlbumSearchPayload> {
   return readJson<ImportAlbumSearchPayload>(apiClient.get('import/staging/suggestions'));
+}
+
+/** List one folder on the server. Omit `path` to open on the first configured
+ * root (normally the download folder), so the common case needs no typing. */
+export async function fetchImportBrowse(path?: string): Promise<ImportBrowsePayload> {
+  return readJson<ImportBrowsePayload>(
+    apiClient.get('import/browse', path ? { searchParams: { path } } : undefined),
+  );
 }
 
 export async function searchImportAlbums(
@@ -215,19 +239,32 @@ export async function clearCompletedAutoImportResults(): Promise<number> {
 // the user is on another page so coming back doesn't re-scan either.
 const STAGING_CACHE = { staleTime: 30 * 60_000, gcTime: 60 * 60_000 } as const;
 
-export function importStagingFilesQueryOptions() {
+// scanPath is part of the KEY, not just the request. Two folders are two
+// different scans; sharing one cache entry would show the previous folder's
+// files under the new folder's name until something invalidated it.
+export function importStagingFilesQueryOptions(scanPath = '') {
   return queryOptions({
-    queryKey: [...IMPORT_QUERY_KEY, 'staging-files'],
-    queryFn: fetchImportStagingFiles,
+    queryKey: [...IMPORT_QUERY_KEY, 'staging-files', scanPath],
+    queryFn: () => fetchImportStagingFiles(scanPath),
     ...STAGING_CACHE,
   });
 }
 
-export function importStagingGroupsQueryOptions() {
+export function importStagingGroupsQueryOptions(scanPath = '') {
   return queryOptions({
-    queryKey: [...IMPORT_QUERY_KEY, 'staging-groups'],
-    queryFn: fetchImportStagingGroups,
+    queryKey: [...IMPORT_QUERY_KEY, 'staging-groups', scanPath],
+    queryFn: () => fetchImportStagingGroups(scanPath),
     ...STAGING_CACHE,
+  });
+}
+
+/** Folder listings are cheap and change under us (a download finishing adds a
+ * folder), so unlike the staging scan these are NOT cached for half an hour. */
+export function importBrowseQueryOptions(path = '') {
+  return queryOptions({
+    queryKey: [...IMPORT_QUERY_KEY, 'browse', path],
+    queryFn: () => fetchImportBrowse(path),
+    staleTime: 0,
   });
 }
 

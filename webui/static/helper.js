@@ -3484,8 +3484,14 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.9.0': [
-        { date: 'August 2026 · 1.9.0' },
+    '1.9.1': [
+        { date: 'August 2026 · 1.9.1' },
+        { title: 'Import from any of your download folders', desc: 'Import only ever read one folder — the Import folder in Settings — so anything sitting where your download client left it had to be moved there by hand before it could be imported at all. There is now a "Change folder" button on the Import page: browse your download, import and library folders, pick the one you want, and the scan reads that instead.' },
+        { title: 'It opens where your downloads land', desc: 'no path typing. The picker starts on your download folder with shortcuts to every configured root, and tells you how many audio files are directly in whatever folder you are looking at before you commit to it — a folder with none can still be the right pick, since subfolders are scanned too.' },
+        { title: 'Your choice sticks while you work', desc: 'switching between the Albums, Singles and Auto-Import tabs keeps the folder you chose. The header says "Scanning: …" instead of "Import: …" whenever you are somewhere other than the configured Import folder, so an empty result is never mistaken for your Import folder having broken. "Back to Import folder" returns you to the default.' },
+        { title: 'Where it will and will not go', desc: 'the browser is limited to the folders SoulSync already knows about — your download folder, the torrent and usenet completed paths, the Import folder, your music library and any extra library paths. It will not walk the rest of the machine, and it stops offering "up" at the edge of those rather than leading you somewhere the scan would then refuse. Admin only, like the rest of the Import page.' },
+        { title: 'Changing folder clears the matching you had in progress', desc: 'deliberately. A selected album and its per-track matches name files in the folder you just left, so carrying them across would let you import a match built against files that are no longer on screen.' },
+        { title: 'Also in 1.9.0', desc: 'every connected source became searchable, and albums got a release picker.' },
         { title: 'Every source you have connected is now searchable', desc: 'the source list behind manual search was filtered by your download mode: in Hybrid it offered only the sources in your fallback chain, and in single-source mode it offered exactly one. But that setting is about which source the AUTOMATIC cascade downloads from — it was never a statement that the others do not work. A source you had connected and could download from was simply invisible unless you also re-ordered your fallback chain to see it. Every configured source is now offered; your chain order still leads the list, it just no longer excludes.' },
         { title: 'Choose a release for a whole album', desc: 'a new button on album and single/EP results. It asks every source that indexes whole albums what it has, shows you the releases side by side — format, track count, size, seeders — and downloads the exact one you choose instead of guessing for you. Your pick overrides your configured download source: choosing a torrent release while running Soulseek-only does what you would expect, because the mode setting was only ever answering "what may claim a whole album unattended?".' },
         { title: 'Whole-album sources are kept separate from track results', desc: 'torrent and usenet index releases, not tracks, so a hit from them is an entire album. Those results now sit under their own heading in the track picker with a note saying what picking one actually does: the full release downloads, the matching track is kept, and if the release turns out not to contain it the download fails rather than importing the wrong file.' },
@@ -3657,6 +3663,19 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.1: import from any of your download folders",
+        description: "Import read one folder and only one — the Import folder in Settings. Anything a download client left elsewhere had to be moved there by hand first. Now you can point the scan at any of your download, import or library folders.",
+        features: [
+            "a Change folder button on the Import page opens a browser over the folders SoulSync already knows about — download folder, torrent and usenet completed paths, Import folder, music library, extra library paths",
+            "it starts on your download folder, so the usual case needs no path typing, and tells you how many audio files are directly in the folder you're looking at before you commit",
+            "a folder with no audio directly in it can still be the right pick — subfolders are scanned too, which is exactly the 'complete/Artist - Album/' case",
+            "the folder you choose survives switching between the Albums, Singles and Auto-Import tabs",
+            "the header reads 'Scanning: …' rather than 'Import: …' whenever you're somewhere other than the configured folder, so an empty result can't be mistaken for a broken Import folder",
+            "changing folder clears the matching work in progress on purpose — a selected album and its per-track matches name files in the folder you just left",
+        ],
+        usage_note: "It won't walk the rest of the machine: the browser is bounded to your configured folders, and stops offering 'up' at their edge rather than leading you somewhere the scan would refuse. Admin only, like the rest of Import.",
+    },
     {
         title: "1.9.0: every source is searchable, and albums get a release picker",
         description: "1.8.19 let you search your sources by hand for a track. This opens that up — every source you have connected is now offered, not just the ones in your fallback chain — and gives albums their own picker so you choose the release instead of SoulSync guessing.",

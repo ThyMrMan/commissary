@@ -30,6 +30,12 @@ function createInitialWorkflowState() {
   return {
     queue: [] as ImportQueueEntry[],
     nextQueueId: 0,
+    // Which folder the staging scan reads. Empty = the configured Import
+    // folder, i.e. the behaviour before folder browsing existed. Lives in the
+    // route-local store so it survives navigation between /import/album,
+    // /singles and /auto — picking a folder and losing it on the next tab
+    // click would make the feature useless.
+    scanPath: '' as string,
     albumQuery: '',
     albumResults: null as ImportAlbumResult[] | null,
     albumSearchError: null as string | null,
@@ -57,6 +63,27 @@ export const useImportWorkflowStore = create(
   combine(createInitialWorkflowState(), (set, get) => ({
     clearFinishedJobs: () => {
       set((state) => ({ queue: state.queue.filter((entry) => entry.status === 'running') }));
+    },
+    setScanPath: (path: string) => {
+      // Changing folder discards the matching work in progress: the selected
+      // album, the per-file matches and the singles selection all name files
+      // in the OLD folder, and carrying them across would let the user import
+      // a match built against files that are no longer on screen.
+      set({
+        scanPath: path,
+        albumQuery: '',
+        albumResults: null,
+        albumSearchError: null,
+        autoGroupFilePaths: null,
+        selectedAlbum: null,
+        albumMatch: null,
+        albumMatchError: null,
+        matchOverrides: {},
+        selectedSingles: new Set<string>(),
+        singlesManualMatches: {},
+        openSingleSearch: null,
+        singleSearches: {},
+      });
     },
     enqueueQueueJob: (job: ImportQueueJob) => {
       const id = get().nextQueueId + 1;
@@ -218,6 +245,15 @@ export function useImportQueueWorkflow() {
       enqueueQueueJob: state.enqueueQueueJob,
       queue: state.queue,
       updateQueueEntry: state.updateQueueEntry,
+    })),
+  );
+}
+
+export function useImportScanFolder() {
+  return useImportWorkflowStore(
+    useShallow((state) => ({
+      scanPath: state.scanPath,
+      setScanPath: state.setScanPath,
     })),
   );
 }

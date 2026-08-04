@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.9.0"
+_SOULSYNC_BASE_VERSION = "1.9.1"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -40937,8 +40937,20 @@ def repair_job_progress():
 # IMPORT / STAGING SYSTEM
 # ================================================================================================
 
-def _build_import_route_runtime():
+def _build_import_route_runtime(scan_path=None):
+    """Build the per-request import runtime.
+
+    ``scan_path`` overrides which folder the staging endpoints scan. The whole
+    scan machinery in ``core.imports.routes`` is already parameterised on a
+    path — it threads ``staging_path`` through every helper and keys the scan
+    cache on it — so pointing it somewhere else needs nothing more than
+    swapping the accessor it asks for that path. Callers MUST pass a value
+    already validated by ``_resolve_import_scan_path``.
+    """
+    from core.imports.staging import get_staging_path as _configured_staging_path
+
     return _ImportRouteRuntime(
+        get_staging_path=((lambda: scan_path) if scan_path else _configured_staging_path),
         post_process_matched_download=_post_process_matched_download,
         add_activity_item=add_activity_item,
         automation_engine=automation_engine,
@@ -40951,31 +40963,215 @@ def _build_import_route_runtime():
     )
 
 
+# A big folder shouldn't ship 50k rows to the browser; the user navigates or types.
+_IMPORT_BROWSE_LIMIT = 1000
+
+
+def _import_browse_shortcuts():
+    """Starting points for the import folder browser, ordered the way a user
+    wants them: where downloads actually land first, then staging, then the
+    libraries. Only folders that EXIST are offered — a shortcut to an unmounted
+    path is worse than no shortcut, because it reads as a SoulSync bug rather
+    than a missing mount. Deduped by real path; first label wins.
+
+    These double as the allowlist for ``_resolve_import_scan_path``, so
+    anything reachable here is scannable and nothing else is.
+    """
+    from core.imports.staging import get_staging_path as _staging_path
+
+    out, seen = [], set()
+
+    def _add(label, path):
+        p = str(path or "").strip()
+        if not p:
+            return
+        try:
+            resolved = os.path.abspath(docker_resolve_path(p))
+        except Exception:   # noqa: BLE001 - a bad config value must not kill the browser
+            return
+        key = os.path.normcase(resolved)
+        if key in seen or not os.path.isdir(resolved):
+            return
+        seen.add(key)
+        out.append({"label": label, "path": resolved})
+
+    _add("Downloads", config_manager.get('soulseek.download_path', ''))
+    for i, p in enumerate(config_manager.get('soulseek.torrent_download_path', []) or []):
+        _add("Torrents" if i == 0 else f"Torrents {i + 1}", p)
+    for i, p in enumerate(config_manager.get('soulseek.usenet_download_path', []) or []):
+        _add("Usenet" if i == 0 else f"Usenet {i + 1}", p)
+    try:
+        _add("Import folder", _staging_path())
+    except Exception:   # noqa: BLE001
+        logger.debug("[Import Browse] staging path unavailable", exc_info=True)
+    _add("Music library", config_manager.get('soulseek.transfer_path', ''))
+    for i, p in enumerate(config_manager.get('library.music_paths', []) or []):
+        _add(f"Extra library {i + 1}", p)
+    return out
+
+
+def _is_within(root: str, candidate: str) -> bool:
+    """True when ``candidate`` is ``root`` or lives beneath it.
+
+    ``os.path.commonpath`` rather than a string prefix: ``startswith`` would
+    accept ``/downloads-elsewhere`` as being inside ``/downloads``.
+    """
+    try:
+        root_r = os.path.normcase(os.path.realpath(root))
+        cand_r = os.path.normcase(os.path.realpath(candidate))
+        if root_r == cand_r:
+            return True
+        return os.path.commonpath([root_r, cand_r]) == root_r
+    except (ValueError, OSError):
+        # commonpath raises across drives on Windows — different drive, not inside.
+        return False
+
+
+def _resolve_import_scan_path(raw):
+    """Validate a caller-supplied scan folder. Returns ``(path, error)``.
+
+    An empty value means "the configured Import folder", i.e. today's behaviour.
+    Anything else must resolve inside one of the browse shortcuts. That check is
+    the point: ``/api/import/browse`` is admin-gated and deliberately lists the
+    filesystem, but the SCAN endpoints read tags from every file they find, so
+    letting them walk an arbitrary path would turn a folder listing into a
+    content read of anywhere on the host. ``realpath`` is used on both sides so
+    a symlink out of an allowed root can't smuggle its way past.
+    """
+    p = str(raw or "").strip()
+    if not p:
+        return None, None
+    resolved = os.path.abspath(docker_resolve_path(p))
+    if not os.path.isdir(resolved):
+        return None, "That folder doesn't exist."
+    for sc in _import_browse_shortcuts():
+        if _is_within(sc["path"], resolved):
+            return resolved, None
+    return None, ("That folder is outside your configured download, import and "
+                  "library folders.")
+
+
+@app.route('/api/import/browse', methods=['GET'])
+@admin_only
+def import_browse():
+    """Walk the server's filesystem to choose a folder to import FROM, instead
+    of everything having to be moved into the one configured Import folder.
+
+    ``?path=`` lists that folder; with none, opens on the first existing
+    shortcut (normally the download folder) so the common case needs no typing.
+
+    Admin-only, like every other ``/api/import/*`` route — this enumerates
+    directories on the host.
+
+    Lists folders and AUDIO files only, using the same ``AUDIO_EXTENSIONS`` the
+    staging scan itself uses, so nothing shown here can be rejected at the next
+    step. Unlike the scan, this reads no tags — just names and sizes.
+    """
+    from core.imports.staging import AUDIO_EXTENSIONS
+
+    shortcuts = _import_browse_shortcuts()
+    raw = str(request.args.get('path') or '').strip()
+    if raw:
+        path, err = _resolve_import_scan_path(raw)
+        if err:
+            return jsonify({"success": False, "path": raw, "shortcuts": shortcuts,
+                            "error": err}), (404 if 'exist' in err else 403)
+    else:
+        path = shortcuts[0]["path"] if shortcuts else ""
+    if not path:
+        return jsonify({"success": True, "path": "", "parent": None, "dirs": [],
+                        "files": [], "shortcuts": [],
+                        "error": "No download or import folder is configured yet."})
+
+    dirs, files = [], []
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                if e.name.startswith('.'):      # .DS_Store, thumbnail caches, …
+                    continue
+                try:
+                    if e.is_dir():
+                        dirs.append({"name": e.name, "path": e.path})
+                    elif os.path.splitext(e.name)[1].lower() in AUDIO_EXTENSIONS:
+                        files.append({"name": e.name, "path": e.path,
+                                      "size": e.stat().st_size})
+                except OSError:
+                    continue                    # one unreadable entry is skipped, not fatal
+    except PermissionError:
+        return jsonify({"success": False, "path": path, "shortcuts": shortcuts,
+                        "error": "No permission to read that folder."}), 403
+    except OSError:
+        logger.exception("[Import Browse] failed for %s", path)
+        return jsonify({"success": False, "path": path, "shortcuts": shortcuts,
+                        "error": "Couldn't read that folder."}), 500
+
+    dirs.sort(key=lambda d: d["name"].lower())
+    files.sort(key=lambda f: f["name"].lower())
+    truncated = len(dirs) + len(files) > _IMPORT_BROWSE_LIMIT
+    # Only offer "up" while it stays inside an allowed root, so the browser
+    # can't walk the user to a folder the scan endpoints will then refuse.
+    raw_parent = os.path.dirname(path.rstrip(os.sep)) or None
+    parent = raw_parent if (raw_parent and raw_parent != path
+                            and any(_is_within(sc["path"], raw_parent)
+                                    for sc in shortcuts)) else None
+    return jsonify({"success": True, "path": path, "parent": parent,
+                    "dirs": dirs[:_IMPORT_BROWSE_LIMIT],
+                    "files": files[:max(0, _IMPORT_BROWSE_LIMIT - len(dirs))],
+                    "shortcuts": shortcuts, "truncated": truncated,
+                    "audio_count": len(files)})
+
+
+def _scan_runtime_or_error():
+    """Build the import runtime for the folder this request names.
+
+    ``?path=`` picks the folder to scan; omitted, it's the configured Import
+    folder and the behaviour is exactly as before. Returns
+    ``(runtime, error_response)`` — exactly one is non-None.
+    """
+    scan_path, err = _resolve_import_scan_path(request.args.get('path'))
+    if err:
+        return None, (jsonify({"success": False, "error": err}),
+                      404 if 'exist' in err else 403)
+    return _build_import_route_runtime(scan_path), None
+
+
 @app.route('/api/import/staging/files', methods=['GET'])
 @admin_only
 def import_staging_files():
-    payload, status = _import_staging_files(_build_import_route_runtime())
+    runtime, err = _scan_runtime_or_error()
+    if err:
+        return err
+    payload, status = _import_staging_files(runtime)
     return jsonify(payload), status
 
 
 @app.route('/api/import/staging/groups', methods=['GET'])
 @admin_only
 def import_staging_groups():
-    payload, status = _import_staging_groups(_build_import_route_runtime())
+    runtime, err = _scan_runtime_or_error()
+    if err:
+        return err
+    payload, status = _import_staging_groups(runtime)
     return jsonify(payload), status
 
 
 @app.route('/api/import/staging/scan-status', methods=['GET'])
 @admin_only
 def import_staging_scan_status():
-    payload, status = _import_staging_scan_status(_build_import_route_runtime())
+    runtime, err = _scan_runtime_or_error()
+    if err:
+        return err
+    payload, status = _import_staging_scan_status(runtime)
     return jsonify(payload), status
 
 
 @app.route('/api/import/staging/hints', methods=['GET'])
 @admin_only
 def import_staging_hints():
-    payload, status = _import_staging_hints(_build_import_route_runtime())
+    runtime, err = _scan_runtime_or_error()
+    if err:
+        return err
+    payload, status = _import_staging_hints(runtime)
     return jsonify(payload), status
 
 

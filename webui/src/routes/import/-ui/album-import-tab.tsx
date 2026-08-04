@@ -23,7 +23,7 @@ import {
   getUnmatchedStagingFiles,
   IMPORT_PLACEHOLDER_IMAGE,
 } from '../-import.helpers';
-import { useAlbumImportWorkflow } from '../-import.store';
+import { useAlbumImportWorkflow, useImportWorkflowStore } from '../-import.store';
 import styles from './import-page.module.css';
 import {
   fallbackImage,
@@ -36,8 +36,11 @@ function useAlbumImportViewModel() {
   const { refreshStaging, stagingFiles } = useImportStaging();
   const [dragOverTrack, setDragOverTrack] = useState<number | null>(null);
   const [tapSelectedChip, setTapSelectedChip] = useState<number | null>(null);
+  // Same folder the file scan is reading — otherwise the auto-detected album
+  // groups would describe a different folder than the file list beside them.
+  const scanPath = useImportWorkflowStore((state) => state.scanPath);
   const groupsQuery = useQuery({
-    ...importStagingGroupsQueryOptions(),
+    ...importStagingGroupsQueryOptions(scanPath),
   });
   const suggestionsQuery = useQuery({
     ...importStagingSuggestionsQueryOptions(),

@@ -40,6 +40,33 @@ export interface ImportStagingFilesPayload {
   progress?: ImportScanProgress;
 }
 
+/** One entry from the server-side folder browser. `size` is only present on files. */
+export interface ImportBrowseEntry {
+  name: string;
+  path: string;
+  size?: number;
+}
+
+/** A shortcut to a configured root (downloads, import folder, libraries). These
+ * double as the server's allowlist — a folder outside all of them can't be scanned. */
+export interface ImportBrowseShortcut {
+  label: string;
+  path: string;
+}
+
+export interface ImportBrowsePayload {
+  success: boolean;
+  path: string;
+  /** null when the parent would leave every allowed root, so "up" stops there. */
+  parent?: string | null;
+  dirs?: ImportBrowseEntry[];
+  files?: ImportBrowseEntry[];
+  shortcuts?: ImportBrowseShortcut[];
+  truncated?: boolean;
+  audio_count?: number;
+  error?: string;
+}
+
 export interface ImportStagingGroup {
   album: string;
   artist: string;

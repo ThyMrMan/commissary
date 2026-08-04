@@ -1,5 +1,6 @@
 import { Link, Outlet } from '@tanstack/react-router';
 import clsx from 'clsx';
+import { useState } from 'react';
 
 import { Button } from '@/components/form/form';
 import { PageHeader } from '@/components/page-header';
@@ -13,7 +14,8 @@ import {
   getQueueStatusText,
   getStagingStatsText,
 } from '../-import.helpers';
-import { useImportQueueWorkflow } from '../-import.store';
+import { useImportQueueWorkflow, useImportScanFolder } from '../-import.store';
+import { ImportFolderPicker } from './folder-picker';
 import styles from './import-page.module.css';
 import { fallbackImage, RefreshIcon, useImportStaging } from './import-shared';
 
@@ -22,6 +24,8 @@ export function ImportPage() {
 
   const { refreshStaging, scanning, scanProgress, stagingFiles, stagingPath, stagingQuery } =
     useImportStaging();
+  const { scanPath } = useImportScanFolder();
+  const [pickerOpen, setPickerOpen] = useState(false);
   const isRefreshing = stagingQuery.isRefetching;
   const lastRefreshedAt =
     stagingQuery.dataUpdatedAt > 0 ? formatShortTime(stagingQuery.dataUpdatedAt) : null;
@@ -40,10 +44,15 @@ export function ImportPage() {
           fileCountText={fileCountText}
           loading={stagingQuery.isLoading}
           stagingPath={stagingPath}
+          isCustomFolder={scanPath !== ''}
           refreshing={isRefreshing}
           lastRefreshedAt={lastRefreshedAt}
           onRefresh={refreshStaging}
+          onChangeFolder={() => setPickerOpen(true)}
         />
+        <Show when={pickerOpen}>
+          <ImportFolderPicker onClose={() => setPickerOpen(false)} />
+        </Show>
         <ImportProcessingQueue />
         <ImportTabNav />
         <section className={clsx(styles.importPageTabContent, styles.active)}>
@@ -67,17 +76,21 @@ function ImportHeader({
   fileCountText,
   loading,
   stagingPath,
+  isCustomFolder,
   refreshing,
   lastRefreshedAt,
   onRefresh,
+  onChangeFolder,
 }: {
   error: unknown;
   fileCountText: string;
   loading: boolean;
   stagingPath: string;
+  isCustomFolder: boolean;
   refreshing: boolean;
   lastRefreshedAt: string | null;
   onRefresh: () => void;
+  onChangeFolder: () => void;
 }) {
   return (
     <>
@@ -85,21 +98,35 @@ function ImportHeader({
         icon={<img src="/static/import.png" alt="" />}
         title="Import Music"
         actions={
-          <Button
-            variant="secondary"
-            title="Re-scan import folder"
-            aria-busy={refreshing}
-            disabled={refreshing}
-            onClick={onRefresh}
-          >
-            <RefreshIcon />
-            {refreshing ? 'Refreshing...' : 'Refresh'}
-          </Button>
+          <>
+            <Button
+              variant="secondary"
+              title="Import from a different folder"
+              onClick={onChangeFolder}
+            >
+              Change folder
+            </Button>
+            <Button
+              variant="secondary"
+              title="Re-scan this folder"
+              aria-busy={refreshing}
+              disabled={refreshing}
+              onClick={onRefresh}
+            >
+              <RefreshIcon />
+              {refreshing ? 'Refreshing...' : 'Refresh'}
+            </Button>
+          </>
         }
       />
       <div className={styles.importPageStagingBar} id="import-staging-bar">
+        {/* Say plainly when this ISN'T the configured Import folder — otherwise a
+            scan of somewhere else is indistinguishable from the normal one, and
+            an empty result reads as "my import folder broke". */}
         <span className={styles.importStagingPath} id="import-page-staging-path">
-          {error ? 'Import folder: error' : `Import: ${stagingPath}`}
+          {error
+            ? 'Import folder: error'
+            : `${isCustomFolder ? 'Scanning' : 'Import'}: ${stagingPath}`}
         </span>
         <Show when={lastRefreshedAt != null}>
           <span className={styles.importStagingRefreshAt}>
