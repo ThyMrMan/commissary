@@ -29,6 +29,7 @@ test surface is just dicts in / dicts out.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # Use the project's namespaced logger so diagnostic lines actually
@@ -230,6 +231,65 @@ def _extract_track_artist(track: Dict[str, Any]) -> str:
     return a.get('name', str(a)) if isinstance(a, dict) else str(a)
 
 
+# Separators a ripper puts between the album name and what follows it.
+_PREFIX_SEPARATORS = " -_.–—|/\\"
+
+
+def strip_album_prefix(stem: str, album: str) -> str:
+    """``'Blue Blood 01 Blue Blood'`` + album ``'Blue Blood'`` → ``'Blue Blood'``.
+
+    Untagged rips are often named ``<Album> <NN> <Title>``. The title fallback
+    only strips a track number at the START of the stem, so with the album
+    name sitting in front of it nothing was stripped and the whole string was
+    scored against the track title — ``"Blue Blood 01 Blue Blood"`` vs
+    ``"Blue Blood"`` scored 0.34 against a 0.40 threshold, so a correctly
+    named album matched nothing at all.
+
+    Returns the stem unchanged unless removing the prefix leaves something
+    real: a track genuinely titled after its album ("Blue Blood" on *Blue
+    Blood*) must not be reduced to nothing.
+    """
+    # Imported here, not at module scope, matching the existing convention in
+    # this file — core.imports.paths pulls in the wider import machinery.
+    from core.imports.paths import strip_leading_track_number
+    s = (stem or "").strip()
+    a = (album or "").strip()
+    if not s or not a or not s.casefold().startswith(a.casefold()):
+        return s
+    rest_raw = s[len(a):]
+    # The album name has to end on a token boundary. Without this, album
+    # "Blue Blood" would strip "Blue Bloodhound Blues" down to "hound Blues"
+    # — a prefix match on a longer word, not the album name at all.
+    if rest_raw and rest_raw[0] not in _PREFIX_SEPARATORS:
+        return s
+    rest = strip_leading_track_number(rest_raw.lstrip(_PREFIX_SEPARATORS))
+    if rest and not rest.isdigit() and re.search(r"[^\W_]", rest):
+        return rest
+    return s
+
+
+def _title_candidates(file_path: str, file_tags: Dict[str, Any], target_album: str) -> List[str]:
+    """The title spellings worth scoring for this file, best-known first.
+
+    A real title tag is authoritative and used alone — rewriting it risks
+    mangling a track legitimately named after its album. The filename is a
+    guess, so when that is all there is, both readings of the guess are
+    offered and the caller keeps whichever agrees better.
+    """
+    from core.imports.paths import strip_leading_track_number
+    tag_title = (file_tags.get('title') or '').strip() if file_tags else ''
+    if tag_title:
+        return [strip_leading_track_number(tag_title)]
+
+    stem = os.path.splitext(os.path.basename(file_path))[0]
+    base = strip_leading_track_number(stem)
+    candidates = [base]
+    without_album = strip_album_prefix(base, target_album)
+    if without_album != base:
+        candidates.append(without_album)
+    return candidates
+
+
 def score_file_against_track(
     file_path: str,
     file_tags: Dict[str, Any],
@@ -261,14 +321,17 @@ def score_file_against_track(
 
     score = 0.0
 
-    # Title similarity (TITLE_WEIGHT). Falls back to filename stem when
+    # Title similarity (TITLE_WEIGHT). Falls back to the filename stem when
     # the file has no title tag — strip a leading track-number prefix off that
-    # stem (#890) so "01 - Sun It Rises" scores against "Sun It Rises".
-    title = file_tags.get('title') or os.path.splitext(os.path.basename(file_path))[0]
-    from core.imports.paths import strip_leading_track_number
-    title = strip_leading_track_number(title)
+    # stem (#890) so "01 - Sun It Rises" scores against "Sun It Rises", and
+    # also try it without a leading album name so the equally common
+    # "<Album> <NN> <Title>" rip naming scores against the title too.
+    # Best-of rather than a single reading: the filename is a guess, and the
+    # right interpretation of it depends on how the ripper was configured.
     track_name = track.get('name', '')
-    score += title_sim(title, track_name) * TITLE_WEIGHT
+    score += max(title_sim(candidate, track_name)
+                 for candidate in _title_candidates(file_path, file_tags, target_album)
+                 ) * TITLE_WEIGHT
 
     # Artist similarity (ARTIST_WEIGHT). Partial credit when either side
     # lacks an artist tag so title-only pairs can still clear threshold.
@@ -845,6 +908,7 @@ __all__ = [
     'CROSS_DISC_POSITION_WEIGHT',
     'ALBUM_WEIGHT',
     'MATCH_THRESHOLD',
+    'strip_album_prefix',
     'EXACT_MATCH_CONFIDENCE',
     'DURATION_TOLERANCE_MS',
     'ALBUM_SEARCH_NAME_WEIGHT',

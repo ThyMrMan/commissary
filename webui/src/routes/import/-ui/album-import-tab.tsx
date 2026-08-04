@@ -531,7 +531,7 @@ function AlbumMatchPanel({ viewModel }: { viewModel: AlbumImportViewModel }) {
       <div className={styles.importPageMatchList} id="import-page-match-list">
         {(albumMatch.matches ?? []).map((match, index) => {
           const trackInfo = getTrackDisplayInfo(match, index);
-          const { confidence, file } = getDisplayedMatchFile(
+          const { confidence, file, isOverride } = getDisplayedMatchFile(
             match,
             index,
             stagingFiles,
@@ -571,12 +571,22 @@ function AlbumMatchPanel({ viewModel }: { viewModel: AlbumImportViewModel }) {
                 {file ? (
                   <>
                     <span className={styles.importPageMatchFileName}>{file.filename}</span>
+                    {/* A file you assigned yourself carries a hardcoded
+                        confidence of 1, so showing it as 100% claimed the
+                        matcher was certain about a pairing it never made —
+                        exactly backwards when you are looking at this row
+                        BECAUSE the matcher failed to find it. */}
                     <span
                       className={clsx(styles.importPageMatchConfidence, {
-                        [styles.low]: confidence < 0.7,
+                        [styles.low]: !isOverride && confidence < 0.7,
                       })}
+                      title={
+                        isOverride
+                          ? 'You assigned this file to this track'
+                          : 'How closely the matcher thinks this file fits the track'
+                      }
                     >
-                      {confidencePercent}%
+                      {isOverride ? 'manual' : `${confidencePercent}%`}
                     </span>
                   </>
                 ) : (

@@ -3484,8 +3484,12 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.9.6': [
-        { date: 'August 2026 · 1.9.6' },
+    '1.9.7': [
+        { date: 'August 2026 · 1.9.7' },
+        { title: 'Fixed: albums named "Album 01 Title" matched nothing', desc: 'a whole album could arrive correctly named and auto-match not one track, leaving you to drag all eleven into place by hand. When a file has no title tag the matcher reads the filename, and it only knew how to strip a track number from the <em>front</em> — so with the album name sitting in front of the number, it scored the entire string "Blue Blood 01 Blue Blood" against the track "Blue Blood". That came to 0.34 against a 0.40 threshold: near enough that the naming looked supported and silently wasn\'t. It now also reads the name without the album prefix and keeps whichever fits better.' },
+        { title: 'A file you assign by hand no longer claims to be a 100% match', desc: 'manual assignments were stamped with full confidence and displayed as <strong>100%</strong> — so the row you were looking at precisely <em>because</em> matching failed was the one boasting the matcher was certain. It now reads <strong>manual</strong>.' },
+        { title: 'It has not been made less strict', desc: 'the album prefix is only removed when the file has no title tag (a real tag stays authoritative), only when the album name ends on a word boundary, and never when removing it would leave nothing — a track genuinely named after its album keeps its title. The threshold is unchanged, so a wrong track still does not match.' },
+        { title: 'Also in 1.9.6', desc: 'download sources collapsed from four settings into one ordered list.' },
         { title: 'Your download sources are one ordered list now', desc: 'they were four settings that all described the same thing — a mode, a hybrid order, and a legacy primary/secondary pair left over from when there were only two. Whether a source was used, and in what order, depended on which of the four a given piece of code happened to read. They are now a single ordered list: the first entry is preferred, the rest are fallbacks, and "hybrid" simply means you listed more than one.' },
         { title: 'Why that was worth doing', desc: 'the settings could genuinely disagree. Album downloads defaulted the mode to <em>hybrid</em> while the album-bundle dispatcher defaulted the same setting to <em>soulseek</em>, so one install could take two different views of its own configuration depending on which path a download took. There is one derivation now, and every consumer asks it the same question.' },
         { title: 'Nothing to reconfigure', desc: 'your existing settings are read exactly as before — including installs old enough to still be on the primary/secondary pair — so an install that never opens Settings behaves identically. Saving Settings once writes the new collapsed form. The old keys are still written alongside it, so downgrading to 1.9.5 finds its configuration intact.' },
@@ -3689,6 +3693,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.7: albums named \"Album 01 Title\" match again",
+        description: "a correctly named album could auto-match zero tracks, leaving every one to be dragged into place by hand. And once you did, the row claimed the match was 100% certain.",
+        features: [
+            "when a file has no title tag the matcher reads the filename, but only knew how to strip a track number from the front — with the album name in front of the number, it scored the whole string \"Blue Blood 01 Blue Blood\" against the track \"Blue Blood\"",
+            "that scored 0.34 against a 0.40 threshold: close enough that the naming looked supported and silently was not. It now reads the name without the album prefix too and keeps whichever fits better",
+            "a file you assign yourself now shows \"manual\" instead of 100% — that number was a placeholder meaning \"you chose it\", displayed as though the matcher had been certain about a pairing it never made",
+            "not looser: the prefix is only dropped when there is no title tag, only when the album name ends on a word boundary, and never when it would leave the title empty",
+            "so a track genuinely named after its album keeps its title, and a wrong track still fails the threshold",
+        ],
+        usage_note: "If an album still matches nothing, check whether its files carry title tags — a tagged file is matched on the tag and ignores the filename entirely. The Auto-Import tab has its own separate confidence threshold (0.9 by default), which is stricter than the manual Import page's 0.4.",
+    },
     {
         title: "1.9.6: download sources become one ordered list",
         description: "four settings described the same thing — a mode, a hybrid order, and a legacy primary/secondary pair — and which one won depended on which piece of code was reading. They collapse into a single ordered list of sources.",

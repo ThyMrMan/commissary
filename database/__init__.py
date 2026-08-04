@@ -36,4 +36,4 @@ __all__ = [
     'close_database'
 ]
 
-__version__ = '1.9.6'
+__version__ = '1.9.7'
