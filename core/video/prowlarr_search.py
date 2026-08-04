@@ -254,21 +254,10 @@ def _search_limit() -> int:
     return max(20, min(1000, n))
 
 
-def _safe_info_url(value: Any) -> str | None:
-    """An indexer's details page, but ONLY if it's http(s).
-
-    This string comes from a third party and is rendered as a link the user
-    clicks. A ``javascript:`` or ``data:`` URL there would execute in the page,
-    so the scheme is checked here — at the boundary where the untrusted value
-    enters — rather than trusted to whatever renders it later."""
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    try:
-        from urllib.parse import urlparse
-        return raw if urlparse(raw).scheme in ("http", "https") else None
-    except ValueError:
-        return None
+# Promoted to core.prowlarr_client so the music side shares the exact same
+# scheme check rather than growing a second one. Re-exported under the old
+# private name because this module's callers already use it.
+from core.prowlarr_client import safe_info_url as _safe_info_url
 
 
 def _project(r: Any, url: str, want_proto: str) -> dict:

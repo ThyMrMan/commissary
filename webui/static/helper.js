@@ -3484,8 +3484,14 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.9.7': [
-        { date: 'August 2026 · 1.9.7' },
+    '1.9.8': [
+        { date: 'August 2026 · 1.9.8' },
+        { title: 'Clicking a search result now asks you which source', desc: 'the multi-source picker arrived in 1.9.0, but clicking a track still opened the old analyse-and-grab modal — so the picker was there and almost nobody met it. Searching every source and choosing is the point of the search page, and it is now what a click does. The automatic download is still one click away as <strong>Auto</strong>, deliberately quieter, for when you would rather not choose.' },
+        { title: 'Failed tracks in a batch download can be picked by hand', desc: 'Begin Analysis runs unattended across a whole playlist — it cannot stop and ask you about track 34 of 60 — so anything it could not place just sat there marked failed. Those rows now carry a <strong>🔍 Sources</strong> button that opens the picker for that one track. The picker could always reach them (the status cell has been clickable all along), but nothing said so, which made the wishlist the only route anyone found.' },
+        { title: 'Torrent results say which tracker they came from', desc: 'Prowlarr hides many indexers behind one "torrent" source, which is no help when you are choosing between two releases. Every torrent and usenet result in the picker now names its tracker, and — when the indexer publishes one — links straight to that release\'s page so you can check the comments, freeleech status or file list before committing. The link opens in a new tab, so clicking it never navigates you away mid-download.' },
+        { title: 'Fixed: torrents ignored your Torrent Client category', desc: 'set the category to <em>Music</em> and every music torrent still arrived tagged <strong>soulsync</strong>. The clients were reading the setting correctly — but the function that hands a release over declared its category default as the literal "soulsync", and each client resolves <em>the value it was given, or the configured one</em>. A literal is always "given", so the configured value could never win. Music now sends nothing and lets your setting apply. Video was never affected: it passes its per-Library category explicitly, which is exactly why this went unnoticed.' },
+        { title: 'What has not changed', desc: 'Begin Analysis still downloads automatically from your source list, in order. That is the right behaviour for a batch, and the per-track picker is the escape hatch for the handful it gets wrong — not a prompt for all sixty.' },
+        { title: 'Also in 1.9.7', desc: 'albums named "Album 01 Title" match again, and hand-assigned files no longer claim to be 100% matches.' },
         { title: 'Fixed: albums named "Album 01 Title" matched nothing', desc: 'a whole album could arrive correctly named and auto-match not one track, leaving you to drag all eleven into place by hand. When a file has no title tag the matcher reads the filename, and it only knew how to strip a track number from the <em>front</em> — so with the album name sitting in front of the number, it scored the entire string "Blue Blood 01 Blue Blood" against the track "Blue Blood". That came to 0.34 against a 0.40 threshold: near enough that the naming looked supported and silently wasn\'t. It now also reads the name without the album prefix and keeps whichever fits better.' },
         { title: 'A file you assign by hand no longer claims to be a 100% match', desc: 'manual assignments were stamped with full confidence and displayed as <strong>100%</strong> — so the row you were looking at precisely <em>because</em> matching failed was the one boasting the matcher was certain. It now reads <strong>manual</strong>.' },
         { title: 'It has not been made less strict', desc: 'the album prefix is only removed when the file has no title tag (a real tag stays authoritative), only when the album name ends on a word boundary, and never when removing it would leave nothing — a track genuinely named after its album keeps its title. The threshold is unchanged, so a wrong track still does not match.' },
@@ -3693,6 +3699,20 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.8: the source picker is finally the default",
+        description: "the multi-source picker shipped in 1.9.0, but clicking a search result still ran the old automatic download — so the feature existed and almost nobody met it. Clicking now opens the picker, and batch downloads gain a per-track escape hatch.",
+        features: [
+            "clicking a track in search opens the picker: every configured source searched, results grouped by source, full releases listed separately, and only what you choose gets downloaded",
+            "the automatic download survives as \"Auto\", styled quieter — it is still the fastest path when you don't care which copy you get",
+            "a failed track inside a Begin Analysis batch now has its own Sources button, so the handful the cascade gets wrong can be picked by hand without going via the wishlist",
+            "that recovery path already existed — the failed status cell has been clickable all along — but nothing indicated it, so effectively it did not",
+            "Begin Analysis itself still downloads automatically in source order: it runs across a whole playlist and cannot stop to ask about track 34 of 60",
+            "torrent and usenet results now name the tracker that served them, linked to that release's page where the indexer publishes one — Prowlarr puts every indexer behind one \"torrent\" source, which tells you nothing when comparing two releases",
+            "fixed: music torrents ignored the category in Torrent Client Settings and always arrived tagged \"soulsync\" — the handover function declared that literal as its default, and a literal always beats the \"or use the configured one\" fallback beneath it",
+        ],
+        usage_note: "If you preferred the old behaviour, \"Auto\" on any result is exactly what clicking used to do. If your torrents have been landing in a soulsync category, existing ones keep that tag — only new downloads pick up your configured category.",
+    },
     {
         title: "1.9.7: albums named \"Album 01 Title\" match again",
         description: "a correctly named album could auto-match zero tracks, leaving every one to be dragged into place by hand. And once you did, the row claimed the match was 100% certain.",

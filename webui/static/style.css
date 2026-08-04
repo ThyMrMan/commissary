@@ -22192,6 +22192,30 @@ body:has(.download-missing-modal[style*="display: flex"]) #helper-float-btn {
     font-size: 0.82rem; cursor: pointer; transition: background 0.15s;
 }
 .search-sources-button:hover { background: rgba(var(--accent-rgb, 88 101 242), 0.26); }
+/* The tracker a Prowlarr result came from, linked to its details page.
+   Underlined on hover rather than always, so a table of these doesn't read as
+   a wall of links — the ↗ already marks it as leaving the app. */
+.candidates-tracker-link {
+    color: rgba(var(--accent-rgb, 88 101 242), 0.95);
+    text-decoration: none;
+    white-space: nowrap;
+}
+.candidates-tracker-link:hover {
+    text-decoration: underline;
+    color: #ffffff;
+}
+/* Picking a source is now the primary action on a result, so the cascade
+   ("Auto") sits beside it as the quieter option rather than the loud one. */
+.download-button--auto {
+    background: transparent !important;
+    border: 1px solid rgba(255, 255, 255, 0.16) !important;
+    color: rgba(255, 255, 255, 0.6) !important;
+    box-shadow: none !important;
+}
+.download-button--auto:hover {
+    background: rgba(255, 255, 255, 0.08) !important;
+    color: rgba(255, 255, 255, 0.9) !important;
+}
 .search-sources-button[disabled] { opacity: 0.5; cursor: default; }
 
 /* Album header delete button */
@@ -40458,6 +40482,44 @@ div.artist-hero-badge {
 .enh-item-sources-btn:disabled {
     opacity: 0.5;
     cursor: default;
+}
+/* The unattended cascade, demoted. Clicking the card opens the picker now, so
+   this is the deliberate "don't ask me, just grab it" escape hatch — quieter
+   than the sources button it sits beside. */
+.enh-item-auto-btn {
+    flex: 0 0 auto;
+    margin-left: 8px;
+    padding: 5px 10px;
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 14px;
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 11px;
+    line-height: 1;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+.enh-item-auto-btn:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: rgba(255, 255, 255, 0.85);
+}
+/* Per-track picker on a batch row that failed. Deliberately looks like an
+   action rather than a status: this is the recovery affordance for the one
+   place the cascade cannot ask you anything. */
+.track-sources-btn {
+    padding: 3px 8px;
+    background: rgba(var(--accent-rgb, 88 101 242), 0.16);
+    border: 1px solid rgba(var(--accent-rgb, 88 101 242), 0.45);
+    border-radius: 4px;
+    color: rgba(255, 255, 255, 0.88);
+    font-size: 11px;
+    line-height: 1.4;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+.track-sources-btn:hover {
+    background: rgba(var(--accent-rgb, 88 101 242), 0.32);
 }
 /* The play button is absolutely positioned at right: 0 of the duration
    block; reserve room so the sources button doesn't sit under it. */

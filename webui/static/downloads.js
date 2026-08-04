@@ -3444,7 +3444,9 @@ async function openAlbumSourcePicker(album, artist, onPicked) {
             if (c.track_count) bits.push(`${c.track_count} track${c.track_count !== 1 ? 's' : ''}`);
             if (c.total_size) bits.push(_candidatesFmtSize(c.total_size));
             if (c.seeders !== null && c.seeders !== undefined) bits.push(`${c.seeders} seeders`);
-            if (c.indexer) bits.push(escapeHtml(c.indexer));
+            // Linked when the indexer gave us a details page — the tracker is
+            // the thing you actually compare releases on.
+            if (c.indexer) bits.push(_candidateTrackerHtml(c, null));
             row.innerHTML = `
                 <div class="album-source-row-main">
                     <div class="album-source-row-title">${escapeHtml(c.title || '(untitled)')}</div>
@@ -3573,6 +3575,27 @@ function _ssShortFileLabel(filename) {
     return filename.split(/[/\\]/).pop();
 }
 
+/**
+ * Which tracker served a result, linked to its details page when there is one.
+ *
+ * Prowlarr aggregates many indexers behind one "torrent" source, so "torrent"
+ * alone doesn't answer the question you actually have when choosing between
+ * two releases — which tracker is this, and can I go look at it.
+ *
+ * `info_url` is scheme-checked server-side (core.prowlarr_client.safe_info_url)
+ * before it ever reaches the browser; it is escaped again here for the
+ * attribute, and opened detached so clicking never navigates the app away
+ * mid-download.
+ */
+function _candidateTrackerHtml(c, fallback) {
+    if (!c || !c.indexer) return escapeHtml(fallback || '-');
+    const name = escapeHtml(c.indexer);
+    if (!c.info_url) return name;
+    return `<a class="candidates-tracker-link" href="${escapeHtml(c.info_url)}"` +
+           ` target="_blank" rel="noopener noreferrer"` +
+           ` title="Open this release on ${name}">${name} ↗</a>`;
+}
+
 function _renderCandidateRow(c, index, rowClass, showSourceBadge) {
     const shortFile = _ssShortFileLabel(c.filename);
     const qBadge = c.quality
@@ -3587,7 +3610,7 @@ function _renderCandidateRow(c, index, rowClass, showSourceBadge) {
         <td class="candidates-col-quality">${qBadge}${c.bitrate ? ` ${c.bitrate}kbps` : ''}</td>
         <td class="candidates-col-size">${_candidatesFmtSize(c.size)}</td>
         <td class="candidates-col-duration">${_candidatesFmtDur(c.duration)}</td>
-        <td class="candidates-col-user" title="Queue: ${c.queue_length || 0} | Slots: ${c.free_upload_slots || 0}">${escapeHtml(c.username || '-')}</td>
+        <td class="candidates-col-user" title="Queue: ${c.queue_length || 0} | Slots: ${c.free_upload_slots || 0}">${_candidateTrackerHtml(c, c.username)}</td>
         <td class="candidates-col-action"><button class="candidates-download-btn" data-index="${index}" title="Download this file">⬇</button></td>
     </tr>`;
 }
@@ -4384,8 +4407,23 @@ function processModalStatusUpdate(playlistId, data) {
                 if (approveBtn) {
                     approveBtn.addEventListener('click', () => approveQuarantineFromDownloadRow(approveBtn));
                 }
-            } else if (actionsEl && ['completed', 'failed', 'cancelled', 'not_found', 'post_processing'].includes(task.status)) {
-                actionsEl.innerHTML = '-'; // No actions available for terminal or processing states
+            } else if (actionsEl && ['failed', 'cancelled', 'not_found'].includes(task.status)) {
+                // Batch downloads run the unattended cascade, so a track that
+                // ended up here is exactly where a human wants to choose the
+                // copy themselves. The picker already reached these rows —
+                // the status cell has been clickable all along — but nothing
+                // said so, so the only discoverable route was the wishlist.
+                actionsEl.innerHTML =
+                    `<button class="track-sources-btn" title="Search every configured source and pick which copy to download">🔍 Sources</button>`;
+                const srcBtn = actionsEl.querySelector('.track-sources-btn');
+                if (srcBtn) {
+                    srcBtn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        showCandidatesModal(task.task_id);
+                    });
+                }
+            } else if (actionsEl && ['completed', 'post_processing'].includes(task.status)) {
+                actionsEl.innerHTML = '-'; // Nothing to act on: done, or still working
             }
         });
 

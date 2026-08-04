@@ -164,7 +164,7 @@ class DelugeAdapter:
     async def add_torrent(
         self,
         url_or_magnet: str,
-        category: str = "soulsync",
+        category: Optional[str] = None,
         save_path: Optional[str] = None,
     ) -> Optional[str]:
         loop = asyncio.get_event_loop()
@@ -198,7 +198,7 @@ class DelugeAdapter:
     async def add_torrent_file(
         self,
         file_bytes: bytes,
-        category: str = "soulsync",
+        category: Optional[str] = None,
         save_path: Optional[str] = None,
     ) -> Optional[str]:
         loop = asyncio.get_event_loop()

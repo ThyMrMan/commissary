@@ -104,15 +104,36 @@ def test_release_level_is_carried_by_the_source_list_not_hardcoded_names():
 
 
 # ── the search page's primary action ─────────────────────────────────────────
-def test_track_rows_in_the_search_dropdown_offer_the_picker():
-    """Clicking a track row starts an automatic download. The deliberate
-    choice needs its own control on the same row."""
-    # Anchor on the mapItem body, not the section id — 'enh-tracks-section'
-    # also appears earlier in a list of element ids and splitting there reads
-    # the wrong block.
-    tracks_section = _SEARCH.split("onClick: () => handleEnhancedSearchTrackClick(track)", 1)[1][:600]
-    assert "onSources:" in tracks_section
-    assert "openManualSearchFor(" in tracks_section
+def test_clicking_a_track_row_opens_the_picker():
+    """The picker IS the default action now.
+
+    This test used to assert the opposite — that clicking a row started an
+    automatic download and the picker needed its own control. That was the
+    shipped behaviour, and it was wrong: the decision was that the picker
+    replaces one-click download, and leaving the cascade on the click meant
+    the picker existed but nobody ever met it. Searching every source and
+    choosing is the point of the search page.
+    """
+    tracks_section = _SEARCH.split("onClick: () => openManualSearchFor(", 1)[1][:600]
+    # ...and the cascade is still reachable, just not by default.
+    assert "onAuto:" in tracks_section
+    assert "handleEnhancedSearchTrackClick(track)" in tracks_section
+
+
+def test_the_cascade_survives_as_an_explicit_choice():
+    """Removing it outright would strip the only interactive way to exercise
+    the fallback chain, which is what wishlist automation runs."""
+    assert "config.onAuto" in _HELPERS
+    assert "enh-item-auto-btn" in _HELPERS
+
+
+def test_the_basic_result_row_leads_with_sources():
+    """The other search renderer has to agree with the dropdown, or the same
+    page teaches two different default actions."""
+    actions = _SEARCH.split('<div class="result-actions">', 1)[1][:1600]
+    assert actions.index("search-sources-button") < actions.index("download-button"), \
+        "Sources must come before the auto-download button"
+    assert "⬇ Auto" in actions and "⬇ Download" not in actions
 
 
 def test_the_compact_row_helper_exposes_the_action_as_opt_in():
@@ -122,14 +143,40 @@ def test_the_compact_row_helper_exposes_the_action_as_opt_in():
     assert "enh-item-sources-btn" in _HELPERS
 
 
-def test_the_sources_button_does_not_also_trigger_the_row_download():
-    """The card's own click handler starts an auto-download. Without
-    stopPropagation, one click would both open the picker AND download."""
-    block = _HELPERS.split("if (config.onSources) {", 1)[1][:400]
-    assert "e.stopPropagation()" in block
+def test_the_row_buttons_do_not_also_trigger_the_card_action():
+    """The card itself is clickable, so without stopPropagation a click on
+    either button would ALSO fire the card's own action — previously that
+    meant downloading while opening the picker; now it would mean opening
+    the picker while starting the cascade. Wrong in both directions."""
+    for marker in ("if (config.onSources) {", "if (config.onAuto) {"):
+        block = _HELPERS.split(marker, 1)[1][:400]
+        assert "e.stopPropagation()" in block, marker
+
+
+# ── recovery inside a batch download ─────────────────────────────────────────
+def test_a_failed_batch_row_offers_the_picker():
+    """Begin Analysis runs the unattended cascade over a whole playlist, so a
+    track that ends up failed is exactly where a human wants to choose the
+    copy. The picker could always reach these rows — the status cell has been
+    clickable all along — but nothing said so, leaving the wishlist as the only
+    discoverable route."""
+    # Anchor on the actionsEl branch specifically — the same three status
+    # names appear earlier inside the "not a terminal state" guard.
+    block = _DOWNLOADS.split(
+        "actionsEl && ['failed', 'cancelled', 'not_found']", 1)[1][:900]
+    assert "track-sources-btn" in block
+    assert "showCandidatesModal(task.task_id)" in block
+
+
+def test_a_completed_row_offers_nothing():
+    """The button is recovery, not decoration — a finished track has nothing
+    to re-pick, and offering it would invite re-downloading over a good file."""
+    tail = _DOWNLOADS.split("'completed', 'post_processing'", 1)[1][:300]
+    assert "actionsEl.innerHTML = '-'" in tail
 
 
 def test_the_new_ui_is_styled():
     for cls in ("candidates-source-group", "candidates-source-group-count-error",
-                "candidates-release-note", "enh-item-sources-btn"):
+                "candidates-release-note", "enh-item-sources-btn",
+                "enh-item-auto-btn", "track-sources-btn", "download-button--auto"):
         assert "." + cls in _CSS, cls

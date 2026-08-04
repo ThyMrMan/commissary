@@ -751,6 +751,14 @@ function renderCompactSection(sectionId, listId, countId, items, mapItem) {
                        title="Search every configured source and pick which copy to download">🔍</button>`
             : '';
 
+        // The unattended cascade — grab from the first source in the chain that
+        // has it, no prompting. Secondary now: clicking the card opens the
+        // picker, so this is for when you deliberately don't want to choose.
+        const autoHtml = config.onAuto
+            ? `<button class="enh-item-auto-btn"
+                       title="Download automatically from the first source that has it">Auto</button>`
+            : '';
+
         elem.innerHTML = `
             ${imageHtml}
             <div class="enh-item-info">
@@ -758,6 +766,7 @@ function renderCompactSection(sectionId, listId, countId, items, mapItem) {
                 <div class="enh-item-meta">${escapeHtml(config.meta)}</div>
             </div>
             ${durationHtml}
+            ${autoHtml}
             ${sourcesHtml}
             ${badgeHtml}
         `;
@@ -781,8 +790,18 @@ function renderCompactSection(sectionId, listId, countId, items, mapItem) {
             const srcBtn = elem.querySelector('.enh-item-sources-btn');
             if (srcBtn) {
                 srcBtn.addEventListener('click', (e) => {
-                    e.stopPropagation();   // the card's own onClick starts an auto-download
+                    e.stopPropagation();   // don't also fire the card's own action
                     config.onSources(srcBtn);
+                });
+            }
+        }
+
+        if (config.onAuto) {
+            const autoBtn = elem.querySelector('.enh-item-auto-btn');
+            if (autoBtn) {
+                autoBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    config.onAuto(autoBtn);
                 });
             }
         }

@@ -79,6 +79,7 @@ from core.prowlarr_client import (
     DEFAULT_MUSIC_CATEGORIES,
     ProwlarrClient,
     ProwlarrSearchResult,
+    safe_info_url,
 )
 from core.torrent_clients import get_active_adapter as get_active_torrent_adapter
 from utils.async_helpers import run_async
@@ -225,6 +226,10 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
                     'leechers': result.leechers,
                     'grabs': result.grabs,
                     'protocol': 'torrent',
+                    # The indexer's own details page. Scheme-checked at this
+                    # boundary because it comes from a third party and is
+                    # rendered as a link the user clicks.
+                    'info_url': safe_info_url(result.info_url),
                 },
             )
             tracks.append(tr)

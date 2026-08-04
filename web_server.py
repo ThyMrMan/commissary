@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.9.7"
+_SOULSYNC_BASE_VERSION = "1.9.8"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -8358,6 +8358,26 @@ def _infer_candidate_source(username: str) -> str:
     return username if username in _STREAMING_SOURCE_NAMES else 'soulseek'
 
 
+def _candidate_indexer_fields(c) -> dict:
+    """``{indexer, info_url}`` for a Prowlarr-backed candidate, else ``{}``.
+
+    Kept separate so the shape is identical to the album picker's, and so a
+    source with no ``_source_metadata`` contributes no keys at all rather than
+    nulls the UI then has to test for.
+    """
+    meta = getattr(c, '_source_metadata', None)
+    if not isinstance(meta, dict):
+        return {}
+    out = {}
+    if meta.get('indexer'):
+        out['indexer'] = meta['indexer']
+    # Already scheme-checked where it entered (safe_info_url); this only
+    # forwards it.
+    if meta.get('info_url'):
+        out['info_url'] = meta['info_url']
+    return out
+
+
 def _serialize_candidate(c, source_override: str = None) -> dict:
     """Convert a TrackResult (or dict) into the JSON shape the candidates
     modal expects. ``source_override`` lets manual-search callers stamp
@@ -8379,6 +8399,10 @@ def _serialize_candidate(c, source_override: str = None) -> dict:
             'title': getattr(c, 'title', None),
             'album': getattr(c, 'album', None),
             'source': source_override or _infer_candidate_source(username),
+            # Prowlarr-backed results carry which tracker served them plus that
+            # tracker's details page. Absent for every other source, which the
+            # picker renders as "no tracker line" rather than an empty link.
+            **_candidate_indexer_fields(c),
         }
     if isinstance(c, dict):
         out = dict(c)
@@ -9078,6 +9102,10 @@ def _serialize_album_candidate(album, source: str):
             seeders = meta.get('seeders')
             entry['indexer'] = meta.get('indexer')
             entry['grabs'] = meta.get('grabs')
+            # Which tracker this came from, and its details page. Already
+            # scheme-checked in the plugin (core.prowlarr_client.safe_info_url);
+            # never build a link from anything else on this dict.
+            entry['info_url'] = meta.get('info_url')
         entry['seeders'] = seeders
         entry['pinnable'] = bool(entry['token'])
     elif source == 'soulseek':

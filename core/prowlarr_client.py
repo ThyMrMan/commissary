@@ -79,6 +79,28 @@ class ProwlarrUnavailable(Exception):
     """
 
 
+def safe_info_url(value: Any) -> Optional[str]:
+    """An indexer's details page, but ONLY if it's http(s).
+
+    This string comes from a third party and is rendered as a link the user
+    clicks. A ``javascript:`` or ``data:`` URL there would execute in the page,
+    so the scheme is checked here — at the boundary where the untrusted value
+    enters — rather than trusted to whatever renders it later.
+
+    Lives on the Prowlarr client because both the music and video sides show
+    these links, and a second copy is how one of them ends up missing a scheme
+    the other learned to reject.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        from urllib.parse import urlparse
+        return raw if urlparse(raw).scheme in ("http", "https") else None
+    except ValueError:
+        return None
+
+
 @dataclass
 class ProwlarrSearchResult:
     """One release returned by a Prowlarr search.

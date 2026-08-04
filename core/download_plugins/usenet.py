@@ -50,6 +50,7 @@ from core.prowlarr_client import (
     DEFAULT_MUSIC_CATEGORIES,
     ProwlarrClient,
     ProwlarrSearchResult,
+    safe_info_url,
 )
 from core.usenet_clients import get_active_adapter as get_active_usenet_adapter
 from utils.async_helpers import run_async
@@ -155,6 +156,9 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
                     'indexer_id': result.indexer_id,
                     'grabs': result.grabs,
                     'protocol': 'usenet',
+                    # Same as the torrent plugin: the indexer's details page,
+                    # scheme-checked because it is rendered as a clickable link.
+                    'info_url': safe_info_url(result.info_url),
                 },
             )
             tracks.append(tr)

@@ -550,13 +550,21 @@ function initializeSearchModeToggle() {
                     name: track.name,
                     meta: `${track.artist} • ${track.album}`,
                     duration: duration,
-                    onClick: () => handleEnhancedSearchTrackClick(track),
-                    onPlay: () => streamEnhancedSearchTrack(track),
-                    onSources: (btn) => openManualSearchFor({
+                    // Clicking the track opens the SOURCE PICKER. Searching
+                    // every source and choosing is the point of the search
+                    // page; the cascade grabbing whatever the top source had
+                    // was the old Soulseek-shaped default, and leaving it on
+                    // the click meant the picker existed but nobody met it.
+                    onClick: () => openManualSearchFor({
                         name: track.name,
                         artist: track.artist,
                         album: track.album,
-                    }, btn),
+                    }, null),
+                    onPlay: () => streamEnhancedSearchTrack(track),
+                    // The cascade is still one click away for when you don't
+                    // want to choose — it is just no longer what happens by
+                    // default.
+                    onAuto: () => handleEnhancedSearchTrackClick(track),
                 };
             }
         );
@@ -1198,9 +1206,6 @@ function displaySearchResults(results) {
                         <button class="stream-button" onclick="event.stopPropagation(); streamTrack(${index})">
                             ▷ Stream
                         </button>
-                        <button class="download-button" onclick="event.stopPropagation(); startDownload(${index})">
-                            ⬇ Download
-                        </button>
                         <button class="search-sources-button"
                                 onclick="event.stopPropagation(); openManualSearchFor({name: this.dataset.msName, artist: this.dataset.msArtist, album: this.dataset.msAlbum}, this)"
                                 data-ms-name="${escapeHtml(result.title || '')}"
@@ -1208,6 +1213,10 @@ function displaySearchResults(results) {
                                 data-ms-album="${escapeHtml(result.album || '')}"
                                 title="Search every configured source for this and pick which copy to download">
                             🔍 Sources
+                        </button>
+                        <button class="download-button download-button--auto" onclick="event.stopPropagation(); startDownload(${index})"
+                                title="Download automatically from the first source that has it, without choosing">
+                            ⬇ Auto
                         </button>
                     </div>
                 </div>

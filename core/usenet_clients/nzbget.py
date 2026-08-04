@@ -108,7 +108,7 @@ class NZBGetAdapter:
     async def add_nzb(
         self,
         url_or_bytes: Union[str, bytes],
-        category: str = "soulsync",
+        category: Optional[str] = None,
         save_path: Optional[str] = None,
     ) -> Optional[str]:
         loop = asyncio.get_event_loop()

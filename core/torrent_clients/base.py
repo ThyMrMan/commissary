@@ -98,7 +98,7 @@ class TorrentClientAdapter(Protocol):
     async def add_torrent(
         self,
         url_or_magnet: str,
-        category: str = "soulsync",
+        category: Optional[str] = None,
         save_path: Optional[str] = None,
     ) -> Optional[str]:
         """Hand the torrent client a HTTP/HTTPS URL pointing to a
@@ -110,7 +110,7 @@ class TorrentClientAdapter(Protocol):
     async def add_torrent_file(
         self,
         file_bytes: bytes,
-        category: str = "soulsync",
+        category: Optional[str] = None,
         save_path: Optional[str] = None,
     ) -> Optional[str]:
         """Upload a raw ``.torrent`` payload. Same return as
@@ -183,14 +183,22 @@ def fetch_torrent_payload(url: str, timeout: int = 30):
 async def add_torrent_smart(
     adapter: "TorrentClientAdapter",
     url_or_magnet: str,
-    category: str = "soulsync",
+    category: Optional[str] = None,
     save_path: Optional[str] = None,
 ) -> Optional[str]:
     """Add a release the way Sonarr/Radarr do: magnets go straight to the
     client; HTTP download links are fetched server-side and handed over as
     file bytes via ``add_torrent_file``. Falls back to the legacy URL handoff
     only when the server-side fetch fails, so setups where the client CAN
-    reach the indexer keep working."""
+    reach the indexer keep working.
+
+    ``category=None`` means "use whatever the client is configured with".
+    Every adapter resolves it as ``category or self._category``, where
+    ``self._category`` is ``torrent_client.category`` from Settings — so a
+    literal default here silently OVERRIDES the user's setting instead of
+    deferring to it. This defaulted to "soulsync" and every music download
+    landed in a category called soulsync no matter what Settings said; only
+    the video side was unaffected, because it always passes one explicitly."""
     from utils.logging_config import get_logger
     logger = get_logger('torrent.add')
 
