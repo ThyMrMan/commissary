@@ -24,6 +24,28 @@ import pytest
 
 from config.settings import ConfigManager
 
+# The logger ConfigManager writes to (get_logger("config") under the "soulsync"
+# namespace). Every assertion below scopes to it — see `_records`.
+_CONFIG_LOGGER = "soulsync.config"
+
+
+def _records(caplog: pytest.LogCaptureFixture, min_level: int) -> list:
+    """Records this module's logger emitted at ``min_level`` or above.
+
+    ``caplog`` captures at the ROOT handler, so ``caplog.records`` holds output
+    from every logger in the process — including background worker threads that
+    happen to be alive during the test. Filtering by level alone made these
+    assertions depend on whatever else logged in the same window: a stray
+    "database is locked" ERROR from ``soulsync.audiodb_worker`` failed the
+    lock-error test intermittently, reporting a config bug that did not exist.
+
+    Scoping by logger name is the fix, and it does not weaken anything — every
+    assertion here is about what ConfigManager logs, never about the process
+    being silent.
+    """
+    return [r for r in caplog.records
+            if r.name == _CONFIG_LOGGER and r.levelno >= min_level]
+
 
 @pytest.fixture
 def manager(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ConfigManager:
@@ -107,6 +129,33 @@ def _fail_n_times_then_succeed(n: int, manager: ConfigManager):
 # ---------------------------------------------------------------------------
 
 
+def test_another_thread_logging_an_error_cannot_fail_these_tests(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The flake itself, pinned.
+
+    ``soulsync.audiodb_worker`` logging "database is locked" on a background
+    thread once failed the lock-error test below — a config assertion broken by
+    an unrelated subsystem, which is indistinguishable from a real regression
+    when you are staring at a red sweep. This is the second cross-thread flake
+    in this file (see ``_count_retry_sleeps``), so it is worth a test rather
+    than a comment.
+    """
+    # Both levels set EXPLICITLY by logger name, the same way every other test
+    # here does it. `caplog.set_level(DEBUG)` with no logger only raises the
+    # ROOT level; once the app's logging config has run, `soulsync.config`
+    # carries its own INFO level and drops a .debug() before any handler sees
+    # it. That passes when this file runs alone and fails in a full suite —
+    # which is how this very test first went red.
+    caplog.set_level(logging.DEBUG, logger="soulsync.config")
+    caplog.set_level(logging.DEBUG, logger="soulsync.audiodb_worker")
+    logging.getLogger("soulsync.audiodb_worker").error("database is locked")
+    logging.getLogger("soulsync.config").debug("config is quiet")
+
+    assert _records(caplog, logging.ERROR) == []
+    assert len(_records(caplog, logging.DEBUG)) == 1
+
+
 def test_save_succeeds_on_first_attempt_emits_no_error_logs(
     manager: ConfigManager, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -117,7 +166,7 @@ def test_save_succeeds_on_first_attempt_emits_no_error_logs(
             manager._save_config()
     assert save_mock.call_count == 1
     assert retry_sleeps == []
-    error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    error_logs = _records(caplog, logging.ERROR)
     assert error_logs == []
 
 
@@ -133,7 +182,7 @@ def test_lock_errors_during_retries_log_at_debug_not_error(
                 manager._save_config()
     assert state["calls"] == 4
     assert len(retry_sleeps) == 3
-    error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    error_logs = _records(caplog, logging.ERROR)
     assert error_logs == [], "transient locks should not log ERROR"
 
 
@@ -163,7 +212,7 @@ def test_all_retries_exhausted_logs_single_error_and_falls_back_to_json(
     with patch("config.settings.time.sleep"):
         with patch.object(manager, "_save_to_database", return_value=False):
             manager._save_config()
-    error_logs = [r for r in caplog.records if r.levelno == logging.ERROR]
+    error_logs = _records(caplog, logging.ERROR)
     assert len(error_logs) == 1
     assert "falling back to config.json" in error_logs[0].getMessage()
     assert manager.config_path.exists()
@@ -183,12 +232,10 @@ def test_save_to_database_lock_error_logs_at_debug(
             )
             ok = manager._save_to_database({"x": 1})
     assert ok is False
-    error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    error_logs = _records(caplog, logging.ERROR)
     assert error_logs == []
-    debug_logs = [
-        r for r in caplog.records
-        if r.levelno == logging.DEBUG and "locked" in r.getMessage().lower()
-    ]
+    debug_logs = [r for r in _records(caplog, logging.DEBUG)
+                  if r.levelno == logging.DEBUG and "locked" in r.getMessage().lower()]
     assert len(debug_logs) == 1
 
 
@@ -204,7 +251,7 @@ def test_save_to_database_non_lock_operational_error_logs_at_error(
             )
             ok = manager._save_to_database({"x": 1})
     assert ok is False
-    error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    error_logs = _records(caplog, logging.ERROR)
     assert len(error_logs) == 1
 
 
