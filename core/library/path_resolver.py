@@ -138,6 +138,21 @@ def _collect_base_dirs(
         except Exception as e:
             logger.debug("music paths read failed: %s", e)
 
+    # Configured Music Libraries. Without these, a file written into a library
+    # other than transfer_path is unresolvable to every consumer of this
+    # module — the quality scanner, album completeness, the repair jobs — so
+    # a second library would look like a library full of missing files.
+    # Read unconditionally (not gated on config_manager): the table is the
+    # authority on where music lives, and a caller that passed no config
+    # still needs its files found.
+    try:
+        from database.music_database import get_database
+        for p in get_database().all_music_library_paths():
+            if isinstance(p, str) and p.strip():
+                candidates.append(_docker_resolve_path(p.strip()))
+    except Exception as e:   # noqa: BLE001 - resolution must degrade, never raise
+        logger.debug("music library paths read failed: %s", e)
+
     # Normalize to absolute forms so resolution does NOT depend on the calling
     # thread's CWD. A relative config like "./Transfer" otherwise only resolves
     # when os.path.isdir("./Transfer") happens to be true from the current CWD —

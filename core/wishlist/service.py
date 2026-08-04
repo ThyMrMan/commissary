@@ -216,6 +216,12 @@ class WishlistService:
                     # settings LIVE via core/quality/selection.py::load_profile_by_id
                     # when it needs them — this is only ever the pointer.
                     "quality_profile_id": wishlist_track.get("quality_profile_id"),
+                    # Which Music Library this track is destined for. Same
+                    # shape as the profile pointer above: only ever the id, and
+                    # the import pipeline resolves the library's path and
+                    # template live. None = the default library, which is the
+                    # destination every wishlist track had before libraries.
+                    "root_folder_id": wishlist_track.get("root_folder_id"),
                     "id": track_id,
                     "name": track_name,
                     "artists": artists,

@@ -1311,6 +1311,12 @@ def preview_album_reorganize(
         # not None, otherwise multi-disc deluxes degrade to single-track
         # folders (the exact bug winecountrygames hit).
         album_info = _build_album_info(context)
+        # Reorganize renames files WITHIN the library they're already in. Tell
+        # the destination resolver where this one lives, or a file in a
+        # non-default Music Library would be planned into the default one and
+        # the "rename" would quietly move it between libraries.
+        if resolved:
+            context['_current_file_path'] = resolved
         try:
             spotify_artist = context['spotify_artist']
             # Dry run: compute the destination path WITHOUT creating the folder.

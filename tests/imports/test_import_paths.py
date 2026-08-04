@@ -1,7 +1,23 @@
 import os
 
+import pytest
+
 import core.imports.album_naming as album_naming
 import core.imports.paths as import_paths
+
+
+@pytest.fixture(autouse=True)
+def _no_music_libraries(monkeypatch):
+    """These are unit tests of TEMPLATING — they inject their own config and
+    should not depend on what happens to be in the database.
+
+    The destination root now comes from the Music Libraries table, falling
+    back to ``soulseek.transfer_path`` when none are configured. Without this
+    stub, the row seeded from the real config would silently outrank each
+    test's injected transfer_path and every expected path would be wrong for
+    a reason that has nothing to do with what the test is checking.
+    """
+    monkeypatch.setattr(import_paths, "_get_music_libraries", lambda: [])
 
 
 class _Config:

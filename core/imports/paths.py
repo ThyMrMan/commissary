@@ -58,6 +58,21 @@ def _extract_year_from_release_date(release_date) -> str:
     return ""
 
 
+def _get_music_libraries():
+    """Configured Music Libraries, default first — or ``[]`` when none are set
+    up (or the DB isn't reachable), which resolves to ``soulseek.transfer_path``.
+
+    A module-level seam like ``_get_config_manager`` above, and for the same
+    reason: the path builders are unit-tested by injecting their inputs, and a
+    templating test should not depend on what happens to be in the database.
+    """
+    try:
+        from database.music_database import get_database
+        return get_database().list_music_libraries() or []
+    except Exception:   # noqa: BLE001 - resolution degrades to the configured path
+        return []
+
+
 def _get_itunes_client():
     try:
         from core.metadata_service import get_itunes_client
@@ -90,7 +105,12 @@ def build_simple_download_destination(context, file_path: str):
     if not isinstance(search_result, dict):
         search_result = {}
 
-    transfer_dir = Path(docker_resolve_path(_get_config_manager().get("soulseek.transfer_path", "./Transfer")))
+    # Which Music Library this file belongs to. With no libraries configured
+    # this is soulseek.transfer_path — the pre-libraries destination.
+    from core.imports.destinations import resolve_music_destination
+    _root, _ = resolve_music_destination(
+        context, libraries=_get_music_libraries(), config_get=_get_config_manager().get)
+    transfer_dir = Path(docker_resolve_path(_root))
     album_name = None
     original_filename = search_result.get("filename", "")
     if "/" in original_filename or "\\" in original_filename:
@@ -486,8 +506,16 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
         if create_dirs:
             _real_makedirs(path, exist_ok=True)
 
-    transfer_dir = docker_resolve_path(_get_config_manager().get("soulseek.transfer_path", "./Transfer"))
     context = normalize_import_context(context)
+    # Resolve AFTER normalizing — normalize_import_context mutates in place and
+    # preserves unknown keys, so `_music_root_id` is intact either way, but
+    # reading the context first keeps the ordering honest for future fields.
+    # A library may override the naming template; None means "use the global
+    # one", which is what every install has until it says otherwise.
+    from core.imports.destinations import resolve_music_destination
+    _root, _library_template = resolve_music_destination(
+        context, libraries=_get_music_libraries(), config_get=_get_config_manager().get)
+    transfer_dir = docker_resolve_path(_root)
     track_info = get_import_track_info(context)
     original_search = get_import_original_search(context)
     album_context = get_import_context_album(context)
@@ -603,7 +631,15 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
 
         _template_key = "compilation_path" if raw_album_type in ("compilation", "compile") else "album_path"
 
-        album_template = _get_config_manager().get("file_organization.templates", {}).get(_template_key, "") or ""
+        # A library's own template replaces whichever template would have been
+        # used — including the compilation one. That's the simple, predictable
+        # reading of "files in this library are named like this", but it does
+        # mean a compilation in a library with a custom template is named by
+        # that template rather than the compilation one. Libraries with no
+        # template (every install, until someone sets one) are unaffected.
+        album_template = (_library_template
+                          or _get_config_manager().get("file_organization.templates", {})
+                          .get(_template_key, "") or "")
         # Suppress the auto-injected disc folder when the user already
         # encodes the disc in the filename via $disc, $discnum, or $cdnum.
         user_controls_disc = (
@@ -615,7 +651,11 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
         )
         disc_label = _get_config_manager().get("file_organization.disc_label", "Disc")
 
-        folder_path, filename_base = get_file_path_from_template(template_context, _template_key)
+        if _library_template:
+            folder_path, filename_base = get_file_path_from_template_raw(
+                _library_template, template_context)
+        else:
+            folder_path, filename_base = get_file_path_from_template(template_context, _template_key)
 
         # #829: if this album already lives in a single folder on disk, drop the
         # new track there instead of a freshly-templated folder — this is what
@@ -725,7 +765,11 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
         "_itunes_artist_id": _itunes_aid,
     }
 
-    folder_path, filename_base = get_file_path_from_template(template_context, "single_path")
+    if _library_template:
+        folder_path, filename_base = get_file_path_from_template_raw(
+            _library_template, template_context)
+    else:
+        folder_path, filename_base = get_file_path_from_template(template_context, "single_path")
     if filename_base:
         if folder_path:
             final_path = os.path.join(transfer_dir, folder_path, filename_base + file_ext)

@@ -42,11 +42,29 @@ def test_labels_dropped_the_ambiguous_transfer_language():
 
 
 def test_extra_libraries_section_stops_being_a_red_herring():
-    assert "<h3>Additional Music Libraries</h3>" in _INDEX
+    """The read-only extras must not read like the output folder. Once
+    "Music Libraries" came to mean DESTINATIONS, calling the read-only list
+    "Additional Music Libraries" recreated exactly the ambiguity this test
+    exists to prevent — so it's now named for what it is."""
+    assert "<h3>Additional Read-Only Paths</h3>" in _INDEX
     assert "<h3>Music Library Paths</h3>" not in _INDEX
-    assert "you don't need to repeat it here" in _INDEX
+    assert "<h3>Additional Music Libraries</h3>" not in _INDEX
+    assert "you don't need to repeat them here" in _INDEX
+    # ...and it says plainly that nothing is filed INTO them.
+    assert "never file downloads into" in _INDEX
+
+
+def test_music_libraries_are_the_destinations():
+    """The section that DOES decide where downloads land, and the two things
+    about it that are easy to get wrong: which one is the default, and that
+    Docker paths are container-side."""
+    assert "<h3>Music Libraries</h3>" in _INDEX
+    assert "first" in _INDEX and "default destination" in _INDEX
+    section = _INDEX.split("<h3>Music Libraries</h3>", 1)[1][:1600]
+    assert "Docker" in section, "the page that takes arbitrary paths must say they're container-side"
 
 
 def test_docs_and_wizard_tell_the_same_story():
-    assert "Additional Music Libraries" in _DOCS
+    assert "Music Libraries" in _DOCS
+    assert "Additional Read-Only Paths" in _DOCS
     assert "Music Library Folder" in _WIZ and "Download Folder" in _WIZ

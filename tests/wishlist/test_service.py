@@ -183,6 +183,10 @@ def test_get_wishlist_tracks_for_download_formats_modal_shape():
             "source_type": "playlist",
             "source_info": {"playlist_name": "Playlist One"},
             "quality_profile_id": None,
+            # Which Music Library the track is destined for. None = the default
+            # library, which is where every wishlist track went before
+            # libraries existed — so an untouched row keeps its old behaviour.
+            "root_folder_id": None,
             "id": "sp-1",
             "name": "Song One",
             "artists": [{"name": "Artist One"}],

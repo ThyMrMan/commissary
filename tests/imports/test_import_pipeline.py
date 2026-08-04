@@ -146,6 +146,11 @@ def test_verification_wrapper_handles_simple_download(tmp_path, monkeypatch):
     monkeypatch.setattr(import_pipeline, "check_audio_integrity",
                         lambda *_a, **_kw: IntegrityResult(ok=True, checks={"size_bytes": 5, "actual_length_s": 0}))
     monkeypatch.setattr(import_paths, "_get_config_manager", lambda: _Config(str(transfer_root)))
+    # The destination root now comes from the Music Libraries table, falling back
+    # to the configured transfer_path when none exist. Stub it empty so this
+    # plumbing test keeps using the transfer_root it just injected rather than a
+    # library row seeded from the real config.
+    monkeypatch.setattr(import_paths, "_get_music_libraries", lambda: [])
     monkeypatch.setattr(import_pipeline, "add_activity_item", lambda *args, **kwargs: activity_calls.append((args, kwargs)))
     monkeypatch.setattr(import_pipeline, "emit_track_downloaded", lambda *args, **kwargs: None)
     monkeypatch.setattr(import_pipeline, "record_library_history_download", lambda *args, **kwargs: None)

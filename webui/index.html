@@ -8698,7 +8698,7 @@
                                         <input type="text" id="transfer-path" placeholder="./Transfer" readonly>
                                         <button class="browse-button locked" onclick="togglePathLock('transfer', this)">Unlock</button>
                                     </div>
-                                    <small class="settings-hint">Your main music library. Finished tracks are moved here, organized into Artist/Album folders.</small>
+                                    <small class="settings-hint">Your main music library — the <strong>default</strong> destination. Finished tracks are moved here, organized into Artist/Album folders. This is the same as the first entry under <strong>Music Libraries</strong> below; editing either updates the other.</small>
                                 </div>
 
                                 <div class="form-group">
@@ -8896,14 +8896,43 @@
                                 </div>
                             </div>
 
-                            <!-- Additional Music Libraries (moved into Paths & Organization) -->
+                            <!-- ═══ MUSIC LIBRARIES — destinations you can file downloads into ═══ -->
                             <div class="settings-group" data-stg="library">
-                                <h3>Additional Music Libraries</h3>
+                                <h3>Music Libraries</h3>
 
                                 <div class="help-text" style="margin-bottom: 12px;">
-                                    Your Music Library Folder above is already covered — <strong>you don't need to repeat it here.</strong>
-                                    Add entries only for <em>extra</em> libraries SoulSync should read (a second collection, an archive
-                                    drive), or when your media server sees the same files at a different path than SoulSync can.
+                                    Where finished music can be filed. The <strong>first</strong> library is the default
+                                    destination — drag or reorder to change which. Downloads and imports let you choose
+                                    one; anything that doesn't choose goes to the default, which is exactly what happened
+                                    before this existed.
+                                    <br><br>
+                                    Each library can override the <strong>naming template</strong> and the
+                                    <strong>quality profile</strong>. Leave those blank to inherit the global settings —
+                                    which is what every library does until you change it.
+                                    <br><br>
+                                    <strong>Docker / Unraid:</strong> these are paths <em>inside</em> the container. Mount
+                                    the real folder in your container config first, then put the container-side path here
+                                    (the right of the <code>:</code> in your volume mount) — a host path will look like it
+                                    saved and then quietly write nowhere your media server can see.
+                                </div>
+
+                                <div id="music-libraries-list"></div>
+
+                                <div class="form-actions" style="margin-top: 8px;">
+                                    <button class="test-button" onclick="addMusicLibraryRow()">+ Add Library</button>
+                                    <button class="test-button" onclick="saveMusicLibraries()">Save Libraries</button>
+                                    <span id="music-libraries-status" class="settings-hint" style="margin-left: 10px;"></span>
+                                </div>
+                            </div>
+
+                            <!-- Additional Music Libraries (moved into Paths & Organization) -->
+                            <div class="settings-group" data-stg="library">
+                                <h3>Additional Read-Only Paths</h3>
+
+                                <div class="help-text" style="margin-bottom: 12px;">
+                                    Your Music Libraries above are already covered — <strong>you don't need to repeat them here.</strong>
+                                    These are folders SoulSync should <em>read</em> but never file downloads into: an old collection you
+                                    aren't adding to, or the same files at a different path than your media server reports.
                                     Used for tag writing, streaming, and file detection.
                                     <strong>Docker users:</strong> mount the extra folder(s) into the SoulSync container with read-write access,
                                     then add the <em>container-side</em> path here (e.g. <code>/music2</code>).

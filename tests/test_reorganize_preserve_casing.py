@@ -144,6 +144,11 @@ def test_preview_leaves_already_organized_file_unchanged(monkeypatch, tmp_path):
     monkeypatch.setattr("core.imports._get_config_manager" if False else
                         "core.imports.paths._get_config_manager",
                         lambda: _TemplateCM())
+    # The destination root now comes from the Music Libraries table, falling
+    # back to the injected transfer_path when none are configured. This test is
+    # about CASING, and its fixture library lives at /xfer, so stub the table
+    # empty rather than let a seeded row decide where the file belongs.
+    monkeypatch.setattr("core.imports.paths._get_music_libraries", lambda: [])
 
     album_data = {"id": "AL1", "title": "The Violence (Sikdope Remix)",
                   "artist_name": "Asking Alexandria", "artist_id": "AR1",

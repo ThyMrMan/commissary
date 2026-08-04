@@ -697,6 +697,44 @@ class MusicDatabase:
             # actually bought (migration)
             self._add_purchased_at_column(cursor)
 
+            # ── Music Libraries ────────────────────────────────────────────
+            # Where finished music is filed. Music had exactly ONE destination
+            # (soulseek.transfer_path) since its Soulseek-era design, while the
+            # video side has had a table of labelled root folders for a long
+            # time — so "send this to the archive drive" was expressible for a
+            # film and not for an album.
+            #
+            # `path` is UNIQUE: two rows pointing at the same folder would make
+            # "which library is this file in?" unanswerable for every scanner
+            # and repair job that resolves a file back to its root.
+            #
+            # `sort_order` lowest = the default destination, matching the video
+            # root_folders convention so both sides read the same way.
+            #
+            # NULL naming_template / quality_profile_id mean "inherit the
+            # global setting" rather than "no template / no profile" — an
+            # install that never edits a library keeps behaving as it did.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS music_root_folders (
+                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path               TEXT NOT NULL UNIQUE,
+                    label              TEXT,
+                    sort_order         INTEGER NOT NULL DEFAULT 0,
+                    naming_template    TEXT,
+                    quality_profile_id INTEGER,
+                    created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_music_roots_order "
+                "ON music_root_folders (sort_order)"
+            )
+            self._seed_music_root_folder(cursor)
+
+            # Which library a wishlist track is destined for. NULL = the
+            # default library, i.e. exactly where it would have gone before.
+            self._add_wishlist_root_folder_column(cursor)
+
             # Library issues — user-reported problems with tracks/albums/artists
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS library_issues (
@@ -1658,6 +1696,60 @@ class MusicDatabase:
                 logger.info("Added purchased_at column to tracks table")
         except Exception as e:
             logger.error(f"Error adding purchased_at column: {e}")
+
+    def _seed_music_root_folder(self, cursor):
+        """Create the first Music Library from the existing transfer path.
+
+        This is what makes multi-library non-breaking. Every install already
+        has exactly one destination — ``soulseek.transfer_path`` — so seeding
+        it as row 1 means an install that never opens the new settings writes
+        files to precisely where it wrote them yesterday, with no migration
+        step and nothing to configure.
+
+        Only ever seeds into an EMPTY table: once the user manages libraries
+        themselves, re-adding a row for a transfer_path they may have since
+        removed would resurrect a destination they deleted on purpose.
+        """
+        try:
+            cursor.execute("SELECT COUNT(*) FROM music_root_folders")
+            if (cursor.fetchone() or [0])[0]:
+                return
+            try:
+                from config.settings import config_manager
+                path = str(config_manager.get('soulseek.transfer_path', '') or '').strip()
+            except Exception:   # noqa: BLE001 - config unavailable during early init
+                path = ''
+            if not path:
+                # Nothing configured yet (fresh install mid-setup). Leave the
+                # table empty; resolution falls back to transfer_path anyway,
+                # and the seed runs again on the next startup once it's set.
+                return
+            cursor.execute(
+                "INSERT OR IGNORE INTO music_root_folders (path, label, sort_order) "
+                "VALUES (?, ?, 0)",
+                (path, 'Music Library'),
+            )
+            if cursor.rowcount:
+                logger.info("Seeded the first Music Library from soulseek.transfer_path: %s", path)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Error seeding the default music root folder: {e}")
+
+    def _add_wishlist_root_folder_column(self, cursor):
+        """Which Music Library a wishlist track should be filed into.
+
+        NULL means the default library — the same destination the track would
+        have had before libraries existed — so existing rows need no backfill.
+        Mirrors the video wishlist's own ``root_folder_id``.
+        """
+        try:
+            cursor.execute("PRAGMA table_info(wishlist_tracks)")
+            cols = {c[1] for c in cursor.fetchall()}
+            if cols and 'root_folder_id' not in cols:
+                cursor.execute(
+                    "ALTER TABLE wishlist_tracks ADD COLUMN root_folder_id INTEGER DEFAULT NULL")
+                logger.info("Added root_folder_id column to wishlist_tracks table (music libraries)")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Error adding root_folder_id column to wishlist_tracks: {e}")
 
     def _add_automation_then_actions_column(self, cursor):
         """Add then_actions column to automations table and migrate existing notify data."""
@@ -10139,8 +10231,15 @@ class MusicDatabase:
         track_data: Dict[str, Any] = None,
         user_initiated: bool = False,
         quality_profile_id: Optional[int] = None,
+        root_folder_id: Optional[int] = None,
     ) -> bool:
         """Add a failed track to the wishlist for retry.
+
+        ``root_folder_id`` names the Music Library this track should be filed
+        into; omitted (``None``) means the default library, which is where
+        every wishlist track went before libraries existed. Stored as the id
+        only — the import pipeline resolves the library's path and naming
+        template live, so editing a library later applies immediately.
 
         ``quality_profile_id`` selects which ``quality_profiles`` row this
         item's download/import must satisfy; omitted (``None``, the default)
@@ -10307,10 +10406,10 @@ class MusicDatabase:
                 cursor.execute("""
                     INSERT OR REPLACE INTO wishlist_tracks
                     (spotify_track_id, spotify_data, failure_reason, source_type, source_info, date_added, profile_id,
-                     quality_profile_id)
-                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
+                     quality_profile_id, root_folder_id)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
                 """, (insert_track_id, spotify_json, failure_reason, source_type, source_json, profile_id,
-                      resolved_qp_id))
+                      resolved_qp_id, root_folder_id))
 
                 conn.commit()
 
@@ -10570,7 +10669,7 @@ class MusicDatabase:
                 query = """
                     SELECT id, spotify_track_id, spotify_data, failure_reason, retry_count,
                            last_attempted, date_added, source_type, source_info,
-                           quality_profile_id
+                           quality_profile_id, root_folder_id
                     FROM wishlist_tracks
                     WHERE profile_id = ?
                 """
@@ -10614,6 +10713,10 @@ class MusicDatabase:
                             'source_type': row['source_type'],
                             'source_info': source_info,
                             'quality_profile_id': row['quality_profile_id'],
+                            # Which Music Library this track is destined for.
+                            # None = the default library, i.e. where it would
+                            # have gone before libraries existed.
+                            'root_folder_id': row['root_folder_id'],
                         })
                     except json.JSONDecodeError as e:
                         logger.error(f"Error parsing wishlist track data: {e}")
@@ -15580,6 +15683,144 @@ class MusicDatabase:
         except Exception as e:
             logger.debug(f"Error deleting history rows: {e}")
             return 0
+
+    # ── Music Libraries ────────────────────────────────────────────────────
+    # Where finished music is filed. See the music_root_folders CREATE TABLE
+    # for why this exists and what NULL means in each column.
+
+    @staticmethod
+    def _music_library_row(row) -> dict:
+        return {
+            'id': row['id'],
+            'path': row['path'],
+            'label': row['label'] or 'Music Library',
+            'sort_order': row['sort_order'],
+            'naming_template': row['naming_template'],
+            'quality_profile_id': row['quality_profile_id'],
+        }
+
+    def list_music_libraries(self) -> list:
+        """Every configured Music Library, default first.
+
+        Order is the contract, not a nicety: the lowest ``sort_order`` IS the
+        default destination, so callers resolving "where does this go with no
+        explicit choice?" take the first row.
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            rows = conn.execute(
+                "SELECT id, path, label, sort_order, naming_template, quality_profile_id "
+                "FROM music_root_folders ORDER BY sort_order, id"
+            ).fetchall()
+            return [self._music_library_row(r) for r in rows]
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Error listing music libraries: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def get_music_library(self, library_id) -> Optional[dict]:
+        """One library by id, or None. None is a normal answer — a wishlist row
+        can name a library the user has since deleted, and the caller falls
+        back to the default rather than failing the download."""
+        if library_id in (None, ''):
+            return None
+        try:
+            lid = int(library_id)
+        except (TypeError, ValueError):
+            return None
+        conn = None
+        try:
+            conn = self._get_connection()
+            row = conn.execute(
+                "SELECT id, path, label, sort_order, naming_template, quality_profile_id "
+                "FROM music_root_folders WHERE id=?", (lid,)
+            ).fetchone()
+            return self._music_library_row(row) if row else None
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Error reading music library {library_id}: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def all_music_library_paths(self) -> list:
+        """Every library path, default first — the READ side.
+
+        Feeds ``core.library.path_resolver``, so a scanner or repair job can
+        resolve a file that lives in any library rather than only the one that
+        used to be the whole story.
+        """
+        return [lib['path'] for lib in self.list_music_libraries() if lib.get('path')]
+
+    def save_music_libraries(self, entries) -> list:
+        """Replace the Music Library list with ``entries`` (each:
+        ``{id?, path, label?, naming_template?, quality_profile_id?}``).
+
+        List position becomes ``sort_order``, so index 0 is the default
+        destination — reordering in the UI reassigns the default, same as the
+        video Libraries page.
+
+        Rows whose id is absent from ``entries`` are deleted, and any wishlist
+        track pointing at a deleted library falls back to NULL (the default)
+        rather than keeping a dangling id that resolves to nothing.
+
+        ``entries is None`` is a no-op, NOT "delete everything" — that
+        distinction is what stops a caller who simply didn't manage libraries
+        from wiping them, and it mirrors ``video_database.save_libraries``.
+        """
+        if entries is None:
+            return self.list_music_libraries()
+        conn = None
+        try:
+            conn = self._get_connection()
+            keep_ids = set()
+            for i, e in enumerate(entries or []):
+                e = e or {}
+                path = str(e.get('path') or '').strip()
+                if not path:
+                    # A library with no path can't be a destination. Skipping
+                    # beats storing a row that silently files nothing.
+                    continue
+                label = str(e.get('label') or '').strip() or None
+                template = str(e.get('naming_template') or '').strip() or None
+                profile = e.get('quality_profile_id')
+                try:
+                    profile = int(profile) if profile not in (None, '') else None
+                except (TypeError, ValueError):
+                    profile = None
+                eid = e.get('id')
+                if eid:
+                    conn.execute(
+                        "UPDATE music_root_folders SET path=?, label=?, sort_order=?, "
+                        "naming_template=?, quality_profile_id=? WHERE id=?",
+                        (path, label, i, template, profile, int(eid)))
+                    keep_ids.add(int(eid))
+                else:
+                    cur = conn.execute(
+                        "INSERT INTO music_root_folders "
+                        "(path, label, sort_order, naming_template, quality_profile_id) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (path, label, i, template, profile))
+                    keep_ids.add(cur.lastrowid)
+            existing = {r[0] for r in conn.execute(
+                "SELECT id FROM music_root_folders").fetchall()}
+            for gone in existing - keep_ids:
+                conn.execute(
+                    "UPDATE wishlist_tracks SET root_folder_id=NULL WHERE root_folder_id=?",
+                    (gone,))
+                conn.execute("DELETE FROM music_root_folders WHERE id=?", (gone,))
+            conn.commit()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Error saving music libraries: {e}")
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                conn.close()
+        return self.list_music_libraries()
 
     def record_torrent_seed_grab(self, torrent_hash: str,
                                  title: Optional[str] = None,

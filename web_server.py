@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.9.1"
+_SOULSYNC_BASE_VERSION = "1.9.2"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -41049,6 +41049,57 @@ def _resolve_import_scan_path(raw):
             return resolved, None
     return None, ("That folder is outside your configured download, import and "
                   "library folders.")
+
+
+@app.route('/api/music/libraries', methods=['GET'])
+def music_libraries_list():
+    """The configured Music Libraries, default first.
+
+    Not admin-gated on read: every destination picker needs this list, and it
+    exposes nothing a user filing a download doesn't already have to see.
+    Writing is admin-only (below) — the same split the video Libraries use.
+    """
+    try:
+        libs = get_database().list_music_libraries()
+        # An install with no libraries yet still has a destination; say what it
+        # is rather than returning an empty list a picker can't render.
+        fallback = config_manager.get('soulseek.transfer_path', './Transfer')
+        return jsonify({"success": True, "libraries": libs,
+                        "default_path": (libs[0]['path'] if libs else fallback)})
+    except Exception as e:
+        logger.error(f"Error listing music libraries: {e}")
+        return jsonify({"success": False, "error": str(e), "libraries": []}), 500
+
+
+@app.route('/api/music/libraries', methods=['POST'])
+@admin_only
+def music_libraries_save():
+    """Replace the Music Library list. Body: ``{libraries: [...]}``.
+
+    List order is the contract — index 0 becomes the default destination.
+
+    The first library's path is written back to ``soulseek.transfer_path``.
+    That keeps the one legacy setting and the table from disagreeing about
+    where music goes: without it, an install that edits its default library
+    here would leave transfer_path stale, and every consumer still reading it
+    (the disk guard, connection tests, the debug bundle) would describe a
+    folder nothing is written to.
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        entries = body.get('libraries')
+        if entries is None or not isinstance(entries, list):
+            return jsonify({"success": False, "error": "libraries must be a list"}), 400
+        libs = get_database().save_music_libraries(entries)
+        if libs:
+            try:
+                config_manager.set('soulseek.transfer_path', libs[0]['path'])
+            except Exception as e:   # noqa: BLE001 - the table is the authority
+                logger.warning("Could not mirror the default library to transfer_path: %s", e)
+        return jsonify({"success": True, "libraries": libs})
+    except Exception as e:
+        logger.error(f"Error saving music libraries: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route('/api/import/browse', methods=['GET'])

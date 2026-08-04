@@ -484,10 +484,24 @@ class TestResolveAttemptShape:
 
 
 class TestDiagnosticForFailedResolves:
-    def test_no_base_dirs_returns_none_with_empty_attempt(self) -> None:
+    def test_no_base_dirs_returns_none_with_empty_attempt(self, monkeypatch) -> None:
         """No transfer/download/config/plex → resolver can't probe.
         Diagnostic must report empty `base_dirs_tried` so the caller can
-        render a "no probe sources configured" hint."""
+        render a "no probe sources configured" hint.
+
+        Configured Music Libraries are read from the DB regardless of what the
+        caller passes — a file in a library has to be findable even by a caller
+        with no config — so "nothing configured" now has to include having no
+        libraries, which is what the stub expresses."""
+        import database.music_database as music_db
+
+        class _NoLibraries:
+            @staticmethod
+            def all_music_library_paths():
+                return []
+
+        monkeypatch.setattr(music_db, "get_database", lambda: _NoLibraries())
+
         path, attempt = resolve_library_file_path_with_diagnostic(
             "/music/Artist/Album/track.flac",
         )

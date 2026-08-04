@@ -220,6 +220,15 @@ def _resolve_context_quality_profile(context: dict) -> dict:
     if isinstance(cached, dict):
         return cached
     try:
+        # A destination Music Library may carry its own profile. Stamped onto
+        # track_info here rather than resolved separately, so the library's
+        # profile inherits this whole mechanism instead of becoming a second,
+        # divergent one. An item that already names a profile keeps it.
+        from core.imports.destinations import apply_library_quality_profile
+        apply_library_quality_profile(context)
+    except Exception as e:  # noqa: BLE001 - never block an import on this
+        logger.debug("library quality profile stamp failed: %s", e)
+    try:
         from core.quality.selection import load_profile_by_id
         track_info = context.get('track_info')
         profile_id = track_info.get('quality_profile_id') if isinstance(track_info, dict) else None

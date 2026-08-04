@@ -1700,6 +1700,11 @@ async function loadSettingsData() {
         const _musicPaths = settings.library?.music_paths || [];
         renderMusicPaths(_musicPaths);
 
+        // Music Libraries live in the DB, not in the settings payload — they
+        // carry per-library naming and quality overrides, so they're loaded
+        // (and saved) on their own rather than riding the settings blob.
+        loadMusicLibraries();
+
         // Library Organize: preserve the user's casing (default on)
         const _pcEl = document.getElementById('reorganize-preserve-casing');
         if (_pcEl) _pcEl.checked = settings.library?.reorganize_preserve_casing !== false;
@@ -3845,6 +3850,164 @@ function collectPathList(containerId) {
 function renderMusicPaths(paths) { renderPathList('music-paths-list', paths); }
 function addMusicPathRow() { addPathListRow('music-paths-list'); }
 function collectMusicPaths() { return collectPathList('music-paths-list') || []; }
+
+// ── Music Libraries ─────────────────────────────────────────────────────────
+// Where finished music can be filed. Music had exactly ONE destination since
+// its Soulseek-era design; this is the table that replaced it. Row order is
+// the contract — index 0 is the default destination — which is why the rows
+// carry ↑/↓ rather than being sorted for you.
+let _musicLibraryProfiles = [];
+
+function _musicLibraryRowHtml(lib) {
+    const profileOptions = ['<option value="">Global quality profile</option>']
+        .concat(_musicLibraryProfiles.map(p =>
+            `<option value="${escapeHtml(String(p.id))}"${String(lib.quality_profile_id || '') === String(p.id) ? ' selected' : ''}>${escapeHtml(p.name)}</option>`
+        )).join('');
+    return `
+        <div class="music-library-row" data-lib-id="${escapeHtml(String(lib.id || ''))}">
+            <div class="music-library-row-top">
+                <input type="text" class="music-lib-label" placeholder="Label (e.g. Main, Archive)"
+                       value="${escapeHtml(lib.label || '')}">
+                <input type="text" class="music-lib-path" placeholder="/music or C:\\Music"
+                       value="${escapeHtml(lib.path || '')}">
+                <button class="test-button music-lib-up" title="Move up (the first library is the default)">↑</button>
+                <button class="test-button music-lib-down" title="Move down">↓</button>
+                <button class="test-button music-lib-remove" title="Remove this library">✕</button>
+            </div>
+            <div class="music-library-row-bottom">
+                <input type="text" class="music-lib-template"
+                       placeholder="Naming template — blank inherits the global one"
+                       value="${escapeHtml(lib.naming_template || '')}">
+                <select class="music-lib-profile">${profileOptions}</select>
+            </div>
+        </div>`;
+}
+
+function renderMusicLibraries(libs) {
+    const host = document.getElementById('music-libraries-list');
+    if (!host) return;
+    const rows = (libs || []);
+    host.innerHTML = rows.length
+        ? rows.map(_musicLibraryRowHtml).join('')
+        : '<div class="settings-hint">No libraries configured — downloads go to your Music Library Folder above.</div>';
+    _markFirstMusicLibrary();
+}
+
+// The default destination is whichever row is first. Say so on the row itself:
+// an ordering that silently decides where every unrouted download lands is the
+// kind of thing that has to be visible, not inferred.
+function _markFirstMusicLibrary() {
+    const host = document.getElementById('music-libraries-list');
+    if (!host) return;
+    host.querySelectorAll('.music-library-row').forEach((row, i) => {
+        row.classList.toggle('music-library-default', i === 0);
+        let badge = row.querySelector('.music-lib-default-badge');
+        if (i === 0 && !badge) {
+            badge = document.createElement('span');
+            badge.className = 'music-lib-default-badge';
+            badge.textContent = 'DEFAULT';
+            row.querySelector('.music-library-row-top').prepend(badge);
+        } else if (i !== 0 && badge) {
+            badge.remove();
+        }
+    });
+}
+
+function addMusicLibraryRow() {
+    const host = document.getElementById('music-libraries-list');
+    if (!host) return;
+    const hint = host.querySelector('.settings-hint');
+    if (hint) hint.remove();
+    host.insertAdjacentHTML('beforeend', _musicLibraryRowHtml({}));
+    _markFirstMusicLibrary();
+}
+
+function collectMusicLibraries() {
+    const host = document.getElementById('music-libraries-list');
+    if (!host) return [];
+    return Array.from(host.querySelectorAll('.music-library-row')).map(row => {
+        const id = row.getAttribute('data-lib-id');
+        return {
+            id: id ? parseInt(id, 10) : undefined,
+            label: row.querySelector('.music-lib-label')?.value.trim() || '',
+            path: row.querySelector('.music-lib-path')?.value.trim() || '',
+            naming_template: row.querySelector('.music-lib-template')?.value.trim() || '',
+            quality_profile_id: row.querySelector('.music-lib-profile')?.value || '',
+        };
+    }).filter(e => e.path);
+}
+
+async function loadMusicLibraries() {
+    try {
+        const [libsResp, profilesResp] = await Promise.all([
+            fetch('/api/music/libraries'),
+            // Built-ins + user-created, default first — the same list the
+            // global quality-profile picker uses.
+            fetch('/api/quality-profile/custom').catch(() => null),
+        ]);
+        if (profilesResp && profilesResp.ok) {
+            const pd = await profilesResp.json().catch(() => null);
+            _musicLibraryProfiles = (pd && pd.profiles) || [];
+            if (!Array.isArray(_musicLibraryProfiles)) _musicLibraryProfiles = [];
+        }
+        const data = libsResp.ok ? await libsResp.json() : null;
+        renderMusicLibraries(data && data.libraries);
+    } catch (err) {
+        console.error('Could not load music libraries:', err);
+    }
+}
+
+async function saveMusicLibraries() {
+    const status = document.getElementById('music-libraries-status');
+    const libs = collectMusicLibraries();
+    if (status) status.textContent = 'Saving…';
+    try {
+        const resp = await fetch('/api/music/libraries', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ libraries: libs }),
+        });
+        const data = await resp.json().catch(() => null);
+        if (!resp.ok || !data || !data.success) {
+            if (status) status.textContent = (data && data.error) || 'Save failed';
+            return;
+        }
+        renderMusicLibraries(data.libraries);
+        // The server mirrors the default library's path back onto
+        // soulseek.transfer_path; reflect that here so the field above doesn't
+        // sit showing the old value until a reload.
+        if (data.libraries && data.libraries.length) {
+            const tp = document.getElementById('transfer-path');
+            if (tp) tp.value = data.libraries[0].path;
+        }
+        if (status) status.textContent = 'Saved';
+        setTimeout(() => { if (status) status.textContent = ''; }, 2500);
+        if (typeof showToast === 'function') showToast('Music libraries saved', 'success');
+    } catch (err) {
+        console.error('Could not save music libraries:', err);
+        if (status) status.textContent = 'Save failed';
+    }
+}
+
+document.addEventListener('click', (e) => {
+    const row = e.target.closest && e.target.closest('.music-library-row');
+    if (!row) return;
+    if (e.target.classList.contains('music-lib-remove')) {
+        row.remove();
+        _markFirstMusicLibrary();
+    } else if (e.target.classList.contains('music-lib-up')) {
+        const prev = row.previousElementSibling;
+        if (prev && prev.classList.contains('music-library-row')) {
+            row.parentNode.insertBefore(row, prev);
+            _markFirstMusicLibrary();
+        }
+    } else if (e.target.classList.contains('music-lib-down')) {
+        const next = row.nextElementSibling;
+        if (next && next.classList.contains('music-library-row')) {
+            row.parentNode.insertBefore(next, row);
+            _markFirstMusicLibrary();
+        }
+    }
+});
 
 // ── Genre Whitelist ──
 let _genreWhitelistCache = [];

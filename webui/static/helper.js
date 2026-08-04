@@ -3484,8 +3484,15 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.9.1': [
-        { date: 'August 2026 · 1.9.1' },
+    '1.9.2': [
+        { date: 'August 2026 · 1.9.2' },
+        { title: 'Music can have more than one library', desc: 'music has had exactly one output folder since the beginning — everything you downloaded went to the Music Library Folder and nowhere else, while the video side has been able to file a film into whichever library you chose for years. Settings → Paths & Organization now has a <strong>Music Libraries</strong> list: add as many as you like, and the first one is the default destination.' },
+        { title: 'Nothing changes until you add a second one', desc: 'your existing library becomes the first entry automatically, so an install that never opens the new setting writes files to exactly where it wrote them yesterday. There is no migration to run and nothing to configure.' },
+        { title: 'Each library can name files its own way', desc: 'and use its own quality profile. Leave both blank — which is how they start — and the library inherits your global settings. A library profile governs the whole pipeline for files going there, not just search ranking: the quality gate, the fingerprint check, deep verify, replace-lower, downsampling.' },
+        { title: 'Reorganize keeps files where they live', desc: 'worth calling out because the opposite would be quiet and destructive: reorganizing a file that sits in one library re-files it <em>within that library</em>. It does not pull everything back into the default one. Moving something between libraries is still possible — it just has to be asked for.' },
+        { title: 'Your library folder and the first entry are the same thing', desc: 'Music Library Folder above the list is the first library, and editing either updates the other. Two settings quietly disagreeing about where music goes is exactly the kind of thing that wastes an afternoon.' },
+        { title: 'The old extras list is now called Additional Read-Only Paths', desc: 'it was "Additional Music Libraries", which now reads like it means destinations — it never did. Those are folders SoulSync reads but never files anything into, and the section says so.' },
+        { title: 'Also in 1.9.1', desc: 'importing from any of your download folders instead of only the Import folder.' },
         { title: 'Import from any of your download folders', desc: 'Import only ever read one folder — the Import folder in Settings — so anything sitting where your download client left it had to be moved there by hand before it could be imported at all. There is now a "Change folder" button on the Import page: browse your download, import and library folders, pick the one you want, and the scan reads that instead.' },
         { title: 'It opens where your downloads land', desc: 'no path typing. The picker starts on your download folder with shortcuts to every configured root, and tells you how many audio files are directly in whatever folder you are looking at before you commit to it — a folder with none can still be the right pick, since subfolders are scanned too.' },
         { title: 'Your choice sticks while you work', desc: 'switching between the Albums, Singles and Auto-Import tabs keeps the folder you chose. The header says "Scanning: …" instead of "Import: …" whenever you are somewhere other than the configured Import folder, so an empty result is never mistaken for your Import folder having broken. "Back to Import folder" returns you to the default.' },
@@ -3663,6 +3670,19 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.2: music can have more than one library",
+        description: "music has had exactly one output folder since the beginning, while the video side has been able to file a title into whichever library you picked for years. Music now has the same: a list of labelled destinations, each with its own naming and quality settings if you want them.",
+        features: [
+            "Settings → Paths & Organization → Music Libraries. Add as many as you like; the first is the default destination, and reordering changes which",
+            "your existing library becomes the first entry automatically — an install that never opens the setting writes files exactly where it did before, with no migration and nothing to configure",
+            "each library can override the naming template and the quality profile; blank inherits your global settings, which is how they all start",
+            "a library's quality profile governs the whole pipeline for files going there — the quality gate, the fingerprint check, deep verify, replace-lower, downsampling — not just search ranking",
+            "reorganizing a file re-files it WITHIN the library it lives in rather than pulling everything into the default one; moving between libraries is still possible, it just has to be asked for",
+            "Music Library Folder above the list is the first library — editing either updates the other, so the two can't disagree about where music goes",
+        ],
+        usage_note: "The old \"Additional Music Libraries\" section is now \"Additional Read-Only Paths\" — it always meant folders SoulSync reads but never writes to, and that name would now read like it meant destinations.",
+    },
     {
         title: "1.9.1: import from any of your download folders",
         description: "Import read one folder and only one — the Import folder in Settings. Anything a download client left elsewhere had to be moved there by hand first. Now you can point the scan at any of your download, import or library folders.",
