@@ -9462,6 +9462,7 @@ function openYouTubeDiscoveryModal(urlHash) {
                             <div class="progress-text" id="youtube-discovery-progress-text-${urlHash}">${getInitialProgressText(state.phase, isTidal, isBeatport, isListenBrainz)}</div>
                         </div>
                         
+                        ${buildDiscoveryFilterBarHtml(state, urlHash)}
                         <div class="discovery-table-container">
                             <table class="discovery-table">
                                 <thead>
@@ -10027,6 +10028,91 @@ function getInitialProgressText(phase, isTidal = false, isBeatport = false, isLi
     }
 }
 
+// ── discovery result filtering ───────────────────────────────────────────────
+// Discovery answers "which library track is this?" for every row, and the
+// answers are not equally trustworthy. A 200-track playlist where 190 matched
+// cleanly buries the 10 that need a human in a wall of green, so the buckets
+// are filterable rather than merely colour-coded.
+//
+// The line between PERFECT and LOW is drawn at the strictest bar any source
+// applies before it will call something a match (Beatport and ListenBrainz
+// both use 0.9; playlist discovery accepts down to 0.7). So "low" means
+// "accepted, but by a looser rule than the strictest source would have used" —
+// exactly the set worth eyeballing.
+const DISCOVERY_PERFECT_CONFIDENCE = 0.9;
+
+const DISCOVERY_BUCKETS = [
+    { id: 'all', label: 'All' },
+    { id: 'perfect', label: 'Perfect' },
+    { id: 'low', label: 'Low confidence' },
+    { id: 'wing-it', label: 'Wing It' },
+    { id: 'not-found', label: 'Not found' },
+    { id: 'error', label: 'Error' },
+];
+
+// Active bucket per open modal. Module-level rather than on `state` so a
+// re-render from the discovery poller can't wipe the user's selection.
+const _discoveryFilters = {};
+
+function discoveryBucketFor(result) {
+    if (!result) return 'not-found';
+    const cls = result.status_class || '';
+    if (cls === 'error' || result.status === 'error') return 'error';
+    if (result.wing_it_fallback || cls === 'wing-it') return 'wing-it';
+
+    const found = cls === 'found' || result.spotify_data || result.spotify_id
+        || (result.spotify_track && result.spotify_track !== '-');
+    if (!found) return 'not-found';
+
+    // A manual match is a human's decision, so it outranks any score.
+    if (result.manual_match) return 'perfect';
+    // Confidence is absent on some transformed shapes; treat a confirmed match
+    // with no score as perfect rather than inventing a doubt we can't support.
+    const conf = result.confidence;
+    if (conf === undefined || conf === null) return 'perfect';
+    return Number(conf) >= DISCOVERY_PERFECT_CONFIDENCE ? 'perfect' : 'low';
+}
+
+function discoveryBucketCounts(results) {
+    const counts = { all: 0, perfect: 0, low: 0, 'wing-it': 0, 'not-found': 0, error: 0 };
+    (results || []).forEach(r => {
+        counts.all++;
+        counts[discoveryBucketFor(r)]++;
+    });
+    return counts;
+}
+
+function buildDiscoveryFilterBarHtml(state, urlHash) {
+    const results = state.discoveryResults || state.discovery_results || [];
+    // Nothing to triage before discovery has produced answers.
+    if (!results.length) return '';
+    const counts = discoveryBucketCounts(results);
+    const active = _discoveryFilters[urlHash] || 'all';
+    const chips = DISCOVERY_BUCKETS
+        // Hide empty buckets so the bar stays about THIS playlist — a run with
+        // no errors shouldn't advertise an Error filter that shows nothing.
+        .filter(b => b.id === 'all' || counts[b.id] > 0)
+        .map(b => `<button class="discovery-filter-chip${b.id === active ? ' is-active' : ''}"
+                 data-discovery-filter="${b.id}" data-url-hash="${urlHash}"
+                 onclick="setDiscoveryFilter('${urlHash}', '${b.id}')">${b.label}
+                 <span class="discovery-filter-count">${counts[b.id]}</span></button>`)
+        .join('');
+    return `<div class="discovery-filter-bar" id="discovery-filter-bar-${urlHash}">${chips}</div>`;
+}
+
+function setDiscoveryFilter(urlHash, bucket) {
+    _discoveryFilters[urlHash] = bucket;
+    // Same store the modal's own refresh reads — the YouTube discovery modal
+    // infrastructure is reused for every source, keyed by url hash.
+    const state = youtubePlaylistStates[urlHash];
+    const root = (state && state.modalElement) || document;
+    const tbody = root.querySelector(`#youtube-discovery-table-${urlHash}`);
+    if (tbody && state) tbody.innerHTML = generateTableRowsFromState(state, urlHash);
+    const bar = root.querySelector(`#discovery-filter-bar-${urlHash}`);
+    if (bar && state) bar.outerHTML = buildDiscoveryFilterBarHtml(state, urlHash);
+}
+window.setDiscoveryFilter = setDiscoveryFilter;
+
 function generateTableRowsFromState(state, urlHash) {
     const isTidal = state.is_tidal_playlist;
     const isQobuz = state.is_qobuz_playlist;
@@ -10042,8 +10128,18 @@ function generateTableRowsFromState(state, urlHash) {
     const discoveryResults = state.discoveryResults || state.discovery_results;
 
     if (discoveryResults && discoveryResults.length > 0) {
+        // View-only filter: narrows what is DISPLAYED. Selection and download
+        // still operate on the full result set, so hiding a bucket can never
+        // silently change what a later action does.
+        const _bucket = _discoveryFilters[urlHash] || 'all';
+        const _visible = _bucket === 'all'
+            ? discoveryResults
+            : discoveryResults.filter(r => discoveryBucketFor(r) === _bucket);
+        if (!_visible.length) {
+            return `<tr><td colspan="7" class="discovery-filter-empty">No tracks in this group.</td></tr>`;
+        }
         // Generate rows from existing discovery results
-        return discoveryResults.map((result, index) => {
+        return _visible.map((result, index) => {
             // Handle different field names based on platform
             const trackName = result.lb_track || result.yt_track || result.track_name || '-';
             // YouTube flat extraction often can't give a per-track artist, so the
@@ -10289,6 +10385,17 @@ function refreshYouTubeDiscoveryModalTable(urlHash) {
         console.log(`✅ Modal table refreshed with discovery data`);
     } else {
         console.warn(`⚠️ Could not find table body for modal ${urlHash}`);
+    }
+
+    // Keep the bucket counts honest while discovery streams in, and mount the
+    // bar on the first refresh that has results (it renders empty before then).
+    const _filterBar = state.modalElement.querySelector(`#discovery-filter-bar-${urlHash}`);
+    if (_filterBar) {
+        _filterBar.outerHTML = buildDiscoveryFilterBarHtml(state, urlHash);
+    } else {
+        const _tableWrap = state.modalElement.querySelector('.discovery-table-container');
+        const _barHtml = buildDiscoveryFilterBarHtml(state, urlHash);
+        if (_tableWrap && _barHtml) _tableWrap.insertAdjacentHTML('beforebegin', _barHtml);
     }
 
     // Update the progress bar and footer buttons too

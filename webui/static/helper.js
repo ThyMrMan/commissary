@@ -3484,8 +3484,12 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.9.9': [
-        { date: 'August 2026 · 1.9.9' },
+    '1.9.10': [
+        { date: 'August 2026 · 1.9.10' },
+        { title: 'Filter playlist discovery by how good the match was', desc: 'importing a playlist matches every track against your library, and on a couple of hundred tracks the handful that need you are buried among the ones that matched cleanly. The results table now has filter chips with counts — <strong>Perfect</strong>, <strong>Low confidence</strong>, <strong>Wing It</strong>, <strong>Not found</strong>, <strong>Error</strong> — so you can jump straight to the rows worth a second look.' },
+        { title: 'What "Low confidence" means', desc: 'the line is drawn at 0.9, the strictest bar any discovery source applies before it will call something a match. Playlist discovery itself accepts down to 0.7, so "low" means <em>accepted, but by a looser rule than the strictest source would have used</em> — matched, plausibly correct, worth your eyes. "Wing It" is different again: a placeholder the app invented because it found nothing, so those are never counted as matches.' },
+        { title: 'It only changes what you see', desc: 'filtering narrows the table and nothing else. Selection and downloading still operate on the whole result set, so hiding a group can never quietly change what a later button does. Your chosen filter also survives the table refreshing as discovery streams in, rather than resetting mid-triage. Buckets with nothing in them are not offered at all.' },
+        { title: 'Also in 1.9.9', desc: 'Auto-Import\'s confidence threshold moved from 90% to 45%, because 90% on a product of three fractions was close to unreachable.' },
         { title: 'Auto-Import will actually import things now', desc: 'the confidence threshold defaulted to 90%, which sounds strict and was in fact close to unreachable. The score is a <em>product</em> of three fractions — how sure we are which album this is, how well the track titles agree, and what fraction of the tracklist is present — so it falls away much faster than a percentage suggests. A perfectly tagged album with slightly imperfect identification scored about 83% and was refused. The default is now 45%.' },
         { title: 'It has not been made careless', desc: 'the same arithmetic is what keeps it safe. A folder holding 3 of 12 tracks scores about 12%; an album whose titles disagree with the release it was matched to scores about 14%; a folder the app could not confidently identify scores about 26%. All three are still refused, comfortably. What changed is that a complete, correctly identified folder no longer waits for you to confirm what the matcher already got right.' },
         { title: 'Where to change it', desc: 'Import → Auto-Import, the confidence slider. Your own setting always wins over the default — this only moves the value used when you have never touched it.' },
@@ -3703,6 +3707,19 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.10: sort the playlist matches that need you from the ones that don't",
+        description: "importing a playlist matches every track against your library. On a few hundred tracks, the handful needing a decision are lost among the ones that matched cleanly — so the results table can now be filtered by how good the match was.",
+        features: [
+            "filter chips with live counts: Perfect, Low confidence, Wing It, Not found, Error",
+            "the Perfect/Low line is 0.9 — the strictest bar any discovery source applies before calling something a match. Playlist discovery accepts down to 0.7, so \"low\" means accepted by a looser rule than the strictest source would have used",
+            "\"Wing It\" is not a match at all: it is a placeholder the app invents when it finds nothing, so those are never counted as matched",
+            "a manually matched row always counts as Perfect — you already decided, and a stale score should not demote that",
+            "filtering changes only what is displayed; selection and downloading still act on the full result set",
+            "your filter survives the table refreshing as discovery streams in, and buckets with nothing in them are not shown",
+        ],
+        usage_note: "The chips appear above the results table once discovery has produced answers. Start with Low confidence and Wing It — those are the rows where the app guessed and could be wrong.",
+    },
     {
         title: "1.9.9: Auto-Import's threshold was set to a value it could not reach",
         description: "the default confidence was 90%. That reads as \"only import when very sure\", but the score is a product of three fractions, so 90% was close to unattainable — even a perfectly tagged album usually fell short. The default is now 45%.",
