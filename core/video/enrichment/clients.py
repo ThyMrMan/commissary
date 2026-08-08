@@ -22,6 +22,25 @@ def _int(val):
         return None
 
 
+def _names_of(result) -> tuple:
+    """Every name a search result answers to (TV and movie shapes both)."""
+    r = result if isinstance(result, dict) else {}
+    return tuple(n for n in (r.get("name"), r.get("original_name"),
+                             r.get("title"), r.get("original_title")) if n)
+
+
+def _is_named(result, want_norm: str) -> bool:
+    """True when a search result actually carries the title we searched for.
+
+    A search RANKS by relevance; it never promises the top hit is the thing you
+    asked for. Taking results[0] on faith is what filed 'Silo' under an
+    unrelated show — TMDB returned a namesake and nothing checked. Comparison
+    goes through the same ``normalize_title`` the release matcher uses, so
+    accents, articles, '&' and punctuation don't cause a false miss."""
+    from core.video.release_parse import normalize_title
+    return any(normalize_title(n) == want_norm for n in _names_of(result))
+
+
 class TMDBClient:
     BASE = "https://api.themoviedb.org/3"
     IMG = "https://image.tmdb.org/t/p/original"
@@ -48,33 +67,96 @@ class TMDBClient:
             logger.exception("TMDB test failed")
             return False, "Could not reach TMDB"
 
-    def match(self, kind, title, year, known_id=None):
-        if not self.api_key:
-            return None
+    # Which of a row's other provider ids TMDB can resolve EXACTLY, per kind.
+    # tvdb_id is a TV-only external source; imdb_id works for both.
+    _FIND_SOURCES = {"show": ("tvdb_id", "imdb_id"), "movie": ("imdb_id",)}
+
+    def find_by_external_id(self, kind, external_ids):
+        """Resolve a TMDB id from another provider's id — exact, no guessing.
+
+        The media server routinely identifies a show by TVDB guid and gives us
+        no TMDB id at all. Falling straight through to a title search there is
+        what let 'Silo' be matched to an unrelated show; /find answers the same
+        question with certainty, in one call. Returns (id, overview) or
+        (None, None) when nothing is carried or nothing resolves."""
+        ids = external_ids if isinstance(external_ids, dict) else {}
+        if not self.api_key or not ids:
+            return (None, None)
         import requests
-        # The server already knows the TMDB id → go straight to the details
-        # fetch (accurate, one call). Otherwise fall back to a title/year search.
-        tmdb_id = _int(known_id)
-        meta = {}
-        if tmdb_id is None:
-            if not title:
-                return None
-            path = "/search/movie" if kind == "movie" else "/search/tv"
-            params = {"api_key": self.api_key, "query": title}
-            if year:
-                params["year" if kind == "movie" else "first_air_date_year"] = year
-            resp = requests.get(self.BASE + path, params=params, timeout=15)
+        key = "tv_results" if kind != "movie" else "movie_results"
+        for source in self._FIND_SOURCES.get("movie" if kind == "movie" else "show", ()):
+            val = str(ids.get(source) or "").strip()
+            if not val:
+                continue
+            r = requests.get(self.BASE + "/find/" + val,
+                             params={"api_key": self.api_key, "external_source": source},
+                             timeout=15)
+            # A 404 means "TMDB doesn't carry that id" — try the next one. Any
+            # other non-200 is a FAILED call and must propagate (see match()).
+            if r.status_code == 404:
+                continue
+            r.raise_for_status()
+            for hit in ((r.json() or {}).get(key) or []):
+                if hit.get("id") is not None:
+                    return (hit["id"], hit.get("overview"))
+        return (None, None)
+
+    def _search_verified(self, kind, title, year):
+        """Title-search fallback that REFUSES to guess. Returns (id, overview),
+        or (None, None) when no result actually carries the title we searched.
+
+        The year is tried first and then dropped, because a wrong or
+        episode-derived year silently excludes the real title from the results
+        and leaves only namesakes to choose from — the exact shape of the Silo
+        mis-match. Whatever survives still has to pass the name check."""
+        import requests
+        from core.video.release_parse import normalize_title
+        path = "/search/movie" if kind == "movie" else "/search/tv"
+        year_key = "year" if kind == "movie" else "first_air_date_year"
+        attempts = ([{year_key: year}] if year else []) + [{}]
+        want = normalize_title(title)
+        if not want:
+            return (None, None)
+        seen = []
+        for extra in attempts:
+            resp = requests.get(self.BASE + path,
+                                params={"api_key": self.api_key, "query": title, **extra},
+                                timeout=15)
             # A non-200 (429 rate-limit, 5xx, timeout-as-error) is a FAILED call,
             # not "no match" — raise so the worker records 'error' (retried later)
             # instead of burning the item to 'not_found'.
             resp.raise_for_status()
-            results = (resp.json() or {}).get("results") or []
-            if not results:
-                return None
-            tmdb_id = results[0].get("id")
-            meta["overview"] = results[0].get("overview")
+            for r in ((resp.json() or {}).get("results") or []):
+                if r.get("id") is None:
+                    continue
+                if _is_named(r, want):
+                    return (r["id"], r.get("overview"))
+                if len(seen) < 5:
+                    seen.extend(n for n in _names_of(r) if n not in seen)
+        # Refusing is the point: 'not_found' is retried and shows up in the
+        # Metadata Gaps job, where a wrong id is silent and permanent.
+        logger.info("TMDB: no result named %r (%s) — refusing to guess; saw: %s",
+                    title, kind, ", ".join(repr(s) for s in seen[:5]) or "nothing")
+        return (None, None)
+
+    def match(self, kind, title, year, known_id=None, external_ids=None):
+        if not self.api_key:
+            return None
+        import requests
+        # Identity, in descending order of certainty: the server's own TMDB id,
+        # then another provider's id resolved through /find, and only then a
+        # title search — which is a guess, and so has to prove itself.
+        tmdb_id = _int(known_id)
+        meta = {}
+        if tmdb_id is None:
+            tmdb_id, overview = self.find_by_external_id(kind, external_ids)
+            if tmdb_id is None:
+                if not title:
+                    return None
+                tmdb_id, overview = self._search_verified(kind, title, year)
             if tmdb_id is None:
                 return None
+            meta["overview"] = overview
         # A failed details CALL (429 rate-limit, 5xx, timeout) must PROPAGATE so the
         # backfill records an error and retries — not get swallowed into empty
         # metadata that then gets marked details_synced=1 forever (the bug that left
@@ -1202,28 +1284,61 @@ class TVDBClient:
         r.raise_for_status()
         return r.json() or {}
 
-    def match(self, kind, title, year, known_id=None):
+    def _remote_id_series(self, external_ids):
+        """A TVDB series id resolved from another provider's id — exact.
+        Returns (id, overview) or (None, None)."""
+        ids = external_ids if isinstance(external_ids, dict) else {}
+        for source in ("imdb_id", "tmdb_id"):
+            val = str(ids.get(source) or "").strip()
+            if not val:
+                continue
+            try:
+                r = self._authed_get("/search/remoteid/" + val)
+            except Exception:   # noqa: BLE001 - an unknown id 404s; try the next
+                continue
+            for hit in ((r or {}).get("data") or []):
+                series = hit.get("series") if isinstance(hit, dict) else None
+                if isinstance(series, dict) and _int(series.get("id")) is not None:
+                    return (_int(series["id"]), series.get("overview"))
+        return (None, None)
+
+    def match(self, kind, title, year, known_id=None, external_ids=None):
         if kind != "show" or not self.api_key:
             return None
-        tvdb_id = _int(known_id)
-        meta = {}
+        # Same certainty ladder as TMDB: the server's id, then another provider's
+        # id resolved through /search/remoteid, and only then a title search.
+        tvdb_id, meta = _int(known_id), {}
+        by_id = tvdb_id is not None
+        if tvdb_id is None:
+            tvdb_id, overview = self._remote_id_series(external_ids)
+            by_id = tvdb_id is not None
+            if overview:
+                meta["overview"] = overview
         if tvdb_id is None:
             if not title:
                 return None
+            from core.video.release_parse import normalize_title
             r = self._authed_get("/search", {"query": title, "type": "series"})
             results = (r or {}).get("data") or []
-            if not results:
+            want = normalize_title(title)
+            # A search ranks, it does not identify. Take the first result that
+            # actually carries this name, or none at all.
+            top = next((x for x in results if want and _is_named(x, want)), None)
+            if not top:
+                logger.info("TVDB: no series named %r — refusing to guess (%d result(s))",
+                            title, len(results))
                 return None
-            top = results[0]
             tvdb_id = _int(top.get("tvdb_id") or top.get("id"))
             meta["overview"] = top.get("overview")
-        else:
-            # Known id from the server → fetch the extended record (overview +
-            # genres + everything TVDB offers).
+        if tvdb_id is None:
+            return None
+        if by_id:
+            # We KNOW the id (server or cross-reference) → fetch the extended
+            # record (overview + genres + everything TVDB offers).
             try:
                 dr = self._authed_get("/series/" + str(tvdb_id) + "/extended")
                 sd = (dr or {}).get("data") or {}
-                meta["overview"] = sd.get("overview")
+                meta["overview"] = sd.get("overview") or meta.get("overview")
                 gs = [g.get("name") for g in (sd.get("genres") or []) if g.get("name")]
                 if gs:
                     meta["genres"] = gs
@@ -1232,8 +1347,6 @@ class TVDBClient:
                 meta["airs_time"] = (sd.get("airsTime") or "").strip() or None
             except Exception:
                 logger.exception("TVDB details fetch failed for %s", title or tvdb_id)
-        if tvdb_id is None:
-            return None
         return {"id": tvdb_id, "metadata": {k: v for k, v in meta.items() if v}}
 
     def search_candidates(self, kind, query, limit=8):

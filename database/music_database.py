@@ -3948,6 +3948,23 @@ class MusicDatabase:
             except Exception as e:
                 logger.error(f"Error rebuilding wishlist_tracks for profiles: {e}")
 
+            # 5b. One-time sweep of self-duplicate wishlist rows.
+            #
+            # A composite id ('<track>::<album>') is only legitimate when the
+            # base row holds the same track from a DIFFERENT album. add_to_wishlist
+            # used to fork one whenever the base id merely existed, so a track
+            # re-added from the SAME album (every drain cycle, for anything that
+            # keeps failing) grew a second row that duplicated the first.
+            #
+            # Those forks are invisible to record_failed_attempt, which stamps the
+            # base id — so their retry_count stays 0, they are permanently "due",
+            # and the retry backoff can never quiet them. Deleting them is safe
+            # precisely because the base row already covers the same track+album.
+            try:
+                self._prune_self_duplicate_wishlist_rows(cursor)
+            except Exception as e:
+                logger.error(f"Error pruning duplicate wishlist rows: {e}")
+
             # 6. Rebuild bubble_snapshots for profile-scoped PRIMARY KEY
             try:
                 cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='bubble_snapshots'")
@@ -10281,6 +10298,49 @@ class MusicDatabase:
             logger.debug("Could not resolve quality profile id: %s", e)
             return None
 
+    def _prune_self_duplicate_wishlist_rows(self, cursor) -> int:
+        """Delete composite wishlist rows that merely duplicate their base row.
+
+        A row keyed '<track>::<album>' is redundant when the plain '<track>' row
+        in the same profile is for that very album — the fork carried no extra
+        information and no attempt history. Rows for a genuinely different album
+        are left alone. Returns the number removed. See the caller for why these
+        exist at all."""
+        cursor.execute(
+            "SELECT id, spotify_track_id, profile_id FROM wishlist_tracks "
+            "WHERE spotify_track_id LIKE '%::%'")
+        forks = cursor.fetchall()
+        if not forks:
+            return 0
+        doomed = []
+        for row in forks:
+            base_id, _, album_id = str(row['spotify_track_id']).rpartition('::')
+            if not base_id or not album_id:
+                continue
+            cursor.execute(
+                "SELECT spotify_data FROM wishlist_tracks "
+                "WHERE spotify_track_id = ? AND profile_id = ?", (base_id, row['profile_id']))
+            base = cursor.fetchone()
+            if base and self._wishlist_row_album_id(base['spotify_data']) == album_id:
+                doomed.append(row['id'])
+        for row_id in doomed:
+            cursor.execute("DELETE FROM wishlist_tracks WHERE id = ?", (row_id,))
+        if doomed:
+            logger.info("Removed %d duplicate wishlist row(s) that shadowed their own "
+                        "base entry and could never earn a retry cooldown", len(doomed))
+        return len(doomed)
+
+    @staticmethod
+    def _wishlist_row_album_id(spotify_data) -> str:
+        """The album id stored on a wishlist row, '' when absent/unparseable.
+        Used to tell 'the same track from another album' (which deserves its own
+        row) from 'the same track again' (which does not)."""
+        try:
+            album = (json.loads(spotify_data) or {}).get('album')
+            return str(album.get('id') or '') if isinstance(album, dict) else ''
+        except (ValueError, TypeError, AttributeError):
+            return ''
+
     def add_to_wishlist(
         self,
         spotify_track_data: Dict[str, Any] = None,
@@ -10453,23 +10513,77 @@ class MusicDatabase:
                         if cursor.fetchone():
                             logger.debug(f"Skipping wishlist entry — same track+album already in wishlist: '{track_name}' on '{album_obj.get('name', '')}'")
                             return False
-                        # Check if base track_id exists (from a different album)
-                        cursor.execute("SELECT id FROM wishlist_tracks WHERE spotify_track_id = ? AND profile_id = ?",
+                        # Does the base id already hold this track — and if so, is
+                        # it a DIFFERENT album? Only then does the composite key
+                        # earn its keep.
+                        #
+                        # This used to fork on the base id existing at all, without
+                        # comparing albums, so re-adding a track from the SAME album
+                        # (which is what the wishlist drain does every cycle to a
+                        # track that failed again) created a second row that was a
+                        # duplicate of the first. Nothing ever stamped the fork's
+                        # attempt counter — record_failed_attempt stamps the base id
+                        # — so its retry_count sat at 0 forever, it was therefore
+                        # always "due", and the progressive backoff could never
+                        # apply to it. That is the endless-retry loop: a real log
+                        # shows 34 files re-downloaded and re-quarantined up to 132
+                        # times each, with zero cooldowns in twelve hours.
+                        cursor.execute("SELECT spotify_data FROM wishlist_tracks "
+                                       "WHERE spotify_track_id = ? AND profile_id = ?",
                                        (track_id, profile_id))
-                        if cursor.fetchone():
-                            # Same track exists from different album — use composite ID
+                        _existing_row = cursor.fetchone()
+                        if _existing_row and self._wishlist_row_album_id(_existing_row['spotify_data']) != album_id:
+                            # Genuinely the same track from a different album.
                             insert_track_id = composite_id
 
                 resolved_qp_id = self._resolve_quality_profile_id(cursor, quality_profile_id)
 
-                # Insert the track
-                cursor.execute("""
-                    INSERT OR REPLACE INTO wishlist_tracks
-                    (spotify_track_id, spotify_data, failure_reason, source_type, source_info, date_added, profile_id,
-                     quality_profile_id, root_folder_id)
-                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
-                """, (insert_track_id, spotify_json, failure_reason, source_type, source_json, profile_id,
-                      resolved_qp_id, root_folder_id))
+                # Insert the track.
+                #
+                # NOT `INSERT OR REPLACE`: that DELETEs the conflicting row and
+                # inserts a fresh one, so every column absent from the list
+                # silently reverts to its default — including `retry_count` and
+                # `last_attempted`. A failing track is re-added on every drain
+                # cycle, so the counter was wiped to 0 and re-stamped to 1 each
+                # time, and `cooldown_seconds()` returns 0 at 1. That is why the
+                # progressive retry backoff (4h → 24h → 7d) never once engaged:
+                # a real log covering 12 hours shows the same 20 tracks retried
+                # every 30 minutes, and zero cooldowns. An explicit upsert
+                # touches only the columns a re-add should actually refresh.
+                _wishlist_row = (insert_track_id, spotify_json, failure_reason, source_type,
+                                 source_json, profile_id, resolved_qp_id, root_folder_id)
+                try:
+                    cursor.execute("""
+                        INSERT INTO wishlist_tracks
+                        (spotify_track_id, spotify_data, failure_reason, source_type, source_info, date_added, profile_id,
+                         quality_profile_id, root_folder_id)
+                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
+                        ON CONFLICT(profile_id, spotify_track_id) DO UPDATE SET
+                            spotify_data = excluded.spotify_data,
+                            failure_reason = excluded.failure_reason,
+                            source_type = excluded.source_type,
+                            source_info = excluded.source_info,
+                            date_added = excluded.date_added,
+                            quality_profile_id = excluded.quality_profile_id,
+                            root_folder_id = excluded.root_folder_id
+                    """, _wishlist_row)
+                except sqlite3.OperationalError as upsert_error:
+                    # The conflict target needs the profile-scoped UNIQUE index,
+                    # which a migration adds — and that migration logs-and-
+                    # continues on failure. On a DB where it never landed, an
+                    # unusable retry counter is a far smaller problem than a
+                    # wishlist that cannot accept tracks at all, so fall back.
+                    if 'ON CONFLICT' not in str(upsert_error):
+                        raise
+                    logger.warning(
+                        "wishlist upsert unavailable (%s) — falling back to REPLACE; "
+                        "retry_count will not accumulate on this database", upsert_error)
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO wishlist_tracks
+                        (spotify_track_id, spotify_data, failure_reason, source_type, source_info, date_added, profile_id,
+                         quality_profile_id, root_folder_id)
+                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
+                    """, _wishlist_row)
 
                 conn.commit()
 

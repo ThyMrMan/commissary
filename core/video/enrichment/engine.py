@@ -255,7 +255,8 @@ class VideoEnrichmentEngine:
             return {"ok": False, "reason": "not_found"}
         try:
             result = w.client.match("show", info.get("title"), info.get("year"),
-                                    known_id=info.get("tmdb_id"))
+                                    known_id=info.get("tmdb_id"),
+                                    external_ids={"tvdb_id": info.get("tvdb_id")})
         except Exception:
             logger.exception("refresh_show_art: match failed for show %s", show_id)
             return {"ok": False, "reason": "match_error"}
@@ -369,7 +370,8 @@ class VideoEnrichmentEngine:
             return {"ok": False, "reason": "not_found"}
         try:
             result = w.client.match("movie", info.get("title"), info.get("year"),
-                                    known_id=info.get("tmdb_id"))
+                                    known_id=info.get("tmdb_id"),
+                                    external_ids={"imdb_id": info.get("imdb_id")})
         except Exception:
             logger.exception("refresh_movie_art: match failed for movie %s", movie_id)
             return {"ok": False, "reason": "match_error"}

@@ -48,7 +48,7 @@ class _Client:
     def season_episodes(self, _sid, sn):
         return self._eps.get(sn, [])
 
-    def match(self, _kind, _title, _year, known_id=None):
+    def match(self, _kind, _title, _year, known_id=None, external_ids=None):
         return {"id": known_id or 1,
                 "metadata": {"seasons": [{"season_number": n} for n in self._seasons]}}
 

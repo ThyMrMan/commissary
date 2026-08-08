@@ -124,7 +124,7 @@ def test_refresh_show_art_recent_only_scopes_seasons_and_leaves_synced_flag():
     cap = {}
 
     class _Client:
-        def match(self, kind, title, year, known_id=None):
+        def match(self, kind, title, year, known_id=None, external_ids=None):
             return {"id": 999, "metadata": {"seasons": [
                 {"season_number": 0}, {"season_number": 1},
                 {"season_number": 2}, {"season_number": 3}]}}

@@ -3484,8 +3484,22 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.9.10': [
-        { date: 'August 2026 · 1.9.10' },
+    '1.9.11': [
+        { date: 'August 2026 · 1.9.11' },
+        { title: 'Fixed: a failing track could be retried forever, never backing off', desc: 'the wishlist has had a retry ladder for a while — a track that keeps failing earns a growing cooldown (4 hours, then a day, then weekly) instead of burning a search every cycle. In one 12-hour log it <strong>never engaged once</strong>. Re-adding a failed track created a second, duplicate wishlist row for the same album, and nothing ever recorded an attempt against that copy — so its counter sat at zero, it looked freshly-added on every pass, and it was retried indefinitely. The re-add now recognises a track it already has.' },
+        { title: 'What that was costing you', desc: 'in the same log, <strong>34 files were downloaded and quarantined again and again — one of them 132 times</strong>. Each cycle re-fetched a file that had already failed its integrity check, threw it away for the same reason, and queued it up to do it again. Duplicate rows already in your wishlist are cleaned up once on upgrade; a track from a genuinely different album still gets its own entry, which is what that mechanism was for.' },
+        { title: 'Downloads stopped reporting healthy batches as broken', desc: 'the batch self-check counted every finished track as an "orphaned task", so a perfectly normal download batch was declared damaged every 30 seconds for its entire life — one log had 1,499 of these warnings across 31 batches, with the "orphan" count simply climbing in step with progress. It now looks for the two things that are actually wrong: a batch whose tasks have all finished without it completing, and a queued task whose record has gone missing.' },
+        { title: 'Fixed: Deezer would stop working and never start again', desc: 'the gateway hands out a session token when you authenticate, and SoulSync kept that one token for as long as the app was running. Deezer expires it after a while — and from that moment every single Deezer download failed, forever, until you restarted. One log covering half a day showed <strong>669 consecutive failures, about 20 an hour</strong>, all of them the same rejected token. The client now notices that specific rejection, renews the session from your saved ARL, and retries the call.' },
+        { title: 'Why it was invisible', desc: 'nothing marked the source as broken, so the connection light stayed green and Deezer stayed first in the download chain — being handed tracks it could only fail. Worse, the error you saw was <em>"impl returned None"</em>, while the only line that named a cause was a warning buried further up. A failed session now drops the source out of the chain honestly, and the real reason travels with the failure.' },
+        { title: 'This is what jams the wishlist', desc: 'if your wishlist has been reporting the same number of failures every run and never shrinking, this is why. With Deezer first in the chain and silently dead, every track failed and went straight back on the list, so the next run tried the identical set and failed identically. The same log showed 22 consecutive runs of exactly 20 tracks, all failing.' },
+        { title: 'Wishlist runs are logged honestly now', desc: 'the completion summary was written at ERROR level for every run — including runs where <em>nothing failed at all</em> — and read as "20 added to wishlist, 20 failed", which looks like 40 tracks with half of them fine. It is the same 20 tracks counted twice: the ones that failed, going back on the list. A clean run is now an ordinary info line, and a run with failures says so once.' },
+        { title: 'Video grabs name the show that was refused', desc: 'a refused TV grab logged "refused for None" — 49 times in one log — because episode entries carry the show name in a different field from movies, and both messages only read the movie one. Same for the out-of-disk-space skip.' },
+        { title: 'Fixed: a downloaded episode could be filed under the wrong show entirely', desc: 'a wishlist grab would fetch exactly the right episode, and the show it belonged to would then be matched to an unrelated title. The cause was in how a show gets identified: when your media server knew the show by its TVDB id but had no TMDB id for it, the app searched TMDB for the show\'s <em>name</em> and accepted the first result without ever checking it was the right one. One reported case matched <strong>Silo</strong> to a completely different series.' },
+        { title: 'Why it did more damage than a wrong poster', desc: 'everything downstream of that id came from the other show — summary, status, ratings, and the <strong>season list</strong>. A wished S03 then had no season to belong to, so the episode never reconciled against your library, the wishlist row was never satisfied, and the drain grabbed the same episode again on the next tick. The row was marked "matched", so nothing ever re-examined it.' },
+        { title: 'Identity is now established, not guessed', desc: 'if your server supplied a TMDB id, that is used. Failing that, any other id the show already carries — TVDB or IMDb — resolves the correct TMDB entry <em>exactly</em>, in one call. Only when there is no id of any kind does it fall back to searching by name, and that search now has to prove the result actually carries that title before it counts. When nothing does, it records "not found" and retries later rather than picking something.' },
+        { title: 'A wrong year no longer buries the right show', desc: 'the name search filtered by year, so a show whose stored year was off had the real entry excluded from its own results — leaving only same-named strangers to choose between. The year is now dropped and the search retried before the app will give up.' },
+        { title: 'Shows already filed wrong get corrected on their own', desc: 'nothing would have revisited them, so each show carrying both a TMDB and a TVDB id is now checked once, in the background, against the one question that settles it — which TMDB entry does this show\'s TVDB id belong to. A show that agrees is marked verified and never checked again. A show that <em>disagrees</em> is re-pointed at the right title and the wrong show\'s metadata is cleared so it refills correctly. One lookup per show, once, then never again.' },
+        { title: 'Also in 1.9.10', desc: 'playlist discovery results can be filtered by match quality.' },
         { title: 'Filter playlist discovery by how good the match was', desc: 'importing a playlist matches every track against your library, and on a couple of hundred tracks the handful that need you are buried among the ones that matched cleanly. The results table now has filter chips with counts — <strong>Perfect</strong>, <strong>Low confidence</strong>, <strong>Wing It</strong>, <strong>Not found</strong>, <strong>Error</strong> — so you can jump straight to the rows worth a second look.' },
         { title: 'What "Low confidence" means', desc: 'the line is drawn at 0.9, the strictest bar any discovery source applies before it will call something a match. Playlist discovery itself accepts down to 0.7, so "low" means <em>accepted, but by a looser rule than the strictest source would have used</em> — matched, plausibly correct, worth your eyes. "Wing It" is different again: a placeholder the app invented because it found nothing, so those are never counted as matches.' },
         { title: 'It only changes what you see', desc: 'filtering narrows the table and nothing else. Selection and downloading still operate on the whole result set, so hiding a group can never quietly change what a later button does. Your chosen filter also survives the table refreshing as discovery streams in, rather than resetting mid-triage. Buckets with nothing in them are not offered at all.' },
@@ -3707,6 +3721,44 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.11: the wishlist stops retrying the same failures forever",
+        description: "a retry ladder has existed for a while — repeated failures earn a growing cooldown instead of a search every cycle. A 12-hour log shows it never engaged once, because re-adding a failed track quietly created a duplicate row that no attempt was ever recorded against.",
+        features: [
+            "the duplicate looked freshly added on every pass, so it was always \"due\" and could never earn a cooldown",
+            "the cost: 34 files downloaded and quarantined again and again — one of them 132 times — each cycle re-fetching a file that had already failed its integrity check",
+            "a re-add now recognises a track it already holds; the same track from a genuinely different album still gets its own entry, which is what that mechanism was for",
+            "duplicate rows already sitting in your wishlist are swept once on upgrade",
+            "separately, the batch self-check counted every finished track as an \"orphaned task\", declaring healthy download batches broken every 30 seconds — 1,499 such warnings across 31 batches in one log",
+            "it now looks for the two real faults: all tasks finished but the batch never completed, and a queued task whose record has vanished",
+        ],
+        usage_note: "Nothing to configure. A track that keeps failing now goes quiet on its own — 4 hours, then a day, then weekly — and the Failing filter plus a manual search stay the way to push one through.",
+    },
+    {
+        title: "1.9.11: Deezer could die silently and stay dead",
+        description: "the gateway session token was fetched once at login and cached for the life of the app. When Deezer expired it, every download failed from that moment until a restart — one log showed 669 consecutive failures over half a day, roughly 20 an hour, all the same rejected token.",
+        features: [
+            "the client now recognises that specific rejection, renews the session from your saved ARL, and retries the call",
+            "a renewal that fails drops the source out of the chain instead of leaving the connection light green on a session that cannot download",
+            "the real reason travels with the failure — the error used to read \"impl returned None\" while the only line naming a cause was a warning further up",
+            "concurrent downloads that hit the same expiry share one renewal rather than firing a login each",
+            "if your wishlist has been failing the same tracks every run and never shrinking, this is the cause: Deezer sits first in the chain, so everything failed and went straight back on the list",
+        ],
+        usage_note: "Nothing to reconfigure — it renews from the ARL you already saved. If the renewal itself fails, the log says so plainly and asks you to re-enter the ARL in Settings.",
+    },
+    {
+        title: "1.9.11: a show is identified now, not guessed at",
+        description: "a wishlist grab could fetch exactly the right episode and then have its show matched to an unrelated title — because when your server knew a show by TVDB id but not TMDB, the app searched TMDB for the name and took the first result on faith. One reported case put Silo under a completely different series.",
+        features: [
+            "the damage went past a wrong poster: summary, status, ratings and the season list all came from the other show, so a wished S03 had no season to land in and the wishlist re-grabbed the same episode forever",
+            "identity now comes from an id wherever one exists — your server's TMDB id first, otherwise the show's TVDB or IMDb id resolved to the exact TMDB entry",
+            "a name search is the last resort, and it has to prove the result carries that title; when nothing does it records \"not found\" and retries rather than picking something",
+            "a wrong stored year used to exclude the real show from its own search results, leaving only same-named strangers — the year is now dropped and the search retried before giving up",
+            "shows already filed wrong are corrected automatically: each one carrying both a TMDB and a TVDB id is checked once in the background, and only a genuine contradiction re-points it",
+            "the same rule applies to TVDB matching, which had the identical flaw",
+        ],
+        usage_note: "Nothing to configure. The background re-check is one lookup per show, once, and shows that agree are never checked again. A correction is logged as \"was matched to TMDB X, but its TVDB id resolves to TMDB Y\".",
+    },
     {
         title: "1.9.10: sort the playlist matches that need you from the ones that don't",
         description: "importing a playlist matches every track against your library. On a few hundred tracks, the handful needing a decision are lost among the ones that matched cleanly — so the results table can now be filtered by how good the match was.",

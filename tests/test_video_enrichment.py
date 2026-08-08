@@ -26,7 +26,7 @@ class FakeClient:
         self._result = result
         self.calls = []
 
-    def match(self, kind, title, year, known_id=None):
+    def match(self, kind, title, year, known_id=None, external_ids=None):
         self.calls.append((kind, title, year, known_id))
         return self._result
 
@@ -111,7 +111,7 @@ def test_refresh_show_art_backfills_seasons_even_when_already_matched(db):
 
     class C:
         enabled = True
-        def match(self, kind, title, year, known_id=None):
+        def match(self, kind, title, year, known_id=None, external_ids=None):
             assert known_id == 1396
             return {"id": 1396, "metadata": {"seasons": [
                 {"season_number": 1, "poster_url": "https://img/s1.jpg"}]}}
@@ -151,7 +151,7 @@ def test_worker_background_episode_sync_pulls_full_list(db):
 
     class C:
         enabled = True
-        def match(self, kind, title, year, known_id=None):
+        def match(self, kind, title, year, known_id=None, external_ids=None):
             return {"id": 1396, "metadata": {"seasons": [{"season_number": 1, "poster_url": None}]}}
         def season_episodes(self, tv, sn):
             return {"episodes": [{"episode_number": 1}, {"episode_number": 2}, {"episode_number": 3}]}
@@ -548,7 +548,7 @@ def test_refresh_movie_art_backfills_cast_and_genres(db):
 
     class C:
         enabled = True
-        def match(self, kind, title, year, known_id=None):
+        def match(self, kind, title, year, known_id=None, external_ids=None):
             assert kind == "movie" and known_id == 438631
             return {"id": 438631, "metadata": {"genres": ["Sci-Fi"],
                                                "cast": [{"name": "Timothee", "tmdb_id": 1}]}}
@@ -560,7 +560,10 @@ def test_refresh_movie_art_backfills_cast_and_genres(db):
 
 def test_movie_match_info(db):
     mid = db.upsert_movie("plex", {"server_id": "m1", "title": "Dune", "year": 2021, "tmdb_id": 438631})
-    assert db.movie_match_info(mid) == {"title": "Dune", "year": 2021, "tmdb_id": 438631}
+    # imdb_id rides along so an unmatched movie can be resolved EXACTLY through
+    # TMDB's /find instead of a title search that can only guess.
+    assert db.movie_match_info(mid) == {"title": "Dune", "year": 2021,
+                                        "tmdb_id": 438631, "imdb_id": None}
     assert db.movie_match_info(999999) is None
 
 
@@ -589,7 +592,7 @@ def test_show_worker_cascades_episode_backfill(db):
 
     class CascadeClient:
         enabled = True
-        def match(self, kind, title, year, known_id=None):
+        def match(self, kind, title, year, known_id=None, external_ids=None):
             return {"id": 1396, "metadata": {}}
         def season_episodes(self, tv_id, snum):
             assert tv_id == 1396
@@ -709,7 +712,7 @@ def test_movie_collection_reads_nested_metadata(db):
     # level (the top-level bug returned None → every franchise backfilled as id 0).
     class Tmdb:
         enabled = True
-        def match(self, kind, title, year, known_id=None):
+        def match(self, kind, title, year, known_id=None, external_ids=None):
             return {"id": known_id, "metadata": {
                 "tmdb_collection_id": 328, "tmdb_collection_name": "Jurassic Park Collection"}}
     eng = VideoEnrichmentEngine(db, {"tmdb": Tmdb()})
@@ -974,7 +977,10 @@ def test_tvdb_client_refreshes_expired_token(monkeypatch):
         state["calls"] += 1
         if state["calls"] == 1:
             return _Resp(401, {})                      # stale token rejected
-        return _Resp(200, {"data": [{"tvdb_id": 77, "overview": "O"}]})
+        # A real TVDB search result carries the series name, and the matcher now
+        # requires one: a result that can't be shown to BE the show we asked for
+        # is a guess, not a match (see TVDBClient.match).
+        return _Resp(200, {"data": [{"tvdb_id": 77, "name": "Some Show", "overview": "O"}]})
 
     monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(get=fake_get, post=fake_post))
     res = TVDBClient("KEY").match("show", "Some Show", 2020)

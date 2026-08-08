@@ -73,6 +73,17 @@ _ENRICH = {
     },
 }
 
+# CROSS-REFERENCE ids a matcher may resolve BY when the service's own id is
+# missing. A row that carries any of these can be identified EXACTLY (TMDB's
+# /find, TVDB's /search/remoteid) instead of guessed at from its title — which
+# is what a title search is, and what once filed 'Silo' under an unrelated show
+# because it took TMDB's first search result on faith. The service's own id
+# column is filtered out at query time (it is already ``known_id``).
+_ENRICH_XREF_COLS = {
+    "movies": ("tmdb_id", "imdb_id"),
+    "shows": ("tvdb_id", "tmdb_id", "imdb_id"),
+}
+
 # Whitelist of metadata columns enrichment may write per table (guards against
 # arbitrary keys; backfill semantics applied by the caller).
 _ENRICH_META_COLS = {
@@ -197,6 +208,11 @@ _COLUMN_MIGRATIONS = [
     ("movies", "tmdb_last_attempted", "TEXT"),
     ("shows", "tmdb_match_status", "TEXT"),
     ("shows", "tmdb_last_attempted", "TEXT"),
+    # Has this show's TMDB id been CONFIRMED against a second provider, rather
+    # than guessed from its title? Existing rows default to 0, which is what
+    # makes the one-time re-check sweep find the shows an early title search
+    # mis-identified (see VideoEnrichmentWorker._verify_identity_one).
+    ("shows", "tmdb_identity_verified", "INTEGER DEFAULT 0"),
     ("shows", "tvdb_match_status", "TEXT"),
     ("shows", "tvdb_last_attempted", "TEXT"),
     # "capture everything" — richer metadata from the server.
@@ -633,9 +649,15 @@ class VideoDatabase:
     def enrichment_next(self, service: str, retry_days: int = 30, priority=None) -> dict | None:
         """Next item that needs enrichment for a service: pending (never tried)
         first, then a not_found item older than retry_days. Returns
-        {kind, id, title, year, known_id} or None. ``known_id`` is the provider
-        id the media server already supplied (e.g. tmdb_id/tvdb_id) so the worker
-        can enrich BY ID instead of re-searching by title.
+        {kind, id, title, year, known_id, external_ids} or None. ``known_id`` is
+        the provider id the media server already supplied (e.g. tmdb_id/tvdb_id)
+        so the worker can enrich BY ID instead of re-searching by title.
+
+        ``external_ids`` are the OTHER providers' ids already on the row. They
+        matter when ``known_id`` is None: a show the server identified by TVDB
+        guid but not by TMDB can still be resolved EXACTLY (TMDB's /find), which
+        is the difference between knowing what a title is and guessing from its
+        name. See _ENRICH_XREF_COLS.
 
         ``priority`` ('movie'/'show') pins a kind to be processed first across the
         queue; a compound 'movie:<root_folder_id>'/'show:<root_folder_id>' also
@@ -653,38 +675,47 @@ class VideoDatabase:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=retry_days)).strftime("%Y-%m-%d %H:%M:%S")
         conn = self._get_connection()
 
-        def _row(row, kind, idc):
+        def _xrefs(tbl, idc):
+            """The row's OTHER provider id columns — never the service's own."""
+            return [c for c in _ENRICH_XREF_COLS.get(tbl, ()) if c != idc]
+
+        def _cols(tbl, idc):
+            return ", ".join(["id", "title", "year", idc] + _xrefs(tbl, idc))
+
+        def _row(row, kind, tbl, idc):
             return {"kind": kind, "id": row["id"], "title": row["title"],
-                    "year": row["year"], "known_id": row[idc]}
+                    "year": row["year"], "known_id": row[idc],
+                    "external_ids": {c: row[c] for c in _xrefs(tbl, idc) if row[c]}}
 
         try:
             for kind, (tbl, idc, sc, _ac) in items:
                 if priority_root and kind == priority_kind:
                     row = conn.execute(
-                        f"SELECT id, title, year, {idc} FROM {tbl} "
+                        f"SELECT {_cols(tbl, idc)} FROM {tbl} "
                         f"WHERE {sc} IS NULL AND root_folder_id=? ORDER BY id LIMIT 1",
                         (priority_root,)).fetchone()
                     if row:
-                        return _row(row, kind, idc)
+                        return _row(row, kind, tbl, idc)
                 row = conn.execute(
-                    f"SELECT id, title, year, {idc} FROM {tbl} WHERE {sc} IS NULL ORDER BY id LIMIT 1").fetchone()
+                    f"SELECT {_cols(tbl, idc)} FROM {tbl} "
+                    f"WHERE {sc} IS NULL ORDER BY id LIMIT 1").fetchone()
                 if row:
-                    return _row(row, kind, idc)
+                    return _row(row, kind, tbl, idc)
             for kind, (tbl, idc, sc, ac) in items:
                 if priority_root and kind == priority_kind:
                     row = conn.execute(
-                        f"SELECT id, title, year, {idc} FROM {tbl} "
+                        f"SELECT {_cols(tbl, idc)} FROM {tbl} "
                         f"WHERE {sc} IN ('not_found','error') AND root_folder_id=? "
                         f"AND ({ac} IS NULL OR {ac} < ?) ORDER BY {ac} LIMIT 1",
                         (priority_root, cutoff)).fetchone()
                     if row:
-                        return _row(row, kind, idc)
+                        return _row(row, kind, tbl, idc)
                 row = conn.execute(
-                    f"SELECT id, title, year, {idc} FROM {tbl} "
+                    f"SELECT {_cols(tbl, idc)} FROM {tbl} "
                     f"WHERE {sc} IN ('not_found','error') "
                     f"AND ({ac} IS NULL OR {ac} < ?) ORDER BY {ac} LIMIT 1", (cutoff,)).fetchone()
                 if row:
-                    return _row(row, kind, idc)
+                    return _row(row, kind, tbl, idc)
             return None
         finally:
             conn.close()
@@ -1067,10 +1098,12 @@ class VideoDatabase:
             conn.close()
 
     def movie_match_info(self, movie_id: int) -> dict | None:
-        """Title/year/tmdb_id for one movie — for on-demand (lazy) refresh."""
+        """Title/year/tmdb_id/imdb_id for one movie — for on-demand (lazy) refresh.
+        ``imdb_id`` lets an unmatched movie be resolved EXACTLY (TMDB's /find)
+        instead of by a title search that can only guess."""
         conn = self._get_connection()
         try:
-            row = conn.execute("SELECT title, year, tmdb_id FROM movies WHERE id=?",
+            row = conn.execute("SELECT title, year, tmdb_id, imdb_id FROM movies WHERE id=?",
                                (movie_id,)).fetchone()
             return dict(row) if row else None
         finally:
@@ -1745,6 +1778,51 @@ class VideoDatabase:
         try:
             conn.execute(f"UPDATE {tbl} SET details_synced=1 WHERE id=?", (item_id,))
             conn.commit()
+        finally:
+            conn.close()
+
+    def identity_unverified_show(self) -> dict | None:
+        """Next show whose TMDB id has never been CONFIRMED against a second
+        provider. Returns {id, title, tmdb_id, tvdb_id} or None.
+
+        Only shows carrying BOTH ids qualify, because the tvdb_id is what makes
+        confirmation possible — it resolves to exactly one TMDB id, so a
+        disagreement is proof rather than an opinion. Shows without one are left
+        alone: there is nothing to check them against, and re-running the same
+        title search that produced the id would only agree with itself."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT id, title, tmdb_id, tvdb_id FROM shows "
+                "WHERE tmdb_id IS NOT NULL AND tvdb_id IS NOT NULL "
+                "AND COALESCE(tmdb_identity_verified, 0) = 0 ORDER BY id LIMIT 1").fetchone()
+            return dict(row) if row else None
+        except sqlite3.Error:
+            logger.exception("identity_unverified_show failed")
+            return None
+        finally:
+            conn.close()
+
+    def mark_identity_verified(self, show_id: int) -> None:
+        """Record that a show's TMDB id was checked against its TVDB id — whether
+        it agreed or was corrected. One call per show, once, ever."""
+        conn = self._get_connection()
+        try:
+            conn.execute("UPDATE shows SET tmdb_identity_verified=1 WHERE id=?", (show_id,))
+            conn.commit()
+        except sqlite3.Error:
+            logger.exception("mark_identity_verified failed for show %s", show_id)
+        finally:
+            conn.close()
+
+    def identity_unverified_count(self) -> int:
+        conn = self._get_connection()
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM shows WHERE tmdb_id IS NOT NULL AND tvdb_id IS NOT NULL "
+                "AND COALESCE(tmdb_identity_verified, 0) = 0").fetchone()[0]
+        except sqlite3.Error:
+            return 0
         finally:
             conn.close()
 

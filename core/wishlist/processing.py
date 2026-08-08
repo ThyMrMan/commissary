@@ -498,9 +498,17 @@ def finalize_auto_wishlist_completion(
     behavior — the gate treats a missing run_id as "lone batch"."""
     tracks_added = completion_summary.get('tracks_added', 0)
     total_failed = completion_summary.get('total_failed', 0)
-    logger.error(
-        f"[Auto-Wishlist] Background processing complete: {tracks_added} added to wishlist, {total_failed} failed"
-    )
+    # `tracks_added` IS the failed set going back on the wishlist, not a second
+    # group alongside it — reporting them as two numbers read as twice the work,
+    # and reporting a routine summary (including a clean '0 and 0') at ERROR put
+    # a run that went fine in the same bucket as things that actually broke.
+    if total_failed:
+        logger.warning(
+            f"[Auto-Wishlist] Background processing complete: {total_failed} track(s) "
+            f"failed and went back on the wishlist"
+        )
+    else:
+        logger.info("[Auto-Wishlist] Background processing complete: nothing failed")
 
     if tracks_added > 0:
         add_activity_item("", "Wishlist Updated", f"{tracks_added} failed tracks added to wishlist", "Now")

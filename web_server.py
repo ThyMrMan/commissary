@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.9.10"
+_SOULSYNC_BASE_VERSION = "1.9.11"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -2148,7 +2148,8 @@ def validate_and_heal_batch_states():
 
                 # Count actually active tasks
                 actually_active = 0
-                orphaned_tasks = []
+                finished_tasks = []   # reached a terminal status — the NORMAL case
+                missing_tasks = []    # queued but absent from download_tasks — a real fault
                 # Respect _on_download_completed dedup set — don't re-inflate active_count
                 completed_task_ids = batch_data.get('_completed_task_ids', set())
 
@@ -2159,10 +2160,10 @@ def validate_and_heal_batch_states():
                             if task_id not in completed_task_ids:
                                 actually_active += 1
                         elif task_status in ['failed', 'completed', 'cancelled', 'not_found']:
-                            orphaned_tasks.append(task_id)
+                            finished_tasks.append(task_id)
                     else:
                         # Task in queue but not in download_tasks dict
-                        orphaned_tasks.append(task_id)
+                        missing_tasks.append(task_id)
 
                 # Check for inconsistencies
                 if active_count != actually_active:
@@ -2176,9 +2177,27 @@ def validate_and_heal_batch_states():
                         if queue_index < len(queue):
                             batches_needing_workers.append(batch_id)
 
-                # Clean up orphaned tasks that are blocking progress
-                if orphaned_tasks and phase == 'downloading':
-                    logger.warning(f"[Batch Healing] Found {len(orphaned_tasks)} orphaned tasks in active batch {batch_id}")
+                # Nudge a batch that is genuinely STUCK.
+                #
+                # This used to fire whenever a downloading batch contained ANY
+                # finished task — which is every healthy batch, on every 30s
+                # tick, for its whole life. A real log shows 1,499 of these
+                # warnings across just 31 batches, one of them "healed" 68 times
+                # in 41 minutes while working perfectly; the "orphan" count was
+                # simply its completed-track count, climbing 1 → 2 → … → 32.
+                #
+                # A finished task in a running batch is not a fault. The two
+                # things that ARE: every task done but the phase never advanced
+                # (the completion callback was missed), and a queued task whose
+                # record has vanished.
+                queue_index = batch_data.get('queue_index', 0)
+                fully_dispatched = queue_index >= len(queue)
+                if phase == 'downloading' and (missing_tasks or
+                                               (fully_dispatched and actually_active == 0)):
+                    reason = (f"{len(missing_tasks)} task(s) missing from the task table"
+                              if missing_tasks else
+                              f"all {len(finished_tasks)} task(s) finished but the batch never completed")
+                    logger.warning(f"[Batch Healing] Batch {batch_id} looks stuck — {reason}")
                     batches_needing_completion_check.append(batch_id)
 
             # Cleanup stale batches inside the lock (safe - just dict mutations)

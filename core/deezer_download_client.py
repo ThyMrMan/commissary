@@ -28,6 +28,11 @@ logger = get_logger("deezer_download")
 
 # Deezer API endpoints
 _GW_API = "https://www.deezer.com/ajax/gw-light.php"
+
+# The gateway's "your api_token is stale" error key (its value reads 'Invalid
+# CSRF token'). Distinct from every other gateway error because it is the one
+# the client can fix by itself — see _gw_call's renewal branch.
+_TOKEN_EXPIRED_KEY = 'VALID_TOKEN_REQUIRED'
 _MEDIA_API = "https://media.deezer.com/v1/get_url"
 
 # Blowfish decryption secret (public knowledge, used by all Deezer clients)
@@ -122,6 +127,11 @@ class DeezerDownloadClient(DownloadSourcePlugin):
         self._user_data = None
         self._authenticated = False
         self._pending_arl: Optional[str] = None
+        # Serialises token renewal so a batch of workers that all hit the same
+        # expiry fires ONE handshake, not one each.
+        self._reauth_lock = threading.Lock()
+        # Why the last gateway call failed, for the error the user actually sees.
+        self._last_gw_error: Optional[str] = None
 
         # Quality preference
         self._quality = quality_tier_for_source('deezer', default='flac')
@@ -149,16 +159,22 @@ class DeezerDownloadClient(DownloadSourcePlugin):
         try:
             self._session.cookies.set('arl', arl)
 
-            # Get user data and API token
-            resp = self._gw_call('deezer.getUserData')
+            # Get user data and API token. allow_reauth=False: this call IS the
+            # renewal, so letting it renew on failure would recurse.
+            resp = self._gw_call('deezer.getUserData', allow_reauth=False)
             if not resp:
                 logger.error("Failed to get user data from Deezer")
+                self._authenticated = False
                 return False
 
             user = resp.get('USER', {})
             user_id = user.get('USER_ID', 0)
             if not user_id or user_id == 0:
                 logger.error("Invalid ARL token — Deezer returned no user")
+                # Every failure path clears the flag. is_configured() reads it,
+                # so a session that just failed to establish must not keep
+                # advertising itself as a usable download source.
+                self._authenticated = False
                 return False
 
             self._api_token = resp.get('checkForm', '')
@@ -184,8 +200,37 @@ class DeezerDownloadClient(DownloadSourcePlugin):
             self._authenticated = False
             return False
 
-    def _gw_call(self, method: str, params: dict = None) -> Optional[dict]:
-        """Call the Deezer gateway API."""
+    def _refresh_token(self, stale_token) -> bool:
+        """Re-run the ARL handshake after the gateway rejected our api_token.
+
+        ``stale_token`` is the token the CALLER used. If it no longer matches
+        what's stored, another thread already renewed it and this is a no-op —
+        without that check, every worker that hit the same expiry would fire its
+        own handshake.
+
+        A renewal that FAILS clears ``_authenticated`` here rather than relying
+        on ``_authenticate`` to have done it. That matters as much as the
+        renewal itself — ``is_configured()`` reads ``is_authenticated()``, so a
+        client that can no longer talk to Deezer was still advertising itself as
+        a working source and being handed tracks it could only fail — and a
+        guarantee this load-bearing should not depend on a callee's side
+        effect."""
+        with self._reauth_lock:
+            if self._api_token != stale_token:
+                return bool(self._api_token)        # someone else already renewed it
+            arl = self._config.get('deezer_download.arl', '') or self._pending_arl or ''
+            if arl and self._authenticate(arl):
+                return True
+            self._authenticated = False
+            return False
+
+    def _gw_call(self, method: str, params: dict = None, *,
+                 allow_reauth: bool = True) -> Optional[dict]:
+        """Call the Deezer gateway API.
+
+        ``allow_reauth=False`` is used for the handshake's OWN call, which would
+        otherwise recurse into itself when the token it is trying to replace is
+        the thing being rejected."""
         with self._api_lock:
             elapsed = time.time() - self._last_request
             if elapsed < self._min_interval:
@@ -194,7 +239,8 @@ class DeezerDownloadClient(DownloadSourcePlugin):
 
         try:
             url_params = {'method': method, 'api_version': '1.0'}
-            url_params['api_token'] = self._api_token if self._api_token else 'null'
+            stale_token = self._api_token
+            url_params['api_token'] = stale_token if stale_token else 'null'
 
             resp = self._session.post(
                 _GW_API,
@@ -208,17 +254,33 @@ class DeezerDownloadClient(DownloadSourcePlugin):
             if data.get('error'):
                 error = data['error']
                 if isinstance(error, dict):
-                    error_msg = error.get('VALID_TOKEN_REQUIRED') or error.get('GATEWAY_ERROR') or str(error)
+                    error_msg = error.get(_TOKEN_EXPIRED_KEY) or error.get('GATEWAY_ERROR') or str(error)
                 else:
                     error_msg = str(error)
+                # An expired checkForm token is RECOVERABLE, and ignoring it is
+                # not survivable: the token is minted once at authentication and
+                # cached for the life of the process, so the first expiry makes
+                # every later call fail identically, forever, with the source
+                # still showing green. Renew and retry the call once.
+                if allow_reauth and isinstance(error, dict) and _TOKEN_EXPIRED_KEY in error:
+                    logger.info("Deezer token expired on %s — renewing the session", method)
+                    if self._refresh_token(stale_token):
+                        return self._gw_call(method, params, allow_reauth=False)
+                    self._last_gw_error = ("Deezer session expired and could not be renewed — "
+                                           "re-enter the ARL in Settings")
+                    logger.error("Deezer re-authentication failed — %s", self._last_gw_error)
+                    return None
                 if error_msg:
-                    logger.warning(f"Deezer API error ({method}): {error_msg}")
+                    self._last_gw_error = f"Deezer API error ({method}): {error_msg}"
+                    logger.warning(self._last_gw_error)
                     return None
 
+            self._last_gw_error = None
             return data.get('results', {})
 
         except Exception as e:
-            logger.error(f"Deezer API call failed ({method}): {e}")
+            self._last_gw_error = f"Deezer API call failed ({method}): {e}"
+            logger.error(self._last_gw_error)
             return None
 
     # ─── Status & Config ─────────────────────────────────────────
@@ -757,7 +819,11 @@ class DeezerDownloadClient(DownloadSourcePlugin):
         # Get track data from private API
         track_data = self._get_track_data(track_id)
         if not track_data:
-            self._set_error(download_id, 'Failed to get track data')
+            # Carry the gateway's own reason. Without it this reads 'Failed to
+            # get track data' and the worker logs 'impl returned None' — two
+            # messages that between them never say the session expired.
+            self._set_error(download_id,
+                            self._last_gw_error or 'Failed to get track data')
             return None
 
         track_token = track_data.get('TRACK_TOKEN', '')

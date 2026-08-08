@@ -168,3 +168,123 @@ def test_ignore_ttl_reads_config(monkeypatch):
     assert ig.configured_ttl_days() == 30           # fallback
     monkeypatch.setattr(cs, 'config_manager', _Cfg(0))
     assert ig.configured_ttl_days() == 1            # floor
+
+
+# ── the retry loop, as it actually happened (from a real 12-hour app.log) ────
+# The two stamps above run back-to-back. A real drain cycle does not: it re-adds
+# the failed track to the wishlist FIRST, then stamps the attempt.
+#
+# That re-add used to fork a SECOND row keyed '<track>::<album>' whenever the
+# base id already existed — without checking whether the album was actually
+# different. So a track failing repeatedly from the same album grew a duplicate
+# of itself. record_failed_attempt stamps the BASE id, so the fork's retry_count
+# stayed 0, is_due() was permanently true for it, and the progressive backoff
+# could never quiet it. Measured behaviour before the fix:
+#
+#     cycle 1: rows=1  [('trk1', 1)]
+#     cycle 2: rows=2  [('trk1', 2), ('trk1::a1', 0)]
+#     cycle 3: rows=2  [('trk1', 3), ('trk1::a1', 0)]   ← forever
+#
+# In the log that is 34 files re-downloaded and re-quarantined up to 132 times
+# each, and not one cooldown in twelve hours.
+
+def _payload(sp_id="trk1", album_id="a1"):
+    return {
+        'id': sp_id, 'name': 'Elusive Song', 'artists': [{'name': 'Ghost Artist'}],
+        'album': {'id': album_id, 'name': f'Album {album_id}',
+                  'artists': [{'name': 'Ghost Artist'}], 'images': [],
+                  'album_type': 'single', 'release_date': '2020-01-01', 'total_tracks': 1},
+        'duration_ms': 1000, 'track_number': 1, 'disc_number': 1,
+    }
+
+
+def _failed_cycle(db, svc, album_id="a1", sp_id="trk1"):
+    """What a drain cycle really does to a track that failed again."""
+    from core.wishlist.processing import record_failed_attempt
+    db.add_to_wishlist(spotify_track_data=_payload(sp_id, album_id),
+                       failure_reason='Not found', source_type='wishlist',
+                       source_info='{}', profile_id=1)
+    record_failed_attempt(svc, {'id': sp_id}, 'Not found', 1)
+
+
+def test_repeated_failures_do_not_fork_a_duplicate_row(tmp_path):
+    from database.music_database import MusicDatabase
+
+    db = MusicDatabase(database_path=str(tmp_path / 'm.db'))
+    svc = _ForwardingService(db)
+    for _ in range(5):
+        _failed_cycle(db, svc)
+
+    rows = db.get_wishlist_tracks()
+    assert len(rows) == 1, [r['spotify_track_id'] for r in rows]
+    assert rows[0]['retry_count'] == 5
+
+
+def test_the_backoff_ladder_engages_across_real_cycles(tmp_path):
+    """The whole point of the counter — and unreachable before the fix, because
+    the duplicate row reset the effective state every cycle."""
+    from datetime import datetime, timezone
+
+    from core.wishlist.retry_backoff import is_due
+    from database.music_database import MusicDatabase
+
+    db = MusicDatabase(database_path=str(tmp_path / 'm.db'))
+    svc = _ForwardingService(db)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    _failed_cycle(db, svc)
+    assert all(is_due(r, now) for r in db.get_wishlist_tracks())      # attempt 1: still every cycle
+    _failed_cycle(db, svc)
+    assert not any(is_due(r, now) for r in db.get_wishlist_tracks())  # attempt 2: 4h cooldown
+
+
+def test_the_same_track_from_a_different_album_still_gets_its_own_row(tmp_path):
+    """The composite key exists for a real case — don't break it."""
+    from database.music_database import MusicDatabase
+
+    db = MusicDatabase(database_path=str(tmp_path / 'm.db'))
+    svc = _ForwardingService(db)
+    _failed_cycle(db, svc, album_id='a1')
+    _failed_cycle(db, svc, album_id='a2')
+
+    ids = sorted(r['spotify_track_id'] for r in db.get_wishlist_tracks())
+    assert ids == ['trk1', 'trk1::a2']
+
+
+def test_a_re_add_still_refreshes_the_failure_reason(tmp_path):
+    """Preserving the counter must not freeze the row."""
+    from database.music_database import MusicDatabase
+
+    db = MusicDatabase(database_path=str(tmp_path / 'm.db'))
+    db.add_to_wishlist(spotify_track_data=_payload(), failure_reason='Not found',
+                       source_type='wishlist', source_info='{}', profile_id=1)
+    db.add_to_wishlist(spotify_track_data=_payload(), failure_reason='All sources failed',
+                       source_type='wishlist', source_info='{}', profile_id=1)
+    rows = db.get_wishlist_tracks()
+    assert len(rows) == 1
+    assert rows[0]['failure_reason'] == 'All sources failed'
+
+
+def test_existing_duplicate_rows_are_swept_once(tmp_path):
+    """Databases already carry these forks — that is what is looping right now."""
+    import json
+
+    from database.music_database import MusicDatabase
+
+    db = MusicDatabase(database_path=str(tmp_path / 'm.db'))
+    db.add_to_wishlist(spotify_track_data=_payload(), failure_reason='x',
+                       source_type='wishlist', source_info='{}', profile_id=1)
+    with db._get_connection() as conn:
+        c = conn.cursor()
+        # the self-duplicate the old code produced...
+        c.execute("INSERT INTO wishlist_tracks (spotify_track_id, spotify_data, profile_id) "
+                  "VALUES (?, ?, 1)", ('trk1::a1', json.dumps(_payload())))
+        # ...and a legitimate different-album fork, which must survive
+        c.execute("INSERT INTO wishlist_tracks (spotify_track_id, spotify_data, profile_id) "
+                  "VALUES (?, ?, 1)", ('trk1::a2', json.dumps(_payload(album_id='a2'))))
+        conn.commit()
+        assert db._prune_self_duplicate_wishlist_rows(c) == 1
+        conn.commit()
+
+    ids = sorted(r['spotify_track_id'] for r in db.get_wishlist_tracks())
+    assert ids == ['trk1', 'trk1::a2']

@@ -661,3 +661,44 @@ def test_db_update_cleanup_runs_on_dedicated_thread_not_shared_pool():
     text = src.read_text(encoding="utf-8")
     assert "missing_download_executor.submit(_automatic_wishlist_cleanup_after_db_update)" not in text
     assert 'name="WishlistCleanup"' in text
+
+
+# ── the completion summary's log level (from a real 12-hour app.log) ─────────
+# 30 of these were logged at ERROR, including runs where nothing failed at all.
+# `tracks_added` IS the failed set going back on the wishlist, not a second
+# group beside it, so "20 added to wishlist, 20 failed" also read as 40 tracks
+# with half of them fine. Neither is true, and both made a genuinely stuck
+# wishlist (every run failing all 20) look like routine noise.
+
+def _finalize_with(summary, logger):
+    processing.finalize_auto_wishlist_completion(
+        "batch-1",
+        summary,
+        download_batches={"batch-1": {"current_cycle": "albums"}},
+        tasks_lock=_FakeLock(),
+        reset_processing_state=lambda: None,
+        add_activity_item=lambda *args: None,
+        automation_engine=_FakeAutomationEngine(),
+        db_factory=_FakeDB,
+        logger=logger,
+    )
+    return logger
+
+
+def test_a_clean_wishlist_run_is_not_logged_as_an_error():
+    log = _finalize_with({"tracks_added": 0, "total_failed": 0, "errors": 0}, _FakeLogger())
+    assert log.errors == []
+    assert log.warnings == []
+    assert any("nothing failed" in m for m in log.infos)
+
+
+def test_failures_are_reported_once_not_as_two_numbers():
+    """The old line read '20 added to wishlist, 20 failed' — the same 20 tracks
+    counted twice, which looks like half the batch succeeded."""
+    log = _finalize_with({"tracks_added": 20, "total_failed": 20, "errors": 0}, _FakeLogger())
+    assert log.errors == []
+    assert len(log.warnings) == 1
+    msg = log.warnings[0]
+    assert "20 track(s) failed" in msg
+    assert "back on the wishlist" in msg
+    assert msg.count("20") == 1          # ...once, not twice

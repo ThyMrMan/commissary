@@ -613,7 +613,8 @@ def _default_enqueue(item: Dict[str, Any], best: Dict[str, Any], candidates: Lis
     ok_room, free = disk_guard.has_room(target_dir, organization.load(get_video_db()))
     if not ok_room:
         logger.warning("disk guard: %.1f GB free on %s — skipping grab of %s",
-                       free or 0, target_dir, item.get("title"))
+                       free or 0, target_dir,
+                       item.get("title") or item.get("show_title") or "?")
         return False
     source = str(best.get("source") or "soulseek").lower()
     if source == "soulseek":
@@ -628,7 +629,12 @@ def _default_enqueue(item: Dict[str, Any], best: Dict[str, Any], candidates: Lis
         from core.video.client_grab import grab
         res = grab(source, best.get("download_url"), category=_category_for_item(item, media_type))
         if not res.get("ok"):
-            logger.warning("video hybrid: %s grab refused for %s: %s", source, item.get("title"), res.get("error"))
+            # Episode items alias the show name as `show_title`; reading only
+            # `title` made every episode refusal log 'refused for None' — the
+            # same aliasing already handled in _default_record_outcome.
+            logger.warning("video hybrid: %s grab refused for %s: %s", source,
+                           item.get("title") or item.get("show_title") or "?",
+                           res.get("error"))
             return False
         best = {**best, "_client_ref": res["ref"]}
     ctx = search_context(item, media_type)
