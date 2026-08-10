@@ -406,6 +406,64 @@ PREVIEW_SAMPLES = {
 }
 
 
+# Tokens only the IMPORT path can fill. They come from ffprobe reading the file
+# as it lands, or from the grab's own release name and quality profile — none of
+# which survives into the library row a rename works from. Anything that renames
+# an EXISTING file has to know this list, or it will happily compute a "correct"
+# name that silently drops whatever the template asked for here.
+LIBRARY_UNAVAILABLE_TOKENS = (
+    "MediaInfo VideoBitDepth", "MediaInfo AudioLanguages", "Custom Formats",
+    "Original Title", "Original Filename", "absolute",
+)
+
+
+def library_media_fields(row: dict, filename: Any = None) -> dict:
+    """Naming fields recoverable for a file ALREADY in the library.
+
+    Two sources, in this order of trust:
+      · the scan's own facts (``media_files``) for audio codec, channel layout
+        and dynamic range — measured from the container, same as at import;
+      · the CURRENT filename for release group, edition and 3D, because those
+        never had a column and the name is the only place they survive.
+
+    That second one is deliberately lossy in one direction: a file whose name
+    was already stripped of its group can't get it back. It recovers what is
+    there and claims nothing more.
+    """
+    from core.video.mediainfo import audio_channel_label
+    from core.video.release_parse import parse_release
+    row = row if isinstance(row, dict) else {}
+    # The BASENAME without its extension. The release-group pattern anchors to
+    # end-of-string, so a trailing '.mkv' hides the '-NTb' that precedes it, and
+    # a full path lets a parent folder's text leak into the parse.
+    raw = str(filename or row.get("relative_path") or "")
+    stem = os.path.splitext(raw.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1])[0]
+    parsed = parse_release(stem)
+    return {
+        "audio_codec": row.get("audio_codec"),
+        "audio_channels": audio_channel_label(row.get("audio_channels")),
+        "dynamic_range_type": row.get("dynamic_range") or (
+            str(parsed.get("hdr")).upper() if parsed.get("hdr") else None),
+        "release_group": parsed.get("group"),
+        "edition": parsed.get("edition"),
+        "three_d": parsed.get("three_d"),
+    }
+
+
+def template_uses_unavailable_tokens(template: Any) -> list:
+    """Which import-only tokens a template references, if any.
+
+    A caller that renames existing files consults this before proposing
+    anything: rendering a template it cannot fully satisfy produces a shorter
+    name that LOOKS canonical, so acting on it would quietly delete information
+    from the filename."""
+    if not naming_tokens.has_brace_tokens(template):
+        return []
+    folded = naming_tokens.canonical(template)
+    return [name for name in LIBRARY_UNAVAILABLE_TOKENS
+            if naming_tokens.canonical(name) in folded]
+
+
 def brace_token_names(scope: str) -> list:
     """Every ``{Token}`` this scope understands — drives the settings-page
     reference list, so the UI can never advertise a token the renderer lacks."""

@@ -5940,9 +5940,13 @@ class VideoDatabase:
         conn = self._get_connection()
         try:
             rows = conn.execute(
-                "SELECT m.id AS movie_id, m.tmdb_id, m.title, m.year, m.runtime_minutes, "
+                "SELECT m.id AS movie_id, m.tmdb_id, m.imdb_id, m.title, m.year, "
+                "m.runtime_minutes, "
                 "f.id AS file_id, f.relative_path, f.size_bytes, f.resolution, f.quality, "
-                "f.video_codec, f.audio_codec, f.release_source, f.runtime_seconds "
+                "f.video_codec, f.audio_codec, f.release_source, f.runtime_seconds, "
+                # See rename_owned_episode_files — the MediaInfo a {Token}
+                # rename needs so it doesn't propose stripping the filename.
+                "f.audio_channels, f.dynamic_range "
                 "FROM movies m JOIN media_files f ON f.movie_id = m.id "
                 f"WHERE {where} ORDER BY m.title COLLATE NOCASE, f.size_bytes DESC",
                 args).fetchall()
@@ -5971,7 +5975,12 @@ class VideoDatabase:
                 # without waiting for a deep scan (musicagine).
                 "COALESCE(s.year, CAST(substr(NULLIF(s.first_air_date, ''), 1, 4) AS INTEGER)) AS show_year, "
                 "f.id AS file_id, f.relative_path, f.size_bytes, f.resolution, f.quality, "
-                "f.video_codec, f.release_source "
+                "f.video_codec, f.release_source, "
+                # MediaInfo + ids for the Sonarr/Radarr {Token} names. Without
+                # these a rename recomputes the file's name WITHOUT its audio,
+                # dynamic range or release group and proposes deleting them.
+                "f.audio_codec, f.audio_channels, f.dynamic_range, "
+                "s.tvdb_id, s.tmdb_id, s.imdb_id, e.air_date "
                 "FROM episodes e JOIN shows s ON s.id = e.show_id "
                 "JOIN media_files f ON f.episode_id = e.id "
                 f"WHERE {where} "

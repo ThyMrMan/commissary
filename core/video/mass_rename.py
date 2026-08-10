@@ -52,18 +52,26 @@ def is_running() -> bool:
 
 
 def _movie_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    from core.video.organization import library_media_fields
     return {"title": row.get("title"), "year": row.get("year"),
             "quality": row.get("quality"), "resolution": row.get("resolution"),
             "source": row.get("release_source"), "codec": row.get("video_codec"),
-            "tmdbid": row.get("tmdb_id")}
+            "tmdbid": row.get("tmdb_id"), "imdbid": row.get("imdb_id"),
+            # MediaInfo + release facts, so a rename reproduces the name the
+            # IMPORTER would have written rather than a shorter one.
+            **library_media_fields(row)}
 
 
 def _episode_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    from core.video.organization import library_media_fields
     return {"series": row.get("show_title"), "season": row.get("season_number"),
             "episode": row.get("episode_number"), "episode_title": row.get("episode_title"),
             "year": row.get("show_year"), "quality": row.get("quality"),
             "resolution": row.get("resolution"), "source": row.get("release_source"),
-            "codec": row.get("video_codec")}
+            "codec": row.get("video_codec"), "tvdbid": row.get("tvdb_id"),
+            "tmdbid": row.get("tmdb_id"), "imdbid": row.get("imdb_id"),
+            "air_date": row.get("air_date"),
+            **library_media_fields(row)}
 
 
 # What each $token means, for the rename panel's variable list. The NAMES are
@@ -92,28 +100,91 @@ TOKEN_HELP = {
     "resolution": "Resolution",
     "source": "Release source (BluRay, WEB-DL…)",
     "codec": "Video codec, uppercased (H264, HEVC…)",
+
+    # ── Sonarr/Radarr {Token} names ──────────────────────────────────────────
+    # Same rule as above: a token in organization.py with no entry here fails
+    # test_every_offered_variable_has_a_description rather than reaching the
+    # picker as a bare name nobody can interpret.
+    "Series Title": "Show title, as stored",
+    "Series CleanTitle": "Show title with filename-hostile characters removed",
+    "Series CleanTitleWithoutYear": "Clean show title with a trailing '(2019)' stripped, "
+                                    "so '{(Series Year)}' doesn't print it twice",
+    "Series TitleThe": "Show title with a leading article moved to the end (Matrix, The)",
+    "Series TitleYear": "Clean show title followed by its year",
+    "Series Year": "Year the show first aired",
+    "Movie Title": "Movie title, as stored",
+    "Movie CleanTitle": "Movie title with filename-hostile characters removed",
+    "Movie TitleThe": "Movie title with a leading article moved to the end",
+    "Movie OriginalTitle": "Original-language title, falling back to the stored one",
+    "Movie Year": "Release year",
+    "Release Year": "Release year",
+    "season": "Season number — pair with ':00' to zero-pad ({season:00})",
+    "episode": "Episode number — ':00' zero-pads. A multi-episode file renders its span",
+    "absolute": "Absolute episode number, for anime ({absolute:000})",
+    "Episode Title": "Episode title",
+    "Episode CleanTitle": "Episode title with filename-hostile characters removed; "
+                          "':90' caps the length",
+    "Air-Date": "Air date, 2026-07-08",
+    "AirDate": "Air date, dotted: 2026.07.08",
+    "Quality Full": "Full quality name (WEBDL-1080p, Bluray-2160p)",
+    "Quality Title": "Resolution only (1080p)",
+    "MediaInfo VideoCodec": "Video codec as the schemes write it (x265, x264)",
+    "MediaInfo AudioCodec": "Audio codec (EAC3, TrueHD, DTS)",
+    "MediaInfo AudioChannels": "Channel layout (5.1, 7.1)",
+    "MediaInfo AudioLanguages": "Audio track languages (EN+JA)",
+    "MediaInfo VideoBitDepth": "Bit depth (8, 10, 12)",
+    "MediaInfo VideoDynamicRange": "'HDR' when the file carries any HDR format, else empty",
+    "MediaInfo VideoDynamicRangeType": "Exact HDR format (DV, HDR10, HDR10+, HLG)",
+    "MediaInfo 3D": "'3D' for a 3D release, else empty",
+    "Release Group": "Release group, from the release name",
+    "Custom Formats": "Custom formats this release matched",
+    "Edition Tags": "Edition (Directors Cut, IMAX, Extended…)",
+    "Original Title": "The release name the file was grabbed under",
+    "Original Filename": "The file's name at import time",
+    "ImdbId": "IMDb id (tt0133093)",
+    "TmdbId": "TMDB id",
+    "TvdbId": "TheTVDB id",
 }
 
 
 def tokens_for(kind: str, sample_row: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
-    """The $variables available for ``kind``, each with its meaning and — when a
-    real file is passed — the value it would take for THIS title.
+    """Every variable available for ``kind`` — both the ``$name`` scheme and the
+    Sonarr/Radarr ``{Token}`` one — each with its meaning and, when a real file
+    is passed, the value it would take for THIS title.
 
     Names come from organization.py's own value builders, so the list cannot
-    drift from what the template engine actually substitutes.
+    drift from what the template engine actually substitutes. This is the same
+    vocabulary the Settings page offers: a picker that showed fewer would leave
+    the tokens users had just been introduced to looking unavailable here.
+
+    Import-only tokens (``LIBRARY_UNAVAILABLE_TOKENS``) are still listed, but
+    marked — they render empty when renaming an existing file, and a picker that
+    hid them would make a template silently lose content instead of explaining
+    why.
     """
     from core.video import organization
-    if kind == "movie":
-        fields = _movie_fields(sample_row or {})
-        values = organization._movie_values(fields)
-    else:
-        fields = _episode_fields(sample_row or {})
-        values = organization._episode_values(fields)
-    out = []
-    for name in sorted(values):
-        out.append({"token": "$" + name,
-                    "description": TOKEN_HELP.get(name, ""),
-                    "example": str(values.get(name) or "")})
+    scope = "movie" if kind == "movie" else "episode"
+    fields = _movie_fields(sample_row or {}) if scope == "movie" \
+        else _episode_fields(sample_row or {})
+    values = (organization._movie_values(fields) if scope == "movie"
+              else organization._episode_values(fields))
+    brace = (organization._movie_brace_tokens(fields) if scope == "movie"
+             else organization._episode_brace_tokens(fields))
+    unavailable = {organization.naming_tokens.canonical(n)
+                   for n in organization.LIBRARY_UNAVAILABLE_TOKENS}
+
+    out = [{"token": "$" + name, "style": "legacy",
+            "description": TOKEN_HELP.get(name, ""),
+            "example": str(values.get(name) or "")}
+           for name in sorted(values)]
+    for name in sorted(brace, key=str.lower):
+        note = TOKEN_HELP.get(name, "")
+        if organization.naming_tokens.canonical(name) in unavailable:
+            note = (note + " — " if note else "") + \
+                "only available at import; empty when renaming an existing file"
+        out.append({"token": "{" + name + "}", "style": "brace",
+                    "description": note,
+                    "example": str(brace.get(name) or "")})
     return out
 
 

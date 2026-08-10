@@ -72274,3 +72274,20 @@ body.app-locked > *:not(#launch-pin-overlay):not(#login-overlay):not(#plex-signi
     border-color: var(--accent-color, #1db954);
     color: var(--accent-color, #1db954);
 }
+
+/* ── Rename panel: grouped variable picker ───────────────────────────────────
+   The picker now lists two vocabularies ($name and {Token}). Only the group
+   heading and the dimmed state are styled here — .vrn-chip itself has never had
+   rules of its own and keeps rendering on the generic button styling. */
+.vrn-chip-head {
+    flex-basis: 100%;
+    margin: 8px 0 2px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.65;
+}
+.vrn-chip-head:first-child { margin-top: 0; }
+/* An import-only token has nothing to show for an existing file. Dimmed rather
+   than hidden, so a template that uses one explains itself via the tooltip. */
+.vrn-chip-dim { opacity: 0.5; }

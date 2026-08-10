@@ -22,17 +22,27 @@ import shutil
 
 from core.video.repair import register_job
 from core.video.repair.base import JobContext, JobResult, VideoRepairJob
+from utils.logging_config import get_logger
+
+logger = get_logger("video.repair.naming_conformance")
 
 _SIDECAR_SUFFIXES = (".nfo", "-thumb.jpg", "-thumb.jpeg", "-thumb.png", "-thumb.webp",
                      ".srt", ".ass", ".sub", ".idx", ".jpg")
 
 
 def _fields_of(row: dict) -> dict:
+    from core.video.organization import library_media_fields
     return {"title": row.get("title"), "series": row.get("series"),
             "year": row.get("year"), "season": row.get("season"),
             "episode": row.get("episode"), "episode_title": row.get("episode_title"),
             "quality": row.get("quality"), "resolution": row.get("resolution"),
-            "codec": row.get("video_codec"), "tmdbid": row.get("tmdb_id")}
+            "codec": row.get("video_codec"), "tmdbid": row.get("tmdb_id"),
+            "tvdbid": row.get("tvdb_id"), "imdbid": row.get("imdb_id"),
+            "air_date": row.get("air_date"),
+            # Without these the expected name is computed WITHOUT the file's
+            # audio, dynamic range and release group — so a correctly-named file
+            # looks wrong and "fixing" it would strip those from the filename.
+            **library_media_fields(row)}
 
 
 def _same_path(a: str, b: str) -> bool:
@@ -109,6 +119,19 @@ class NamingConformanceJob(VideoRepairJob):
         # actually contains the file, not whichever comes first.
         roots = {"movie": library_roots(context.db, "movie"),
                  "episode": library_roots(context.db, "show")}
+        # A template asking for something only the import path can know —
+        # bit depth, audio languages, custom formats — cannot be reproduced from
+        # a library row. Rendering it anyway yields a SHORTER name that looks
+        # canonical, so flagging files against it would propose deleting real
+        # information from their filenames. Say so and check nothing.
+        blocked = {scope: organization.template_uses_unavailable_tokens(
+                       settings.get("movie_template" if scope == "movie" else "episode_template"))
+                   for scope in ("movie", "episode")}
+        if all(blocked.values()):
+            logger.info("naming conformance skipped: both templates use import-only "
+                        "token(s) %s that a rename cannot reproduce",
+                        sorted(set(blocked["movie"]) | set(blocked["episode"])))
+            return result
         rows = context.db.repair_library_files() or []
         context.report(total=len(rows), phase="checking names")
         valid = []
@@ -119,6 +142,9 @@ class NamingConformanceJob(VideoRepairJob):
             scope_roots = roots.get(r["scope"]) or []
             if not scope_roots:
                 result.skipped += 1          # that library has no configured folder
+                continue
+            if blocked.get(r["scope"]):
+                result.skipped += 1          # see `blocked` above — never a lossy rename
                 continue
             real = resolve_video_file_path(r.get("relative_path"), base_dirs,
                                            size_bytes=r.get("size_bytes"))

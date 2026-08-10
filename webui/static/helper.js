@@ -3484,8 +3484,13 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.9.12': [
-        { date: 'August 2026 · 1.9.12' },
+    '1.9.13': [
+        { date: 'August 2026 · 1.9.13' },
+        { title: 'Fixed: renaming a file could strip its audio and release group', desc: 'reported as "the Rename Files variable picker doesn\'t show the new tokens" — which turned out to be the visible edge of something worse. Only the <em>import</em> path knew about the new <code>{Token}</code> values, so for a file already in your library the rename preview and the Naming Conformance job both worked out its name <strong>without</strong> its audio codec, channels, dynamic range or release group. Conformance would flag a correctly-named file as wrong, and approving that fix would rename it to the shorter version — deleting that detail from the filename.' },
+        { title: 'All three now agree', desc: 'renames and the conformance check read the audio codec, channel layout and dynamic range the scan already recorded, and recover the release group and edition from the file\'s current name. For the same file, the importer, the rename preview and the conformance job now produce identical results.' },
+        { title: 'And a rename can no longer lose what it cannot rebuild', desc: 'a few tokens only exist at import — bit depth, audio languages, custom formats, the original release name. If your template uses one of those, the Naming Conformance job now stands down for those files and says so in the log, instead of proposing a rename that would quietly drop them.' },
+        { title: 'The picker matches Settings', desc: 'the Rename Files variable list now offers the same vocabulary the Settings page does — 43 entries for a show — split into <strong>Variables</strong> and <strong>Sonarr/Radarr tokens</strong>, each with a description and the value it would take for the title you are looking at. Tokens that only exist at import are shown dimmed with an explanation rather than hidden, so a template using one explains itself.' },
+        { title: 'Also in 1.9.12', desc: 'Sonarr/Radarr <code>{Token}</code> naming arrived, so a scheme copied from the TRaSH guides works as-is.' },
         { title: 'Sonarr/Radarr naming, including the TRaSH schemes', desc: 'video naming templates now understand Sonarr and Radarr\'s <code>{Token}</code> names alongside the existing <code>$variables</code> — so a format string copied straight out of the <a href="https://trash-guides.info/Sonarr/Sonarr-recommended-naming-scheme/" target="_blank" rel="noopener noreferrer">TRaSH guides</a> works as-is, no translation. There is a one-click button for the recommended scheme in <strong>Settings → Library Organization</strong>, and a browsable list of every token (24 for movies, 31 for episodes) that inserts at your cursor.' },
         { title: 'Optional groups are what make those schemes work', desc: 'wrapping a token in braces makes the whole group conditional: <code>{[Quality Full]}</code> renders <code>[WEBDL-1080p]</code>, or disappears completely — brackets included — when there is nothing to put there. That is what keeps empty <code>[]</code>, stray dashes and orphaned punctuation out of your filenames when a release has no edition, no HDR, or no known group. <code>{season:00}</code> zero-pads and <code>{Episode CleanTitle:90}</code> caps a length, exactly as they do in Sonarr.' },
         { title: 'New: what the file actually contains', desc: 'audio channels (<strong>5.1</strong>, <strong>7.1</strong>), video bit depth (<strong>10bit</strong>), audio languages and the real dynamic range type (<strong>DV</strong>, <strong>HDR10</strong>, <strong>HLG</strong>) are now read out of the container by ffprobe and available as tokens. They come from the file, never from what the release name claims — which is the point, since a name asserting "HDR" proves nothing. Edition detection (<strong>Directors Cut</strong>, <strong>IMAX</strong>, <strong>Extended</strong>) and <code>{Custom Formats}</code> are wired up too.' },
@@ -3726,6 +3731,19 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.13: a rename could strip detail out of a filename",
+        description: "reported as a short variable list in the Rename Files picker. The list was the visible edge: only the import path knew the new {Token} values, so for a file already in your library the rename preview and the Naming Conformance job computed its name without the audio, dynamic range and release group.",
+        features: [
+            "conformance would flag a correctly-named file as wrong, and approving that fix would rename it to the shorter version — deleting that detail from the name",
+            "renames and the conformance check now read the audio codec, channel layout and dynamic range the scan already recorded, and recover the release group and edition from the file's current name",
+            "for the same file, importer, rename preview and conformance job now produce identical results",
+            "a few tokens only exist at import (bit depth, audio languages, custom formats, original release name) — if your template uses one, conformance stands down for those files and logs why, instead of proposing a lossy rename",
+            "the picker now offers the same vocabulary as Settings — 43 entries for a show — grouped into Variables and Sonarr/Radarr tokens, each with a description and this title's own value",
+            "import-only tokens are shown dimmed with an explanation rather than hidden",
+        ],
+        usage_note: "If you adopted a {Token} scheme in 1.9.12 and ran Naming Conformance, check its findings before approving any that predate this release — they were computed against the shorter name.",
+    },
     {
         title: "1.9.12: Sonarr/Radarr naming — paste a TRaSH scheme and it works",
         description: "video naming templates now understand {Token} names alongside the existing $variables, so a format string copied out of the TRaSH guides renders exactly as documented. Nothing about your current naming changes unless you choose a new scheme.",

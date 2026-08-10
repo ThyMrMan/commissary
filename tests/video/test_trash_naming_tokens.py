@@ -274,3 +274,124 @@ def test_a_plain_title_containing_an_edition_word_is_not_given_an_edition():
     phrases count."""
     assert edition_tags("The.Cut.2014.1080p.BluRay") is None
     assert edition_tags("Special.2006.1080p.WEB") is None
+
+
+# ── renaming an existing file must reproduce what the import wrote ───────────
+# Reported as "the Rename Files picker doesn't show the new variables". The
+# short list was the visible symptom of something worse: only the IMPORT path
+# supplied the new fields, so for the same file the rename preview and the
+# naming-conformance job computed a name WITHOUT its audio, dynamic range and
+# release group. Conformance would therefore flag correctly-named files as
+# wrong, and approving the fix would strip that information off the filename.
+
+_TRASH_EP = (
+    "{Series CleanTitleWithoutYear} {(Series Year)} - S{season:00}E{episode:00} - "
+    "{Episode CleanTitle:90}{[Quality Full]}{[Mediainfo AudioCodec}"
+    "{ Mediainfo AudioChannels]}{[MediaInfo VideoDynamicRangeType]}"
+    "{[Mediainfo VideoCodec]}{-Release Group}")
+
+
+def _imported_name():
+    return _name("episode", _TRASH_EP, {
+        "series": "Silo", "year": 2023, "season": 3, "episode": 6,
+        "episode_title": "The Getaway", "quality": "WEBDL-1080p", "audio_codec": "eac3",
+        "audio_channels": "5.1", "codec": "hevc", "dynamic_range_type": "DV",
+        "release_group": "NTb"})
+
+
+def _library_row():
+    """The row a scan leaves behind for that file, plus its own filename."""
+    return {"show_title": "Silo", "show_year": 2023, "season_number": 3,
+            "episode_number": 6, "episode_title": "The Getaway", "quality": "WEBDL-1080p",
+            "video_codec": "hevc", "resolution": "1080p", "release_source": "web-dl",
+            "audio_codec": "eac3", "audio_channels": 6, "dynamic_range": "DV",
+            "relative_path": "/tv/Silo/Season 03/" + _imported_name()}
+
+
+def test_a_rename_reproduces_the_name_the_import_wrote():
+    from core.video.mass_rename import _episode_fields
+    rendered = _name("episode", _TRASH_EP, _episode_fields(_library_row()))
+    assert rendered == _imported_name()
+
+
+def test_the_conformance_job_agrees_with_the_import_too():
+    from core.video.repair.naming_conformance import _fields_of
+    row = _library_row()
+    conf_row = {"series": "Silo", "year": 2023, "season": 3, "episode": 6,
+                "episode_title": "The Getaway", "quality": "WEBDL-1080p",
+                "video_codec": "hevc", "audio_codec": "eac3", "audio_channels": 6,
+                "dynamic_range": "DV", "relative_path": row["relative_path"]}
+    assert _name("episode", _TRASH_EP, _fields_of(conf_row)) == _imported_name()
+
+
+def test_the_release_group_is_recovered_from_the_existing_filename():
+    """It has no column — the current name is the only place it survives, and
+    the group pattern anchors to end-of-string, so the extension has to go."""
+    fields = org.library_media_fields(
+        {}, "Silo (2023) - S03E06 - The Getaway[WEBDL-1080p][x265]-NTb.mkv")
+    assert fields["release_group"] == "NTb"
+    assert org.library_media_fields({}, "Some.Movie.2020.IMAX.1080p.mkv")["edition"] == "IMAX"
+
+
+def test_scanned_channel_counts_become_layout_labels():
+    assert org.library_media_fields({"audio_channels": 6})["audio_channels"] == "5.1"
+    assert org.library_media_fields({"audio_channels": 8})["audio_channels"] == "7.1"
+    assert org.library_media_fields({})["audio_channels"] is None
+
+
+def test_import_only_tokens_are_named_so_a_rename_cannot_be_lossy():
+    """A template asking for something a library row cannot supply renders a
+    SHORTER name that looks canonical. Callers that rename existing files check
+    this first rather than proposing to delete content."""
+    assert org.template_uses_unavailable_tokens(_TRASH_EP) == []
+    assert org.template_uses_unavailable_tokens(
+        _TRASH_EP + "[{MediaInfo VideoBitDepth}bit]") == ["MediaInfo VideoBitDepth"]
+    # a $token template can always be reproduced — never blocked
+    assert org.template_uses_unavailable_tokens(org.DEFAULTS["episode_template"]) == []
+
+
+def test_the_conformance_job_stands_down_on_an_unreproducible_template():
+    from core.video.repair.naming_conformance import NamingConformanceJob
+    from core.video.repair.base import JobContext
+
+    class _DB:
+        def set_setting(self, *a):
+            return None
+
+        def get_setting(self, key):
+            import json
+            return json.dumps({"episode_template": _TRASH_EP + "{MediaInfo AudioLanguages}",
+                               "movie_template": "{Movie CleanTitle} {Custom Formats}"}) \
+                if key == "organization" else None
+
+        def all_library_paths(self, kind=None):
+            return ["/tv"]
+
+        def repair_library_files(self):
+            raise AssertionError("must not even look at files it cannot judge")
+
+    result = NamingConformanceJob().scan(JobContext(db=_DB()))
+    assert result.scanned == 0
+
+
+def test_the_rename_picker_offers_the_same_vocabulary_as_settings():
+    """The reported bug: Settings introduced tokens the rename picker never
+    listed, so they looked unavailable where you actually rename files."""
+    from core.video.mass_rename import tokens_for
+    for kind, scope in (("show", "episode"), ("movie", "movie")):
+        offered = {t["token"] for t in tokens_for(kind, _library_row())}
+        for name in org.brace_token_names(scope):
+            assert "{%s}" % name in offered, (kind, name)
+
+
+def test_the_picker_marks_tokens_it_cannot_fill_here():
+    from core.video.mass_rename import tokens_for
+    by_token = {t["token"]: t for t in tokens_for("show", _library_row())}
+    bitdepth = by_token["{MediaInfo VideoBitDepth}"]
+    assert bitdepth["example"] == ""
+    assert "only available at import" in bitdepth["description"]
+    # ...while one it CAN fill shows the real value for this title
+    # the picker emits the canonical spelling; the guides' 'Mediainfo' also
+    # renders, because token matching ignores case
+    assert by_token["{MediaInfo AudioChannels}"]["example"] == "5.1"
+    assert by_token["{Release Group}"]["example"] == "NTb"

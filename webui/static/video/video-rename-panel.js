@@ -227,11 +227,32 @@
                 var input = document.getElementById('vrn-template');
                 if (input) { input.value = state.saved; input.placeholder = state.defaultTemplate; }
                 var chips = document.getElementById('vrn-chips');
-                chips.innerHTML = (d.tokens || []).map(function (t) {
-                    var ex = t.example ? '<small>' + esc(t.example) + '</small>' : '';
-                    return '<button class="vrn-chip" type="button" data-vrn-token="' + esc(t.token) + '" title="' +
-                        esc(t.description || '') + '">' + esc(t.token) + ex + '</button>';
-                }).join('') || '<span class="vrn-empty">No variables available.</span>';
+                // Two vocabularies, grouped and labelled rather than run together:
+                // the $names and the Sonarr/Radarr {Token}s are the same list the
+                // Settings page offers, and mixing 40-odd chips into one wall
+                // makes neither findable.
+                var groups = [
+                    ['legacy', 'Variables'],
+                    ['brace', 'Sonarr/Radarr tokens — wrap in braces to make a section optional']
+                ];
+                var html = groups.map(function (g) {
+                    var items = (d.tokens || []).filter(function (t) {
+                        return (t.style || 'legacy') === g[0];
+                    });
+                    if (!items.length) return '';
+                    return '<div class="vrn-chip-head">' + esc(g[1]) + '</div>' +
+                        items.map(function (t) {
+                            var ex = t.example ? '<small>' + esc(t.example) + '</small>' : '';
+                            // An import-only token has no value to show here; dim it
+                            // and let the tooltip say why rather than looking broken.
+                            var dim = (!t.example && /only available at import/.test(t.description || ''))
+                                ? ' vrn-chip-dim' : '';
+                            return '<button class="vrn-chip' + dim + '" type="button" data-vrn-token="' +
+                                esc(t.token) + '" title="' + esc(t.description || '') + '">' +
+                                esc(t.token) + ex + '</button>';
+                        }).join('');
+                }).join('');
+                chips.innerHTML = html || '<span class="vrn-empty">No variables available.</span>';
                 return d;
             });
     }
