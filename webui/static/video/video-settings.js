@@ -1469,42 +1469,71 @@
     // ── Library Organization (naming templates + post-process toggles) ───────
     var ORG_URL = '/api/video/organization';
     var _videoOrg = null;
-    // Sample values for the live preview (mirrors what the importer feeds the engine).
-    var _ORG_MOVIE_EG = { title: 'The Matrix', titlefirst: 'T', year: '1999', quality: 'Bluray-1080p',
-        resolution: '1080p', source: 'Bluray', codec: 'HEVC', edition: '', tmdbid: '603', imdbid: 'tt0133093' };
-    var _ORG_EP_EG = { series: 'Breaking Bad', season: '01', seasonraw: '1', episode: '01', episodetitle: 'Pilot',
-        year: '2008', quality: 'WEBDL-1080p', resolution: '1080p', source: 'WEBDL', codec: 'H264', tvdbid: '81189' };
-    var _ORG_YT_EG = { channel: 'Veritasium', title: 'How Electricity Actually Works', year: '2024',
-        date: '2024-03-15', month: '03', day: '15', sxe: 's2024e0315', videoid: 'oI_X2cMHNe0' };
+    // TRaSH-recommended schemes (trash-guides.info), offered as a one-click preset.
+    // Not the default: switching an existing library's naming silently would make
+    // every file on disk non-conforming until renamed.
+    var _TRASH_PRESETS = {
+        movie: "{Movie CleanTitle} {(Release Year)} {edition-{Edition Tags}} {[Custom Formats]}"
+             + "{[Quality Full]}{[MediaInfo VideoDynamicRangeType]}"
+             + "{[Mediainfo AudioCodec}{ Mediainfo AudioChannels]}{[Mediainfo VideoCodec]}"
+             + "{-Release Group}",
+        episode: "{Series CleanTitleWithoutYear} {(Series Year)}/Season {season:00}/"
+               + "{Series CleanTitleWithoutYear} {(Series Year)} - S{season:00}E{episode:00} - "
+               + "{Episode CleanTitle:90} {[Custom Formats]}{[Quality Full]}"
+               + "{[Mediainfo AudioCodec}{ Mediainfo AudioChannels]}"
+               + "{[MediaInfo VideoDynamicRangeType]}{[Mediainfo VideoCodec]}{-Release Group}"
+    };
 
-    function _orgSanitize(v) {
-        return String(v == null ? '' : v).replace(/[\\/:*?"<>|\x00-\x1f]/g, '')
-            .replace(/\s+/g, ' ').trim().replace(/[ .]+$/, '');
-    }
-    // Client-side mirror of core/video/organization.render_template + _tidy_component
-    // (kept in lockstep) so the preview matches what actually lands on disk.
-    function _orgRender(tmpl, vals) {
-        var keys = Object.keys(vals).sort(function (a, b) { return b.length - a.length; });
-        var out = String(tmpl || '');
-        keys.forEach(function (k) { out = out.split('${' + k + '}').join(_orgSanitize(vals[k])); });
-        keys.forEach(function (k) { out = out.split('$' + k).join(_orgSanitize(vals[k])); });
-        return out.split('/').map(function (p) {
-            p = p.replace(/\s+-\s+(?=(\s|$))/g, ' ').replace(/\(\s*\)/g, '').replace(/\[\s*\]/g, '');
-            p = p.replace(/\s+/g, ' ').trim().replace(/^-+|-+$/g, '').trim().replace(/[ .]+$/, '');
-            return p;
-        }).filter(function (p) { return p !== ''; }).join('/');
-    }
+    // The preview renders SERVER-SIDE, through the same code that names files on
+    // import. This used to be a JavaScript re-implementation of the template
+    // engine kept "in lockstep" by hand — which the {Token} scheme's optional
+    // groups, padding and truncation would have made a second engine to maintain
+    // and a second place to be wrong. One renderer, so the preview cannot lie.
+    var _orgPreviewTimer = null;
+    var _orgTokenCache = null;
+
     function renderOrgPreview() {
-        var mt = document.getElementById('vo-movie-template');
-        var et = document.getElementById('vo-episode-template');
-        var yt = document.getElementById('vo-youtube-template');
-        var mp = document.getElementById('vo-movie-preview');
-        var ep = document.getElementById('vo-episode-preview');
-        var yp = document.getElementById('vo-youtube-preview');
-        if (mp && mt) mp.textContent = _orgRender(mt.value || mt.placeholder, _ORG_MOVIE_EG) + '.mkv';
-        if (ep && et) ep.textContent = _orgRender(et.value || et.placeholder, _ORG_EP_EG) + '.mkv';
-        if (yp && yt) yp.textContent = _orgRender(yt.value || yt.placeholder, _ORG_YT_EG) + '.mp4';
+        if (_orgPreviewTimer) clearTimeout(_orgPreviewTimer);
+        _orgPreviewTimer = setTimeout(_fetchOrgPreview, 250);
     }
+
+    function _fetchOrgPreview() {
+        var get = function (id) { var el = document.getElementById(id); return el ? (el.value || el.placeholder) : null; };
+        var body = { movie_template: get('vo-movie-template'),
+                     episode_template: get('vo-episode-template'),
+                     youtube_template: get('vo-youtube-template') };
+        fetch(ORG_URL + '/naming/preview', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        }).then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
+            if (!d) return;
+            _orgTokenCache = d.tokens || _orgTokenCache;
+            [['movie', 'vo-movie-preview'], ['episode', 'vo-episode-preview'],
+             ['youtube', 'vo-youtube-preview']].forEach(function (pair) {
+                var el = document.getElementById(pair[1]);
+                if (!el) return;
+                // A template the renderer refused is shown as an error rather than
+                // a stale success — a preview that keeps displaying the last good
+                // render while the box holds something broken is worse than none.
+                el.textContent = d[pair[0]] || (d[pair[0] + '_error'] ? 'Invalid template' : '…');
+            });
+        }).catch(function () { /* preview is a nicety; never block the page */ });
+    }
+
+    function _toggleTokenList(scope) {
+        var box = document.getElementById('vo-' + scope + '-tokens');
+        if (!box) return;
+        if (!box.hidden) { box.hidden = true; return; }
+        var names = (_orgTokenCache || {})[scope] || [];
+        box.innerHTML = names.length
+            ? names.map(function (n) {
+                return '<code class="vo-token" data-vo-insert="' + escA(scope) + '" title="Click to insert">{'
+                     + esc(n) + '}</code>';
+              }).join(' ')
+            : '<small class="settings-hint">Token list unavailable — check the connection.</small>';
+        box.hidden = false;
+    }
+
     function fillOrg() {
         if (!_videoOrg) return;
         var set = function (id, v) { var el = document.getElementById(id); if (el) el.value = v; };
@@ -1584,6 +1613,40 @@
             'vo-sponsorblock', 'vo-yt-subs', 'vo-min-free', 'vo-yt-follow-count'].forEach(function (id) {
             var el = document.getElementById(id);
             if (el) el.addEventListener('change', function () { saveOrganization(false); });
+        });
+        // Token reference, click-to-insert, and the TRaSH preset. Delegated so the
+        // token chips (rendered on demand) need no wiring of their own.
+        card.addEventListener('click', function (e) {
+            var show = e.target.closest('[data-vo-tokens]');
+            if (show) { _toggleTokenList(show.getAttribute('data-vo-tokens')); return; }
+            var chip = e.target.closest('[data-vo-insert]');
+            if (chip) {
+                var box = document.getElementById('vo-' + chip.getAttribute('data-vo-insert') + '-template');
+                if (box) {
+                    // Insert at the caret, not at the end — a token belongs where
+                    // the user was typing.
+                    var at = box.selectionStart == null ? box.value.length : box.selectionStart;
+                    var end = box.selectionEnd == null ? at : box.selectionEnd;
+                    box.value = box.value.slice(0, at) + chip.textContent + box.value.slice(end);
+                    box.focus();
+                    box.selectionStart = box.selectionEnd = at + chip.textContent.length;
+                    renderOrgPreview();
+                }
+                return;
+            }
+            var preset = e.target.closest('[data-vo-preset]');
+            if (preset) {
+                var scope = preset.getAttribute('data-vo-preset');
+                var target = document.getElementById('vo-' + scope + '-template');
+                if (target && _TRASH_PRESETS[scope]) {
+                    target.value = _TRASH_PRESETS[scope];
+                    renderOrgPreview();
+                    // Deliberately NOT saved: the preview below the box is the
+                    // point — see what it does to your naming, then commit by
+                    // leaving the field (which fires the normal change-save).
+                    toast('TRaSH scheme loaded — check the example, then click away to save', 'info');
+                }
+            }
         });
         var reset = document.getElementById('vo-reset');
         if (reset) reset.addEventListener('click', function () {

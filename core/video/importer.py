@@ -226,6 +226,15 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
             parsed["aspect"] = probe["aspect"]
         if probe.get("video_codec") and not parsed.get("codec"):
             parsed["codec"] = probe["video_codec"]
+        # MediaInfo naming tokens ({Mediainfo AudioChannels} and friends). These
+        # come from the container ONLY — there is no name-derived fallback for
+        # them, because a filename asserting '7.1' is exactly the kind of claim
+        # probing exists to check. Absent ffprobe they stay empty and their
+        # template groups collapse, which is the honest outcome.
+        for key in ("audio_codec", "audio_channels", "audio_languages",
+                    "video_bit_depth", "dynamic_range_type"):
+            if probe.get(key):
+                parsed[key] = probe[key]
 
     root = (override.get("target_dir") if force else None) or dl.get("target_dir") or ""
     if not root:
@@ -248,6 +257,26 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
         "source": parsed.get("source"), "codec": parsed.get("codec"),
         "tmdbid": media_id if scope == "movie" else None,
         "tvdbid": media_id if scope == "episode" else None,
+        # Sonarr/Radarr {Token} inputs. Everything here is optional — a template
+        # that doesn't mention them is byte-for-byte unaffected, and a token
+        # whose value is missing collapses its own group.
+        "absolute": ctx.get("absolute"),
+        "release_group": parsed.get("group"),
+        "edition": parsed.get("edition"),
+        "three_d": parsed.get("three_d"),
+        "original_title": dl.get("release_title") or name,
+        "original_filename": name,
+        # Scored by the monitor, which has the DB and the profile; plan_import
+        # stays pure and just reads what it was handed.
+        "custom_formats": dl.get("_custom_formats"),
+        "audio_codec": parsed.get("audio_codec") or parsed.get("audio"),
+        "audio_channels": parsed.get("audio_channels"),
+        "audio_languages": parsed.get("audio_languages"),
+        "video_bit_depth": parsed.get("video_bit_depth"),
+        # The FILE's dynamic range when probed; the name's claim only as a
+        # last resort, flagged by being the coarser 'HDR' rather than a type.
+        "dynamic_range_type": (parsed.get("dynamic_range_type")
+                               or (str(parsed.get("hdr")).upper() if parsed.get("hdr") else None)),
     }
     dest = organization.render_path(scope, root, fields, settings, ext)
     # The library already owns this item at a REAL, resolved location

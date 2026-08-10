@@ -72232,3 +72232,45 @@ body.app-locked > *:not(#launch-pin-overlay):not(#login-overlay):not(#plex-signi
     font-weight: 800; text-transform: uppercase; font-size: 0.85em;
     color: rgba(255, 255, 255, 0.55);
 }
+
+/* ── Naming-template token reference (Settings → Library Organization) ────────
+   A borderless button that reads as a link, used inline inside a settings hint
+   to expand the {Token} list or load the TRaSH preset. */
+.link-button {
+    background: none;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    color: var(--accent-color, #1db954);
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+.link-button:hover { filter: brightness(1.2); }
+.link-button:focus-visible { outline: 2px solid var(--accent-color, #1db954); outline-offset: 2px; }
+
+.vo-token-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 8px 0 4px;
+    padding: 10px;
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.12));
+    border-radius: 8px;
+    background: var(--bg-tertiary, rgba(255, 255, 255, 0.04));
+    max-height: 220px;
+    overflow-y: auto;
+}
+.vo-token {
+    padding: 2px 7px;
+    border-radius: 5px;
+    background: var(--bg-secondary, rgba(255, 255, 255, 0.08));
+    border: 1px solid transparent;
+    font-size: 12px;
+    white-space: nowrap;
+    cursor: pointer;
+}
+.vo-token:hover {
+    border-color: var(--accent-color, #1db954);
+    color: var(--accent-color, #1db954);
+}

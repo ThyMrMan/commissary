@@ -37,6 +37,7 @@ from utils.logging_config import get_logger
 logger = get_logger("video.organization")
 from typing import Any
 
+from core.video import naming_tokens
 from core.video.library_paths import sanitize, source_label
 
 DEFAULTS = {
@@ -266,6 +267,154 @@ def _episode_values(f: dict) -> dict:
     }
 
 
+# ── Sonarr/Radarr {Token} vocabulary ─────────────────────────────────────────
+# Names follow the guides exactly (matching is case/space-insensitive, so the
+# guides' own inconsistent 'Mediainfo' vs 'MediaInfo' both resolve). Tokens
+# listed in _NUMERIC_TOKENS treat ':00' as zero-padding; every other token
+# treats ':90' as a length cap. See core/video/naming_tokens.
+
+_NUMERIC_TOKENS = ("season", "episode", "absolute", "MediaInfo VideoBitDepth")
+
+# Deliberately NOT supported: {Preferred Words}. Sonarr's release-preference
+# scoring has no counterpart here, and rendering it empty would quietly drop a
+# component the user's scheme asked for — an unknown token is left visible
+# instead, so a paste that relies on it is obvious rather than silently wrong.
+
+
+# Codec labels as the naming schemes write them. Our internal forms come from
+# ffprobe ('hevc', 'eac3') and the release parser ('x264'); blanket-uppercasing
+# them yields 'HEVC'/'TRUEHD', which is not what a Sonarr-shaped filename looks
+# like. Anything unlisted falls back to upper-case, which is right far more
+# often than not for audio formats.
+_VIDEO_CODEC_LABELS = {"hevc": "x265", "h265": "x265", "x265": "x265",
+                       "x264": "x264", "h264": "x264", "avc": "x264",
+                       "av1": "AV1", "vp9": "VP9", "mpeg2video": "MPEG2"}
+_AUDIO_CODEC_LABELS = {"truehd": "TrueHD", "eac3": "EAC3", "ac3": "AC3",
+                       "dts": "DTS", "dtshd": "DTS-HD", "dts-hd": "DTS-HD",
+                       "aac": "AAC", "opus": "Opus", "flac": "FLAC",
+                       "vorbis": "Vorbis", "mp3": "MP3", "pcm_s24le": "PCM"}
+
+
+def _codec_label(value: Any, table: dict) -> str:
+    key = _str(value).strip().lower()
+    if not key:
+        return ""
+    return table.get(key, key.upper())
+
+
+def _media_tokens(f: dict) -> dict:
+    """The MediaInfo/quality/release tokens shared by movies and episodes.
+
+    Every value prefers what ffprobe read from the FILE over what the release
+    name claimed, because that is the whole point of probing — a name saying
+    'HDR' proves nothing, and these end up in the filename."""
+    return {
+        "Quality Full": _str(f.get("quality")),
+        "Quality Title": _str(f.get("resolution")),
+        "MediaInfo VideoCodec": _codec_label(f.get("codec"), _VIDEO_CODEC_LABELS),
+        "MediaInfo AudioCodec": _codec_label(f.get("audio_codec"), _AUDIO_CODEC_LABELS),
+        "MediaInfo AudioChannels": _str(f.get("audio_channels")),
+        "MediaInfo AudioLanguages": _str(f.get("audio_languages")),
+        "MediaInfo VideoBitDepth": _str(f.get("video_bit_depth")),
+        "MediaInfo VideoDynamicRange": "HDR" if f.get("dynamic_range_type") else "",
+        "MediaInfo VideoDynamicRangeType": _str(f.get("dynamic_range_type")),
+        "MediaInfo 3D": "3D" if f.get("three_d") else "",
+        "Release Group": _str(f.get("release_group")),
+        "Custom Formats": _str(f.get("custom_formats")),
+        "Edition Tags": _str(f.get("edition")),
+        "Original Title": _str(f.get("original_title")),
+        "Original Filename": _str(f.get("original_filename")),
+        "ImdbId": _str(f.get("imdbid")),
+        "TmdbId": _str(f.get("tmdbid")),
+        "TvdbId": _str(f.get("tvdbid")),
+    }
+
+
+def _movie_brace_tokens(f: dict) -> dict:
+    title = f.get("title") or "Unknown"
+    year = _str(f.get("year")) if _plausible_year(f.get("year")) else ""
+    return {
+        **_media_tokens(f),
+        "Movie Title": _str(title),
+        "Movie CleanTitle": naming_tokens.clean_title(title),
+        "Movie TitleThe": naming_tokens.title_the(title),
+        "Movie OriginalTitle": _str(f.get("original_title")) or _str(title),
+        "Movie Year": year,
+        "Release Year": year,
+    }
+
+
+def _episode_brace_tokens(f: dict) -> dict:
+    series = f.get("series") or f.get("title") or "Unknown"
+    year = _str(f.get("year")) if _plausible_year(f.get("year")) else ""
+    clean = naming_tokens.clean_title(series)
+    # 'WithoutYear' strips a trailing '(2019)' the series title may itself carry,
+    # so '{Series CleanTitleWithoutYear} {(Series Year)}' can't print it twice.
+    without_year = re.sub(r"\s*\((?:19|20)\d{2}\)\s*$", "", clean).strip()
+    episode = _pad2(f.get("episode"))
+    if f.get("episode_end"):
+        episode = "%s-E%s" % (episode, _pad2(f.get("episode_end")))
+    ep_title = _str(f.get("episode_title"))
+    return {
+        **_media_tokens(f),
+        "Series Title": _str(series),
+        "Series CleanTitle": clean,
+        "Series CleanTitleWithoutYear": without_year,
+        "Series TitleThe": naming_tokens.title_the(series),
+        "Series TitleYear": ("%s (%s)" % (without_year, year)) if year else without_year,
+        "Series Year": year,
+        "season": _str(f.get("season")),
+        "episode": episode,
+        "absolute": _str(f.get("absolute")),
+        "Episode Title": ep_title,
+        "Episode CleanTitle": naming_tokens.clean_title(ep_title),
+        "Air-Date": str(f.get("air_date") or "")[:10],
+        "AirDate": str(f.get("air_date") or "")[:10].replace("-", "."),
+    }
+
+
+_BRACE_TOKENS = {"movie": _movie_brace_tokens, "episode": _episode_brace_tokens}
+
+
+# The sample title the settings-page preview renders. Deliberately carries a
+# value for EVERY token, including the awkward ones (an apostrophe for
+# CleanTitle, a multi-episode span, a Dolby Vision 10-bit HEVC release), so the
+# preview shows what a template does at its fullest rather than a tidy case.
+PREVIEW_SAMPLES = {
+    "movie": {
+        "title": "The Director's Cut", "year": 1999, "quality": "Bluray-2160p",
+        "resolution": "2160p", "source": "bluray", "codec": "hevc",
+        "audio_codec": "truehd", "audio_channels": "7.1", "audio_languages": "EN",
+        "video_bit_depth": 10, "dynamic_range_type": "DV", "three_d": False,
+        "edition": "Directors Cut", "release_group": "FraMeSToR",
+        "custom_formats": "IMAX", "tmdbid": 603, "imdbid": "tt0133093",
+        "original_title": "The Director's Cut 1999 UHD BluRay 2160p TrueHD Atmos 7.1 DV HEVC-FraMeSToR",
+    },
+    "episode": {
+        "series": "The Expanse", "year": 2015, "season": 4, "episode": 2,
+        "episode_title": "Jetsam", "air_date": "2019-12-13", "absolute": 32,
+        "quality": "WEBDL-1080p", "resolution": "1080p", "source": "web-dl",
+        "codec": "x264", "audio_codec": "eac3", "audio_channels": "5.1",
+        "audio_languages": "EN", "video_bit_depth": 8, "release_group": "NTb",
+        "custom_formats": "AMZN", "tvdbid": 280619, "imdbid": "tt3230854",
+        "original_title": "The.Expanse.S04E02.Jetsam.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb",
+    },
+    "youtube": {
+        "channel": "Techmoan", "title": "The forgotten cassette format",
+        "published_at": "2026-03-14", "youtube_id": "dQw4w9WgXcQ",
+    },
+}
+
+
+def brace_token_names(scope: str) -> list:
+    """Every ``{Token}`` this scope understands — drives the settings-page
+    reference list, so the UI can never advertise a token the renderer lacks."""
+    builder = _BRACE_TOKENS.get(str(scope or "").lower())
+    if not builder:
+        return []
+    return sorted(builder({}).keys(), key=str.lower)
+
+
 def _youtube_values(f: dict) -> dict:
     """Template values for a YouTube upload — channel-as-show, season=year, date-named
     episode (Plex 'TV by date'). ``published_at``/``date`` is 'YYYY-MM-DD'."""
@@ -289,12 +438,20 @@ def _youtube_values(f: dict) -> dict:
     }
 
 
-def render_template(template: Any, values: dict) -> str:
+def render_template(template: Any, values: dict, brace: Any = None) -> str:
     """Substitute ``$token`` / ``${token}`` from ``values`` into ``template``. Each
     value is path-sanitised first (so a title with '/' can't spawn a folder), and
-    tokens are replaced longest-name-first ($episodetitle before $episode)."""
+    tokens are replaced longest-name-first ($episodetitle before $episode).
+
+    ``brace`` (a ``naming_tokens.TokenSet``) additionally enables the
+    Sonarr/Radarr ``{Token}`` scheme. The two run in ONE order for a reason:
+    ``{…}`` groups resolve FIRST, so a ``$token`` value that happens to contain a
+    brace — an episode literally titled 'The {Redacted} Job' — is inserted after
+    group parsing is done and can never be read as a group itself."""
     clean = {k: sanitize(v) for k, v in (values or {}).items()}
     out = str(template or "")
+    if brace is not None and naming_tokens.has_brace_tokens(out):
+        out = naming_tokens.render(out, brace, sanitize=sanitize)
     for tok in sorted(clean, key=len, reverse=True):
         out = out.replace("${" + tok + "}", clean[tok])
     for tok in sorted(clean, key=len, reverse=True):
@@ -305,10 +462,16 @@ def render_template(template: Any, values: dict) -> str:
 def _tidy_component(part: str) -> str:
     """Clean one path segment: drop a ' - ' left dangling by an empty token, remove
     empty ()/[] left by an empty $year, collapse whitespace, trim stray dashes and
-    Windows-hostile trailing dots/spaces."""
-    p = re.sub(r"\s+-\s+(?=(\s|$))", " ", part)   # ' - ' before an empty token
+    Windows-hostile trailing dots/spaces.
+
+    Orphan brackets are swept too: the ``{[A}{ B]}`` idiom the TRaSH schemes use
+    spreads one bracket pair across two groups, so when only one survives the
+    segment is left lopsided ('[EAC3' / ' 5.1]')."""
+    p = naming_tokens.strip_orphan_brackets(part)
+    p = re.sub(r"\s+-\s+(?=(\s|$))", " ", p)      # ' - ' before an empty token
     p = re.sub(r"\(\s*\)", "", p)                 # empty ( ) from a missing $year
     p = re.sub(r"\[\s*\]", "", p)
+    p = re.sub(r"\{\s*\}", "", p)                 # empty { } from a vanished group
     p = re.sub(r"\s+", " ", p).strip()
     p = p.strip("-").strip()
     return p.rstrip(". ")
@@ -323,12 +486,15 @@ def render_path(scope: Any, root: Any, fields: dict, settings: Any, ext: Any) ->
     root = str(root or "")
     sc = str(scope or "").lower()
 
+    brace = None
     if sc == "movie":
         tmpl = settings.get("movie_template") or DEFAULTS["movie_template"]
         values = _movie_values(fields)
+        brace = naming_tokens.TokenSet(_movie_brace_tokens(fields), _NUMERIC_TOKENS)
     elif sc == "episode":
         tmpl = settings.get("episode_template") or DEFAULTS["episode_template"]
         values = _episode_values(fields)
+        brace = naming_tokens.TokenSet(_episode_brace_tokens(fields), _NUMERIC_TOKENS)
     elif sc == "youtube":
         tmpl = settings.get("youtube_template") or DEFAULTS["youtube_template"]
         # Saved settings snapshot the default, so simply changing DEFAULTS would
@@ -342,7 +508,7 @@ def render_path(scope: Any, root: Any, fields: dict, settings: Any, ext: Any) ->
         base = (sanitize(fields.get("title")) or "download") + _ext(ext)
         return {"dir": root, "filename": base, "path": os.path.join(root, base)}
 
-    rendered = render_template(tmpl, values)
+    rendered = render_template(tmpl, values, brace)
     parts = [p for p in (_tidy_component(seg) for seg in rendered.split("/")) if p]
     if not parts:
         parts = ["download"]

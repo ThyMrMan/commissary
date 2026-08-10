@@ -6752,6 +6752,8 @@
                                     <label>Movie Path Template:</label>
                                     <input type="text" id="vo-movie-template" placeholder="$title ($year)/$title ($year) $quality">
                                     <small class="settings-hint">Variables: $title, $titlefirst, $year, $quality (e.g. Bluray-1080p), $resolution, $source, $codec, $edition, $tmdbid, $imdbid. Folders split on "/", the last segment is the filename.</small>
+                                    <small class="settings-hint">Or use Radarr-style <code>{Token}</code> names &mdash; <button type="button" class="link-button" data-vo-tokens="movie">show all 24</button>, or <button type="button" class="link-button" data-vo-preset="movie">use the TRaSH recommended scheme</button>.</small>
+                                    <div class="vo-token-list" id="vo-movie-tokens" hidden></div>
                                     <small class="settings-hint">Example: <code id="vo-movie-preview">&hellip;</code></small>
                                 </div>
 
@@ -6759,7 +6761,14 @@
                                     <label>Episode Path Template:</label>
                                     <input type="text" id="vo-episode-template" placeholder="$series/Season $season/$series - S$seasonE$episode - $episodetitle $quality">
                                     <small class="settings-hint">Variables: $series, $season (01), $seasonraw (1), $episode (01), $episodetitle, $year, $quality, $resolution, $source, $codec, $tvdbid.</small>
+                                    <small class="settings-hint">Or use Sonarr-style <code>{Token}</code> names &mdash; <button type="button" class="link-button" data-vo-tokens="episode">show all 31</button>, or <button type="button" class="link-button" data-vo-preset="episode">use the TRaSH recommended scheme</button>.</small>
+                                    <div class="vo-token-list" id="vo-episode-tokens" hidden></div>
                                     <small class="settings-hint">Example: <code id="vo-episode-preview">&hellip;</code></small>
+                                </div>
+
+                                <div class="form-group">
+                                    <small class="settings-hint"><strong>About <code>{Token}</code> names:</strong> a schema copied from the <a href="https://trash-guides.info/Sonarr/Sonarr-recommended-naming-scheme/" target="_blank" rel="noopener noreferrer">TRaSH guides</a> works as-is. Wrapping a token in braces makes it optional: <code>{[Quality Full]}</code> renders <code>[WEBDL-1080p]</code>, or vanishes entirely &mdash; brackets included &mdash; when there is nothing to show, which is what keeps empty <code>[]</code> and trailing dashes out of filenames. <code>{season:00}</code> zero-pads; <code>{Episode CleanTitle:90}</code> caps the length. The <code>$</code> variables above keep working, and the two can be mixed.</small>
+                                    <small class="settings-hint">Audio channels, bit depth, languages and dynamic range are read from the file itself by ffprobe, so they need <strong>Verify with ffprobe</strong> (below) left on. <code>{Preferred Words}</code> is not supported &mdash; SoulSync has no equivalent setting.</small>
                                 </div>
 
                                 <div class="form-group">

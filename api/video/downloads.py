@@ -586,6 +586,39 @@ def register_routes(bp):
             "tokens": tokens_for(kind, rows[0] if rows else None),
         })
 
+    @bp.route("/organization/naming/preview", methods=["POST"])
+    def video_naming_preview():
+        """Render sample filenames for typed templates, through the REAL renderer.
+
+        The settings page used to mirror the template engine in JavaScript to
+        draw this preview, which meant the preview could only be as correct as
+        the copy — and the ``{Token}`` scheme's optional groups and padding are
+        not something worth re-implementing twice. Rendering server-side makes
+        the preview true by construction.
+
+        Body: {movie_template?, episode_template?}. Nothing is saved."""
+        from core.video import organization
+        body = request.get_json(silent=True) or {}
+        out = {"success": True, "tokens": {
+            "movie": organization.brace_token_names("movie"),
+            "episode": organization.brace_token_names("episode"),
+        }}
+        for scope, key, ext in (("movie", "movie_template", ".mkv"),
+                                ("episode", "episode_template", ".mkv"),
+                                ("youtube", "youtube_template", ".mp4")):
+            tmpl = body.get(key)
+            if tmpl is None:
+                continue
+            try:
+                rendered = organization.render_path(
+                    scope, "", organization.PREVIEW_SAMPLES[scope],
+                    {key: tmpl or organization.DEFAULTS[key]}, ext)
+                out[scope] = rendered["path"].replace("\\", "/").lstrip("/")
+            except Exception as e:   # noqa: BLE001 - a bad template is user input, not a 500
+                out[scope] = None
+                out[scope + "_error"] = str(e)
+        return jsonify(out)
+
     @bp.route("/organization/rename/preview/title", methods=["POST"])
     def video_rename_preview_title():
         """Preview one title's renames against a typed template.

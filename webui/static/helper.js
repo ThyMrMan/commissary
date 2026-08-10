@@ -3484,8 +3484,13 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.9.11': [
-        { date: 'August 2026 · 1.9.11' },
+    '1.9.12': [
+        { date: 'August 2026 · 1.9.12' },
+        { title: 'Sonarr/Radarr naming, including the TRaSH schemes', desc: 'video naming templates now understand Sonarr and Radarr\'s <code>{Token}</code> names alongside the existing <code>$variables</code> — so a format string copied straight out of the <a href="https://trash-guides.info/Sonarr/Sonarr-recommended-naming-scheme/" target="_blank" rel="noopener noreferrer">TRaSH guides</a> works as-is, no translation. There is a one-click button for the recommended scheme in <strong>Settings → Library Organization</strong>, and a browsable list of every token (24 for movies, 31 for episodes) that inserts at your cursor.' },
+        { title: 'Optional groups are what make those schemes work', desc: 'wrapping a token in braces makes the whole group conditional: <code>{[Quality Full]}</code> renders <code>[WEBDL-1080p]</code>, or disappears completely — brackets included — when there is nothing to put there. That is what keeps empty <code>[]</code>, stray dashes and orphaned punctuation out of your filenames when a release has no edition, no HDR, or no known group. <code>{season:00}</code> zero-pads and <code>{Episode CleanTitle:90}</code> caps a length, exactly as they do in Sonarr.' },
+        { title: 'New: what the file actually contains', desc: 'audio channels (<strong>5.1</strong>, <strong>7.1</strong>), video bit depth (<strong>10bit</strong>), audio languages and the real dynamic range type (<strong>DV</strong>, <strong>HDR10</strong>, <strong>HLG</strong>) are now read out of the container by ffprobe and available as tokens. They come from the file, never from what the release name claims — which is the point, since a name asserting "HDR" proves nothing. Edition detection (<strong>Directors Cut</strong>, <strong>IMAX</strong>, <strong>Extended</strong>) and <code>{Custom Formats}</code> are wired up too.' },
+        { title: 'Your current naming has not changed', desc: 'the defaults are untouched and every <code>$variable</code> keeps working exactly as before — adopting a new scheme is something you choose, because switching silently would leave every file already on disk mis-named until renamed. The two styles can even be mixed in one template. The example under each box is now rendered by the real naming code rather than a copy of it, so what it shows is what you get.' },
+        { title: 'Also in 1.9.11', desc: 'four bugs found in the logs: a downloaded episode filed under the wrong show, Deezer dying silently, the wishlist retrying the same failures forever, and healthy download batches reported as broken.' },
         { title: 'Fixed: a failing track could be retried forever, never backing off', desc: 'the wishlist has had a retry ladder for a while — a track that keeps failing earns a growing cooldown (4 hours, then a day, then weekly) instead of burning a search every cycle. In one 12-hour log it <strong>never engaged once</strong>. Re-adding a failed track created a second, duplicate wishlist row for the same album, and nothing ever recorded an attempt against that copy — so its counter sat at zero, it looked freshly-added on every pass, and it was retried indefinitely. The re-add now recognises a track it already has.' },
         { title: 'What that was costing you', desc: 'in the same log, <strong>34 files were downloaded and quarantined again and again — one of them 132 times</strong>. Each cycle re-fetched a file that had already failed its integrity check, threw it away for the same reason, and queued it up to do it again. Duplicate rows already in your wishlist are cleaned up once on upgrade; a track from a genuinely different album still gets its own entry, which is what that mechanism was for.' },
         { title: 'Downloads stopped reporting healthy batches as broken', desc: 'the batch self-check counted every finished track as an "orphaned task", so a perfectly normal download batch was declared damaged every 30 seconds for its entire life — one log had 1,499 of these warnings across 31 batches, with the "orphan" count simply climbing in step with progress. It now looks for the two things that are actually wrong: a batch whose tasks have all finished without it completing, and a queued task whose record has gone missing.' },
@@ -3721,6 +3726,20 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.12: Sonarr/Radarr naming — paste a TRaSH scheme and it works",
+        description: "video naming templates now understand {Token} names alongside the existing $variables, so a format string copied out of the TRaSH guides renders exactly as documented. Nothing about your current naming changes unless you choose a new scheme.",
+        features: [
+            "one-click button for the TRaSH recommended scheme, and a browsable list of every token — 24 for movies, 31 for episodes — that inserts at your cursor",
+            "optional groups are what make those schemes work: {[Quality Full]} renders [WEBDL-1080p] or vanishes entirely, brackets included, so nothing leaves empty [] or a trailing dash behind",
+            "{season:00} zero-pads, {Episode CleanTitle:90} caps a length, and token names ignore case and spacing — the guides mix 'Mediainfo' and 'MediaInfo' in a single line",
+            "new file facts read by ffprobe: audio channels, video bit depth, audio languages and the real dynamic range type (DV / HDR10 / HLG) — from the container, never from what the release name claims",
+            "edition detection (Directors Cut, IMAX, Extended) and {Custom Formats} are wired in",
+            "defaults untouched and every $variable still works; the two styles can be mixed in one template",
+            "the example under each template box is now rendered by the real naming code instead of a JavaScript copy of it, so the preview cannot drift from what lands on disk",
+        ],
+        usage_note: "Settings → Library Organization. Load the preset, watch the example update, then click away to save. {Preferred Words} is the one guide token not supported — SoulSync has no equivalent setting, so it is left visible rather than silently dropped.",
+    },
     {
         title: "1.9.11: the wishlist stops retrying the same failures forever",
         description: "a retry ladder has existed for a while — repeated failures earn a growing cooldown instead of a search every cycle. A 12-hour log shows it never engaged once, because re-adding a failed track quietly created a duplicate row that no attempt was ever recorded against.",

@@ -116,6 +116,26 @@ def _size_of(path: str) -> int:
         return 0
 
 
+def _custom_formats_for(db, dl) -> str:
+    """The custom formats this release matches, as the ``{Custom Formats}``
+    naming token wants them — space-joined names, '' when none match.
+
+    Lives here rather than in the importer because it needs the DB and the
+    grab's quality profile, and ``plan_import`` is deliberately pure. Templates
+    that don't use the token never notice; ones that do get the same names the
+    ranker scored the release under."""
+    try:
+        from core.video.custom_formats import load_formats, matching_formats
+        formats = load_formats(db)
+        if not formats:
+            return ""
+        name = (dl or {}).get("release_title") or (dl or {}).get("filename") or ""
+        return " ".join(f.get("name") for f in matching_formats(name, formats) if f.get("name"))
+    except Exception:   # noqa: BLE001 - a naming nicety must never block an import
+        logger.debug("custom-format naming lookup failed", exc_info=True)
+        return ""
+
+
 def _make_organizer(db):
     """A per-tick organizer closure: post-process a finished download into the library
     via the importer (Radarr-style parse → ffprobe-verify → templated rename →
@@ -141,6 +161,7 @@ def _make_organizer(db):
             db.update_video_download(dl["id"], status="importing", progress=100)
         except Exception:   # noqa: BLE001, S110 - a status blip must never wedge the import
             pass
+        dl = {**dl, "_custom_formats": _custom_formats_for(db, dl)}
         from core.video.recycle import discarder
         # A season/series grab hands us the pack FOLDER; fan it out into one
         # per-episode import each (core.video.importer.run_season_import), which

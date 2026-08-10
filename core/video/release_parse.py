@@ -75,6 +75,45 @@ _GROUP = re.compile(r"-([A-Za-z0-9]{2,})\s*$")
 _AIR_DATE = re.compile(r"\b((?:19|20)\d{2})[ ._-](0[1-9]|1[0-2])[ ._-](0[1-9]|[12]\d|3[01])\b")
 
 
+# Edition markers, longest/most specific first — the {Edition Tags} token, and
+# what Plex reads out of an 'edition-X' filename. Deliberately a fixed list of
+# real editions rather than "any of these words": 'cut' and 'edition' on their
+# own appear in ordinary titles ('The Final Cut', 'Special'), so matching them
+# loose would stamp an edition on films that have none.
+_EDITIONS = [
+    (re.compile(r"\bdirector'?s?[. _-]?cut\b", re.I), "Directors Cut"),
+    (re.compile(r"\bextended[. _-]?(?:edition|cut|version)\b", re.I), "Extended"),
+    (re.compile(r"\bfinal[. _-]?cut\b", re.I), "Final Cut"),
+    (re.compile(r"\bspecial[. _-]?edition\b", re.I), "Special Edition"),
+    (re.compile(r"\bultimate[. _-]?(?:edition|cut)\b", re.I), "Ultimate"),
+    (re.compile(r"\bdefinitive[. _-]?edition\b", re.I), "Definitive"),
+    (re.compile(r"\bcollector'?s?[. _-]?edition\b", re.I), "Collectors"),
+    (re.compile(r"\banniversary[. _-]?edition\b", re.I), "Anniversary"),
+    (re.compile(r"\bcriterion\b", re.I), "Criterion"),
+    (re.compile(r"\bremaster(?:ed)?\b", re.I), "Remastered"),
+    (re.compile(r"\bunrated\b", re.I), "Unrated"),
+    (re.compile(r"\buncut\b", re.I), "Uncut"),
+    (re.compile(r"\bimax\b", re.I), "IMAX"),
+    (re.compile(r"\bextended\b", re.I), "Extended"),
+]
+
+
+def edition_tags(release_name: Any) -> str | None:
+    """The edition a release advertises ('Directors Cut', 'IMAX'), or None.
+
+    Multiple markers join with a space, in the order listed above, so
+    'Extended.IMAX' reads 'IMAX Extended' consistently regardless of how the
+    release happened to order them."""
+    t = str(release_name or "")
+    if not t:
+        return None
+    found = []
+    for rx, label in _EDITIONS:
+        if label not in found and rx.search(t):
+            found.append(label)
+    return " ".join(found) if found else None
+
+
 def _first(table, text) -> Any:
     for rx, val in table:
         if rx.search(text):
@@ -110,6 +149,7 @@ def parse_release(title: Any) -> dict:
         "air_date": None,
         "is_season_pack": False,
         "is_series_pack": False,
+        "edition": edition_tags(t),
     }
     g = _GROUP.search(t)
     if g:
