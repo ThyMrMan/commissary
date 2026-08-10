@@ -1534,13 +1534,20 @@
         box.hidden = false;
     }
 
-    function fillOrg() {
+    // Bumped by every edit to a template box. A load that was already in flight
+    // when an edit happened must not paint over it — see loadOrganization.
+    var _orgEditSeq = 0;
+    var _orgLoadSeq = 0;
+
+    function fillOrg(keepTemplates) {
         if (!_videoOrg) return;
         var set = function (id, v) { var el = document.getElementById(id); if (el) el.value = v; };
         var chk = function (id, v) { var el = document.getElementById(id); if (el) el.checked = !!v; };
-        set('vo-movie-template', _videoOrg.movie_template || '');
-        set('vo-episode-template', _videoOrg.episode_template || '');
-        set('vo-youtube-template', _videoOrg.youtube_template || '');
+        if (!keepTemplates) {
+            set('vo-movie-template', _videoOrg.movie_template || '');
+            set('vo-episode-template', _videoOrg.episode_template || '');
+            set('vo-youtube-template', _videoOrg.youtube_template || '');
+        }
         set('vo-transfer-mode', _videoOrg.transfer_mode || 'copy');
         chk('vo-verify', _videoOrg.verify_with_ffprobe);
         chk('vo-replace', _videoOrg.replace_existing);
@@ -1559,9 +1566,21 @@
         renderOrgPreview();
     }
     function loadOrganization() {
+        // Showing this page fires a dozen loads at once, and this GET has been
+        // measured landing ~900ms after the page appears. Anything the user did
+        // in that window used to be painted over by the response — their edit
+        // vanished from the box, which reads as "it didn't save" even when it
+        // did. A response only fills the templates if no edit beat it here, and
+        // a superseded response is dropped entirely.
+        var seq = ++_orgLoadSeq;
+        var editsAtStart = _orgEditSeq;
         fetch(ORG_URL, { headers: { 'Accept': 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) { if (d) { _videoOrg = d; fillOrg(); } })
+            .then(function (d) {
+                if (!d || seq !== _orgLoadSeq) return;
+                _videoOrg = d;
+                fillOrg(_orgEditSeq !== editsAtStart);
+            })
             .catch(function () { /* ignore */ });
     }
     function collectOrg() {
@@ -1589,12 +1608,44 @@
         };
     }
     function saveOrganization(silent) {
+        // Resolves true only when the server actually took it. A save that failed
+        // used to toast success anyway, which on this card is the worst possible
+        // lie — the field keeps showing the value while the library keeps naming
+        // files the old way. A FAILED save always speaks, silent or not.
         return fetch(ORG_URL, {
             method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
             body: JSON.stringify(collectOrg())
         }).then(function (r) { return r.ok ? r.json() : null; })
-          .then(function (d) { if (d) { _videoOrg = d; } if (!silent) toast('Library organization saved', 'success'); })
-          .catch(function () { /* ignore */ });
+          .then(function (d) {
+              if (!d) { toast('Could not save library organization', 'error'); return false; }
+              _videoOrg = d;
+              if (!silent) toast('Library organization saved', 'success');
+              return true;
+          })
+          .catch(function () { toast('Could not save library organization', 'error'); return false; });
+    }
+
+    // Commit a template the CODE wrote into the box (a token chip, the TRaSH
+    // preset). Those never fire 'change' — browsers raise it only for edits the
+    // user typed — so the change-listener autosave below never ran for them and
+    // the template was silently lost on the next page load, which is exactly
+    // "the naming template doesn't save after leaving the page". Debounced, so
+    // clicking five tokens in a row is one save rather than five.
+    var _orgSaveTimer = null;
+    function _commitOrgNow(message) {
+        // collectOrg() reads EVERY field, so saving before the initial load has
+        // populated the form would write the markup's blank toggles over real
+        // settings. Wait for it rather than dropping the edit.
+        if (!_videoOrg) { _orgSaveTimer = setTimeout(function () { _commitOrgNow(message); }, 200); return; }
+        saveOrganization(true).then(function (ok) {
+            if (ok) toast(message || 'Library organization saved', 'success');
+        });
+    }
+    function commitTemplateEdit(message) {
+        _orgEditSeq++;
+        renderOrgPreview();
+        if (_orgSaveTimer) clearTimeout(_orgSaveTimer);
+        _orgSaveTimer = setTimeout(function () { _commitOrgNow(message); }, 400);
     }
     function wireOrganization() {
         var anchor = document.getElementById('vo-movie-template');
@@ -1605,8 +1656,10 @@
         ['vo-movie-template', 'vo-episode-template', 'vo-youtube-template'].forEach(function (id) {
             var el = document.getElementById(id);
             if (!el) return;
-            el.addEventListener('input', renderOrgPreview);          // live preview while typing
-            el.addEventListener('change', function () { saveOrganization(false); });
+            // 'input' marks the box edited so an in-flight load can't paint over
+            // what is being typed; 'change' (blur) commits it.
+            el.addEventListener('input', function () { _orgEditSeq++; renderOrgPreview(); });
+            el.addEventListener('change', function () { commitTemplateEdit(); });
         });
         ['vo-transfer-mode', 'vo-verify', 'vo-replace', 'vo-subs', 'vo-artwork', 'vo-nfo',
             'vo-subs-dl', 'vo-sub-langs', 'vo-recycle', 'vo-recycle-days', 'vo-recycle-path',
@@ -1630,7 +1683,7 @@
                     box.value = box.value.slice(0, at) + chip.textContent + box.value.slice(end);
                     box.focus();
                     box.selectionStart = box.selectionEnd = at + chip.textContent.length;
-                    renderOrgPreview();
+                    commitTemplateEdit();
                 }
                 return;
             }
@@ -1640,11 +1693,12 @@
                 var target = document.getElementById('vo-' + scope + '-template');
                 if (target && _TRASH_PRESETS[scope]) {
                     target.value = _TRASH_PRESETS[scope];
-                    renderOrgPreview();
-                    // Deliberately NOT saved: the preview below the box is the
-                    // point — see what it does to your naming, then commit by
-                    // leaving the field (which fires the normal change-save).
-                    toast('TRaSH scheme loaded — check the example, then click away to save', 'info');
+                    // Saved, like every other edit on this card. It used to be
+                    // left for the user to "commit by clicking away", which was
+                    // advice that could not work: a value the code wrote raises
+                    // no 'change', so clicking away saved nothing and the scheme
+                    // vanished on the next page load.
+                    commitTemplateEdit('TRaSH scheme applied — see the example below');
                 }
             }
         });
