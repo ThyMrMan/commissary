@@ -30,6 +30,13 @@ def _client(instances):
     c._api_lock = threading.Lock()
     c._last_api_call = 0.0
     c._min_interval = 0.0
+    # Circuit-breaker state. These tests bypass __init__ deliberately, so the
+    # fields it would have set have to be supplied here; a closed breaker is
+    # the right starting point for rotation tests, which are about what happens
+    # on the FIRST failure of each instance.
+    c._breaker = {}
+    c._breaker_lock = threading.Lock()
+    c._pool_down_logged_until = 0.0
     c.session = MagicMock()
     return c
 

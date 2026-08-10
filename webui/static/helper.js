@@ -3484,8 +3484,16 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
-    '1.9.13': [
-        { date: 'August 2026 · 1.9.13' },
+    '1.9.14': [
+        { date: 'August 2026 · 1.9.14' },
+        { title: 'HiFi stops re-dialling instances it already knows are down', desc: 'the public HiFi instances are volunteer-run and outages are normal — but SoulSync had no memory of them. Every search walked all seven hosts and paid the full connection timeout on each, every time. In one 12-hour log that came to <strong>4,094 "all instances exhausted" errors and around 23,500 warnings</strong> — between them 47% of that log\'s errors and 80% of its warnings — with one search burning 16 seconds on a host the app had <em>already</em> declared dead moments earlier.' },
+        { title: 'What changes', desc: 'each instance now gets a cooldown after it fails, and is skipped without opening a connection until that elapses. When every instance is cooling, HiFi is skipped instantly and your search falls through to your other sources. Measured on a fully dead pool: the first search still tries all seven and learns, the next ten make <strong>no network calls at all</strong>.' },
+        { title: 'It recovers by itself', desc: 'the cooldown starts at a minute and doubles for an instance that keeps failing, capped at fifteen. When it elapses that host gets one probe, and a single success clears its record completely — a host that works is not "less broken", it is working. Editing your instance list or hitting Restore Defaults clears every cooldown immediately, so a change you make takes effect at once.' },
+        { title: 'And the log says it once', desc: 'a whole-pool outage is now one warning per cooldown window telling you roughly how long HiFi will sit out, instead of thousands of identical lines burying it. The HiFi status endpoint also reports which instances are cooling and for how long, so a source that gets skipped can say why.' },
+        { title: 'Fixed: a video naming template would not stick', desc: 'reported as "Library video naming templates do not save after leaving the page". Typing a template and clicking away did save — but the two controls that write the box <em>for</em> you did not. A value set by code raises no change event, and the change event was the only thing that triggered the save, so <strong>clicking a token to insert it, or loading the TRaSH scheme, never reached the server</strong>. The box showed your new template until you left the page, then it was gone. The preset even said "click away to save", which could not work for exactly that reason.' },
+        { title: 'And a slow load could eat what you just typed', desc: 'opening Settings → Library fires about a dozen requests at once, and the organization one was measured landing <strong>924ms after the page appeared</strong> — then writing the stored template back over the box. Anything you did in that window vanished in front of you, which reads as "it didn\'t save" even when it had. A response that loses the race no longer touches a field you have edited, and a save can no longer fire before the form has loaded, which could write blank checkboxes over your real post-processing settings.' },
+        { title: 'Fixed: "Reset to the standard layout" did not restore the standard layout', desc: 'found next door to the above. That button posted its own copy of every default, written in JavaScript a directory away from the real ones — and it had drifted: it turned <strong>off</strong> the NFO and artwork sidecars, which the actual defaults turn on. It also posted the minimum-free-disk value, which is not the video side\'s to set — that setting is shared app-wide, so resetting a video <em>naming</em> card dropped the <strong>music</strong> side\'s disk floor to zero and disabled its guard. Reset now sends blank templates and lets the server fill the rest from the real defaults, which is what it always claimed to do.' },
+        { title: 'Also in 1.9.13', desc: 'renaming an existing file no longer strips its audio, dynamic range and release group.' },
         { title: 'Fixed: renaming a file could strip its audio and release group', desc: 'reported as "the Rename Files variable picker doesn\'t show the new tokens" — which turned out to be the visible edge of something worse. Only the <em>import</em> path knew about the new <code>{Token}</code> values, so for a file already in your library the rename preview and the Naming Conformance job both worked out its name <strong>without</strong> its audio codec, channels, dynamic range or release group. Conformance would flag a correctly-named file as wrong, and approving that fix would rename it to the shorter version — deleting that detail from the filename.' },
         { title: 'All three now agree', desc: 'renames and the conformance check read the audio codec, channel layout and dynamic range the scan already recorded, and recover the release group and edition from the file\'s current name. For the same file, the importer, the rename preview and the conformance job now produce identical results.' },
         { title: 'And a rename can no longer lose what it cannot rebuild', desc: 'a few tokens only exist at import — bit depth, audio languages, custom formats, the original release name. If your template uses one of those, the Naming Conformance job now stands down for those files and says so in the log, instead of proposing a rename that would quietly drop them.' },
@@ -3731,6 +3739,35 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.14: a video naming template would not stick",
+        description: "reported as \"Library video naming templates do not save after leaving the page\". Typing one and clicking away did save — but the two controls that fill the box for you did not, because a value written by code raises no change event, and that event was the only thing that triggered a save.",
+        features: [
+            "clicking a token to insert it now saves, instead of showing you a template that was gone on the next page load",
+            "so does the TRaSH preset — it used to say \"click away to save\", which could not work for the same reason",
+            "several tokens clicked in a row are one save, not one each",
+            "opening Settings → Library fires ~a dozen requests at once; this one was measured landing 924ms later and writing the stored template back over the box, so anything typed in that window disappeared",
+            "a response that loses that race no longer touches a field you have edited",
+            "a save can no longer fire before the form has loaded — which could write blank checkboxes over your real post-processing settings",
+            "a save that fails now says so, instead of reporting success while the library keeps naming files the old way",
+            "and \"Reset to the standard layout\" now restores the standard layout — it had drifted into switching OFF the NFO and artwork sidecars, and into resetting the disk-space floor that the music side shares",
+        ],
+        usage_note: "Nothing to configure. If you set a naming template before and found it reverted, set it again — it will hold now.",
+    },
+    {
+        title: "1.9.14: HiFi stops re-dialling instances it already knows are down",
+        description: "the public HiFi instances are volunteer-run and outages are normal — but SoulSync kept no memory of them, so every search walked all seven hosts and paid the full timeout on each. One 12-hour log: 4,094 \"all instances exhausted\" errors and ~23,500 warnings, which was 47% of its errors and 80% of its warnings.",
+        features: [
+            "each instance gets a cooldown after it fails and is skipped without opening a connection until that elapses",
+            "when every instance is cooling, HiFi is skipped instantly and the search falls through to your other sources",
+            "measured on a fully dead pool: the first search tries all seven and learns, the next ten make no network calls at all",
+            "the cooldown starts at a minute and doubles for a host that keeps failing, capped at fifteen — then one probe, and a single success clears its record entirely",
+            "editing your instance list or hitting Restore Defaults clears every cooldown at once, so your change takes effect immediately",
+            "a whole-pool outage is one warning per cooldown window saying how long HiFi will sit out, instead of thousands of identical lines burying it",
+            "the HiFi status endpoint reports which instances are cooling and for how long, so a skipped source can say why",
+        ],
+        usage_note: "Nothing to configure. If HiFi shows as unavailable and recovers a minute later, that is the breaker doing its job — it is not retrying a host it has just watched fail.",
+    },
     {
         title: "1.9.13: a rename could strip detail out of a filename",
         description: "reported as a short variable list in the Rename Files picker. The list was the visible edge: only the import path knew the new {Token} values, so for a file already in your library the rename preview and the Naming Conformance job computed its name without the audio, dynamic range and release group.",

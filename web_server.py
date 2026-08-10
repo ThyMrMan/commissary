@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.9.13"
+_SOULSYNC_BASE_VERSION = "1.9.14"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -25042,10 +25042,18 @@ def hifi_status():
         hifi = download_orchestrator.client("hifi")
         available = hifi.is_available()
         version = hifi.get_version() if available else None
+        # Instances the circuit breaker is currently skipping, with the seconds
+        # left on each. Without this, a probe that returns instantly because
+        # every host is cooling down is indistinguishable from one that actually
+        # asked and got nothing — which is the state the user most wants
+        # explained ("why is HiFi red / why did my search skip it?").
+        cooling = hifi.breaker_status() if hasattr(hifi, "breaker_status") else {}
         return jsonify({
             "available": available,
             "version": version,
             "instance": hifi._get_instance(),
+            "cooling_down": cooling,
+            "cooling_seconds": max(cooling.values()) if cooling else 0,
         })
     except Exception as e:
         return jsonify({"available": False, "error": str(e)})
