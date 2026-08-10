@@ -1704,17 +1704,18 @@
         });
         var reset = document.getElementById('vo-reset');
         if (reset) reset.addEventListener('click', function () {
-            // POST blank templates + standard toggles; the backend normalises to the
-            // Radarr/Sonarr defaults and echoes them back.
+            // POST *only* the blank templates. normalize() starts from DEFAULTS and
+            // overrides solely the keys present in the body, so an absent key IS the
+            // default — restating the toggles here only creates a second copy of the
+            // defaults that drifts (it did: save_artwork/write_nfo were posted false
+            // against a True default, so "reset" silently disabled the sidecars).
+            // min_free_disk_gb is deliberately omitted for a second reason: it is the
+            // app-wide settings.min_free_disk_gb shared with music, and save() rewrites
+            // that shared key whenever the body carries it — resetting the video naming
+            // card must not drop music's disk floor to 0.
             fetch(ORG_URL, {
                 method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                body: JSON.stringify({ movie_template: '', episode_template: '', youtube_template: '',
-                    transfer_mode: 'copy', verify_with_ffprobe: true, replace_existing: true,
-                    carry_subtitles: true, save_artwork: false, write_nfo: false,
-                    download_subtitles: false, subtitle_langs: 'en',
-                    recycle_deletes: true, recycle_keep_days: 7, recycle_path: '',
-                    youtube_sponsorblock: 'off', youtube_embed_subs: false, min_free_disk_gb: 0,
-                    youtube_follow_count: 5 })
+                body: JSON.stringify({ movie_template: '', episode_template: '', youtube_template: '' })
             }).then(function (r) { return r.ok ? r.json() : null; })
               .then(function (d) { if (d) { _videoOrg = d; fillOrg(); toast('Reset to the standard layout', 'success'); } });
         });
