@@ -341,18 +341,31 @@ def test_scanned_channel_counts_become_layout_labels():
 
 def test_import_only_tokens_are_named_so_a_rename_cannot_be_lossy():
     """A template asking for something a library row cannot supply renders a
-    SHORTER name that looks canonical. Callers that rename existing files check
-    this first rather than proposing to delete content."""
+    SHORTER name that looks canonical. Callers that rename existing files are
+    told which tokens those are, so they can warn instead of pretending."""
     assert org.template_uses_unavailable_tokens(_TRASH_EP) == []
     assert org.template_uses_unavailable_tokens(
         _TRASH_EP + "[{MediaInfo VideoBitDepth}bit]") == ["MediaInfo VideoBitDepth"]
-    # a $token template can always be reproduced — never blocked
+    # a $token template can always be reproduced — never flagged
     assert org.template_uses_unavailable_tokens(org.DEFAULTS["episode_template"]) == []
+    # Custom formats are matched against a release NAME and a library file has
+    # one, so they are computable here — see library_media_fields.
+    assert org.template_uses_unavailable_tokens("{Movie CleanTitle} {Custom Formats}") == []
 
 
-def test_the_conformance_job_stands_down_on_an_unreproducible_template():
+def test_the_conformance_job_examines_files_and_warns_instead_of_standing_down():
+    """It used to refuse: a template naming ANY import-only token made the job
+    skip every file of that scope, silently. The user saw "0 findings", which is
+    exactly what a fully-conforming library looks like — so the tool appeared
+    broken, and the app's own recommended TRaSH scheme triggered it.
+
+    The findings ARE a preview and nothing renames without approval, so the job
+    now looks, reports, and says on the finding what it could not reproduce.
+    """
     from core.video.repair.naming_conformance import NamingConformanceJob
     from core.video.repair.base import JobContext
+
+    looked = []
 
     class _DB:
         def set_setting(self, *a):
@@ -361,17 +374,21 @@ def test_the_conformance_job_stands_down_on_an_unreproducible_template():
         def get_setting(self, key):
             import json
             return json.dumps({"episode_template": _TRASH_EP + "{MediaInfo AudioLanguages}",
-                               "movie_template": "{Movie CleanTitle} {Custom Formats}"}) \
+                               "movie_template": "{Movie CleanTitle}"}) \
                 if key == "organization" else None
 
         def all_library_paths(self, kind=None):
             return ["/tv"]
 
         def repair_library_files(self):
-            raise AssertionError("must not even look at files it cannot judge")
+            looked.append(True)
+            return []
 
-    result = NamingConformanceJob().scan(JobContext(db=_DB()))
-    assert result.scanned == 0
+        def repair_dismiss_absent(self, *a):
+            return None
+
+    NamingConformanceJob().scan(JobContext(db=_DB()))
+    assert looked, "the job must examine the library, not stand down on it"
 
 
 def test_the_rename_picker_offers_the_same_vocabulary_as_settings():

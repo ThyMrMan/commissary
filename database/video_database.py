@@ -6109,22 +6109,39 @@ class VideoDatabase:
 
     def repair_library_files(self) -> list:
         """Every owned movie/episode file with the fields the naming templates
-        need — the naming-conformance job's source."""
+        need — the naming-conformance job's source.
+
+        Must select the SAME columns as repair_owned_movie_files /
+        rename_owned_episode_files. It did not, and the gap was not cosmetic:
+        episodes carried a hardcoded ``NULL AS year`` and neither scope carried
+        the MediaInfo columns, so this job rendered a strictly poorer name than
+        the Rename Files preview did for the very same file — no series year, no
+        audio codec or channels, no dynamic range, no release-group ids. Against
+        a template that asks for them, a correctly-named file looked wrong and
+        approving the "fix" would have stripped that detail off disk.
+        """
         conn = self._get_connection()
         try:
             movies = [dict(r) for r in conn.execute(
                 "SELECT 'movie' AS scope, m.id AS item_id, f.id AS file_id, "
-                "m.title, m.year, m.tmdb_id, NULL AS season, NULL AS episode, "
-                "NULL AS episode_title, NULL AS series, "
-                "f.relative_path, f.size_bytes, f.quality, f.resolution, f.video_codec "
+                "m.title, m.year, m.tmdb_id, m.imdb_id, "
+                "NULL AS season, NULL AS episode, NULL AS air_date, "
+                "NULL AS episode_title, NULL AS series, NULL AS tvdb_id, "
+                "f.relative_path, f.size_bytes, f.quality, f.resolution, f.video_codec, "
+                "f.audio_codec, f.audio_channels, f.dynamic_range, f.release_source "
                 "FROM movies m JOIN media_files f ON f.movie_id = m.id "
                 "WHERE m.has_file = 1")]
             eps = [dict(r) for r in conn.execute(
                 "SELECT 'episode' AS scope, e.id AS item_id, f.id AS file_id, "
-                "s.title AS title, NULL AS year, s.tmdb_id, "
-                "e.season_number AS season, e.episode_number AS episode, "
+                "s.title AS title, s.tmdb_id, s.tvdb_id, s.imdb_id, "
+                # Same COALESCE as rename_owned_episode_files: the premiere year
+                # stands in when the server never sent ProductionYear, so
+                # {(Series Year)} resolves instead of silently vanishing.
+                "COALESCE(s.year, CAST(substr(NULLIF(s.first_air_date, ''), 1, 4) AS INTEGER)) AS year, "
+                "e.season_number AS season, e.episode_number AS episode, e.air_date, "
                 "e.title AS episode_title, s.title AS series, "
-                "f.relative_path, f.size_bytes, f.quality, f.resolution, f.video_codec "
+                "f.relative_path, f.size_bytes, f.quality, f.resolution, f.video_codec, "
+                "f.audio_codec, f.audio_channels, f.dynamic_range, f.release_source "
                 "FROM episodes e JOIN shows s ON e.show_id = s.id "
                 "JOIN media_files f ON f.episode_id = e.id "
                 "WHERE e.has_file = 1")]

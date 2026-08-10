@@ -411,24 +411,50 @@ PREVIEW_SAMPLES = {
 # which survives into the library row a rename works from. Anything that renames
 # an EXISTING file has to know this list, or it will happily compute a "correct"
 # name that silently drops whatever the template asked for here.
+#
+# ``Custom Formats`` used to be on this list and is not any more. Custom formats
+# are matched against a release NAME, and an existing file still has one — its
+# own filename — so they are as computable for a library file as they were at
+# import. Leaving them here blocked the TRaSH scheme this app recommends with a
+# one-click button, which silently turned the Naming Conformance job off.
 LIBRARY_UNAVAILABLE_TOKENS = (
-    "MediaInfo VideoBitDepth", "MediaInfo AudioLanguages", "Custom Formats",
+    "MediaInfo VideoBitDepth", "MediaInfo AudioLanguages",
     "Original Title", "Original Filename", "absolute",
 )
 
 
-def library_media_fields(row: dict, filename: Any = None) -> dict:
+def library_custom_formats(db) -> list:
+    """The custom-format definitions, loaded once for a whole rename pass.
+
+    Callers hold this across every file: load_formats() parses JSON out of the
+    settings table, and doing that per file turns a library scan into thousands
+    of redundant parses."""
+    try:
+        from core.video.custom_formats import load_formats
+        return load_formats(db)
+    except Exception:   # noqa: BLE001 - naming must never fail on a config read
+        logger.exception("custom format definitions could not be loaded for renaming")
+        return []
+
+
+def library_media_fields(row: dict, filename: Any = None,
+                         custom_formats: Any = None) -> dict:
     """Naming fields recoverable for a file ALREADY in the library.
 
-    Two sources, in this order of trust:
+    Three sources, in this order of trust:
       · the scan's own facts (``media_files``) for audio codec, channel layout
         and dynamic range — measured from the container, same as at import;
       · the CURRENT filename for release group, edition and 3D, because those
-        never had a column and the name is the only place they survive.
+        never had a column and the name is the only place they survive;
+      · the custom-format definitions, matched against that same filename.
+        Custom formats are name matchers, and a library file has a name — the
+        one it is called right now — so they are computable here exactly as they
+        were at import. Pass the definitions in (see library_custom_formats);
+        omitting them leaves the token empty rather than guessing.
 
-    That second one is deliberately lossy in one direction: a file whose name
-    was already stripped of its group can't get it back. It recovers what is
-    there and claims nothing more.
+    The filename sources are deliberately lossy in one direction: a file whose
+    name was already stripped of its group can't get it back. This recovers what
+    is there and claims nothing more.
     """
     from core.video.mediainfo import audio_channel_label
     from core.video.release_parse import parse_release
@@ -439,7 +465,7 @@ def library_media_fields(row: dict, filename: Any = None) -> dict:
     raw = str(filename or row.get("relative_path") or "")
     stem = os.path.splitext(raw.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1])[0]
     parsed = parse_release(stem)
-    return {
+    out = {
         "audio_codec": row.get("audio_codec"),
         "audio_channels": audio_channel_label(row.get("audio_channels")),
         "dynamic_range_type": row.get("dynamic_range") or (
@@ -448,6 +474,13 @@ def library_media_fields(row: dict, filename: Any = None) -> dict:
         "edition": parsed.get("edition"),
         "three_d": parsed.get("three_d"),
     }
+    if custom_formats:
+        from core.video.custom_formats import matching_formats
+        names = [f.get("name") for f in matching_formats(stem, custom_formats)
+                 if f.get("name")]
+        if names:
+            out["custom_formats"] = " ".join(names)
+    return out
 
 
 def template_uses_unavailable_tokens(template: Any) -> list:

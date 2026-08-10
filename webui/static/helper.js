@@ -3484,6 +3484,13 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
+    '1.9.15': [
+        { date: 'August 2026 · 1.9.15' },
+        { title: 'Fixed: Naming Conformance found nothing after a naming change', desc: 'reported as "changed the naming scheme but the tool finds no episodes that need renaming". Two faults, and both of them looked identical to a library that already conforms. First, the job stood down entirely on any template mentioning a token it could not work out for an existing file — and <code>{Custom Formats}</code> was on that list, which is in the TRaSH scheme this app installs with a one-click button. So adopting the recommended naming <strong>silently switched the tool off</strong>.' },
+        { title: 'Custom formats are no longer a mystery to a rename', desc: 'they are matched against a release NAME, and a file already in your library still has one — the name it is called right now. So they are worked out the same way at rename time as at import, from the file\'s own name and your own format definitions. A format whose terms are not in the name is never invented. That takes the token off the unavailable list altogether, so the TRaSH scheme just works.' },
+        { title: 'And the job was computing a poorer name than the rename preview', desc: 'the second fault, and the one that could actually have cost you something. This job\'s query never got the column widening its sibling gained in 1.9.13: episodes carried <strong>no series year at all</strong>, and neither movies nor episodes carried audio codec, channel layout or dynamic range. So for the same file, Naming Conformance worked out a shorter name than Rename Files did — and approving that "fix" would have stripped the year, the audio detail and the release group off disk. Both paths now render the identical name.' },
+        { title: 'When something really cannot be reproduced, it says so', desc: 'a few tokens genuinely only exist at import — bit depth, audio languages, the original release name. Those files are no longer hidden from you. The finding is raised as a <strong>warning</strong> naming the tokens involved, so you see current → new side by side and decide. Nothing here has ever renamed anything without your approval, so refusing to look was the wrong trade: it left "0 findings" as the only thing the tool could say, whether your library was perfect or the job had simply declined to run.' },
+    ],
     '1.9.14': [
         { date: 'August 2026 · 1.9.14' },
         { title: 'HiFi stops re-dialling instances it already knows are down', desc: 'the public HiFi instances are volunteer-run and outages are normal — but SoulSync had no memory of them. Every search walked all seven hosts and paid the full connection timeout on each, every time. In one 12-hour log that came to <strong>4,094 "all instances exhausted" errors and around 23,500 warnings</strong> — between them 47% of that log\'s errors and 80% of its warnings — with one search burning 16 seconds on a host the app had <em>already</em> declared dead moments earlier.' },
@@ -3739,6 +3746,19 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.15: Naming Conformance found nothing after a naming change",
+        description: "reported as \"changed the naming scheme but the tool finds no episodes that need renaming\". Two separate faults, and both of them looked exactly like a library that already conforms — \"0 findings\" was the only thing the tool could say either way.",
+        features: [
+            "the job stood down completely on any template naming a token it could not work out for an existing file, and {Custom Formats} was on that list — which is in the TRaSH scheme this app installs with one click, so adopting the recommended naming silently switched the tool off",
+            "custom formats are matched against a release name, and a library file still has one, so they are now worked out from the file's own name and your format definitions — a format whose terms are not in the name is never invented",
+            "the second fault could have cost you something: this job's query never got the widening its sibling gained in 1.9.13, so episodes carried no series year at all and neither scope carried audio codec, channels or dynamic range",
+            "that meant Naming Conformance computed a SHORTER name than Rename Files did for the very same file, and approving the \"fix\" would have stripped the year, the audio detail and the release group off disk",
+            "both paths now render an identical name, pinned by a test that runs them against one file",
+            "for the few tokens that really do only exist at import, the finding is now raised as a warning naming them, instead of the file being hidden from you",
+        ],
+        usage_note: "If you changed your naming scheme and the tool reported nothing, run it again — it will report properly now. Findings are still a preview: nothing is renamed until you approve it.",
+    },
     {
         title: "1.9.14: a video naming template would not stick",
         description: "reported as \"Library video naming templates do not save after leaving the page\". Typing one and clicking away did save — but the two controls that fill the box for you did not, because a value written by code raises no change event, and that event was the only thing that triggered a save.",

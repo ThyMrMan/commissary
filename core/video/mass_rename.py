@@ -51,7 +51,7 @@ def is_running() -> bool:
     return _running
 
 
-def _movie_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+def _movie_fields(row: Dict[str, Any], custom_formats=None) -> Dict[str, Any]:
     from core.video.organization import library_media_fields
     return {"title": row.get("title"), "year": row.get("year"),
             "quality": row.get("quality"), "resolution": row.get("resolution"),
@@ -59,10 +59,10 @@ def _movie_fields(row: Dict[str, Any]) -> Dict[str, Any]:
             "tmdbid": row.get("tmdb_id"), "imdbid": row.get("imdb_id"),
             # MediaInfo + release facts, so a rename reproduces the name the
             # IMPORTER would have written rather than a shorter one.
-            **library_media_fields(row)}
+            **library_media_fields(row, custom_formats=custom_formats)}
 
 
-def _episode_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+def _episode_fields(row: Dict[str, Any], custom_formats=None) -> Dict[str, Any]:
     from core.video.organization import library_media_fields
     return {"series": row.get("show_title"), "season": row.get("season_number"),
             "episode": row.get("episode_number"), "episode_title": row.get("episode_title"),
@@ -71,7 +71,7 @@ def _episode_fields(row: Dict[str, Any]) -> Dict[str, Any]:
             "codec": row.get("video_codec"), "tvdbid": row.get("tvdb_id"),
             "tmdbid": row.get("tmdb_id"), "imdbid": row.get("imdb_id"),
             "air_date": row.get("air_date"),
-            **library_media_fields(row)}
+            **library_media_fields(row, custom_formats=custom_formats)}
 
 
 # What each $token means, for the rename panel's variable list. The NAMES are
@@ -306,9 +306,11 @@ def preview(progress: Optional[Callable[[int, int], None]] = None, *,
             entries.append({"key": key, "kind": kind, "title": title,
                             "current": local, "proposed": proposed})
 
+    # Loaded once for the whole pass, not per file — see library_custom_formats.
+    formats = organization.library_custom_formats(db)
     for r in movies:
         _consider("movie", "m:%s" % r["file_id"], "%s (%s)" % (r.get("title"), r.get("year") or "?"),
-                  r["relative_path"], r.get("size_bytes"), _movie_fields(r))
+                  r["relative_path"], r.get("size_bytes"), _movie_fields(r, formats))
         done += 1
         if progress and done % 25 == 0:
             progress(done, total)
@@ -316,7 +318,7 @@ def preview(progress: Optional[Callable[[int, int], None]] = None, *,
         label = "%s S%02dE%02d" % (r.get("show_title") or "?",
                                    r.get("season_number") or 0, r.get("episode_number") or 0)
         _consider("episode", "e:%s" % r["file_id"], label,
-                  r["relative_path"], r.get("size_bytes"), _episode_fields(r))
+                  r["relative_path"], r.get("size_bytes"), _episode_fields(r, formats))
         done += 1
         if progress and done % 25 == 0:
             progress(done, total)
