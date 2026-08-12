@@ -20,6 +20,15 @@ processed_download_ids = set()
 post_process_locks: Dict[str, threading.Lock] = {}
 post_process_locks_lock = threading.Lock()
 
+# A task in one of these is finished — its batch slot has been accounted for and
+# nothing more will happen to it. Lives here rather than in any one consumer so
+# the download tracker, the cleanup sweep and the post-processing safety net all
+# agree on what "done" means; two copies of this set would drift into a task
+# that one of them thinks is still running.
+TERMINAL_TASK_STATUSES = frozenset({
+    'completed', 'failed', 'not_found', 'cancelled', 'skipped', 'already_owned',
+})
+
 activity_feed = []
 activity_feed_lock = threading.Lock()
 _activity_toast_emitter = None

@@ -29,6 +29,7 @@ import logging
 from typing import Callable
 
 from core.runtime_state import (
+    TERMINAL_TASK_STATUSES,
     batch_locks,
     download_batches,
     download_tasks,
@@ -37,9 +38,8 @@ from core.runtime_state import (
 
 logger = logging.getLogger(__name__)
 
-_TERMINAL_STATUSES = {
-    'completed', 'failed', 'not_found', 'cancelled', 'skipped', 'already_owned',
-}
+# Shared with the post-processing safety net — see core.runtime_state.
+_TERMINAL_STATUSES = TERMINAL_TASK_STATUSES
 
 
 def cancel_single_download(download_orchestrator, run_async: Callable,

@@ -56,6 +56,7 @@ from core.imports.side_effects import (
 )
 from core.wishlist.resolution import check_and_remove_from_wishlist
 from core.runtime_state import (
+    TERMINAL_TASK_STATUSES,
     add_activity_item,
     download_batches,
     download_tasks,
@@ -1437,9 +1438,33 @@ def _attempt_version_mismatch_fallback(context, task_id, batch_id, runtime, meta
 def post_process_matched_download_with_verification(context_key, context, file_path, task_id, batch_id, runtime, metadata_runtime=None):
     on_download_completed = getattr(runtime, "on_download_completed", None)
 
+    # EXACTLY-ONCE batch notification.
+    #
+    # This function has a dozen exits. Most notify the batch that the task is
+    # over; four deliberately do NOT, because the task is going around again and
+    # something else owns its outcome. That worked only while every one of those
+    # exits remembered which kind it was — and one that forgets costs a wedged
+    # batch: the slot it reserved is never released, active_count can never fall
+    # to zero, and the batch hangs showing work in progress until the healer
+    # notices. Observed on a real 9-track album: one integrity retry, then
+    # "reported=3, actual=2" every pass for 80 seconds, then "all 9 task(s)
+    # finished but the batch never completed".
+    #
+    # So the bookkeeping is no longer per-exit. A hand-off must be declared; any
+    # other way out of this function notifies, and it can only happen once.
+    _state = {"notified": False, "handed_off": None}
+
     def _notify_download_completed(batch_id, task_id, success=True):
+        if _state["notified"]:
+            return
+        _state["notified"] = True
         if on_download_completed:
             on_download_completed(batch_id, task_id, success=success)
+
+    def _hand_off(reason):
+        """Declare that this task's outcome now belongs to someone else — a
+        queued retry, or the inner pipeline. Suppresses the safety net below."""
+        _state["handed_off"] = reason
 
     logger = pp_logger
     try:
@@ -1473,6 +1498,7 @@ def post_process_matched_download_with_verification(context_key, context, file_p
                 f"Task {task_id} quarantined by the quality/audio guard — inner "
                 f"pipeline already handled retry/fail; wrapper not marking completed"
             )
+            _hand_off("quality/audio guard — inner pipeline owns retry/fail")
             return
 
         if context.get('_race_guard_failed'):
@@ -1525,11 +1551,13 @@ def post_process_matched_download_with_verification(context_key, context, file_p
                 logger.info(
                     f"AcoustID mismatch for task {task_id} — retrying next-best candidate: {failure_msg}"
                 )
+                _hand_off("acoustid retry queued")
                 return
             # Retries exhausted. Opt-in last resort: if every quarantined
             # candidate for this track failed the SAME version mismatch (e.g. all
             # instrumental), accept the best one rather than leaving it missing.
             if _attempt_version_mismatch_fallback(context, task_id, batch_id, runtime, metadata_runtime):
+                _hand_off("version-mismatch fallback re-dispatched")
                 return
             logger.info(f"File was quarantined by AcoustID verification (task={task_id}): {failure_msg}")
             with tasks_lock:
@@ -1589,6 +1617,7 @@ def post_process_matched_download_with_verification(context_key, context, file_p
                 logger.info(
                     f"Integrity check failed for task {task_id} — retrying next-best candidate: {failure_msg}"
                 )
+                _hand_off("integrity retry queued")
                 return
             logger.error(
                 f"Task {task_id} failed integrity check — marking failed: {failure_msg}"
@@ -1725,3 +1754,26 @@ def post_process_matched_download_with_verification(context_key, context, file_p
             if context_key in matched_downloads_context:
                 del matched_downloads_context[context_key]
         _notify_download_completed(batch_id, task_id, success=False)
+    finally:
+        # The safety net. Reaching here un-notified and without a declared
+        # hand-off means a path returned while still holding the batch slot —
+        # the bug this whole mechanism exists to stop. Free it and say so
+        # loudly: the batch recovers, and the log names the task so the gap can
+        # be found rather than being absorbed silently.
+        if not _state["notified"] and not _state["handed_off"]:
+            logger.error(
+                "[Batch Accounting] Post-processing for task %s (batch %s, %s) returned "
+                "without completing it and without queueing a retry — freeing the worker "
+                "slot so the batch can finish. This is a bug; the task is being marked "
+                "failed rather than left to wedge the batch.",
+                task_id, batch_id, context_key,
+            )
+            with tasks_lock:
+                _t = download_tasks.get(task_id)
+                if isinstance(_t, dict) and _t.get('status') not in TERMINAL_TASK_STATUSES:
+                    _t['status'] = 'failed'
+                    _t.setdefault(
+                        'error_message',
+                        'Post-processing ended without recording an outcome',
+                    )
+            _notify_download_completed(batch_id, task_id, success=False)

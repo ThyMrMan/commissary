@@ -3484,6 +3484,12 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
+    '1.9.16': [
+        { date: 'August 2026 · 1.9.16' },
+        { title: 'Fixed: a replacement download could hang its whole album', desc: 'reported as "music download replacements seem to get stuck in a Downloading state", and your log had it exactly. A 9-track album: three tracks failed the integrity check on duration and went back for a better copy — and sixteen seconds after the first retry, one worker slot leaked and never came back. A batch cannot finish until its active count reaches zero, so a slot reserved for a track that quietly finished holds the <strong>entire album</strong> open. The log shows <code>reported=3, actual=2</code> on every pass for 80 seconds, then "all 9 task(s) finished but the batch never completed".' },
+        { title: 'The accounting is now enforced, not remembered', desc: 'post-processing has a dozen ways out, and four of them deliberately don\'t finish the track because it is going around again. That only worked while every single exit remembered which kind it was — one that forgets costs a hung album. Now a hand-off has to be <em>declared</em>; any other way out of that code releases the slot, exactly once, including routes that don\'t return normally at all. If a future change ever does leak one, the log says which track and the batch still finishes instead of hanging.' },
+        { title: 'And something is finally watching replacements', desc: 'the 90-second stall detector — the thing that should have caught this — never ran once. In 41,902 lines of your log the phrase it logs appears <strong>zero</strong> times. It bailed out immediately for any track with no recorded source, which is precisely the state a replacement passes through: fetching a better copy deliberately clears the old source first. So an ordinary download that stalls was rescued in 90 seconds while a replacement in the same state was invisible forever. A track that claims to be downloading with nothing to download from is now stalled by definition, and gets the same timeout and retry ladder as everything else.' },
+    ],
     '1.9.15': [
         { date: 'August 2026 · 1.9.15' },
         { title: 'Fixed: Naming Conformance found nothing after a naming change', desc: 'reported as "changed the naming scheme but the tool finds no episodes that need renaming". Two faults, and both of them looked identical to a library that already conforms. First, the job stood down entirely on any template mentioning a token it could not work out for an existing file — and <code>{Custom Formats}</code> was on that list, which is in the TRaSH scheme this app installs with a one-click button. So adopting the recommended naming <strong>silently switched the tool off</strong>.' },
@@ -3746,6 +3752,20 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.16: a replacement download could hang its whole album",
+        description: "reported as \"music download replacements seem to get stuck in a Downloading state\". When a downloaded track fails its integrity check, SoulSync goes back for a better copy — and one of those replacements could quietly finish without telling the batch it belonged to, which holds the entire album open.",
+        features: [
+            "from the reported log: a 9-track album, three tracks retried on a duration mismatch, and sixteen seconds later one worker slot leaked and never came back",
+            "\"reported=3, actual=2\" every pass for 80 seconds, then \"all 9 task(s) finished but the batch never completed\" — a batch cannot finish until its active count reaches zero",
+            "post-processing has a dozen exits and four of them deliberately don't finish the track, because it is going around again; that only worked while every exit remembered which kind it was",
+            "a hand-off now has to be declared, and every other way out releases the slot exactly once — including routes that never return normally",
+            "if a future change ever leaks one anyway, the log names the track and the batch still finishes instead of hanging",
+            "the 90-second stall detector never ran once in 41,902 lines: it bailed out for any track with no recorded source, which is exactly the state a replacement passes through",
+            "so an ordinary stalled download was rescued in 90 seconds while a stalled replacement was invisible forever — both are now on the same timeout and retry ladder",
+        ],
+        usage_note: "Nothing to configure. An album that looks stuck part-way should now finish or fail on its own rather than waiting on the 5-minute healer.",
+    },
     {
         title: "1.9.15: Naming Conformance found nothing after a naming change",
         description: "reported as \"changed the naming scheme but the tool finds no episodes that need renaming\". Two separate faults, and both of them looked exactly like a library that already conforms — \"0 findings\" was the only thing the tool could say either way.",

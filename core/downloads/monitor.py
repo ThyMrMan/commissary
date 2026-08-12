@@ -622,11 +622,17 @@ class WebUIDownloadMonitor:
         task_filename = task.get('filename') or ti.get('filename')
         task_username = task.get('username') or ti.get('username')
 
-        if not task_filename or not task_username:
-            return False
-
-        lookup_key = _make_context_key(task_username, task_filename)
-        live_info = _lookup_live_info(task, live_transfers_lookup)
+        # A task with no source identity used to return here, which left it with
+        # NO watchdog at all — no timeout, no retry, no failure, forever. That is
+        # exactly the state a REPLACEMENT passes through: the quarantine requeue
+        # clears username/filename by design, and a Spotify-sourced track_info
+        # has no filename to fall back on. Meanwhile the caller only reaches this
+        # for tasks in 'downloading' or 'queued' — and claiming to be downloading
+        # with no source to download FROM is already wrong, so it belongs in the
+        # not-in-live-transfers timeout below rather than being exempted from it.
+        has_source = bool(task_filename and task_username)
+        lookup_key = _make_context_key(task_username, task_filename) if has_source else None
+        live_info = _lookup_live_info(task, live_transfers_lookup) if has_source else None
 
         if not live_info:
             # User-initiated manual pick — skip auto-retry. The status
@@ -642,7 +648,13 @@ class WebUIDownloadMonitor:
                 last_retry = task.get('last_retry_time', 0)
 
                 if retry_count < 3 and (current_time - last_retry) > 30:
-                    logger.warning(f"Task not in live transfers for >90s - retry {retry_count + 1}/3")
+                    logger.warning(
+                        "Task %s stuck in '%s' for >90s (%s) - retry %d/3",
+                        task_id, task.get('status'),
+                        "no live transfer" if has_source
+                        else "no source recorded — a replacement that never restarted",
+                        retry_count + 1,
+                    )
                     task['stuck_retry_count'] = retry_count + 1
                     task['last_retry_time'] = current_time
 
