@@ -1670,6 +1670,12 @@ async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlis
                     <button class="download-control-btn sync-to-server-btn" id="sync-server-btn-${virtualPlaylistId}" onclick="syncPlaylistToServer('${virtualPlaylistId}')" ${_isSoulsyncStandalone ? 'style="display:none"' : ''}>
                         Sync to Server
                     </button>` : ''}
+                    <button class="download-control-btn" id="manual-search-btn-${virtualPlaylistId}"
+                            onclick="openManualSearchForModalSelection('${virtualPlaylistId}')"
+                            title="Pick the file yourself for ONE ticked track — searches every configured source and shows you the candidates."
+                            style="background-color: #0ea5e9; color: white;">
+                        🔎 Manual Search
+                    </button>
                     <button class="download-control-btn" id="add-to-wishlist-btn-${virtualPlaylistId}" onclick="addModalTracksToWishlist('${virtualPlaylistId}')" style="background-color: #9333ea; color: white;">
                         Add to Wishlist
                     </button>

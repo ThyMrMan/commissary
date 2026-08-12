@@ -1473,6 +1473,12 @@ async function openDownloadMissingModalForTidal(virtualPlaylistId, playlistName,
                     <button class="download-control-btn primary" id="begin-analysis-btn-${virtualPlaylistId}" onclick="startMissingTracksProcess('${virtualPlaylistId}')">
                         Begin Analysis
                     </button>
+                    <button class="download-control-btn" id="manual-search-btn-${virtualPlaylistId}"
+                            onclick="openManualSearchForModalSelection('${virtualPlaylistId}')"
+                            title="Pick the file yourself for ONE ticked track — searches every configured source and shows you the candidates."
+                            style="background-color: #0ea5e9; color: white;">
+                        🔎 Manual Search
+                    </button>
                     <button class="download-control-btn" id="add-to-wishlist-btn-${virtualPlaylistId}" onclick="addModalTracksToWishlist('${virtualPlaylistId}')" style="background-color: #9333ea; color: white;">
                         Add to Wishlist
                     </button>

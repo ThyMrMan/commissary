@@ -625,6 +625,12 @@ async function openDownloadMissingModalForYouTube(virtualPlaylistId, playlistNam
                     <button class="download-control-btn primary" id="begin-analysis-btn-${virtualPlaylistId}" onclick="startMissingTracksProcess('${virtualPlaylistId}')">
                         Begin Analysis
                     </button>
+                    <button class="download-control-btn" id="manual-search-btn-${virtualPlaylistId}"
+                            onclick="openManualSearchForModalSelection('${virtualPlaylistId}')"
+                            title="Pick the file yourself for ONE ticked track — searches every configured source and shows you the candidates."
+                            style="background-color: #0ea5e9; color: white;">
+                        🔎 Manual Search
+                    </button>
                     <button class="download-control-btn" id="add-to-wishlist-btn-${virtualPlaylistId}" onclick="addModalTracksToWishlist('${virtualPlaylistId}')" style="background-color: #9333ea; color: white;">
                         Add to Wishlist
                     </button>
@@ -3659,6 +3665,17 @@ function _renderCandidatesModal(data) {
         sourceControl = `<span class="candidates-manual-source-label">Searching ${escapeHtml(label)}</span>`;
     }
 
+    // Pre-fill with the track this modal is about. The header already names it,
+    // so an empty box left the user retyping what the dialog had just told them —
+    // and the Search button sat disabled ("type at least 2 characters") next to a
+    // title spelling out the exact query. Artist first, matching how the search
+    // sources index tracks. It stays fully editable; this is a starting point,
+    // which is the whole reason to open a MANUAL search.
+    const prefill = [trackArtist, trackName]
+        .filter(v => v && !/^Unknown (Track|Artist)$/.test(v))
+        .join(' ')
+        .slice(0, 300);
+
     const manualSearchHtml = `
         <div class="candidates-manual-search">
             <div class="candidates-manual-search-header">Manual search</div>
@@ -3667,6 +3684,7 @@ function _renderCandidatesModal(data) {
                        class="candidates-manual-search-input"
                        id="candidates-manual-search-input"
                        placeholder="Search, or paste a Tidal / Qobuz track link..."
+                       value="${escapeHtml(prefill)}"
                        maxlength="300" />
                 ${sourceControl}
                 <button class="candidates-manual-search-btn"

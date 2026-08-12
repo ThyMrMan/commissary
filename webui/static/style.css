@@ -6357,6 +6357,7 @@ body.helper-mode-active #dashboard-activity-feed:hover {
    search bar and FAB buttons on top of the player's transport controls. */
 body.np-modal-open #gsearch-bar,
 body.np-modal-open #gsearch-aura,
+body.np-modal-open #activity-float-btn,
 body.np-modal-open #notif-bell-btn,
 body.np-modal-open #helper-float-btn {
     display: none !important;
@@ -6371,8 +6372,25 @@ body.np-modal-open #helper-float-btn {
    (base CSS is display:none; it is revealed with style.display='flex'). */
 body:has(.download-missing-modal[style*="display: flex"]) #gsearch-bar,
 body:has(.download-missing-modal[style*="display: flex"]) #gsearch-aura,
+body:has(.download-missing-modal[style*="display: flex"]) #activity-float-btn,
 body:has(.download-missing-modal[style*="display: flex"]) #notif-bell-btn,
 body:has(.download-missing-modal[style*="display: flex"]) #helper-float-btn {
+    display: none !important;
+}
+
+/* And the video Rename Files slide-over. Same collision, different shape: the
+   panel is pinned to the right edge for the full height (z-index 9101), so the
+   bottom-right FAB cluster at z-index 999999 lands squarely on its footer —
+   Server Activity, the notification bell and the help button sitting over the
+   Preview/Apply controls. The panel is opaque, so lowering their z-index would
+   only hide them anyway; suppressing them is the same answer the two cases
+   above already reached. Keyed off .vrn-open, which video-rename-panel.js adds
+   and removes as the panel slides in and out. */
+body:has(.vrn-panel.vrn-open) #gsearch-bar,
+body:has(.vrn-panel.vrn-open) #gsearch-aura,
+body:has(.vrn-panel.vrn-open) #activity-float-btn,
+body:has(.vrn-panel.vrn-open) #notif-bell-btn,
+body:has(.vrn-panel.vrn-open) #helper-float-btn {
     display: none !important;
 }
 

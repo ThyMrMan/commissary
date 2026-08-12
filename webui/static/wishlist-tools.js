@@ -1331,6 +1331,80 @@ async function handleWishlistDownloadNow() {
  * Add all tracks from any download modal to the wishlist
  * Universal handler for all modal types (artist albums, playlists, YouTube, Tidal, etc.)
  */
+// Which tracks the download-missing modal's footer buttons act on: the ticked
+// ones, or all of them when the table has no checkboxes. Shared by "Add to
+// Wishlist" and "Manual Search" so the two buttons can never disagree about
+// what the user selected.
+function selectedModalTracks(playlistId, process) {
+    const tracks = (process && process.tracks) || [];
+    const tbody = document.getElementById(`download-tracks-tbody-${playlistId}`);
+    if (!tbody) return tracks;
+    const allCbs = tbody.querySelectorAll('.track-select-cb');
+    if (allCbs.length === 0) return tracks;
+    const checked = tbody.querySelectorAll('.track-select-cb:checked');
+    const selected = new Set([...checked].map(cb => parseInt(cb.dataset.trackIndex)));
+    return tracks.filter((_, i) => selected.has(i));
+}
+window.selectedModalTracks = selectedModalTracks;
+
+
+// Manual search from the modal footer, beside "Add to Wishlist".
+//
+// Deliberately one track at a time: the picker is a per-track choice — you look
+// at candidates for ONE song and pick the right file — so there is no coherent
+// meaning for "manually search these nine". Rather than silently searching the
+// first of a multi-selection, say what it needs.
+async function openManualSearchForModalSelection(playlistId) {
+    const process = activeDownloadProcesses[playlistId];
+    if (!process || !process.tracks || process.tracks.length === 0) {
+        showToast('No tracks to search for', 'error');
+        return;
+    }
+
+    const tracks = selectedModalTracks(playlistId, process);
+    if (tracks.length === 0) {
+        showToast('Tick the track you want to search for', 'error');
+        return;
+    }
+    if (tracks.length > 1) {
+        showToast(
+            `Manual search handles one track at a time — ${tracks.length} are ticked. ` +
+            `Leave just the one you want.`,
+            'info',
+        );
+        return;
+    }
+
+    const track = tracks[0];
+    // process.artist is only set for album downloads; a playlist carries the
+    // artist per track, so resolve in that order rather than defaulting.
+    let artist = '';
+    if (Array.isArray(track.artists) && track.artists.length) {
+        artist = typeof track.artists[0] === 'string'
+            ? track.artists[0]
+            : (track.artists[0] && track.artists[0].name) || '';
+    } else if (typeof track.artists === 'string') {
+        artist = track.artists;
+    }
+    if (!artist) artist = (process.artist && process.artist.name) || '';
+
+    const albumName = (track.album && (track.album.name || track.album))
+        || (process.album && process.album.name) || '';
+
+    if (typeof window.openManualSearchFor !== 'function') {
+        showToast('The manual search picker is unavailable on this page', 'error');
+        return;
+    }
+    await window.openManualSearchFor({
+        id: track.id || '',
+        name: track.name || '',
+        artist: artist,
+        album: typeof albumName === 'string' ? albumName : '',
+    }, document.getElementById(`manual-search-btn-${playlistId}`));
+}
+window.openManualSearchForModalSelection = openManualSearchForModalSelection;
+
+
 async function addModalTracksToWishlist(playlistId) {
     const process = activeDownloadProcesses[playlistId];
     if (!process) {
@@ -1346,17 +1420,7 @@ async function addModalTracksToWishlist(playlistId) {
         return;
     }
 
-    // Filter tracks based on checkbox selection (if checkboxes exist in this modal)
-    const wishlistTbody = document.getElementById(`download-tracks-tbody-${playlistId}`);
-    let tracks = process.tracks;
-    if (wishlistTbody) {
-        const allCbs = wishlistTbody.querySelectorAll('.track-select-cb');
-        if (allCbs.length > 0) {
-            const checkedCbs = wishlistTbody.querySelectorAll('.track-select-cb:checked');
-            const selectedIndices = new Set([...checkedCbs].map(cb => parseInt(cb.dataset.trackIndex)));
-            tracks = process.tracks.filter((_, i) => selectedIndices.has(i));
-        }
-    }
+    const tracks = selectedModalTracks(playlistId, process);
 
     // Get album context if available (for artist album downloads)
     // Artist is resolved per-track below — process.artist is only set for album downloads,

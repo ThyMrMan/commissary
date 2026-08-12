@@ -3484,6 +3484,16 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
+    '1.9.18': [
+        { date: 'August 2026 · 1.9.18' },
+        { title: 'Fixed: the corner buttons covered the Rename Files panel', desc: 'Server Activity, the notification bell and the Interactive Help button float in the bottom-right above everything, which is right until something else owns that corner. The video <strong>Rename Files</strong> panel slides in against the right edge for the full height — 680px wide on a 1280px screen — and the buttons sit at x1156–1256, landing squarely on its Preview and Apply controls. They now step aside while the panel is open and come straight back when it closes.' },
+        { title: 'And Server Activity was missing from two older rules', desc: 'the same thing was already handled for the Now Playing modal and the download-missing modal — but the Server Activity button had never been added to either list, so it kept covering both surfaces it was supposed to yield to. All three rules now name all four floating elements, with a test that fails if a new corner button or a new full-height surface is added without joining them.' },
+    ],
+    '1.9.17': [
+        { date: 'August 2026 · 1.9.17' },
+        { title: 'Manual search, straight from the download modal', desc: 'the Download Missing Tracks modal could only ever hand a track to the automatic cascade or drop it on the wishlist. There is now a <strong>🔎 Manual Search</strong> button beside Add to Wishlist that opens the multi-source picker for the track you have ticked — every configured source searched at once, candidates listed, you choose the file. It is deliberately one track at a time: the picker is a per-track decision, so with several ticked it says so rather than quietly searching whichever came first.' },
+        { title: 'And the manual search box fills itself in', desc: 'the picker\'s header already named the song you were looking for — and the search box underneath it sat empty, with the Search button greyed out telling you to "type at least 2 characters". So the dialog showed you the query and then made you type it. The box now opens pre-filled with the artist and title, ready to run, and still fully editable — being able to change it is the entire point of a manual search.' },
+    ],
     '1.9.16': [
         { date: 'August 2026 · 1.9.16' },
         { title: 'Fixed: a replacement download could hang its whole album', desc: 'reported as "music download replacements seem to get stuck in a Downloading state", and your log had it exactly. A 9-track album: three tracks failed the integrity check on duration and went back for a better copy — and sixteen seconds after the first retry, one worker slot leaked and never came back. A batch cannot finish until its active count reaches zero, so a slot reserved for a track that quietly finished holds the <strong>entire album</strong> open. The log shows <code>reported=3, actual=2</code> on every pass for 80 seconds, then "all 9 task(s) finished but the batch never completed".' },
@@ -3752,6 +3762,29 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.18: the corner buttons no longer cover Rename Files",
+        description: "Server Activity, the notification bell and the Interactive Help button float above everything in the bottom-right — right up until something else owns that corner.",
+        features: [
+            "the video Rename Files panel is pinned to the right edge for the full height, so those buttons landed on its Preview and Apply controls",
+            "they now step aside while it is open, and come straight back when it closes",
+            "hidden rather than re-stacked: the panel is opaque, so \"behind it\" and \"gone\" look the same, and this is what the two existing cases already did",
+            "Server Activity had never been added to those two older rules, so it kept covering the Now Playing modal and the download-missing modal too — fixed in the same pass",
+            "a test now fails if a new corner button, or a new full-height surface, is added without joining all three rules",
+        ],
+    },
+    {
+        title: "1.9.17: manual search from the download modal",
+        description: "the Download Missing Tracks modal could only hand a track to the automatic cascade or drop it on the wishlist. Now you can pick the file yourself without leaving it.",
+        features: [
+            "a 🔎 Manual Search button beside Add to Wishlist opens the multi-source picker for the ticked track",
+            "every configured source is searched at once and the candidates are listed for you to choose from",
+            "one track at a time on purpose — the picker is a per-track decision, so with several ticked it says so instead of quietly searching whichever came first",
+            "both footer buttons read the ticked rows through the same code, so they can never disagree about what you selected",
+            "the picker's search box now opens pre-filled with the artist and title it is about — it used to sit empty under a header naming the exact song, with Search greyed out telling you to type at least 2 characters",
+            "still fully editable: being able to change the query is the whole point of a manual search",
+        ],
+    },
     {
         title: "1.9.16: a replacement download could hang its whole album",
         description: "reported as \"music download replacements seem to get stuck in a Downloading state\". When a downloaded track fails its integrity check, SoulSync goes back for a better copy — and one of those replacements could quietly finish without telling the batch it belonged to, which holds the entire album open.",

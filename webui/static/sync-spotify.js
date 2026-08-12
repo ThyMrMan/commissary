@@ -2385,6 +2385,12 @@ async function openDownloadMissingModal(playlistId) {
                     <button class="download-control-btn primary" id="begin-analysis-btn-${playlistId}" onclick="startMissingTracksProcess('${playlistId}')">
                         Begin Analysis
                     </button>
+                    <button class="download-control-btn" id="manual-search-btn-${playlistId}"
+                            onclick="openManualSearchForModalSelection('${playlistId}')"
+                            title="Pick the file yourself for ONE ticked track — searches every configured source and shows you the candidates."
+                            style="background-color: #0ea5e9; color: white;">
+                        🔎 Manual Search
+                    </button>
                     <button class="download-control-btn" id="add-to-wishlist-btn-${playlistId}" onclick="addModalTracksToWishlist('${playlistId}')" style="background-color: #9333ea; color: white;">
                         Add to Wishlist
                     </button>

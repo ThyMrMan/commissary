@@ -111,3 +111,97 @@ def test_the_buttons_are_styled():
                 "search-sources-button"):
         assert "." + cls in _CSS, cls
         assert "." + cls + "[disabled]" in _CSS, f"{cls} has no disabled state"
+
+
+# ── the download-missing modal's footer ──────────────────────────────────────
+# Requested: "next to Add to Wishlist, provide a button to start a manual
+# download/search as well". Four separate files build that footer, so the real
+# risk is not the button — it is the button existing in three of them.
+_MODAL_SOURCES = {
+    "downloads.js": _DOWNLOADS,
+    "shared-helpers.js": (_ROOT / "webui" / "static" / "shared-helpers.js").read_text(encoding="utf-8"),
+    "sync-services.js": (_ROOT / "webui" / "static" / "sync-services.js").read_text(encoding="utf-8"),
+    "sync-spotify.js": (_ROOT / "webui" / "static" / "sync-spotify.js").read_text(encoding="utf-8"),
+}
+_WISHLIST_TOOLS = (_ROOT / "webui" / "static" / "wishlist-tools.js").read_text(encoding="utf-8")
+
+
+def test_every_modal_offering_the_wishlist_also_offers_manual_search():
+    """The invariant that matters. A fifth modal copied from one of these, or a
+    future edit touching only some, would otherwise ship the pair unevenly."""
+    for name, src in _MODAL_SOURCES.items():
+        wishlist = src.count('onclick="addModalTracksToWishlist(')
+        manual = src.count('onclick="openManualSearchForModalSelection(')
+        assert wishlist > 0, f"{name} lost its Add to Wishlist button"
+        assert manual == wishlist, (
+            f"{name} builds {wishlist} wishlist button(s) but {manual} manual-search "
+            f"button(s) — every footer must offer both"
+        )
+
+
+def test_the_manual_search_button_sits_next_to_the_wishlist_one():
+    for name, src in _MODAL_SOURCES.items():
+        manual_at = src.index('id="manual-search-btn-')
+        wishlist_at = src.index('id="add-to-wishlist-btn-')
+        between = src[min(manual_at, wishlist_at):max(manual_at, wishlist_at)]
+        assert between.count("<button") <= 1, (
+            f"{name}: something else was inserted between the two buttons"
+        )
+
+
+def test_the_modal_action_routes_through_the_one_opener():
+    body = _WISHLIST_TOOLS.split("async function openManualSearchForModalSelection(", 1)[1]
+    body = body[:body.index("\nwindow.openManualSearchForModalSelection")]
+    assert "window.openManualSearchFor(" in body, "must not hand-roll the task dance"
+    assert "/api/downloads/manual-search/task" not in body
+
+
+def test_the_modal_action_refuses_a_multi_selection_rather_than_guessing():
+    """The picker is a per-track choice, so 'manually search these nine' has no
+    meaning. Searching the first of them silently would be the wrong track."""
+    body = _WISHLIST_TOOLS.split("async function openManualSearchForModalSelection(", 1)[1]
+    body = body[:body.index("\nwindow.openManualSearchForModalSelection")]
+    assert "tracks.length > 1" in body
+    assert "tracks.length === 0" in body, "an empty selection must say so too"
+    assert body.index("tracks.length === 0") < body.index("window.openManualSearchFor("), \
+        "the guards must run before the picker opens"
+
+
+def test_both_footer_buttons_read_the_selection_the_same_way():
+    """They act on the same ticked rows. Two copies of the checkbox-reading
+    logic would drift into the buttons disagreeing about what is selected."""
+    assert "function selectedModalTracks(" in _WISHLIST_TOOLS
+    assert _WISHLIST_TOOLS.count(".track-select-cb:checked") == 1, \
+        "the selection logic was duplicated instead of shared"
+    for fn in ("addModalTracksToWishlist", "openManualSearchForModalSelection"):
+        body = _WISHLIST_TOOLS.split(f"function {fn}(", 1)[1][:2000]
+        assert "selectedModalTracks(" in body, f"{fn} does not use the shared helper"
+
+
+# ── the picker's own search box ──────────────────────────────────────────────
+def test_the_manual_search_box_is_prefilled_with_the_track():
+    """Reported: the header names the song but the box below it is empty, so the
+    user retypes what the dialog just told them — with the Search button greyed
+    out saying 'type at least 2 characters'."""
+    block = _DOWNLOADS.split("const manualSearchHtml = `", 1)[1]
+    block = block[:block.index("`;")]
+    assert 'id="candidates-manual-search-input"' in block
+    assert "value=\"${escapeHtml(prefill)}\"" in block, "the box must carry a value, not just a placeholder"
+    assert 'placeholder=' in block, "the placeholder still helps when the prefill is empty"
+
+
+def test_the_prefill_uses_the_track_the_modal_is_about():
+    setup = _DOWNLOADS.split("const prefill = ", 1)[1][:400]
+    assert "trackArtist" in setup and "trackName" in setup
+    assert "Unknown" in setup, "placeholder names must not be searched for literally"
+    assert ".slice(0, 300)" in setup, "must respect the input's maxlength"
+
+
+def test_the_button_state_is_recomputed_after_wiring():
+    """The button ships disabled. With a prefilled box it has to enable itself,
+    or the fix would put a query in front of the user they cannot run."""
+    body = _DOWNLOADS.split("function _wireManualSearch(", 1)[1]
+    body = body[:body.index("\nfunction ")]      # to the end of this function, not a fixed window
+    last_call = body.rindex("updateButtonState();")
+    listener = body.index("input.addEventListener('input', updateButtonState);")
+    assert last_call > listener, "updateButtonState must run once after wiring, not only on input"
