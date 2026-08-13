@@ -586,6 +586,24 @@ class VideoDatabase:
         # Recently-Added ranks shows by their newest episode's add-date — MAX(added_at)
         # per show over a 200k-episode table, so index it.
         "CREATE INDEX IF NOT EXISTS idx_episodes_show_added ON episodes(show_id, added_at)",
+        # ── adapted from upstream 3.2.0's perf sweep (21276350) ──────────────
+        # movies had a tmdb_id index from day one; shows never did. Every
+        # library-id lookup, watchlist-state check and calendar hit was a full
+        # shows scan — upstream measured 224ms EACH on a 3.4k-show library, and
+        # a discover rail hits it once per row.
+        "CREATE INDEX IF NOT EXISTS idx_shows_tmdb ON shows(tmdb_id)",
+        # The watchlist/episode roll-ups count owned episodes per show. With
+        # only idx_episodes_show, every row of the show is fetched just to test
+        # has_file.
+        "CREATE INDEX IF NOT EXISTS idx_episodes_show_file ON episodes(show_id, has_file)",
+        # Upstream's sweep added a third — episodes(show_id, season_number,
+        # episode_number) — for wishlist_owned_media_resolutions. Deliberately
+        # NOT taken: our episodes table declares UNIQUE (show_id, season_number,
+        # episode_number), and SQLite's implicit index for that constraint
+        # already covers exactly those columns in that order. Measured on 120k
+        # episodes with the real query, the planner picks sqlite_autoindex_
+        # episodes_1 either way and the timing is identical (1.0 ms). Adding it
+        # would cost an extra index write per episode row for no read.
     )
 
     @classmethod

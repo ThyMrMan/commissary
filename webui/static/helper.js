@@ -3484,6 +3484,15 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
+    '1.9.19': [
+        { date: 'August 2026 · 1.9.19' },
+        { title: 'Adapted from upstream 3.2.0: album torrents that stalled for hours', desc: 'the biggest fix in this batch, and six separate faults behind one symptom — an album grab sitting at 0% until the deadline, then failing with "no audio files found". The album flow preferred the <strong>magnet</strong> whenever the indexer offered both, and a magnet the client cannot resolve sits on "downloading metadata" forever; the stall timeout you had configured was wired into the per-track poll and <strong>never consulted for albums</strong>; nothing enforced a seeder floor, so a release with a dead swarm was still picked; and a stalled torrent was left running in your client, untracked, to be grabbed again as a duplicate next time.' },
+        { title: 'What that means in practice', desc: 'SoulSync now fetches the .torrent server-side and hands the file to your client the way Sonarr and Radarr do, keeping the magnet as a fallback. A stalled album gives up on your configured timeout and cleans up after itself, and — new — falls back to the per-track flow instead of ending the whole batch, so one dead release no longer sinks an album. There is a new <strong>minimum seeders</strong> setting (default 1) that drops releases known to have a dead swarm, while leaving alone anything whose seeder count the indexer simply does not report.' },
+        { title: 'And the "no audio files found" at the end of it', desc: 'staging walked the save path plus the torrent\'s display name, but the folder on disk routinely differs from that name and the save path is shared with every other download running. It now asks qBittorrent directly where the release actually landed. A single-file torrent stages that one file rather than sweeping its parent — which was the shared download root, and could pull in a neighbouring download\'s audio. When a path genuinely cannot be read, the error now says so and names the path-mapping setting instead of claiming the release was empty.' },
+        { title: 'Fixed: settings could vanish after a crash or a busy moment', desc: 'the configuration loader could not tell "this row is unreadable" from "there is no row" — and the no-row path regenerates defaults and writes them <strong>over your real settings</strong>. One locked database at startup, one I/O blip, and everything was gone. Absence now has to be positively established before anything overwrites; an unreadable row is retried, then the app runs on your config file with the stored row <em>protected</em> until a restart can read it. A corrupt row is copied aside to <code>config.corrupt-…json</code> the moment it is seen, rather than replaced.' },
+        { title: 'Saving settings is now one write, not hundreds', desc: 'a single Save click wrote the entire configuration once per field — hundreds of encrypt-and-commit cycles for one form. That is what created the database contention that pushed saves onto the fallback file in the first place. And that fallback file was written with a truncate-on-open, so a crash mid-write left it empty; it is now written to a temp file and swapped into place, so the old contents survive until the new ones are safely on disk.' },
+        { title: 'Two performance fixes with numbers behind them', desc: 'idle enrichment workers were re-counting the database every 2 seconds for as long as a tab was open — measured here at <strong>5,400 scans reduced to 360</strong> over a ten-minute idle session, with running workers still updating every tick and any start/pause showing immediately. Separately, TV shows had no index on their TMDB id where movies have had one since day one, so every discover rail, watchlist check and calendar lookup was a full table scan — now a <strong>20× faster</strong> indexed lookup. Calls to slskd are also bounded now, so an unresponsive Soulseek can no longer tie up the server\'s request threads.' },
+    ],
     '1.9.18': [
         { date: 'August 2026 · 1.9.18' },
         { title: 'Fixed: the corner buttons covered the Rename Files panel', desc: 'Server Activity, the notification bell and the Interactive Help button float in the bottom-right above everything, which is right until something else owns that corner. The video <strong>Rename Files</strong> panel slides in against the right edge for the full height — 680px wide on a 1280px screen — and the buttons sit at x1156–1256, landing squarely on its Preview and Apply controls. They now step aside while the panel is open and come straight back when it closes.' },
@@ -3762,6 +3771,20 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.19: fixes adapted from upstream 3.2.0",
+        description: "upstream shipped ~650 commits, most of it a React rewrite of pages this fork has customised heavily — that part is not adaptable. These are the four backend fixes that are, each verified as still broken here before being taken.",
+        features: [
+            "album torrents no longer stall for hours then lose the file — six faults behind one symptom: the magnet was preferred over the .torrent, your stall timeout was never consulted for albums, no seeder floor existed, and a stalled torrent was left running in your client to be re-grabbed as a duplicate",
+            "a dead release now falls back to the per-track flow instead of ending the whole album batch, and there is a new minimum-seeders setting (default 1) that only drops what is positively known dead",
+            "the \"no audio files found\" at the end of a completed torrent: staging now asks qBittorrent where the release actually landed, and a single-file torrent stages that file rather than sweeping the shared download root",
+            "settings could vanish after a crash — an unreadable config row was mistaken for an absent one, and the absent path writes defaults over your real settings; absence must now be proven first, and a corrupt row is copied aside rather than replaced",
+            "saving settings is one database write instead of one per field, and the fallback config file is written atomically so a crash cannot leave it empty",
+            "idle enrichment workers stopped re-counting the database every 2 seconds — measured 5,400 scans down to 360 over a ten-minute idle session",
+            "TV shows gained the TMDB-id index movies have always had: a 20x faster lookup where every discover rail and calendar check used to scan the whole table",
+        ],
+        usage_note: "Nothing to configure. The new minimum-seeders setting lives in Settings → Downloads and defaults to 1; set it to 0 to switch the check off.",
+    },
     {
         title: "1.9.18: the corner buttons no longer cover Rename Files",
         description: "Server Activity, the notification bell and the Interactive Help button float above everything in the bottom-right — right up until something else owns that corner.",

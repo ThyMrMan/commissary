@@ -662,6 +662,13 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
 
             candidates = [r for r in search_results
                           if r.protocol == 'torrent' and (r.magnet_uri or r.download_url)]
+            # #1139(3): nothing enforced a seeder floor. Sorting BY seeders
+            # still returns a release when the whole field is on zero, and a
+            # zero-seeder torrent is what sits at "downloading metadata" for
+            # hours. Candidates that report NO seeder count are exempt — some
+            # indexers omit the field, and this may only drop what we
+            # positively know is dead.
+            candidates = _drop_dead_releases(candidates, log_prefix='[Torrent album]')
             if not candidates:
                 # Album isn't available on this source. Mark the failure as
                 # fallback-eligible so the dispatch returns to the per-track flow
@@ -685,7 +692,16 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
                 return result
 
             release_title = picked.title
-            download_url = picked.magnet_uri or picked.download_url
+            # #1139(1): this preferred the MAGNET whenever the indexer offered
+            # both. A magnet is an info-hash — the client has to find the swarm
+            # itself, and one that cannot sits on "downloading metadata" (zero
+            # size, zero peers) forever. add_torrent_smart already fetches the
+            # .torrent server-side and hands over the file, the way Sonarr and
+            # Radarr do, and never got the chance. Prefer the .torrent, keeping
+            # the magnet as the fallback so a failed fetch uses the link we
+            # already had rather than a URL this process just proved unreachable.
+            download_url = picked.download_url or picked.magnet_uri
+            fallback_magnet = picked.magnet_uri if picked.download_url else None
             logger.info("[Torrent album] Picked '%s' (size=%.1fMB seeders=%s indexer=%s)",
                         picked.title, picked.size / 1_048_576, picked.seeders, picked.indexer_name)
             _emit('queued', release=picked.title, size=picked.size, seeders=picked.seeders)
@@ -695,11 +711,17 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
         try:
             from core.torrent_clients.base import add_torrent_smart
             torrent_id = run_async(add_torrent_smart(adapter, download_url))
+            if not torrent_id and fallback_magnet:
+                logger.warning("[Torrent album] .torrent handoff failed for '%s' — "
+                               "retrying with the magnet", release_title)
+                torrent_id = run_async(add_torrent_smart(adapter, fallback_magnet))
         except Exception as e:
             result['error'] = f'Torrent client refused the release: {e}'
+            result['fallback'] = True          # #1139(5) — try another source
             return result
         if not torrent_id:
             result['error'] = 'Torrent client refused the release'
+            result['fallback'] = True
             return result
 
         # Phase 3: poll until complete. The lifted helper handles
@@ -733,10 +755,20 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
             # with expect_name for the stricter content-checked path.
             resolve_path=resolve_reported_save_path,
             log_prefix='[Torrent album]',
+            # #1139(2)+(4): the album loop finally consults the configured
+            # stall timeout, and cleans up after itself when it trips.
+            stall_check=_album_stall_check(StallTracker(get_stall_timeout())),
+            on_stall=lambda: _cleanup_stalled_album(adapter, torrent_id, release_title),
         )
         if save_path is None:
             # poll_album_download already emitted terminal 'failed'.
+            # #1139(5): every album failure used to be terminal — none set
+            # `fallback`, so one dead release ended the whole batch instead of
+            # returning to the per-track flow (and, in hybrid mode, the next
+            # source). A stall or timeout is exactly the case where another
+            # source is likely to work.
             result['error'] = 'Torrent download failed or timed out'
+            result['fallback'] = True
             return result
 
         # Phase 4: extract + walk + copy to staging.
@@ -746,32 +778,67 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
         # folder) so an existing-but-wrong mount can't win, and walk just
         # that release so a shared root can't donate another torrent's files.
         torrent_name = None
+        content_path = None
         try:
             _final_status = run_async(adapter.get_status(torrent_id))
             torrent_name = _final_status.name if _final_status else None
+            # #1139(6): "No audio files found" after a torrent completed and
+            # seeded. Staging walked save_path + the torrent's display NAME,
+            # but the on-disk release folder routinely differs from that name
+            # and save_path is shared with every concurrent grab. qBittorrent
+            # answers directly with content_path — the exact release root, or
+            # the file itself for a single-file torrent — which the video side
+            # has used for a while and this flow never adopted. Transmission
+            # and Deluge don't report it; they fall through to the old
+            # resolution below.
+            content_path = getattr(_final_status, 'content_path', None) if _final_status else None
         except Exception:   # noqa: BLE001 - the name is an assist, not a requirement
             torrent_name = None
         local_path = resolve_reported_save_path(save_path, expect_name=torrent_name)
         if local_path != save_path:
             logger.info("[Torrent album] Resolved client path %r -> %r", save_path, local_path)
         walk_root = Path(local_path)
-        if torrent_name and (walk_root / torrent_name).is_dir():
+        single_file: Optional[Path] = None
+        if content_path:
+            resolved_content = Path(resolve_reported_save_path(str(content_path),
+                                                               expect_name=torrent_name))
+            if resolved_content.is_dir():
+                walk_root = resolved_content
+            elif resolved_content.is_file():
+                # A single-FILE torrent: stage that ONE file. Walking its parent
+                # would be the shared download root and would donate every
+                # neighbouring torrent's audio into this album's staging.
+                single_file = resolved_content
+        if single_file is None and torrent_name and (walk_root / torrent_name).is_dir():
             # is_dir, not exists: a single-FILE torrent's name points at the
             # file itself, and the audio walker only walks directories.
             walk_root = walk_root / torrent_name
         try:
-            audio_files = collect_audio_after_extraction(walk_root)
+            audio_files = [single_file] if single_file else collect_audio_after_extraction(walk_root)
         except Exception as e:
             result['error'] = f'Failed to walk audio files: {e}'
+            result['fallback'] = True
             return result
         if not audio_files:
-            suffix = f' (resolved: {local_path})' if local_path != save_path else ''
-            result['error'] = f'No audio files found in {save_path}{suffix}'
+            # Separate "SoulSync cannot read that path" — a remote-path-mapping
+            # problem — from "readable, and it holds no audio". They need
+            # completely different things from the user.
+            if not walk_root.is_dir():
+                result['error'] = (
+                    f'Cannot read the completed download at {walk_root} — if the torrent '
+                    f'client runs in a different container or host, add a '
+                    f'download_source.path_mappings entry for it'
+                )
+            else:
+                suffix = f' (resolved: {local_path})' if local_path != save_path else ''
+                result['error'] = f'No audio files found in {save_path}{suffix}'
+            result['fallback'] = True
             return result
 
         copied = copy_audio_files_atomically(audio_files, Path(staging_dir))
         if not copied:
             result['error'] = 'No audio files copied to staging'
+            result['fallback'] = True
             return result
         logger.info("[Torrent album] Staged %d audio files for '%s'", len(copied), album_name)
         _emit('staged', count=len(copied))
@@ -784,6 +851,79 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
 # ---------------------------------------------------------------------------
 # Module-level helpers (pure functions — easy to unit-test)
 # ---------------------------------------------------------------------------
+
+
+# ── #1139 helpers (adapted from upstream 3.2.0, 6180aff4) ────────────────────
+DEFAULT_MIN_SEEDERS = 1
+
+
+def get_min_seeders() -> int:
+    """The seeder floor for album grabs. 0 disables the check."""
+    try:
+        raw = int(config_manager.get("download_source.torrent_min_seeders",
+                                     DEFAULT_MIN_SEEDERS))
+    except (TypeError, ValueError):
+        return DEFAULT_MIN_SEEDERS
+    return max(0, raw)
+
+
+def _drop_dead_releases(candidates: list, log_prefix: str = "[Torrent]") -> list:
+    """Drop candidates we positively KNOW have no seeders.
+
+    Sorting by seeders still returns a release when the entire field is on
+    zero, and a zero-seeder torrent is precisely the one that sits on
+    "downloading metadata" for hours. A candidate that reports NO seeder count
+    is left alone — usenet has none, and some indexers omit the field, so this
+    may only remove what is known dead, never what is merely unknown.
+    """
+    floor = get_min_seeders()
+    if floor <= 0:
+        return candidates
+    kept, dropped = [], 0
+    for c in candidates:
+        seeders = getattr(c, "seeders", None)
+        if seeders is None or int(seeders) >= floor:
+            kept.append(c)
+        else:
+            dropped += 1
+    if dropped:
+        logger.info("%s dropped %d release(s) below the %d-seeder floor",
+                    log_prefix, dropped, floor)
+    return kept
+
+
+def _album_stall_check(tracker: "StallTracker"):
+    """Adapt a StallTracker to poll_album_download's (status, now) callback."""
+    def _check(status, now: float) -> bool:
+        return tracker.is_stalled(
+            downloaded=getattr(status, "downloaded", 0) or 0,
+            state=getattr(status, "state", "") or "",
+            now=now,
+            size=getattr(status, "size", None),
+        )
+    return _check
+
+
+def _cleanup_stalled_album(adapter, torrent_id: str, title: str) -> None:
+    """Remove or pause a stalled/timed-out ALBUM torrent per
+    download_source.torrent_stall_action.
+
+    The album path never did this: the torrent stayed active in the client,
+    untracked here, and was re-grabbed as a duplicate on the next attempt.
+    """
+    if adapter is None or not torrent_id:
+        return
+    action = get_stall_action()
+    try:
+        if action == "pause":
+            run_async(adapter.pause(torrent_id))
+        else:
+            run_async(adapter.remove(torrent_id, delete_files=True))
+        logger.warning("[Torrent album] '%s' stalled — %s", title,
+                       "paused" if action == "pause" else "removed")
+    except Exception as e:      # noqa: BLE001 - cleanup must not mask the failure
+        logger.warning("[Torrent album] cleanup (%s) failed for '%s': %s",
+                       action, title, e)
 
 
 def _decode_filename(filename: str) -> Tuple[Optional[str], str]:

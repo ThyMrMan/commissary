@@ -64,3 +64,55 @@ def test_first_run_async_call_waits_for_event_loop_startup():
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+# ── bounded waits (adapted from upstream 3.2.0, 21276350) ────────────────────
+# There are 8 request threads in total. An unbounded wait on a hung service
+# pinned one until the worker timeout, and a status poll firing every few
+# seconds queued more behind it.
+
+def test_a_slow_coroutine_can_be_bounded():
+    import asyncio
+    import pytest
+    from utils.async_helpers import run_async
+
+    async def never():
+        await asyncio.sleep(30)
+
+    with pytest.raises(TimeoutError):
+        run_async(never(), timeout=0.05)
+
+
+def test_the_timeout_cancels_rather_than_leaking_the_coroutine():
+    """Letting it run on against a dead service is how you end up with a
+    backlog of them."""
+    import asyncio
+    from utils.async_helpers import run_async
+
+    state = {"cancelled": False}
+
+    async def slow():
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+
+    try:
+        run_async(slow(), timeout=0.05)
+    except TimeoutError:
+        pass
+    time.sleep(0.2)
+    assert state["cancelled"] is True
+
+
+def test_omitting_the_timeout_still_waits():
+    """Background callers must be unaffected — that is most of them."""
+    import asyncio
+    from utils.async_helpers import run_async
+
+    async def slowish():
+        await asyncio.sleep(0.15)
+        return "done"
+
+    assert run_async(slowish()) == "done"

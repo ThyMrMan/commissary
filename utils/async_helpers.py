@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 import threading
 
 _loop = None
@@ -31,7 +32,7 @@ def _get_loop():
     return _loop
 
 
-def run_async(coro):
+def run_async(coro, timeout: float | None = None):
     """Drop-in replacement for asyncio.run() that uses a single shared event loop.
 
     A dedicated daemon thread runs one event loop for the entire process.
@@ -40,7 +41,22 @@ def run_async(coro):
     works correctly with both long-lived and short-lived threads, and lets
     concurrently-submitted coroutines interleave at their own await points
     instead of fully serializing one caller behind another.
+
+    ``timeout`` bounds the WAIT, for callers running on a request thread. There
+    are only 8 of those in total, so one unbounded wait on an unreachable
+    service pins an eighth of the server's capacity until the worker timeout —
+    and a poll that fires every few seconds queues more behind it. On expiry the
+    coroutine is cancelled and TimeoutError is raised; a caller that can degrade
+    (a status poll showing 0 B/s for one tick) should catch it. Omitted means
+    wait forever, exactly as before, which is right for background work.
     """
     loop = _get_loop()
     future = asyncio.run_coroutine_threadsafe(coro, loop)
-    return future.result()
+    try:
+        return future.result(timeout)
+    except FuturesTimeoutError:
+        # Don't leave the coroutine running against a dead service behind us.
+        future.cancel()
+        raise TimeoutError(
+            f"async call exceeded its {timeout}s budget and was cancelled"
+        ) from None

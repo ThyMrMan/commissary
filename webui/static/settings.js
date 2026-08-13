@@ -1547,6 +1547,11 @@ async function loadSettingsData() {
             _tcStall.value = (secs === undefined || secs === null) ? 10 : Math.round(Number(secs) / 60);
         }
         if (_tcStallAct) _tcStallAct.value = settings.download_source?.torrent_stall_action || 'abandon';
+        const _tcMinSeed = document.getElementById('torrent-min-seeders');
+        if (_tcMinSeed) {
+            const ms = settings.download_source?.torrent_min_seeders;
+            _tcMinSeed.value = (ms === undefined || ms === null) ? 1 : Number(ms);
+        }
         renderPathList('torrent-download-paths-list', settings.download_source?.torrent_download_path);
         const _ucType = document.getElementById('usenet-client-type');
         const _ucUrl = document.getElementById('usenet-client-url');
@@ -5017,6 +5022,11 @@ async function saveSettings(quiet = false) {
                 return (Number.isFinite(m) && m >= 0 ? m : 10) * 60;
             })(),
             torrent_stall_action: document.getElementById('torrent-stall-action')?.value || 'abandon',
+            // Blank/NaN → the default 1; 0 stays 0 (check disabled).
+            torrent_min_seeders: (() => {
+                const n = parseInt(document.getElementById('torrent-min-seeders')?.value, 10);
+                return Number.isFinite(n) && n >= 0 ? n : 1;
+            })(),
             // In-container path(s) where SoulSync reads finished torrent/usenet
             // downloads (#857). Rendered in the torrent/usenet client sections
             // as add/remove lists — clients sort into category folders, so one

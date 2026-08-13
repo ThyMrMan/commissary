@@ -8442,6 +8442,13 @@
                                             </div>
                                         </div>
                                         <div class="form-group">
+                                            <label>Minimum seeders:</label>
+                                            <input type="number" id="torrent-min-seeders" min="0" step="1" placeholder="1">
+                                            <div class="setting-help-text">
+                                                Skip releases whose swarm is <strong>known to be dead</strong>. Sorting by seeders still returns a result when every candidate is on zero, and a zero-seeder torrent is exactly the one that sits on "downloading metadata" until it times out. Releases where the indexer reports <em>no</em> seeder count at all are never dropped — only what is positively known dead. <strong>0 disables</strong>.
+                                            </div>
+                                        </div>
+                                        <div class="form-group">
                                             <label>Stalled torrent timeout (minutes):</label>
                                             <input type="number" id="torrent-stall-timeout" min="0" step="1" placeholder="10">
                                             <div class="setting-help-text">

@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.9.18"
+_SOULSYNC_BASE_VERSION = "1.9.19"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -1922,7 +1922,7 @@ def get_cached_transfer_data():
             transfers_data = None
             _slsk = download_orchestrator.client("soulseek") if download_orchestrator else None
             if not soulseek_known_down and _slsk and _slsk.base_url:
-                transfers_data = run_async(download_orchestrator._make_request('GET', 'transfers/downloads'))
+                transfers_data = _slskd_transfers_or_none(download_orchestrator)
             if transfers_data:
                 all_transfers = []
                 for user_data in transfers_data:
@@ -3467,7 +3467,7 @@ def _build_system_stats():
 
     if soulseek_active and not soulseek_known_down:
         try:
-            transfers_data = run_async(download_orchestrator._make_request('GET', 'transfers/downloads'))
+            transfers_data = _slskd_transfers_or_none(download_orchestrator)
             if transfers_data:
                 for user_data in transfers_data:
                     if 'directories' in user_data:
@@ -3890,19 +3890,25 @@ def handle_settings():
             if isinstance(_widgets_in, dict) and 'member_hidden' in _widgets_in:
                 _widgets_in['member_hidden'] = sanitize_widget_ids(_widgets_in['member_hidden'])
 
-            if isinstance(_experimental_in, dict):
-                for key, value in _experimental_in.items():
-                    config_manager.set(f'experimental.{key}', value)
+            # ONE database write for the whole form. Each set() used to encrypt,
+            # serialise and commit the entire config — with ~50 sections' worth
+            # of leaf keys that is hundreds of write cycles per Save click, and
+            # the lock contention it created is what pushed saves onto the
+            # config.json fallback in the first place (upstream #1137).
+            with config_manager.batch():
+                if isinstance(_experimental_in, dict):
+                    for key, value in _experimental_in.items():
+                        config_manager.set(f'experimental.{key}', value)
 
-            for service in ['spotify', 'plex', 'jellyfin', 'navidrome', 'soulseek', 'download_source', 'settings', 'database', 'metadata_enhancement', 'file_organization', 'playlist_sync', 'tidal', 'tidal_download', 'qobuz', 'hifi_download', 'deezer_download', 'amazon_download', 'lidarr_download', 'prowlarr', 'torrent_client', 'usenet_client', 'listenbrainz', 'acoustid', 'lastfm', 'genius', 'import', 'lossy_copy', 'album_downloads', 'listening_stats', 'ui_appearance', 'youtube', 'content_filter', 'itunes', 'm3u_export', 'musicbrainz', 'deezer', 'audiodb', 'metadata', 'hydrabase', 'security', 'discogs', 'library', 'discover', 'wishlist', 'genre_whitelist', 'post_processing', 'playlists', 'dashboard_widgets', 'experimental']:
-                if service in new_settings:
-                    if service == 'experimental' and isinstance(_experimental_in, dict):
-                        continue
-                    for key, value in new_settings[service].items():
-                        config_manager.set(f'{service}.{key}', value)
+                for service in ['spotify', 'plex', 'jellyfin', 'navidrome', 'soulseek', 'download_source', 'settings', 'database', 'metadata_enhancement', 'file_organization', 'playlist_sync', 'tidal', 'tidal_download', 'qobuz', 'hifi_download', 'deezer_download', 'amazon_download', 'lidarr_download', 'prowlarr', 'torrent_client', 'usenet_client', 'listenbrainz', 'acoustid', 'lastfm', 'genius', 'import', 'lossy_copy', 'album_downloads', 'listening_stats', 'ui_appearance', 'youtube', 'content_filter', 'itunes', 'm3u_export', 'musicbrainz', 'deezer', 'audiodb', 'metadata', 'hydrabase', 'security', 'discogs', 'library', 'discover', 'wishlist', 'genre_whitelist', 'post_processing', 'playlists', 'dashboard_widgets', 'experimental']:
+                    if service in new_settings:
+                        if service == 'experimental' and isinstance(_experimental_in, dict):
+                            continue
+                        for key, value in new_settings[service].items():
+                            config_manager.set(f'{service}.{key}', value)
 
-            if _primary_override:
-                config_manager.set('metadata.fallback_source', _primary_override)
+                if _primary_override:
+                    config_manager.set('metadata.fallback_source', _primary_override)
 
             # The Settings → Quality page's toggles are saved as config keys
             # (above), but the pipeline enforces the PROFILE row (live, per
@@ -7943,6 +7949,25 @@ def _find_completed_file_robust_legacy(download_dir, api_filename, transfer_dir=
 
 
 
+def _slskd_transfers_or_none(orchestrator, timeout: float = 3.0):
+    """slskd's transfer list, or None if it does not answer in time.
+
+    These three call sites all run on a REQUEST thread behind a status poll
+    that fires every few seconds, and there are only 8 request threads in
+    total. An unbounded wait on a hung slskd pinned one of them until the
+    worker timeout, and the next poll queued another behind it — a handful of
+    ticks and the whole server is waiting on a service that is already gone.
+    Three seconds is generous for a local slskd; missing one tick shows 0 B/s
+    and the next poll retries. Adapted from upstream 3.2.0 (21276350).
+    """
+    try:
+        return run_async(orchestrator._make_request('GET', 'transfers/downloads'),
+                         timeout=timeout)
+    except TimeoutError:
+        logger.warning("slskd did not answer transfers/downloads within %ss — "
+                       "showing no Soulseek transfers for this tick", timeout)
+        return None
+
 @app.route('/api/downloads/status')
 def get_download_status():
     """
@@ -7958,7 +7983,7 @@ def get_download_status():
         soulseek_known_down = not _status_cache.get('soulseek', {}).get('connected', True)
         transfers_data = None
         if not soulseek_known_down:
-            transfers_data = run_async(download_orchestrator._make_request('GET', 'transfers/downloads'))
+            transfers_data = _slskd_transfers_or_none(download_orchestrator)
 
         # Don't return early if no Soulseek transfers - YouTube/Tidal downloads need to be checked too!
         all_transfers = []
@@ -42103,6 +42128,11 @@ def _has_active_downloads():
 
 
 # Track whether we auto-paused workers so we only resume ones we paused (not user-paused ones)
+from core.enrichment.stats_cache import WorkerStatsCache as _WorkerStatsCache
+
+# Per-worker cache for the 2s enrichment emit loop — see core.enrichment.stats_cache.
+_enrichment_stats_cache = _WorkerStatsCache()
+
 _download_auto_paused = set()
 _download_yield_override = set()  # Workers the user explicitly resumed during downloads — don't re-pause
 _auto_yield_cause = {}            # name -> 'downloads' | 'discovery' (status label for the UI)
@@ -42341,6 +42371,8 @@ def _emit_rate_monitor_loop():
 def _emit_enrichment_status_loop():
     """Background thread that pushes all enrichment worker statuses every 2 seconds.
     Also auto-pauses rate-limited enrichment workers during active downloads."""
+    global _enrichment_stats_cache
+    _enrichment_stats_cache = _WorkerStatsCache()
     workers = {
         'musicbrainz': lambda: mb_worker,
         'audiodb': lambda: audiodb_worker,
@@ -42415,9 +42447,18 @@ def _emit_enrichment_status_loop():
                 worker = get_worker()
                 if worker is None:
                     continue
-                status = worker.get_stats()
-                # Flag workers that were auto-paused for foreground work
+                # get_stats() counts pending items and builds a progress
+                # breakdown — whole-table aggregates on a fresh connection. An
+                # IDLE worker's answer cannot change, so it is re-read every 30s
+                # and served from cache in between; a running one still reads
+                # every tick, and a state change refreshes immediately. The 2s
+                # emit below is untouched.
+                status = _enrichment_stats_cache.get(name, worker)
+                # Flag workers that were auto-paused for foreground work. Copied
+                # rather than mutated: `status` may be the cached dict, and
+                # stamping it would make the flag outlive the pause.
                 if name in _download_auto_paused:
+                    status = dict(status)
                     status['yield_reason'] = _auto_yield_cause.get(name, 'downloads')
                 socketio.emit(f'enrichment:{name}', status)
             except Exception as e:

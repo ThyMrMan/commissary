@@ -459,6 +459,8 @@ def poll_album_download(
     snapshot_path: Callable[[str], Optional[tuple]] = snapshot_incomplete_path,
     resolve_path: Callable[[str], str] = lambda p: p,
     log_prefix: str = '[album_bundle]',
+    stall_check: Optional[Callable[[Any, float], bool]] = None,
+    on_stall: Optional[Callable[[], None]] = None,
 ) -> Optional[str]:
     """Drive the per-poll status loop for an album-bundle download.
 
@@ -728,9 +730,38 @@ def poll_album_download(
                 _fail('Client returned unmapped state repeatedly')
                 return None
 
+        # Stall gate — LAST in the loop on purpose. Everything above can
+        # return on a terminal state this very poll, and a job that has
+        # already finished must never be killed for "not moving". Injected
+        # rather than imported: whether a torrent is stalled is a
+        # protocol-specific judgement (during the metadata phase the byte
+        # counter is noise, which only StallTracker knows), and usenet has no
+        # equivalent — the usenet caller passes neither and behaves exactly as
+        # before. #1139(2): this was wired into the per-TRACK poll only, so
+        # the configured timeout was never consulted for album bundles, which
+        # is the thousands-of-polls-for-hours part of the report.
+        if stall_check is not None and stall_check(status, monotonic()):
+            reason = 'Torrent stalled (no progress)'
+            logger.error("%s '%s' stalled — %s", log_prefix, title, reason)
+            if on_stall is not None:
+                try:
+                    on_stall()
+                except Exception as stall_exc:      # noqa: BLE001 - cleanup is best effort
+                    logger.debug("%s stall cleanup failed: %s", log_prefix, stall_exc)
+            _fail(reason)
+            return None
+
         sleep(interval)
 
     logger.error("%s '%s' timed out", log_prefix, title)
+    if on_stall is not None:
+        # A timeout leaves the job active in the client exactly as a stall
+        # does — #1139(4): without this it stayed there untracked and got
+        # re-grabbed as a duplicate on the next attempt.
+        try:
+            on_stall()
+        except Exception as stall_exc:      # noqa: BLE001
+            logger.debug("%s timeout cleanup failed: %s", log_prefix, stall_exc)
     _fail('Download timed out')
     return None
 

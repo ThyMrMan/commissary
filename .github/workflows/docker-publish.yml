@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version_tag:
-        description: 'Version tag (e.g. 1.9.18). Also published as :latest.'
+        description: 'Version tag (e.g. 1.9.19). Also published as :latest.'
         required: true
-        default: '1.9.18'
+        default: '1.9.19'
 
 jobs:
   build-and-push:
