@@ -37689,7 +37689,10 @@ div.artist-hero-badge {
 
 .discover-playlist-track-compact {
     display: grid;
-    grid-template-columns: 30px 40px 1fr 1.5fr 60px;
+    /* Trailing 22px is the per-row block-artist button. It reserves its column
+       unconditionally (the button itself is display:none until row hover), so
+       revealing it can't reflow the row's other columns under the cursor. */
+    grid-template-columns: 30px 40px 1fr 1.5fr 60px 22px;
     gap: 12px;
     align-items: center;
     padding: 8px 12px;

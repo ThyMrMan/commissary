@@ -2606,6 +2606,31 @@ function _getDecadeBrowserTabsCtrl() {
 // have the same shape — both pull from `track_data_json` first then
 // fall back to top-level fields. Lifted so the helper-driven
 // renderers don't each carry a copy.
+// Attribute-safe escaping. The page's `escapeHtml`/`_esc` helpers go through
+// textContent → innerHTML, which escapes & < > but NOT quotes — fine for text
+// nodes, wrong for an attribute value. Artist names here come from a scraped
+// third-party source (music-map.com), so an apostrophe or quote in a name is a
+// question of when, not if.
+function _attr(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// The per-row "block this artist" affordance. `blockDiscoveryArtist` and its
+// CSS (`.track-compact-block`, revealed on row hover) both already existed —
+// only this markup was missing, so the action was unreachable outside the
+// blocked-artists modal's search box. The name rides in `data-artist` and is
+// read back via `this.dataset`, so it never becomes part of a JS string
+// literal. stopPropagation keeps the row's own click (open/play) from firing.
+function _blockArtistBtn(artistName) {
+    const name = String(artistName || '').trim();
+    if (!name || name === 'Unknown Artist') return '<span></span>';
+    return `<button type="button" class="track-compact-block" data-artist="${_attr(name)}"
+                onclick="event.stopPropagation(); blockDiscoveryArtist(this.dataset.artist)"
+                title="Block ${_attr(name)} from discovery">&#128683;</button>`;
+}
+
 function _renderTabbedTrackList(tracks) {
     let html = '<div class="discover-playlist-tracks-compact">';
     tracks.forEach((track, index) => {
@@ -2636,6 +2661,7 @@ function _renderTabbedTrackList(tracks) {
                     </div>
                     <div class="track-compact-album">${albumName}</div>
                     <div class="track-compact-duration">${duration}</div>
+                    ${_blockArtistBtn(artistName)}
                 </div>
             `;
     });
@@ -4708,6 +4734,7 @@ function renderCompactPlaylist(container, tracks) {
                 </div>
                 <div class="track-compact-album">${_esc(t.album)}</div>
                 <div class="track-compact-duration">${duration}</div>
+                ${_blockArtistBtn(t.artist)}
             </div>
         `;
     });
@@ -4905,6 +4932,31 @@ function openMixModal(mix) {
     }
 }
 
+// Drop every currently-rendered compact row belonging to a just-blocked artist,
+// and renumber what's left so the list doesn't show gaps. Case-insensitive to
+// match the server, which compares LOWER(artist_name).
+function _removeBlockedArtistRows(artistName) {
+    const target = String(artistName || '').trim().toLowerCase();
+    if (!target) return;
+    document.querySelectorAll('.discover-playlist-tracks-compact').forEach(list => {
+        let removed = false;
+        list.querySelectorAll('.discover-playlist-track-compact').forEach(row => {
+            const rowArtist = (row.querySelector('.track-compact-artist')?.textContent || '')
+                .trim().toLowerCase();
+            if (rowArtist === target) { row.remove(); removed = true; }
+        });
+        if (!removed) return;
+        // Visible numbering only. `data-track-index` deliberately keeps its
+        // original value: it indexes the array the list was rendered from, and
+        // that array is not being mutated here. Renumbering it would look
+        // tidier and be wrong the moment anything reads it.
+        list.querySelectorAll('.discover-playlist-track-compact').forEach((row, i) => {
+            const num = row.querySelector('.track-compact-number');
+            if (num) num.textContent = String(i + 1);
+        });
+    });
+}
+
 async function blockDiscoveryArtist(artistName) {
     if (!confirm(`Block "${artistName}" from all discovery playlists?`)) return;
     try {
@@ -4916,6 +4968,13 @@ async function blockDiscoveryArtist(artistName) {
         const data = await res.json();
         if (data.success) {
             showToast(`Blocked ${artistName} from discovery`, 'success');
+            // Pull the artist out of whatever the user is looking at RIGHT NOW.
+            // The section reloads below only rebuild Hidden Gems and Discovery
+            // Shuffle; when the block is fired from an open mix modal (which is
+            // where the per-row button lives) neither of those is on screen, so
+            // without this the row you just blocked sits there unchanged and the
+            // click reads as having done nothing.
+            _removeBlockedArtistRows(artistName);
             // Refresh discovery sections to remove the artist. Daily Mixes
             // is intentionally paused (see loadDiscoverPage), so don't
             // refresh it — the section isn't on the page anyway.

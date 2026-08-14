@@ -3484,6 +3484,12 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
+    '1.9.21': [
+        { date: 'August 2026 · 1.9.21' },
+        { title: 'You can finally say "not this artist" from the track itself', desc: 'hover any track on the Discover page — in a mix, in Hidden Gems, in Discovery Shuffle, in a decade or genre list — and a 🚫 appears on the right. One click blocks that artist from every discovery playlist, and the track disappears from the list you are looking at. Until now the only way to block an artist was to open the blocked-artists panel and type their name in from memory, having already left the song that prompted it.' },
+        { title: 'Why it was missing', desc: 'it wasn\'t, quite. The block action, its API, its database table and even its <em>styling</em> — a red circle that fades in on row hover — had all shipped. The one thing nobody ever added was the button itself, so the function sat in the code with no way to call it. Every layer was individually complete and the feature was unreachable, which is a shape of bug no test was ever going to catch.' },
+        { title: 'A note on what blocking does', desc: 'it is a hard filter, not a preference. A blocked artist is removed from every discovery playlist outright — nothing about the block feeds back into how tracks are ranked, so blocking three metal artists will not steer recommendations away from metal. The dial for <em>that</em> is Settings → Discovery → adventurousness, which trades genre-safety against novelty and unpopularity. There is still no way to mark a single <strong>track</strong> as disliked.' },
+    ],
     '1.9.20': [
         { date: 'August 2026 · 1.9.20' },
         { title: 'Fixed: songs downloaded for a playlist never joined the playlist', desc: 'reported as "a server playlist created in SoulSync doesn\'t sync properly with Plex — the songs get downloaded but don\'t get matched onto the playlist without manual intervention", and the log had it to the minute. A sync matches your library <em>at that moment</em>, writes the server playlist, and hands whatever is left to the wishlist. So the downloads start <strong>after</strong> the playlist is already written. Your log: a 50-track playlist synced with 3 matches at 09:06, 41 tracks downloaded and imported by 09:13, the library database caught up at 09:20 — and then nothing, for the remaining hour. The playlist still held 3 tracks while all 41 songs sat correctly in the library.' },
@@ -3778,6 +3784,17 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.21: block an artist from the track in front of you",
+        description: "the block action, its API, its table and its hover styling had all shipped — the button that would let anyone press it never did, so the function had zero call sites and the feature was unreachable.",
+        features: [
+            "hover any Discover track and a 🚫 appears: one click blocks that artist from every discovery playlist",
+            "wired into both track renderers — the mix modals (Hidden Gems, Discovery Shuffle, Popular Picks, Fresh Tape, The Archives, Last.fm, ListenBrainz) and the decade / genre browsers",
+            "the blocked artist's rows vanish from the list you are looking at, not just from the two sections that happen to reload",
+            "tracks with no identified artist get no button rather than one that blocks the literal string \"Unknown Artist\"",
+        ],
+        usage_note: "Blocking is a hard filter — the artist is removed from discovery entirely, and it does not otherwise influence ranking. To steer the recommendations themselves, use Settings → Discovery → adventurousness. Blocked artists are still managed (and unblocked) from the 🚫 panel in the Discover header.",
+    },
     {
         title: "1.9.20: downloaded songs now reach the playlist they were downloaded for",
         description: "a sync matches your library at that moment, writes the server playlist, and only then hands the leftovers to the wishlist to download — so the tracks land minutes after the playlist was already written, and nothing went back for them. The post-download chain ended one link early.",
