@@ -588,7 +588,14 @@ class PlexClient(MediaServerClient):
                     try:
                         playlist = self.server.createPlaylist(name, first)
                     except Exception as create_error:
-                        logger.error(f"CreatePlaylist failed: {create_error}")
+                        # NOT an error: current plexapi wants the items as a keyword
+                        # ("Must include items to add when creating new playlist"),
+                        # so the positional form below raises on EVERY creation and
+                        # the very next attempt succeeds. Logged at ERROR it was a
+                        # permanent red herring sitting in app.log right next to the
+                        # real playlist problems. The rest of the cascade stays loud
+                        # — reaching those DOES mean something is wrong.
+                        logger.debug(f"createPlaylist(positional) rejected, trying items=: {create_error}")
                         # Try alternative approach - pass items as list
                         try:
                             playlist = self.server.createPlaylist(name, items=first)
@@ -866,17 +873,62 @@ class PlexClient(MediaServerClient):
             logger.error(f"Error reordering Plex playlist '{playlist_name}': {e}")
             return False
 
+    def _playlist_already_matches(self, existing_playlist, tracks) -> bool:
+        """True when ``existing_playlist`` already holds exactly ``tracks``, in order.
+
+        Deliberately cheap and deliberately pessimistic — it may only ever say
+        "yes" when it is certain, because a wrong "yes" silently skips a sync the
+        user asked for. So:
+
+        * every incoming track must ALREADY carry a ratingKey. ``create_playlist``
+          can resolve a bare ``TrackInfo`` via ``_find_track``, but that's a
+          per-track search against the server; a comparison is not worth that, and
+          an unresolved list is exactly the case where we can't be sure.
+        * an empty desired list never matches — a sync that resolved nothing must
+          not be read as "already correct".
+        * any exception means "not sure", which means do the rewrite.
+        """
+        try:
+            desired = [str(t.ratingKey) for t in (tracks or []) if hasattr(t, 'ratingKey')]
+            if not desired or len(desired) != len(tracks or []):
+                return False
+            current = [str(i.ratingKey) for i in existing_playlist.items() if hasattr(i, 'ratingKey')]
+            return current == desired
+        except Exception as e:
+            logger.debug("Plex playlist equality check failed (will rewrite): %s", e)
+            return False
+
     def update_playlist(self, playlist_name: str, tracks: List[TrackInfo]) -> bool:
         if not self.ensure_connection():
             return False
-        
+
         try:
             existing_playlist = self.server.playlist(playlist_name)
-            
+
+            # Nothing to do? Then do nothing. 'replace' mode deletes and
+            # recreates the playlist unconditionally, which re-keys it, churns a
+            # backup copy, and briefly leaves the user with no playlist at all —
+            # all to arrive at exactly what was already there. That was tolerable
+            # when a sync only ran on a user's schedule; it is not now that the
+            # post-download chain re-syncs every playlist that was short (see
+            # core.automation.handlers.resync_playlists), because a playlist with
+            # permanently-unavailable tracks would be rebuilt after every single
+            # database update.
+            #
+            # Compared as an ordered LIST, not a set: a playlist whose membership
+            # matches but whose ORDER has drifted still gets the rewrite, so this
+            # changes behavior in the no-op case only.
+            if self._playlist_already_matches(existing_playlist, tracks):
+                logger.info(
+                    f"Plex playlist '{playlist_name}' already matches the sync result "
+                    f"({len(tracks)} tracks, same order) — leaving it untouched"
+                )
+                return True
+
             # Check if backup is enabled in config
             from config.settings import config_manager
             create_backup = config_manager.get('playlist_sync.create_backup', True)
-            
+
             if create_backup:
                 backup_name = f"{playlist_name} Backup"
                 logger.info(f"Creating backup playlist '{backup_name}' before sync")

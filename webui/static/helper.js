@@ -3484,6 +3484,13 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
+    '1.9.20': [
+        { date: 'August 2026 · 1.9.20' },
+        { title: 'Fixed: songs downloaded for a playlist never joined the playlist', desc: 'reported as "a server playlist created in SoulSync doesn\'t sync properly with Plex — the songs get downloaded but don\'t get matched onto the playlist without manual intervention", and the log had it to the minute. A sync matches your library <em>at that moment</em>, writes the server playlist, and hands whatever is left to the wishlist. So the downloads start <strong>after</strong> the playlist is already written. Your log: a 50-track playlist synced with 3 matches at 09:06, 41 tracks downloaded and imported by 09:13, the library database caught up at 09:20 — and then nothing, for the remaining hour. The playlist still held 3 tracks while all 41 songs sat correctly in the library.' },
+        { title: 'The chain now has its last link', desc: 'a finished download already triggers a media-server scan, and a finished scan already triggers a library database update. That chain then just... stopped, leaving the playlist to wait for whenever you next synced it by hand. A new <strong>Auto-Sync Playlists After Database Update</strong> automation closes it: the instant newly imported tracks become matchable, every playlist whose last sync came up short is re-synced. Playlists that already matched in full are left alone. A schedule could never have covered this — there are roughly 14 minutes between "sync queues the downloads" and "the downloads exist as far as a sync is concerned", so a periodic re-sync mostly lands inside that window and just re-confirms the tracks are missing.' },
+        { title: 'And a sync that changes nothing now touches nothing', desc: 'the default <em>replace</em> mode deleted and recreated your Plex playlist on every sync, re-keying it and churning a "… Backup" copy each time, even when the result was identical to what was already there. Harmless at one sync a day; not harmless now that the chain above re-syncs after every database update. A playlist that already holds exactly the right tracks in the right order is now left untouched. Membership or order actually differing still rewrites, exactly as before.' },
+        { title: 'One less red herring in the log', desc: 'every single successful playlist creation logged <code>ERROR — CreatePlaylist failed: Must include items to add when creating new playlist</code>. The retry on the very next line always succeeded, so nothing was ever wrong — but it sat at ERROR level right beside the real playlist problems, in exactly the file you would read to diagnose them. Demoted to debug; the rest of the fallback chain stays loud, because reaching those genuinely does mean something failed.' },
+    ],
     '1.9.19': [
         { date: 'August 2026 · 1.9.19' },
         { title: 'Adapted from upstream 3.2.0: album torrents that stalled for hours', desc: 'the biggest fix in this batch, and six separate faults behind one symptom — an album grab sitting at 0% until the deadline, then failing with "no audio files found". The album flow preferred the <strong>magnet</strong> whenever the indexer offered both, and a magnet the client cannot resolve sits on "downloading metadata" forever; the stall timeout you had configured was wired into the per-track poll and <strong>never consulted for albums</strong>; nothing enforced a seeder floor, so a release with a dead swarm was still picked; and a stalled torrent was left running in your client, untracked, to be grabbed again as a duplicate next time.' },
@@ -3771,6 +3778,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.20: downloaded songs now reach the playlist they were downloaded for",
+        description: "a sync matches your library at that moment, writes the server playlist, and only then hands the leftovers to the wishlist to download — so the tracks land minutes after the playlist was already written, and nothing went back for them. The post-download chain ended one link early.",
+        features: [
+            "a finished download already triggered a media-server scan, and a finished scan already triggered a library database update — but nothing then re-synced the playlist, so the tracks stayed missing until matched by hand",
+            "new 'Auto-Sync Playlists After Database Update' automation: the moment newly imported tracks become matchable, every playlist whose last sync came up short is re-synced",
+            "deliberately narrow — a playlist that already matched in full is left alone, and a playlist that has never been synced is not touched at all",
+            "a sync whose result is identical to what is already on the server no longer deletes and recreates the Plex playlist (which re-keyed it and churned a backup copy every time); differing membership or order still rewrites",
+            "the ERROR logged on every successful playlist creation ('Must include items to add when creating new playlist') is now debug — the retry beside it always succeeded, and it was sitting in app.log next to the real playlist problems",
+        ],
+        usage_note: "Nothing to configure — the new automation is created enabled, alongside the two existing post-download ones on the Automations page. If a playlist was already left short, it will fill in after the next download finishes; or re-sync it once by hand to catch up immediately.",
+    },
     {
         title: "1.9.19: fixes adapted from upstream 3.2.0",
         description: "upstream shipped ~650 commits, most of it a React rewrite of pages this fork has customised heavily — that part is not adaptable. These are the four backend fixes that are, each verified as still broken here before being taken.",

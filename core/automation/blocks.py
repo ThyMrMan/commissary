@@ -224,6 +224,9 @@ ACTIONS: list[dict] = [
      "config_fields": [
          {"key": "playlist_id", "type": "mirrored_playlist_select", "label": "Playlist"}
      ]},
+    {"type": "resync_incomplete_playlists", "label": "Re-sync Incomplete Playlists", "icon": "sync",
+     "description": "Re-sync mirrored playlists whose last sync left tracks unmatched — pairs with the 'Database Updated' trigger so tracks that just finished downloading land on the server playlist instead of waiting for the next scheduled sync",
+     "available": True},
     {"type": "discover_playlist", "label": "Discover Playlist", "icon": "search", "description": "Find official Spotify/iTunes metadata for mirrored playlist tracks", "available": True,
      "config_fields": [
          {"key": "playlist_id", "type": "mirrored_playlist_select", "label": "Playlist"},

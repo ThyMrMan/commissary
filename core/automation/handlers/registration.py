@@ -14,6 +14,7 @@ from core.automation.handlers.scan_library import auto_scan_library
 from core.automation.handlers.refresh_mirrored import auto_refresh_mirrored
 from core.automation.handlers.sync_playlist import auto_sync_playlist
 from core.automation.handlers.discover_playlist import auto_discover_playlist
+from core.automation.handlers.resync_playlists import auto_resync_incomplete_playlists
 from core.automation.handlers.playlist_pipeline import auto_playlist_pipeline
 from core.automation.handlers.personalized_pipeline import auto_personalized_pipeline
 from core.automation.handlers.database_update import (
@@ -115,6 +116,15 @@ def register_all(deps: AutomationDeps) -> None:
     engine.register_action_handler(
         'discover_playlist',
         lambda config: auto_discover_playlist(config, deps),
+    )
+    # The tail of the post-download chain: once the database update has read the
+    # freshly imported tracks in, re-sync the playlists that were short. Shares
+    # the pipeline flag both ways — the guard refuses it mid-pipeline, and it
+    # holds the flag itself so a pipeline can't start under it.
+    engine.register_action_handler(
+        'resync_incomplete_playlists',
+        lambda config: auto_resync_incomplete_playlists(config, deps),
+        deps.state.is_pipeline_running,
     )
     engine.register_action_handler(
         'playlist_pipeline',

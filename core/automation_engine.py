@@ -102,6 +102,17 @@ SYSTEM_AUTOMATIONS = [
         'trigger_config': {},
         'action_type': 'start_database_update',
     },
+    # The tail of that chain. Without it the chain refreshes the library and
+    # stops: a track downloaded FOR a playlist is imported, scanned and read
+    # into the DB, but the server playlist was written back when the track was
+    # still missing, so it stayed missing until someone matched it by hand.
+    # Only playlists whose last sync came up short are touched.
+    {
+        'name': 'Auto-Sync Playlists After Database Update',
+        'trigger_type': 'database_update_completed',
+        'trigger_config': {},
+        'action_type': 'resync_incomplete_playlists',
+    },
     # Maintenance automations
     {
         'name': 'Refresh Beatport Cache',

@@ -37,6 +37,7 @@ EXPECTED_ACTION_NAMES = frozenset({
     'refresh_mirrored',
     'sync_playlist',
     'discover_playlist',
+    'resync_incomplete_playlists',
     'playlist_pipeline',
     'personalized_pipeline',
     'start_database_update',
@@ -91,6 +92,8 @@ EXPECTED_GUARDED_ACTIONS = frozenset({
     'scan_watchlist',
     'scan_library',
     'playlist_pipeline',
+    # Shares the pipeline flag: refused mid-pipeline, and holds it while running.
+    'resync_incomplete_playlists',
     'personalized_pipeline',
     'start_database_update',
     'deep_scan_library',
