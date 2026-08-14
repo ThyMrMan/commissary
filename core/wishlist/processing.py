@@ -603,8 +603,15 @@ def remove_tracks_already_in_library(
         if not track_name or not artists or not spotify_track_id:
             continue
 
-        # Manual match check — skip fuzzy search if user already linked this track.
-        if _mlm.get_match_for_track(music_database, profile_id, track, default_source='wishlist'):
+        # Manual match check — skip fuzzy search if user already linked this
+        # track, and the linked track is still IN the library. Unverified, a
+        # match to a since-deleted file made this branch remove the track from
+        # the wishlist as a SUCCESS (upstream #1138) — the one place that was
+        # still keeping it alive.
+        if _mlm.resolve_match(
+            music_database,
+            _mlm.get_match_for_track(music_database, profile_id, track, default_source='wishlist'),
+        ):
             try:
                 removed = wishlist_service.mark_track_download_result(spotify_track_id, success=True)
                 if removed:

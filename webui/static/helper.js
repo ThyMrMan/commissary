@@ -3484,6 +3484,13 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
+    '1.9.22': [
+        { date: 'August 2026 · 1.9.22' },
+        { title: 'Fixed: a manually matched track could vanish for good', desc: 'when you link a track to a file in your library by hand, SoulSync stores that as a row in a table — and then treated the row\'s <em>existence</em> as proof the file was still there. Delete or move that file and the track entered a closed trap: the download was skipped as "already matched", the wishlist drain removed it as a <strong>success</strong>, and adding it back was silently refused for the same reason. Three separate places, each individually reasonable, together making the song impossible to re-acquire. A match is now checked against the library before it counts, and a match whose id has gone stale is re-resolved by file path rather than thrown away.' },
+        { title: 'Fixed: albums starting with a dot became invisible', desc: 'the name sanitiser trimmed dots from the <em>end</em> of a folder name, because that is what Windows rejects. Nothing trimmed the front, which is the Unix rule — a leading dot makes the entry hidden. So <code>...And Justice for All</code> imported perfectly into a folder your file manager, your terminal and your media server\'s scanner all skip. The same gap existed on the video side. Interior dots are untouched, so <code>Mr. Bungle</code> is still <code>Mr. Bungle</code>.' },
+        { title: 'Fixed: AcoustID took the first answer, not the best one', desc: 'fingerprint lookups were read from position zero of the results, but the results came back in whatever order the API sent them while the best score was tracked in a completely separate variable. So a remix, a live cut or a compilation entry listed ahead of the real recording had its metadata written to your file. Results are now sorted best-first, and — new — a match has to clear a confidence bar of 0.80 to be used at all. Below that SoulSync declines and leaves your existing tags alone, which for an ambiguous fingerprint is the right answer.' },
+        { title: 'Fixed: the wishlist processing API endpoint never worked', desc: '<code>POST /api/wishlist/process</code> called its own setup helper with an argument that helper has never accepted. Every single call raised a TypeError, which the route caught and returned as a generic 500 — so it failed identically whether or not the wishlist was busy, and looked like a conflict rather than a permanent break. Nothing in the UI used it; if you script against the API, it works now.' },
+    ],
     '1.9.21': [
         { date: 'August 2026 · 1.9.21' },
         { title: 'You can finally say "not this artist" from the track itself', desc: 'hover any track on the Discover page — in a mix, in Hidden Gems, in Discovery Shuffle, in a decade or genre list — and a 🚫 appears on the right. One click blocks that artist from every discovery playlist, and the track disappears from the list you are looking at. Until now the only way to block an artist was to open the blocked-artists panel and type their name in from memory, having already left the song that prompted it.' },
@@ -3784,6 +3791,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.22: four more fixes adapted from upstream 3.2.0",
+        description: "the remaining tier of that release, each one checked against this fork's code before being taken. Four of the eight were already fixed here or never applied; one was left deliberately.",
+        features: [
+            "a manual library match to a deleted file no longer makes the track vanish — three call sites treated the match row as proof the file existed, and together they made the song un-downloadable, un-wishlistable and un-re-addable",
+            "a stale match id is now re-resolved via the stored file path instead of discarded, so a media-server metadata refresh doesn't cost you the link",
+            "album and track names starting with a dot no longer become hidden folders (the sanitiser trimmed trailing dots for Windows, never leading ones for Unix) — video titles too",
+            "AcoustID now sorts results best-first instead of reading position zero, and declines anything below 0.80 confidence rather than writing an uncertain guess into your tags",
+            "POST /api/wishlist/process no longer 500s on every call — it passed its own setup helper an argument that helper never accepted",
+        ],
+        usage_note: "Nothing to configure. If a track disappeared after you deleted its manually-matched file, it can be wishlisted again now. Not adapted: upstream's fix for FLAC arriving under an MP3-only profile — our quality fallback deliberately ignores format when nothing matches your ranked targets, and has its own on/off switch, so that one is a preference rather than a bug. Say if you'd rather it constrained format too.",
+    },
     {
         title: "1.9.21: block an artist from the track in front of you",
         description: "the block action, its API, its table and its hover styling had all shipped — the button that would let anyone press it never did, so the function had zero call sites and the feature was unreachable.",

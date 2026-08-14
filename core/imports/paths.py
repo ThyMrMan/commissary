@@ -140,7 +140,17 @@ def sanitize_filename(filename: str) -> str:
     """Sanitize filename for file system compatibility."""
     sanitized = re.sub(r'[<>:"/\\|?*]', "_", filename)
     sanitized = re.sub(r"\s+", " ", sanitized).strip()
-    sanitized = sanitized.rstrip(". ") or "_"
+    sanitized = sanitized.rstrip(". ")
+    # Leading dots too, not just trailing (upstream #1129). The rstrip above is
+    # the WINDOWS rule — it rejects names ending in a dot or space. The UNIX rule
+    # is the other end: a leading dot makes the entry hidden. So an album like
+    # "...And Justice for All" or a track like ".5 The Gray Chapter" landed in a
+    # folder invisible to `ls`, to the user's file manager, and to the media
+    # server's scanner — the files were imported perfectly and simply could not
+    # be seen. Stripped rather than substituted: a leading "_" would be just as
+    # wrong a name, and the server takes its display title from the tags, not
+    # from the folder.
+    sanitized = sanitized.lstrip(". ") or "_"
     if re.match(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)", sanitized, re.IGNORECASE):
         sanitized = "_" + sanitized
     return sanitized[:200]

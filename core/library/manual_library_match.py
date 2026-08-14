@@ -144,6 +144,68 @@ def get_match_for_track(
     return None
 
 
+def resolve_match(db, match: Optional[dict]) -> Optional[dict]:
+    """Return ``match`` only if it still points at a track the library HAS.
+
+    The row is a record of the user's intent, not evidence the file survived
+    (upstream #1138). Callers were treating its mere existence as proof of
+    ownership — so once the matched file was deleted, or a rescan dropped its
+    row, the track was reported found, its download skipped and its wishlist
+    entry removed. It vanished, permanently and silently, and the only trace was
+    a log line claiming success.
+
+    Verification, in the same order the sync path already uses:
+
+    1. ``library_track_id`` still resolves in ``tracks`` -> good.
+    2. If not, look the stored ``library_file_path`` up again: media servers
+       re-key tracks on a metadata refresh, so a dead id with a live path is a
+       stale id, not a missing file. The returned dict carries the healed id.
+    3. Otherwise the match is dead -> ``None``, and the caller falls back to its
+       normal "not owned" handling (search, download, wishlist).
+
+    Degrades to trusting the row when the db object exposes neither lookup, so
+    a caller with a reduced db shim behaves exactly as before rather than
+    treating every match as dead.
+    """
+    if not match:
+        return None
+
+    by_id = getattr(db, "get_track_by_id", None)
+    by_path = getattr(db, "find_track_id_by_file_path", None)
+    if by_id is None and by_path is None:
+        return match
+
+    track_id = match.get("library_track_id")
+    if by_id is not None and track_id:
+        try:
+            if by_id(track_id):
+                return match
+        except Exception as e:  # noqa: BLE001 — an unreadable DB must not delete a match
+            logger.debug("manual match id lookup failed for %s: %s", track_id, e)
+            return match
+
+    file_path = match.get("library_file_path")
+    if by_path is not None and file_path:
+        try:
+            healed = by_path(file_path)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("manual match path lookup failed for %s: %s", file_path, e)
+            return match
+        if healed:
+            logger.info(
+                "[Manual Match] library id %s is stale — re-resolved to %s via %s",
+                track_id, healed, file_path,
+            )
+            return {**match, "library_track_id": healed}
+
+    logger.warning(
+        "[Manual Match] the matched library track is gone (id=%s, path=%s) — "
+        "treating the track as NOT owned so it can be re-acquired",
+        track_id, file_path,
+    )
+    return None
+
+
 def delete_match(db, match_id: int, profile_id: int) -> bool:
     """Delete match by PK id, scoped to profile."""
     return db.delete_manual_library_match(match_id, profile_id)

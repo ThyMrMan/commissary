@@ -16,6 +16,28 @@ def db(tmp_path):
     return MusicDatabase(str(tmp_path / "music.db"))
 
 
+def _seed_library_track(db, track_id=42, *, title="HUMBLE.", file_path="/music/humble.flac"):
+    """Put a real row in ``tracks`` so a manual match to it RESOLVES.
+
+    Needed since #1138: a match row is no longer taken as proof the file exists
+    — ``resolve_match`` checks the library still has the track. Tests that used
+    to save a match against an id nothing backed were relying on the very
+    assumption that bug was made of.
+    """
+    with db._get_connection() as conn:
+        cur = conn.cursor()
+        # artist_id / album_id are NOT NULL, so a bare track row won't insert.
+        cur.execute("INSERT OR IGNORE INTO artists (id, name) VALUES (1, 'Test Artist')")
+        cur.execute("INSERT OR IGNORE INTO albums (id, title, artist_id) VALUES (1, 'Test Album', 1)")
+        cur.execute(
+            "INSERT OR REPLACE INTO tracks (id, title, artist_id, album_id, file_path) "
+            "VALUES (?, ?, 1, 1, ?)",
+            (track_id, title, file_path),
+        )
+        conn.commit()
+    return track_id
+
+
 # ---------------------------------------------------------------------------
 # normalize_library_track_id — regression guard for issue #754
 # ("Invalid library track id" on Jellyfin/Navidrome/Subsonic servers)
@@ -210,6 +232,7 @@ def test_get_match_for_track_falls_back_to_source_title_artist(db):
 
 
 def test_add_to_wishlist_skips_manual_matched_track(db):
+    _seed_library_track(db, 42)
     db.save_manual_library_match(1, "spotify", "track-abc", 42)
 
     ok = db.add_to_wishlist(
@@ -229,6 +252,7 @@ def test_add_to_wishlist_skips_manual_matched_track(db):
 
 
 def test_add_to_wishlist_skips_manual_match_saved_from_mirrored_source(db):
+    _seed_library_track(db, 42, title="Coffee Break")
     db.save_manual_library_match(
         1,
         "mirrored",

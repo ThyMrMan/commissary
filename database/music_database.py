@@ -10411,8 +10411,12 @@ class MusicDatabase:
                 except Exception as _ignore_exc:
                     logger.debug("Wishlist ignore-list check skipped (fail-open): %s", _ignore_exc)
 
+                # Only a match that still resolves may block the add. Otherwise
+                # a match to a deleted file made the track un-re-addable: this
+                # returned True (reporting success) without adding anything, so
+                # the track could never come back (upstream #1138).
                 from core.library import manual_library_match as _mlm
-                if _mlm.get_match_for_track(self, profile_id, spotify_track_data):
+                if _mlm.resolve_match(self, _mlm.get_match_for_track(self, profile_id, spotify_track_data)):
                     logger.info(
                         "Skipping wishlist add for manually matched track: '%s' (%s:%s)",
                         spotify_track_data.get('name', 'Unknown Track'),

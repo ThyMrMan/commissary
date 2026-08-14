@@ -572,10 +572,16 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
             # Manual library matches are authoritative unless the user explicitly
             # requested a force re-download from the normal download modal.
             _stid = track_data.get('spotify_track_id') or track_data.get('source_track_id') or track_data.get('id', '')
-            _manual_match = (
+            # ...and only if the match still points at a track the library HAS.
+            # The row records the user's intent; it is not evidence the file
+            # survived. Without resolve_match, deleting the matched file made
+            # the track report found=True forever — download skipped, wishlist
+            # entry removed, gone (upstream #1138). The sync path has always
+            # verified; this one never did.
+            _manual_match = _mlm.resolve_match(db, (
                 _mlm.get_match_for_track(db, batch_profile_id, track_data, default_source=batch_source)
                 if (not ignore_manual_matches and _stid) else None
-            )
+            ))
             if _manual_match:
                 logger.info(f"[Manual Match] '{track_name}' already matched in library — skipping download")
                 try:

@@ -48,7 +48,7 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.9.21"
+_SOULSYNC_BASE_VERSION = "1.9.22"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -19672,9 +19672,19 @@ def get_database_stats():
 def process_wishlist_api():
     """Trigger wishlist processing via API. Processes pending wishlist tracks in the background."""
     try:
-        runtime = _build_wishlist_route_runtime(
-            is_auto_processing_flag=lambda: wishlist_auto_processing,
-        )
+        # No overrides: `process_wishlist_api` only reads
+        # `runtime.is_wishlist_actually_processing`, which the factory already
+        # supplies. This used to pass `is_auto_processing_flag=`, a keyword the
+        # factory has never accepted — so every call raised TypeError, the broad
+        # `except` below turned it into a 500, and this endpoint had never once
+        # worked. (Upstream #1134.)
+        #
+        # The factory's default is also the better of the two: the dead kwarg
+        # passed the raw `wishlist_auto_processing` global, while
+        # `is_wishlist_actually_processing()` reads that same flag AND requires
+        # its timestamp to be recent, recovering a stuck flag instead of
+        # answering 409 forever.
+        runtime = _build_wishlist_route_runtime()
         payload, status_code = _wishlist_process_api(
             runtime,
             start_processing=lambda: _process_wishlist_automatically(),

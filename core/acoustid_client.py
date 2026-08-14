@@ -173,6 +173,43 @@ def _find_fpcalc() -> Optional[str]:
 CHROMAPRINT_AVAILABLE = False
 FPCALC_PATH = None
 
+# Confidence floor for letting a fingerprint DECIDE metadata (upstream #1132).
+# AcoustID scores run 0..1 and a weak hit is not a wrong answer, it is an
+# uncertain one — an ambiguous fingerprint (short track, heavy compression, a
+# widely-sampled loop) can return a plausible-looking recording at 0.3. Writing
+# that to the file is worse than leaving the tags alone, because it looks
+# authoritative afterwards. 0.8 matches the bar `auto_import_worker` already
+# applies to metadata-match confidence, so the two agree on what "identified"
+# means. Verification code that COMPARES a fingerprint against known-expected
+# metadata deliberately does NOT use this floor — a low score is still evidence
+# there, it just isn't grounds to invent a title.
+MIN_IDENTIFY_SCORE = 0.8
+
+
+def best_recording(lookup: Optional[Dict[str, Any]],
+                   min_score: float = MIN_IDENTIFY_SCORE) -> Optional[Dict[str, Any]]:
+    """The highest-scoring recording from a lookup, or None when nothing clears
+    ``min_score``.
+
+    Callers used ``result['recordings'][0]`` directly, which was wrong twice
+    over: index 0 was API order rather than best (fixed at the source in
+    ``lookup_with_status``), and nothing checked the score at all. Declining is
+    a real answer — the caller keeps whatever tags the file already had.
+    """
+    recordings = (lookup or {}).get('recordings') or []
+    if not recordings:
+        return None
+    best = max(recordings, key=lambda r: r.get('score') or 0.0)
+    score = best.get('score') or 0.0
+    if score < min_score:
+        logger.info(
+            "AcoustID declined: best match '%s' by '%s' scored %.2f, below the %.2f "
+            "confidence floor — leaving existing metadata alone",
+            best.get('title'), best.get('artist'), score, min_score,
+        )
+        return None
+    return best
+
 if ACOUSTID_AVAILABLE:
     # Try to find or download fpcalc
     FPCALC_PATH = _find_fpcalc()
@@ -411,6 +448,15 @@ class AcoustIDClient:
                 logger.info(f"No AcoustID matches found for: {audio_file}")
                 return {'status': 'no_match', 'recordings': [], 'best_score': best_score,
                         'recording_mbids': [], 'error': 'Track not found in AcoustID database'}
+
+            # Best first. The loop above appends in whatever order the API
+            # returned, while tracking `best_score` in a separate variable — so
+            # `recordings[0]` was "whichever AcoustID happened to list first",
+            # and every caller that reads index 0 believes it is reading the
+            # best. That is upstream #1132's "variants were listed first": a
+            # remix, a live cut or a compilation entry sitting ahead of the
+            # actual recording, and its metadata written to the file.
+            recordings.sort(key=lambda r: r.get('score') or 0.0, reverse=True)
 
             logger.info(f"AcoustID found {len(recordings)} recording(s) (best score: {best_score:.2f})")
             return {'status': 'ok', 'recordings': recordings, 'best_score': best_score,

@@ -1150,8 +1150,12 @@ class AutoImportWorker:
             from core.acoustid_client import AcoustIDClient
             client = AcoustIDClient()
             fp_result = client.fingerprint_and_lookup(file_path)
-            if fp_result and fp_result.get('recordings'):
-                best = fp_result['recordings'][0]
+            # Highest-scoring recording, and only if it clears the confidence
+            # floor — `recordings[0]` was API order, not best, and had no floor
+            # at all (upstream #1132).
+            from core.acoustid_client import best_recording
+            best = best_recording(fp_result)
+            if best:
                 # AcoustID can return None for artist/title on new releases —
                 # fall back to tag data we already have
                 fp_artist = best.get('artist') or artist
@@ -1403,8 +1407,12 @@ class AutoImportWorker:
         for f in candidate.audio_files[:3]:
             try:
                 result = client.fingerprint_and_lookup(f)
-                if result and result.get('recordings'):
-                    best = result['recordings'][0]
+                # Best-scoring, floor-gated — see the note in
+                # _search_metadata_for_file. Here a wrong guess is worse still:
+                # the artist decides the whole FOLDER's identification.
+                from core.acoustid_client import best_recording
+                best = best_recording(result)
+                if best:
                     if best.get('artist'):
                         identified_artists.append(best['artist'])
                     # Try to get album from recording
