@@ -171,6 +171,45 @@ def register_routes(bp):
             logger.exception("Failed to remove from video watchlist")
             return jsonify({"success": False, "error": "Failed"}), 500
 
+    @bp.route("/watchlist/library", methods=["POST"])
+    def video_watchlist_set_library():
+        """Choose which Library a FOLLOWED show belongs in.
+        Body: ``{tmdb_id, root_folder_id|null}``.
+
+        The wishlist has had this for a while, but a wishlist row is created by
+        the airing automation minutes before the grab — there is no moment at
+        which a person could set one. This is the moment: at follow time, before
+        the show exists anywhere. It matters because the FIRST import decides
+        where a show lives forever — the library scan reads it back from
+        whichever server section it landed in and stamps that onto the show row.
+
+        Metadata only; nothing on disk moves. Restricted to profiles that may
+        acquire, since it redirects where downloads land."""
+        from . import get_video_db
+        if not _may_acquire():
+            return jsonify({"success": False,
+                            "error": "You don't have permission to change download destinations."}), 403
+        body = request.get_json(silent=True) or {}
+        tmdb_id = body.get("tmdb_id")
+        if not tmdb_id:
+            return jsonify({"success": False, "error": "tmdb_id is required"}), 400
+        try:
+            db = get_video_db()
+            rfid = body.get("root_folder_id")
+            # Validate here rather than inferring from the row count — a show
+            # that is followed but has no row to update also reports 0, and
+            # calling that "no such Library" would be a lie.
+            if rfid not in (None, "", "null"):
+                row = db.get_root_folder(rfid)
+                if not row or str(row.get("content_kind") or "") != "show":
+                    return jsonify({"success": False,
+                                    "error": "That Library doesn't exist, or isn't a TV Library"}), 400
+            return jsonify({"success": True,
+                            "updated": db.set_watchlist_root_folder(int(tmdb_id), rfid)})
+        except Exception:
+            logger.exception("Failed to set watchlist library")
+            return jsonify({"success": False, "error": "Failed"}), 500
+
     @bp.route("/watchlist/pending", methods=["GET"])
     def video_watchlist_pending():
         """Follows awaiting approval — all of them for an admin, a member's own

@@ -3484,6 +3484,14 @@ const WHATS_NEW = {
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
     // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
+    '1.9.23': [
+        { date: 'August 2026 · 1.9.23' },
+        { title: 'Fixed: the first download of a new Anime show decided its home — wrongly, and forever', desc: 'diagnosed against your actual library. A show you do not own yet has no library row, so nothing could say which shelf it belonged on: the wishlist entry the airing automation creates carried no Library, resolution found nothing, and it fell back to the <strong>primary</strong> TV Library. It downloaded there, Plex scanned it into TV Shows, and the next library scan stamped that Library onto the show permanently — so every later episode resolved "correctly" to the wrong place. One wrong first grab, cemented.' },
+        { title: 'You can now choose the Library when you FOLLOW a show', desc: 'the wishlist has had a Library picker for a while, but a wishlist row is created by the airing automation minutes before the grab — there was never a moment a person could set one. The watchlist is where the decision can actually be made, weeks ahead, and it was the one link in the chain with nowhere to record it. Choosing a Library also moves any episodes already queued and the show row itself, so a title can never end up split across two shelves.' },
+        { title: 'And every path that queues a download now resolves the Library itself', desc: 'nine code paths create wishlist entries and exactly <strong>one</strong> of them — the manual add — ever passed a Library. The daily airing automation, the watchlist scans, import lists, member requests, the re-queue-on-failure hook and two repair jobs all passed nothing, and nothing meant "primary". That is now resolved inside the add itself, so all nine are fixed at once and the next one cannot forget.' },
+        { title: 'Libraries can declare what kind of show they hold', desc: 'a new <strong>Shows here are…</strong> setting on each TV Library (Settings → Libraries). Series type decides how a release is searched for — anime by absolute number (<code>Show 1071</code>), dailies by air date, everything else by S01E01 — and it was per-show, buried, and in practice never set: <strong>565 of the 571 shows</strong> in your Anime library had no type at all, so their releases were being hunted as standard S01E01. Setting it on the Library applies it to every show there that has no type of its own; a per-show setting always wins.' },
+        { title: 'And the fallback stops being silent', desc: 'landing in the primary Library because nothing said otherwise was an invisible decision — indistinguishable in the log from landing there correctly. It now says so, by name, at the moment it happens.' },
+    ],
     '1.9.22': [
         { date: 'August 2026 · 1.9.22' },
         { title: 'Fixed: a manually matched track could vanish for good', desc: 'when you link a track to a file in your library by hand, SoulSync stores that as a row in a table — and then treated the row\'s <em>existence</em> as proof the file was still there. Delete or move that file and the track entered a closed trap: the download was skipped as "already matched", the wishlist drain removed it as a <strong>success</strong>, and adding it back was silently refused for the same reason. Three separate places, each individually reasonable, together making the song impossible to re-acquire. A match is now checked against the library before it counts, and a match whose id has gone stale is re-resolved by file path rather than thrown away.' },
@@ -3791,6 +3799,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "1.9.23: Anime and TV stop leaking into each other",
+        description: "diagnosed against your real video_library.db. Nothing was mis-filed at rest — the bug fires exactly once per show, on its FIRST download, and the library scan then makes that mistake permanent.",
+        features: [
+            "a show you do not own yet had nowhere to record which Library it belongs to — the watchlist had no such field, so every new show's first grab went to the primary TV Library",
+            "new Library picker when you follow a show, which also moves anything already queued and the show row, so a title can't be split across two shelves",
+            "all nine wishlist-creating paths now resolve the Library themselves (only the manual add ever passed one; the airing automation — the one that matters — did not)",
+            "new per-Library 'Shows here are…' default series type: 565 of the 571 shows in your Anime library had none, so their releases were searched as standard S01E01 instead of by absolute number",
+            "falling back to the primary Library is now logged by name instead of being silent",
+        ],
+        usage_note: "Set 'Shows here are… anime' on your Anime library in Settings → Libraries and save — it applies to every show already there that has no type of its own, immediately. Shows already filed on the wrong shelf are not moved: this stops it happening again, and a show's Library can be corrected from its detail page.",
+    },
     {
         title: "1.9.22: four more fixes adapted from upstream 3.2.0",
         description: "the remaining tier of that release, each one checked against this fork's code before being taken. Four of the eight were already fixed here or never applied; one was left deliberately.",

@@ -474,6 +474,16 @@ def _root_folder_for_item(item: Dict[str, Any]) -> Optional[dict]:
     return get_video_db().get_root_folder(rfid)
 
 
+def _item_label(item: Dict[str, Any]) -> str:
+    """Best human name for an item, for logging. Episode rows carry the show
+    under ``show_title``; movies use ``title``."""
+    for key in ("show_title", "title", "episode_title"):
+        val = (item or {}).get(key)
+        if val:
+            return str(val)
+    return "?"
+
+
 def _item_target_dir(item: Dict[str, Any], fallback: str) -> str:
     """Per-item grab destination (multi-library #1105): an item already
     filed under a Library (an existing show/movie's ``root_folder_id``)
@@ -485,6 +495,18 @@ def _item_target_dir(item: Dict[str, Any], fallback: str) -> str:
     root_folder = _root_folder_for_item(item)
     if root_folder and root_folder.get("path"):
         return root_folder["path"]
+    # Falling back is a DECISION, and it used to be an invisible one. Nothing
+    # said which Library a grab chose or why, so a show landing in the primary
+    # TV Library because no one had ever told it otherwise looked exactly like
+    # a show landing there correctly — and once it imported, the next library
+    # scan stamped that Library onto the show row and made it permanent. Say it
+    # out loud, once, at the moment it happens.
+    logger.info(
+        "[Library] '%s' has no Library of its own — falling back to the primary "
+        "(%s). If that is the wrong shelf, set one on its watchlist/wishlist row "
+        "BEFORE it grabs: the first import decides where the show lives from then on.",
+        _item_label(item), fallback,
+    )
     return fallback
 
 

@@ -186,7 +186,7 @@
     // Library (checked, with a rename + destination folder + torrent category).
     // Text inputs stay hidden until checked, and only fire save() on 'change'
     // (blur), never per keystroke, so typing a path never fights a re-render.
-    function libraryRow(title, configured) {
+    function libraryRow(title, configured, kind) {
         var row = document.createElement('div');
         row.className = 'library-editor-row';
         row.dataset.serverTitle = title;
@@ -241,6 +241,36 @@
         indexerIdsInput.value = (configured && configured.preferred_indexer_ids) || '';
         indexerIdsInput.setAttribute('data-lib-indexer-ids', '');
         fields.appendChild(indexerIdsInput);
+
+        // Default series type — TV libraries only (a film has no episode
+        // numbering). series_type decides how a release is SEARCHED for: anime
+        // by absolute number ('Show 1071'), dailies by air date, everything
+        // else by SxxExx. It was per-show and buried, so in practice it went
+        // unset — on the library this was built for, 565 of 571 shows in a
+        // Library called "Anime" had no type, and were all being hunted as
+        // standard SxxExx. A Library that exists to hold anime already knows.
+        // Applies only to shows here that have no type of their OWN.
+        if (kind === 'tv') {
+            var stWrap = document.createElement('label');
+            stWrap.className = 'library-series-type';
+            stWrap.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:6px;font-size:12px;opacity:.85';
+            stWrap.appendChild(document.createTextNode('Shows here are'));
+            var stSel = document.createElement('select');
+            stSel.setAttribute('data-lib-series-type', '');
+            stSel.title = 'Applied to shows in this Library that have no series type of their own. '
+                        + 'Changes how releases are SEARCHED for, not where they are stored.';
+            [['', 'not assumed to be anything'],
+             ['standard', 'standard (S01E01)'],
+             ['daily', 'daily (by air date)'],
+             ['anime', 'anime (absolute numbering)']].forEach(function (o) {
+                var opt = document.createElement('option');
+                opt.value = o[0]; opt.textContent = o[1];
+                stSel.appendChild(opt);
+            });
+            stSel.value = (configured && configured.default_series_type) || '';
+            stWrap.appendChild(stSel);
+            fields.appendChild(stWrap);
+        }
 
         // A VISIBLE label and explanation, not a tooltip on the input. The input
         // is switched to type=hidden as soon as the checkbox picker renders, and
@@ -323,7 +353,7 @@
         });
     }
 
-    function fill(group, items, configured) {
+    function fill(group, items, configured, kind) {
         if (!group) return;
         group.textContent = '';
         items = items || [];
@@ -333,11 +363,11 @@
         }
         var seen = {};
         (configured || []).forEach(function (c) {
-            group.appendChild(libraryRow(c.server_title, c));
+            group.appendChild(libraryRow(c.server_title, c, kind));
             seen[c.server_title] = true;
         });
         items.forEach(function (it) {
-            if (!seen[it.title]) group.appendChild(libraryRow(it.title, null));
+            if (!seen[it.title]) group.appendChild(libraryRow(it.title, null, kind));
         });
     }
 
@@ -359,7 +389,11 @@
                 label: labelInput ? labelInput.value.trim() : '',
                 path: pathInput ? pathInput.value.trim() : '',
                 category: categoryInput ? categoryInput.value.trim() : '',
-                preferred_indexer_ids: indexerIdsInput ? indexerIdsInput.value.trim() : ''
+                preferred_indexer_ids: indexerIdsInput ? indexerIdsInput.value.trim() : '',
+                default_series_type: (function () {
+                    var el = row.querySelector('[data-lib-series-type]');
+                    return el ? el.value : '';
+                })()
             });
         }
         return out;
@@ -392,8 +426,8 @@
             .then(function (d) {
                 if (!d || d.error) { status('Could not load libraries'); return; }
                 var cfg = d.configured || {};
-                fill(document.querySelector('[data-video-lib-group="movies"]'), d.movies || [], cfg.movies);
-                fill(document.querySelector('[data-video-lib-group="tv"]'), d.tv || [], cfg.tv);
+                fill(document.querySelector('[data-video-lib-group="movies"]'), d.movies || [], cfg.movies, 'movies');
+                fill(document.querySelector('[data-video-lib-group="tv"]'), d.tv || [], cfg.tv, 'tv');
                         status('');
                 probeLibraries();
             })

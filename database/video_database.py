@@ -423,6 +423,22 @@ _COLUMN_MIGRATIONS = [
     ("video_watchlist", "requested_by", "INTEGER"),
     ("video_watchlist", "requested_by_name", "TEXT"),
     ("video_watchlist", "monitor", "TEXT"),
+    # The Library a FOLLOWED show is destined for, chosen when you followed it.
+    # The wishlist gained this column already, but a wishlist row is created by
+    # the airing automation moments before the grab — far too late to ask the
+    # user where it goes. The watchlist is where the decision can actually be
+    # made in advance, and it was the only link in the chain with nowhere to
+    # record it: a show you do not own yet has no movies/shows row to inherit
+    # from, so every first grab of a new show landed in the PRIMARY Library,
+    # was scanned back in from there, and had that mistake stamped onto its
+    # shows row permanently. NULL keeps today's behaviour exactly.
+    ("video_watchlist", "root_folder_id", "INTEGER"),
+    # Default series type for shows filed into this Library ('standard' |
+    # 'daily' | 'anime'; NULL = no default). series_type drives how a release is
+    # SEARCHED for — anime by absolute number, dailies by air date — and it had
+    # to be set per show, by hand, on a field most users never find. A Library
+    # that exists specifically to hold anime already knows the answer.
+    ("root_folders", "default_series_type", "TEXT"),
 ]
 
 
@@ -3222,14 +3238,15 @@ class VideoDatabase:
         """Every configured library for this server, full detail (for the
         Settings editor + the Library page's tab bar).
         {"movies": [...], "tv": [...]} — each entry:
-        {id, server_title, label, path, sort_order, category, preferred_indexer_ids}."""
+        {id, server_title, label, path, sort_order, category, preferred_indexer_ids,
+        default_series_type}."""
         conn = self._get_connection()
         try:
             self._migrate_legacy_libraries(conn, server)
             out = {}
             for ui_kind, content_kind in self._LIB_KIND.items():
                 rows = conn.execute(
-                    "SELECT id, server_title, label, path, sort_order, category, preferred_indexer_ids "
+                    "SELECT id, server_title, label, path, sort_order, category, preferred_indexer_ids, default_series_type "
                     "FROM root_folders WHERE server=? AND content_kind=? ORDER BY sort_order, id",
                     (server, content_kind)).fetchall()
                 out[ui_kind] = [dict(r) for r in rows]
@@ -3283,19 +3300,26 @@ class VideoDatabase:
                     path = str(e.get("path") or "").strip()
                     category = str(e.get("category") or "").strip() or None
                     preferred_indexer_ids = _norm_indexer_ids(e.get("preferred_indexer_ids"))
+                    # Only meaningful for show Libraries; a movie has no series type.
+                    dst = str(e.get("default_series_type") or "").strip().lower()
+                    if content_kind != "show" or dst not in ("standard", "daily", "anime"):
+                        dst = None
                     eid = e.get("id")
                     if eid:
                         conn.execute(
                             "UPDATE root_folders SET server_title=?, label=?, path=?, sort_order=?, category=?, "
-                            "preferred_indexer_ids=? WHERE id=? AND server=? AND content_kind=?",
-                            (title, label, path, i, category, preferred_indexer_ids,
+                            "preferred_indexer_ids=?, default_series_type=? "
+                            "WHERE id=? AND server=? AND content_kind=?",
+                            (title, label, path, i, category, preferred_indexer_ids, dst,
                              int(eid), server, content_kind))
                         keep_ids.add(int(eid))
                     else:
                         cur = conn.execute(
                             "INSERT INTO root_folders (path, content_kind, server, server_title, label, "
-                            "sort_order, category, preferred_indexer_ids) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                            (path, content_kind, server, title, label, i, category, preferred_indexer_ids))
+                            "sort_order, category, preferred_indexer_ids, default_series_type) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (path, content_kind, server, title, label, i, category,
+                             preferred_indexer_ids, dst))
                         keep_ids.add(cur.lastrowid)
                 existing_ids = {r[0] for r in conn.execute(
                     "SELECT id FROM root_folders WHERE server=? AND content_kind=?",
@@ -3307,6 +3331,11 @@ class VideoDatabase:
             conn.commit()
         finally:
             conn.close()
+        # Apply the (possibly just-changed) Library defaults to shows that have
+        # no series type of their own. Doing it on SAVE rather than only on the
+        # next scan means setting "Anime" on a Library fixes the shows already
+        # in it immediately, which is the whole point of the setting.
+        self.apply_library_default_series_type()
         return self.list_libraries(server)
 
     def root_folder_id_for(self, server: str, kind: str, server_title) -> int | None:
@@ -6778,6 +6807,15 @@ class VideoDatabase:
         """
         if not tmdb_id or not title:
             return False
+        # Resolve the destination Library HERE rather than trusting the caller.
+        # Only ONE of the nine paths that create wishlist rows ever passed this
+        # (the manual add); the airing automation, watchlist scans, import
+        # lists, member requests, the re-wishlist-on-failure hook and two repair
+        # jobs all passed nothing — and nothing meant "primary Library". Doing it
+        # in the adder fixes every caller at once and cannot be forgotten by the
+        # next one. An explicit id still wins.
+        if root_folder_id is None:
+            root_folder_id = self.resolve_destination_library("movie", tmdb_id)
         # NOTE: release_date (the downloadable/home-availability date) is NOT set here — TMDB's
         # primary detail date is theatrical/premiere, which mis-gates cinema-only films. The
         # wishlist drain's availability backfill owns it (digital/physical, or wide-theatrical +
@@ -7079,6 +7117,13 @@ class VideoDatabase:
         Idempotent per (show, season, episode). Returns the count written."""
         if not show_tmdb_id or not show_title or not episodes:
             return 0
+        # See add_movie_to_wishlist — resolved here so every caller benefits.
+        # This is the one that matters most: the daily airing automation is how
+        # episodes of a followed show reach the wishlist, and it passed nothing,
+        # so a new anime show's first episode always went to the primary TV
+        # Library and was cemented there by the next scan.
+        if root_folder_id is None:
+            root_folder_id = self.resolve_destination_library("show", show_tmdb_id)
         conn = self._get_connection()
         n = 0
         try:
@@ -7550,6 +7595,130 @@ class VideoDatabase:
         except sqlite3.Error:
             logger.exception("delete_unlisted_episode_rows failed (show %s)", show_id)
             return 0
+        finally:
+            conn.close()
+
+    def apply_library_default_series_type(self, root_folder_id=None) -> int:
+        """Give shows the series type their Library says they are.
+
+        ``series_type`` decides how a release is SEARCHED for — anime by
+        absolute number ('Show 1071'), dailies by air date, everything else by
+        SxxExx. It is per-show, and in practice almost nobody sets it: on the
+        library this was written for, 565 of 571 shows in a Library literally
+        named "Anime" had it unset, so their releases were being hunted as
+        standard SxxExx.
+
+        A Library that exists to hold anime already knows the answer, so this
+        applies its ``default_series_type`` to every show filed there whose own
+        type is UNSET. Only unset ones — a type set by hand, or detected per
+        show, is a deliberate statement and outranks a Library-wide default.
+
+        Idempotent, and safe to run after every scan. ``root_folder_id`` limits
+        it to one Library (used when that Library's default has just changed);
+        None does all of them. Returns rows changed."""
+        conn = self._get_connection()
+        try:
+            sql = ("UPDATE shows SET series_type = ("
+                   "  SELECT rf.default_series_type FROM root_folders rf"
+                   "  WHERE rf.id = shows.root_folder_id) "
+                   "WHERE COALESCE(shows.series_type,'') = '' "
+                   "  AND shows.root_folder_id IS NOT NULL "
+                   "  AND EXISTS (SELECT 1 FROM root_folders rf WHERE rf.id = shows.root_folder_id "
+                   "              AND COALESCE(rf.default_series_type,'') <> '')")
+            params = ()
+            if root_folder_id is not None:
+                sql += " AND shows.root_folder_id = ?"
+                params = (int(root_folder_id),)
+            cur = conn.execute(sql, params)
+            conn.commit()
+            if cur.rowcount:
+                logger.info("[Library] applied the Library default series type to %s show(s)",
+                            cur.rowcount)
+            return cur.rowcount
+        except (sqlite3.Error, ValueError, TypeError):
+            logger.exception("apply_library_default_series_type failed (%s)", root_folder_id)
+            return 0
+        finally:
+            conn.close()
+
+    def set_watchlist_root_folder(self, tmdb_id, root_folder_id) -> int:
+        """Direct a FOLLOWED show at a specific Library, before it exists at all.
+
+        ``set_wishlist_root_folder`` writes the decision onto wishlist rows — but
+        those are created by the airing automation moments before the grab, so
+        there is no point at which a human could realistically set one. The
+        watchlist is where you actually make the choice: at follow time, weeks
+        before the first episode airs.
+
+        Shows only (the watchlist also holds people and channels, which have no
+        destination of their own). Returns rows changed; 0 for an unknown
+        Library or one that isn't a show Library."""
+        if not tmdb_id:
+            return 0
+        rid = None
+        if root_folder_id not in (None, "", "null"):
+            try:
+                rid = int(root_folder_id)
+            except (TypeError, ValueError):
+                return 0
+            row = self.get_root_folder(rid)
+            if not row or str(row.get("content_kind") or "") != "show":
+                return 0
+        conn = self._get_connection()
+        try:
+            cur = conn.execute(
+                "UPDATE video_watchlist SET root_folder_id=? WHERE kind='show' AND tmdb_id=?",
+                (rid, int(tmdb_id)))
+            # Keep the wishlist and the library row in step, exactly as
+            # set_wishlist_root_folder does — otherwise choosing a Library on the
+            # watchlist would leave episodes already queued heading elsewhere.
+            # Clearing does NOT cascade: 'Default' means 'inherit', and wiping
+            # the others would unassign a title nobody asked to touch.
+            if rid is not None:
+                conn.execute(
+                    "UPDATE video_wishlist SET root_folder_id=? WHERE kind='episode' AND tmdb_id=?",
+                    (rid, int(tmdb_id)))
+                conn.execute("UPDATE shows SET root_folder_id=? WHERE tmdb_id=?",
+                             (rid, int(tmdb_id)))
+            conn.commit()
+            return cur.rowcount
+        except (sqlite3.Error, ValueError, TypeError):
+            logger.exception("set_watchlist_root_folder failed (%s)", tmdb_id)
+            return 0
+        finally:
+            conn.close()
+
+    def resolve_destination_library(self, kind: str, tmdb_id) -> int | None:
+        """The Library a title should be filed into, for a caller that has only a
+        tmdb id — the single answer every wishlist-creating path needs.
+
+        Order: the title's own library row (it already lives somewhere, so keep
+        it there), else — for shows — the Library chosen when you FOLLOWED it.
+        None when nothing has an opinion, which callers treat as 'use primary'.
+
+        The library row wins over the watchlist choice deliberately: once a show
+        is on disk, moving new episodes somewhere else would split it in two,
+        and the fix for a genuinely wrong Library is to reassign the show (which
+        ``set_watchlist_root_folder`` does to all three tables at once)."""
+        owned = self.root_folder_id_for_tmdb(kind, tmdb_id)
+        if owned:
+            return owned
+        if str(kind or "").lower() != "show" or tmdb_id is None:
+            return None
+        try:
+            tmdb_id = int(tmdb_id)
+        except (TypeError, ValueError):
+            return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT root_folder_id FROM video_watchlist "
+                "WHERE kind='show' AND tmdb_id=? AND root_folder_id IS NOT NULL LIMIT 1",
+                (tmdb_id,)).fetchone()
+            return row["root_folder_id"] if row else None
+        except sqlite3.Error:
+            logger.exception("resolve_destination_library failed (%s %s)", kind, tmdb_id)
+            return None
         finally:
             conn.close()
 
