@@ -1,8 +1,18 @@
 name: Build and Push Docker Image
 
+# Publishes to GitHub Container Registry (GHCR), not Docker Hub. Auth is the
+# built-in GITHUB_TOKEN via the `packages: write` permission below — there are
+# no DOCKERHUB_* secrets to keep alive.
+#
+# ONE-TIME SETUP after the first successful run: the package is created PRIVATE
+# and `docker pull` will fail for everyone until it is made public. Flip it at
+# github.com/users/ThyMrMan/packages/container/soul-sync-custom/settings →
+# "Change visibility" → Public. GITHUB_TOKEN cannot do this, so no workflow step
+# can automate it.
+
 on:
-  # MANUAL ONLY. There is deliberately no `push:` trigger — publishing to Docker
-  # Hub is a release decision, not something every commit to main should do.
+  # MANUAL ONLY. There is deliberately no `push:` trigger — publishing an image
+  # is a release decision, not something every commit to main should do.
   # Run it from Actions → "Build and Push Docker Image" → Run workflow.
   workflow_dispatch:
     inputs:
@@ -24,6 +34,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
+      # GHCR rejects uppercase path segments, and the owner here is "ThyMrMan".
       - name: Set lowercase owner
         run: echo "OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
 
@@ -33,11 +44,28 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Log in to Docker Hub
+      - name: Log in to GHCR
         uses: docker/login-action@v4
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Generates both the tag list and the OCI labels. The label that matters is
+      # org.opencontainers.image.source — without it the GHCR package page is an
+      # orphan that never links back to this repo or inherits its README.
+      - name: Derive tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        env:
+          # Annotate the multi-arch manifest index too, not just the per-arch
+          # children, so the package page reads correctly for a multi-platform build.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+        with:
+          images: ghcr.io/${{ env.OWNER }}/soul-sync-custom
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ inputs.version_tag }},enable=${{ inputs.version_tag != '' }}
 
       - name: Build and push
         uses: docker/build-push-action@v7
@@ -50,6 +78,6 @@ jobs:
           cache-to: type=gha,mode=max
           build-args: |
             COMMIT_SHA=${{ github.sha }}
-          tags: |
-            thymrman/soul-sync-custom:latest
-            ${{ inputs.version_tag != '' && format('thymrman/soul-sync-custom:{0}', inputs.version_tag) || '' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
