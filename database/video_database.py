@@ -6630,6 +6630,10 @@ class VideoDatabase:
                 "s.id AS library_id, s.status, "
                 "(s.poster_url IS NOT NULL AND s.poster_url <> '') AS lib_has_poster, "
                 "w.approved, w.requested_by, w.requested_by_name, w.monitor, "
+                # The Library this follow is aimed at — the card's picker renders
+                # its CURRENT state from this, and a control that cannot show what
+                # it is set to reads as if it were never set.
+                "w.root_folder_id, "
                 + self._EPS_COLS +
                 " FROM video_watchlist w LEFT JOIN shows s ON s.id = COALESCE("
                 "(SELECT s1.id FROM shows s1 WHERE s1.id = w.library_id), "
@@ -6670,6 +6674,12 @@ class VideoDatabase:
                         "poster_url": "/api/video/poster/show/%d" % r["library_id"],
                         "library_id": r["library_id"], "status": r["status"],
                         "episode_count": r["episode_count"], "owned_count": r["owned_count"],
+                        # No watchlist row exists for this arm, so there is no
+                        # recorded intent — carried as None rather than omitted so
+                        # every show row has the same shape. These all have a
+                        # library_id anyway: the show is already filed, and its
+                        # detail page reassigns it for real.
+                        "root_folder_id": None,
                         "date_added": None, "auto": True})
         return out
 
