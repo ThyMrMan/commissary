@@ -23,7 +23,7 @@ on:
 
 jobs:
   build-and-push:
-    if: github.repository == 'ThyMrMan/soul-sync-thymrman-customized'
+    if: github.repository == 'ThyMrMan/commissary'
     runs-on: ubuntu-latest
 
     permissions:

@@ -36,18 +36,18 @@ Create `/boot/config/plugins/dockerMan/templates-user/commissary.xml`:
 <Container version="2">
   <Name>Commissary</Name>
   <Repository>ghcr.io/thymrman/commissary:latest</Repository>
-  <Registry>https://github.com/ThyMrMan/soul-sync-thymrman-customized/pkgs/container/commissary</Registry>
+  <Registry>https://github.com/ThyMrMan/commissary/pkgs/container/commissary</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>bash</Shell>
   <Privileged>false</Privileged>
-  <Support>https://github.com/ThyMrMan/soul-sync-thymrman-customized/issues</Support>
-  <Project>https://github.com/ThyMrMan/soul-sync-thymrman-customized</Project>
+  <Support>https://github.com/ThyMrMan/commissary/issues</Support>
+  <Project>https://github.com/ThyMrMan/commissary</Project>
   <Overview>Automated music and video discovery and collection manager. Sync Spotify/Tidal/YouTube playlists to Plex/Jellyfin via Soulseek, and manage Movies/TV/YouTube through Prowlarr.</Overview>
   <Category>MediaApp:Music MediaApp:Video</Category>
   <WebUI>http://[IP]:[PORT:8008]</WebUI>
   <TemplateURL/>
-  <Icon>https://raw.githubusercontent.com/ThyMrMan/soul-sync-thymrman-customized/main/templates/commissary.png</Icon>
+  <Icon>https://raw.githubusercontent.com/ThyMrMan/commissary/main/templates/commissary.png</Icon>
   <ExtraParams>--restart unless-stopped</ExtraParams>
   <PostArgs/>
   <CPUset/>

@@ -1627,7 +1627,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="ts-reporting">
                 <h3 class="docs-subsection-title">Reporting Issues</h3>
-                <p class="docs-text">Report Commissary bugs on <a href="https://github.com/ThyMrMan/soul-sync-thymrman-customized/issues" target="_blank">this fork's GitHub Issues</a> &mdash; not upstream, which cannot reproduce changes made here. Include:</p>
+                <p class="docs-text">Report Commissary bugs on <a href="https://github.com/ThyMrMan/commissary/issues" target="_blank">this fork's GitHub Issues</a> &mdash; not upstream, which cannot reproduce changes made here. Include:</p>
                 <ol class="docs-list">
                     <li><strong>Debug info snapshot</strong> &mdash; Click <strong>Copy Debug Info</strong> in the Help sidebar and paste the output</li>
                     <li><strong>Steps to reproduce</strong> &mdash; What you did, what you expected, what happened instead</li>
@@ -3210,7 +3210,7 @@ function initializeDocsPage() {
                 } else {
                     text += '(no log lines)\n';
                 }
-                text += '\n---\nPaste this output into your GitHub issue at https://github.com/ThyMrMan/soul-sync-thymrman-customized/issues\n';
+                text += '\n---\nPaste this output into your GitHub issue at https://github.com/ThyMrMan/commissary/issues\n';
 
                 // Copy to clipboard — navigator.clipboard requires HTTPS/localhost,
                 // so fall back to execCommand for Docker/LAN HTTP access

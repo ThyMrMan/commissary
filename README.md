@@ -10,7 +10,7 @@
 
 > **Before you start:** configure file sharing in slskd or you will be banned from Soulseek. Set up shared folders at `http://localhost:5030/shares`.
 
-**Support**: [GitHub Issues on this repo](https://github.com/ThyMrMan/soul-sync-thymrman-customized/issues)
+**Support**: [GitHub Issues on this repo](https://github.com/ThyMrMan/commissary/issues)
 
 ---
 
@@ -21,7 +21,7 @@ Commissary began as a private customization of SoulSync 3.1.5 and has diverged s
 | | |
 |---|---|
 | **Upstream** | [Nezreka/SoulSync](https://github.com/Nezreka/SoulSync) — the original project, its Discord, and its `ssync.net` site. All of the credit for the foundation, and none of the blame for anything below. |
-| **This fork** | [ThyMrMan/soul-sync-thymrman-customized](https://github.com/ThyMrMan/soul-sync-thymrman-customized), published as `ghcr.io/thymrman/commissary`. |
+| **This fork** | [ThyMrMan/commissary](https://github.com/ThyMrMan/commissary), published as `ghcr.io/thymrman/commissary`. |
 | **Versioning** | Independent. Commissary reset to `1.0.0` at the fork point and is now **2.0.0** — the release that took the name. Upstream's numbering (3.x) is unrelated, and the in-app update check points here, not there. |
 | **Upstream fixes** | Pulled in selectively. Everything through SoulSync **3.1.8** was cherry-picked (released here as 1.6.0), and individually-triaged fixes from **3.2.0** landed in 1.9.19 and 1.9.22. |
 | **Upstream features** | Not automatically adopted. SoulSync 3.2.0 is largely a React rewrite that deletes the vanilla-JS pages this fork has customized most heavily, so it is deliberately not followed. |
@@ -103,7 +103,7 @@ Published to **GitHub Container Registry** as `ghcr.io/thymrman/commissary`, man
 ### Docker (recommended)
 
 ```bash
-curl -O https://raw.githubusercontent.com/ThyMrMan/soul-sync-thymrman-customized/main/docker-compose.yml
+curl -O https://raw.githubusercontent.com/ThyMrMan/commissary/main/docker-compose.yml
 docker-compose up -d
 # Access at http://localhost:8008
 ```
@@ -123,7 +123,7 @@ docker pull ghcr.io/thymrman/commissary:2.0.0
 Install the template from:
 
 ```
-https://raw.githubusercontent.com/ThyMrMan/soul-sync-thymrman-customized/main/templates/commissary.xml
+https://raw.githubusercontent.com/ThyMrMan/commissary/main/templates/commissary.xml
 ```
 
 PUID/PGID are exposed — set them to match your Unraid permissions (default 99/100 for nobody/users). See [Support/UNRAID.md](Support/UNRAID.md) for the full guide.
@@ -131,8 +131,8 @@ PUID/PGID are exposed — set them to match your Unraid permissions (default 99/
 ### Python (no Docker)
 
 ```bash
-git clone https://github.com/ThyMrMan/soul-sync-thymrman-customized
-cd soul-sync-thymrman-customized
+git clone https://github.com/ThyMrMan/commissary
+cd commissary
 python -m pip install -r requirements.txt
 
 # Build the React WebUI bundle the Python server serves.

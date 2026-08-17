@@ -2,19 +2,19 @@
 <Container version="2">
   <Name>Commissary</Name>
   <Repository>ghcr.io/thymrman/commissary:latest</Repository>
-  <Registry>https://github.com/ThyMrMan/soul-sync-thymrman-customized/pkgs/container/commissary</Registry>
+  <Registry>https://github.com/ThyMrMan/commissary/pkgs/container/commissary</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>bash</Shell>
   <Privileged>false</Privileged>
-  <Support>https://github.com/ThyMrMan/soul-sync-thymrman-customized/issues</Support>
-  <Project>https://github.com/ThyMrMan/soul-sync-thymrman-customized</Project>
-  <ReadMe>https://github.com/ThyMrMan/soul-sync-thymrman-customized/blob/main/README.md</ReadMe>
+  <Support>https://github.com/ThyMrMan/commissary/issues</Support>
+  <Project>https://github.com/ThyMrMan/commissary</Project>
+  <ReadMe>https://github.com/ThyMrMan/commissary/blob/main/README.md</ReadMe>
   <Overview>Music AND video discovery and automation platform, a fork of SoulSync by Nezreka. Find new music, curate playlists, sync libraries, and manage Movies, TV and YouTube alongside them — with multi-user profiles, per-user request approval and multiple libraries per content kind. Integrates with Soulseek (slskd), Prowlarr, the streaming services, and Plex / Jellyfin / Navidrome.</Overview>
   <Category>MediaApp:Music MediaApp:Video</Category>
   <WebUI>http://[IP]:[PORT:8008]</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/ThyMrMan/soul-sync-thymrman-customized/main/templates/commissary.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/ThyMrMan/soul-sync-thymrman-customized/main/templates/commissary.png</Icon>
+  <TemplateURL>https://raw.githubusercontent.com/ThyMrMan/commissary/main/templates/commissary.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/ThyMrMan/commissary/main/templates/commissary.png</Icon>
   <ExtraParams/>
   <PostArgs/>
   <CPUset/>

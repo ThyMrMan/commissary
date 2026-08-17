@@ -62,7 +62,7 @@ class MusicBrainzClient:
     # MusicBrainz mandates a meaningful User-Agent with contact info. Falling back
     # to a bare name/version risks IP blocking under load — include the project
     # URL so MB operators have a way to reach us if we misbehave.
-    DEFAULT_CONTACT = "https://github.com/ThyMrMan/soul-sync-thymrman-customized"
+    DEFAULT_CONTACT = "https://github.com/ThyMrMan/commissary"
 
     def __init__(self, app_name: str = "Commissary", app_version: str = "1.0", contact_email: str = ""):
         """

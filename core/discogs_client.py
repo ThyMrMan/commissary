@@ -378,7 +378,7 @@ class DiscogsClient:
 
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Commissary/2.2 +https://github.com/ThyMrMan/soul-sync-thymrman-customized',
+            'User-Agent': 'Commissary/2.2 +https://github.com/ThyMrMan/commissary',
             'Accept': 'application/json',
         })
 

@@ -6,8 +6,8 @@ Complete guide to running Commissary in Docker with persistent data and proper c
 
 ```bash
 # Clone the repository
-git clone https://github.com/ThyMrMan/soul-sync-thymrman-customized
-cd soul-sync-thymrman-customized
+git clone https://github.com/ThyMrMan/commissary
+cd commissary
 
 # Start the container
 docker-compose up -d

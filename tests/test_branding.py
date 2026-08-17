@@ -91,3 +91,40 @@ def test_standalone_server_value_is_unchanged():
 def test_compose_and_workflow_agree_on_the_image_name():
     assert "ghcr.io/thymrman/commissary:latest" in _read("docker-compose.yml")
     assert "/commissary" in _read(".github/workflows/docker-publish.yml")
+
+
+def test_publish_guard_matches_the_repo_the_remote_points_at():
+    """The publish job is gated on `github.repository == '<owner>/<repo>'`.
+    That string has to track the repo's ACTUAL name, and when it doesn't the
+    job SKIPS — which reads as a green run that published nothing. Exactly how
+    the 2.0.0 publish failed: renaming the repo to ThyMrMan/commissary left the
+    guard naming soul-sync-thymrman-customized, and the run went green in 12s.
+
+    Checked against git's own origin URL rather than a second hardcoded copy,
+    so renaming the repo and updating the remote is enough to keep this honest.
+    """
+    import re
+    import subprocess
+
+    try:
+        url = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=10,
+            cwd=REPO, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        import pytest
+        pytest.skip("no git/origin available (shallow CI checkout or tarball)")
+
+    m = re.search(r"github\.com[:/]([^/]+/[^/\s]+?)(?:\.git)?$", url)
+    assert m, f"could not parse an owner/repo out of origin: {url}"
+    remote_repo = m.group(1)
+
+    workflow = _read(".github/workflows/docker-publish.yml")
+    guard = re.search(r"if:\s*github\.repository\s*==\s*'([^']+)'", workflow)
+    assert guard, "the publish job lost its repository guard"
+    # GitHub Actions compares strings case-insensitively; match that.
+    assert guard.group(1).lower() == remote_repo.lower(), (
+        f"publish guard names {guard.group(1)!r} but origin is {remote_repo!r} "
+        "— the job would skip and publish nothing"
+    )
