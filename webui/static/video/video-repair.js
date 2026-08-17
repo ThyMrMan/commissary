@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video Library Maintenance (Tools page).
+ * Commissary — Video Library Maintenance (Tools page).
  *
  * The music repair UI, video-scoped — SAME card DOM as enrichment.js's
  * loadRepairJobs/loadRepairFindings/loadRepairHistory so the shared .repair-*
@@ -575,7 +575,7 @@
             '<div class="vrf-show-info">' +
                 '<div class="vrf-show-title">' + esc(d.title || '?') + '</div>' +
                 '<div class="vrf-chips">' + chips + '</div>' +
-                '<p class="vrf-show-overview">SoulSync downloaded this episode but the file is gone ' +
+                '<p class="vrf-show-overview">Commissary downloaded this episode but the file is gone ' +
                     '(' + esc(d.dest_path || 'no path recorded') + '). Approving marks it deleted — ' +
                     'the badge clears and it will NOT be re-downloaded. Files are never touched.</p>' +
                 '<div class="vrf-actions">' + actions + '</div>' +
@@ -1316,7 +1316,7 @@
                         body: JSON.stringify({ name: rs.getAttribute('data-vbk-restore') }) })
                         .then(function (r) { return r.json(); })
                         .then(function (d) {
-                            if (d && d.success) { if (typeof showToast === 'function') showToast('Restore staged — restart SoulSync to apply', 'success'); loadBackups(); }
+                            if (d && d.success) { if (typeof showToast === 'function') showToast('Restore staged — restart Commissary to apply', 'success'); loadBackups(); }
                             else if (typeof showToast === 'function') showToast((d && d.error) || 'Could not stage the restore', 'error');
                         })
                         .catch(function () { /* toast skipped */ });

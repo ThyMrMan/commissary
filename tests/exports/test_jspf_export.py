@@ -65,8 +65,8 @@ def test_optional_fields_omitted_when_absent():
 
 
 def test_creator_and_title_defaults():
-    jspf, summary = build_jspf("", [], creator="SoulSync")
-    assert jspf["playlist"]["title"] == "SoulSync Export"  # blank -> default
-    assert jspf["playlist"]["creator"] == "SoulSync"
+    jspf, summary = build_jspf("", [], creator="Commissary")
+    assert jspf["playlist"]["title"] == "Commissary Export"  # blank -> default
+    assert jspf["playlist"]["creator"] == "Commissary"
     assert jspf["playlist"]["track"] == []
     assert summary == {"total": 0, "included": 0, "skipped": 0}

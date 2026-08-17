@@ -2,7 +2,7 @@
 
 Phase 0 of the Discover-to-Sync unification. Each external playlist
 provider (Spotify, Tidal, Qobuz, YouTube, Spotify public, iTunes link,
-ListenBrainz, Last.fm radio, SoulSync Discovery) gets an adapter that
+ListenBrainz, Last.fm radio, Commissary Discovery) gets an adapter that
 exposes the same ``PlaylistSource`` Protocol, so callers no longer have
 to branch on ``source`` string with an if/elif chain.
 

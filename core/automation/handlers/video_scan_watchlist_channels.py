@@ -1,6 +1,6 @@
 """Automation handler: ``video_scan_watchlist_channels`` action.
 
-The "what's new from the channels I follow" scan — the piece that lets SoulSync replace
+The "what's new from the channels I follow" scan — the piece that lets Commissary replace
 ytdl-sub-style YouTube auto-downloaders. For every YouTube channel on the video watchlist,
 look at its recent uploads and wishlist the new long-form videos the user doesn't already
 have, so the (future) fulfillment engine can grab them.

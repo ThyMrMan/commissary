@@ -141,7 +141,7 @@ def _publish_atomic_album(batch_id: str, batch: dict, deps=None) -> None:
 def _cleanup_private_album_bundle_staging(batch_id: str, batch: dict) -> None:
     """Best-effort cleanup for album-bundle private staging copies.
 
-    Fires when a batch reaches a terminal state. SoulSync's per-batch
+    Fires when a batch reaches a terminal state. Commissary's per-batch
     copy lives at ``storage/album_bundle_staging/<batch_id>/`` —
     safe to remove because by the time the batch is "complete" the
     per-track workers have already claimed their files out of staging

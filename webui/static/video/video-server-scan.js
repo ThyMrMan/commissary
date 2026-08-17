@@ -1,6 +1,6 @@
 /* Video Tools — Server Scan card.
  *
- * DISTINCT from video-scan.js (the Library Scan, where SoulSync READS the server
+ * DISTINCT from video-scan.js (the Library Scan, where Commissary READS the server
  * into video.db). This one tells the media server (Plex/Jellyfin) to rescan its
  * OWN folders so newly-downloaded files get indexed — the manual twin of the
  * post-download "Scan Video Server" automation.

@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video "Manage Workers" modal (isolated).
+ * Commissary — Video "Manage Workers" modal (isolated).
  *
  * Reuses the music modal's CSS (.enrichment-manager-modal / .em-* — shared
  * design) but is entirely its own JS: it never calls music functions, targets

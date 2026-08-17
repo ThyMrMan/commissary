@@ -1,9 +1,9 @@
 """Trust an authenticated-user header from a forward-auth proxy.
 
-When SoulSync sits behind an auth proxy (Authelia / Authentik / oauth2-proxy), the
+When Commissary sits behind an auth proxy (Authelia / Authentik / oauth2-proxy), the
 proxy authenticates the user and passes their identity in a header (commonly
 ``Remote-User``). With ``security.auth_proxy_header`` set to that header name,
-SoulSync treats a request carrying it as already-authenticated and lets it past the
+Commissary treats a request carrying it as already-authenticated and lets it past the
 launch lock — the proxy is the gatekeeper.
 
 OFF by default (empty header name) → a strict no-op; the launch PIN behaves exactly

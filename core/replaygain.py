@@ -1,5 +1,5 @@
 """
-ReplayGain analysis and tag writing for SoulSync.
+ReplayGain analysis and tag writing for Commissary.
 
 Analysis is performed via FFmpeg's ebur128 filter (ReplayGain 2.0, -18 LUFS reference).
 Tag writing uses mutagen directly to stay consistent with the rest of the codebase.

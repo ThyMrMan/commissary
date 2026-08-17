@@ -177,7 +177,7 @@ class MissingCoverArtJob(RepairJob):
             # Resolve the representative path the SAME way the apply does
             # (_fix_missing_cover_art) before checking disk art. Checking the raw
             # DB path would fail on any path-mapped setup (docker mounts, a
-            # Plex/SoulSync path mismatch) — the file isn't found, album art
+            # Plex/Commissary path mismatch) — the file isn't found, album art
             # reads as "missing", and EVERY album gets flagged while the apply
             # (which resolves) then finds the art already present. Unresolvable →
             # treat as no-local-file (don't claim disk-missing).

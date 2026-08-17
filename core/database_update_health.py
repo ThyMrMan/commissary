@@ -71,7 +71,7 @@ def stalled_error_message(state: Mapping[str, Any], now: float) -> str:
     if phase:
         msg += f" (last phase: {phase})"
     msg += (". The worker may be hung on the media server. Start a new update "
-            "to try again, or restart SoulSync if it keeps stalling.")
+            "to try again, or restart Commissary if it keeps stalling.")
     return msg
 
 

@@ -2,7 +2,7 @@
 
 Search results carry an opaque token; the download path resolves it back.
 A client-supplied raw URL or an expired/unknown token must be rejected —
-the browser can no longer make SoulSync forward arbitrary URLs to the
+the browser can no longer make Commissary forward arbitrary URLs to the
 download client, and Prowlarr API keys never reach the frontend.
 """
 

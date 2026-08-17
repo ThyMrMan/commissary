@@ -1,7 +1,7 @@
 """YouTube Ghosts job — ledger rows whose file is gone from disk.
 
 The ownership ledger (video_download_history, source=youtube, outcome=completed)
-is SoulSync's memory of what it downloaded. When the user deletes episodes on
+is Commissary's memory of what it downloaded. When the user deletes episodes on
 the server side, the ledger still says "owned" — badges lie, retention counts
 lie, and the Channels tab overcounts. This job path-checks every un-pruned
 ledger row and flags the ghosts.
@@ -79,7 +79,7 @@ class YoutubeGhostsJob(VideoRepairJob):
     job_id = "youtube_ghosts"
     display_name = "YouTube Ghost Files"
     description = "Finds downloaded YouTube episodes whose file is gone from disk."
-    help_text = ("SoulSync remembers every YouTube episode it downloaded. If you "
+    help_text = ("Commissary remembers every YouTube episode it downloaded. If you "
                  "delete files on the server side, that memory goes stale: episodes "
                  "still show as Downloaded and channel counts overcount. This job "
                  "verifies every remembered file still exists. Approving marks the "

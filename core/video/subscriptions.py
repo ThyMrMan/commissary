@@ -1,8 +1,8 @@
-"""Import ytdl-sub / Kometa subscription files into SoulSync watchlist follows.
+"""Import ytdl-sub / Kometa subscription files into Commissary watchlist follows.
 
 A ytdl-sub subscription file is YAML: each top-level key is a subscription whose
 ``overrides.url`` is a YouTube channel or playlist and ``overrides.tv_show_name``
-is the show name. That maps 1:1 onto SoulSync's YouTube follows — so importing
+is the show name. That maps 1:1 onto Commissary's YouTube follows — so importing
 one is: parse → resolve each URL → follow it (channel or playlist) → apply the
 show name as the channel's custom name, and ``best_video_quality`` as a quality
 override.
@@ -122,14 +122,14 @@ def wants_recent_only(presets: List[str]) -> bool:
 
 
 def channel_settings_from_presets(presets: List[str]) -> Dict[str, Any]:
-    """Translate the ytdl-sub presets on a subscription into SoulSync channel
+    """Translate the ytdl-sub presets on a subscription into Commissary channel
     settings (the same fields the channel cog modal edits):
 
     - ``best_video_quality`` → a max-quality override (a full profile the modal
       round-trips: highest resolution, any codec, mp4, 60fps + HDR on).
     - ``only_recent_videos`` → the ``days_90`` retention window. ytdl-sub's
-      'keep recent' ≈ SoulSync's 'Last 3 months'; without it a channel keeps
-      everything (SoulSync's default), which is ytdl-sub's 'keep all'.
+      'keep recent' ≈ Commissary's 'Last 3 months'; without it a channel keeps
+      everything (Commissary's default), which is ytdl-sub's 'keep all'.
 
     The custom show-name (from ``tv_show_name``) is applied separately — it needs
     the resolved channel title to know whether it actually differs."""

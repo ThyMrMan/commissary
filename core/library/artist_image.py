@@ -8,7 +8,7 @@ behavior also picks up `artist.jpg` as a fallback, so writing the
 file to disk is a portable mechanism that works for every server.
 
 Pre-existing reference: issue #572 (rhwc) — Navidrome users only
-saw album-art-derived artist thumbnails. SoulSync's
+saw album-art-derived artist thumbnails. Commissary's
 `update_artist_poster()` for Navidrome at `core/navidrome_client.py`
 was a NO-OP (returned True without doing anything).
 
@@ -41,7 +41,7 @@ _DEFAULT_IMAGE_DOWNLOAD_TIMEOUT = 30
 def derive_artist_folder(album_folder: str) -> str:
     """Derive the artist's folder from an album's folder.
 
-    Standard SoulSync path templates produce
+    Standard Commissary path templates produce
     ``<library_root>/<artist>/<album>/...`` — so the artist folder is
     one level up from the album folder. Returns empty string for
     empty input; preserves the platform's path separator.

@@ -126,7 +126,7 @@ def available_sources_for_album(album_data: dict) -> List[dict]:
     """Return the list of metadata sources the user can pick for this
     album's reorganize. Every entry has both (a) a stored album ID on
     the local row AND (b) an authenticated / configured client on this
-    SoulSync instance.
+    Commissary instance.
 
     Returns entries in source-priority order (preferred source first).
     Each entry is ``{'source': str, 'label': str}``. No API calls —
@@ -155,7 +155,7 @@ def available_sources_for_album(album_data: dict) -> List[dict]:
 
 def authed_sources() -> List[dict]:
     """Return all metadata sources the user has authed/configured on
-    this SoulSync instance. Doesn't require any album-specific stored
+    this Commissary instance. Doesn't require any album-specific stored
     ID — used by the bulk "Reorganize All" picker where each album
     has its own ID coverage and we just want to know which sources
     are reachable. Returned in priority order."""
@@ -616,7 +616,7 @@ def _score_candidate(
     Components:
 
     - **Exact normalized-title match** is the strongest signal — usually
-      enough on its own, especially because local titles SoulSync wrote
+      enough on its own, especially because local titles Commissary wrote
       should already match the source's text after normalization.
     - **Substring containment** with a length-ratio guard handles
       annotation drift like ``"The Recipe - Bonus Track"`` (local)
@@ -1366,7 +1366,7 @@ def _is_in_deleted_quarantine(resolved_path, transfer_dir) -> bool:
     de-duplicated files into ``<transfer_dir>/deleted/``. If the user's
     media server scans the transfer folder (e.g. a ``/music`` root that
     contains both the library and the transfer dir), those quarantined
-    files get real rows in SoulSync's DB — and Reorganize, being purely
+    files get real rows in Commissary's DB — and Reorganize, being purely
     DB-driven, would otherwise dutifully move them back OUT of /deleted
     to the template location. This guard makes Reorganize skip them so
     the quarantine stays quarantined (#746).

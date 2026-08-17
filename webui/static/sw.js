@@ -1,4 +1,4 @@
-/* SoulSync Service Worker — image cache + lightweight shell cache.
+/* Commissary Service Worker — image cache + lightweight shell cache.
  *
  * Strategy:
  *

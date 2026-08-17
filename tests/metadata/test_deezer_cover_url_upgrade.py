@@ -4,7 +4,7 @@ Discord report (Tim, 2026-05-XX): downloaded cover art via Deezer
 metadata source comes out blurry — visibly low-res in Navidrome.
 Cause: Deezer's API returns ``cover_xl`` URLs at 1000×1000 but the
 underlying CDN serves up to 1900×1900 by rewriting the size segment
-in the URL path. SoulSync wasn't doing the rewrite.
+in the URL path. Commissary wasn't doing the rewrite.
 
 Helper: ``_upgrade_deezer_cover_url(url, target_size=1900)`` — pure
 function, lifts to one boundary so cover-download sites don't each
@@ -88,7 +88,7 @@ class TestAlreadyUpgraded:
     def test_already_at_target_returned_unchanged(self):
         """Re-running the upgrade on an already-upgraded URL should
         be a no-op. Idempotent — important for cached URLs that may
-        have been rewritten by a previous SoulSync version."""
+        have been rewritten by a previous Commissary version."""
         url = 'https://cdn-images.dzcdn.net/images/cover/abc/1900x1900-000000-80-0-0.jpg'
         assert _upgrade_deezer_cover_url(url) == url
 

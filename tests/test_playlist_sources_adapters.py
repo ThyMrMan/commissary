@@ -560,7 +560,7 @@ def test_lastfm_adapter_projects_radio_rows():
     assert detail.tracks[0].source_track_id == "lfm-rec-1"
 
 
-# ─── SoulSync Discovery ─────────────────────────────────────────────────
+# ─── Commissary Discovery ─────────────────────────────────────────────────
 
 
 class _FakeDiscoveryManager:
@@ -796,7 +796,7 @@ def test_mirror_dict_spotify_authed_emits_matched_data():
 def test_default_discover_tracks_is_no_op():
     """Adapters whose tracks already carry provider IDs (Spotify,
     Tidal, Qobuz, YouTube, Deezer, Spotify-public, iTunes-link,
-    SoulSync-Discovery) inherit the ABC default — return tracks
+    Commissary-Discovery) inherit the ABC default — return tracks
     unchanged."""
     track = NormalizedTrack(
         position=0,

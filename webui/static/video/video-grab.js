@@ -1,5 +1,5 @@
 /*
- * SoulSync — headless video acquisition helper (VideoGrab).
+ * Commissary — headless video acquisition helper (VideoGrab).
  *
  * Powers the TV detail page's inline per-episode / per-season buttons. Runs the
  * SAME backend contract the download modal uses — search/start → poll →

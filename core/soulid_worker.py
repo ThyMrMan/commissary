@@ -7,7 +7,7 @@ computes a deterministic hash from normalized metadata, and stores the result.
 Hash inputs (all lowercased, stripped of accents/punctuation, collapsed):
   - Artist:      normalize(artist_name) + normalize(debut_year) if known
                  Debut year is sourced from iTunes + Deezer APIs (not local DB)
-                 to ensure deterministic results across all SoulSync nodes.
+                 to ensure deterministic results across all Commissary nodes.
   - Album:       normalize(artist_name) + normalize(album_name)
   - Track (song): normalize(artist_name) + normalize(track_name)
   - Track (album): normalize(artist_name) + normalize(album_name) + normalize(track_name)
@@ -292,7 +292,7 @@ class SoulIDWorker:
 
         Searches both services for 'artist_name track_title' to find the exact artist,
         then returns max(deezer_id, itunes_id) as a deterministic canonical identifier.
-        Any SoulSync instance with the same artist and at least one matching track
+        Any Commissary instance with the same artist and at least one matching track
         will arrive at the same canonical ID.
 
         Args:

@@ -75,7 +75,7 @@ def test_finds_file_via_transfer_folder_suffix_walk(tmp_path: Path) -> None:
 
 
 def test_finds_file_via_relative_db_path_full_suffix(tmp_path: Path) -> None:
-    """SoulSync's own library scanner stores RELATIVE paths with NO leading
+    """Commissary's own library scanner stores RELATIVE paths with NO leading
     slash, e.g. "Artist/Album/track.flac". Index 0 is the artist folder, so the
     resolver must try the FULL path first — the old range(1, ...) dropped the
     artist segment and every such track came back unresolved (quality scanner:
@@ -230,7 +230,7 @@ def test_strips_whitespace_from_music_paths(tmp_path: Path) -> None:
 
 
 def test_finds_file_via_plex_library_location(tmp_path: Path) -> None:
-    """When SoulSync mounts the Plex library at a different path than
+    """When Commissary mounts the Plex library at a different path than
     Plex itself reports, the Plex-reported location is added to the
     search and the file is found."""
     plex_loc = tmp_path / "PlexLibrary"

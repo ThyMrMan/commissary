@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video Wishlist page (isolated).
+ * Commissary — Video Wishlist page (isolated).
  *
  * The curated 'get this' list, split by a Movies / TV tab. Movies render as a
  * poster grid; TV groups into collapsible show → season → episode rows with

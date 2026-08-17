@@ -1,7 +1,7 @@
 """Mass rename with preview (arr-parity P7).
 
 Radarr/Sonarr can re-render the WHOLE library's filenames when you change the
-naming template; SoulSync's templates only ever applied at import time, so a
+naming template; Commissary's templates only ever applied at import time, so a
 template change forked your library into two naming eras. This closes it:
 
   preview()  — for every owned movie/episode file, resolve the DB's stored

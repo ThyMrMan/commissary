@@ -1,8 +1,8 @@
 /*
- * SoulSync — Video Person page (isolated, in-app).
+ * Commissary — Video Person page (isolated, in-app).
  *
  * Drill-in for a cast/crew member (from a detail page or a search result). Shows
- * bio + a filmography grid; every credit links back into SoulSync — the owned
+ * bio + a filmography grid; every credit links back into Commissary — the owned
  * library detail when we have it, otherwise the TMDB-backed preview detail. No
  * external links.
  *

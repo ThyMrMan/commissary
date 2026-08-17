@@ -1,5 +1,5 @@
 /*
- * SoulSync — Overlay Studio (Artwork Studio): the visual overlay-template editor.
+ * Commissary — Overlay Studio (Artwork Studio): the visual overlay-template editor.
  *
  * A full-bleed design tool for authoring poster overlays. Phase 1a: a gallery of
  * saved templates + a canvas editor (palette · stage · layers) that can add text
@@ -3147,7 +3147,7 @@
         back.className = 'voe-confirm-back';
         back.innerHTML = '<div class="voe-lp">' +
             '<div class="voe-lp-t">' + I.logo + ' Logo badges need an image pack</div>' +
-            '<div class="voe-lp-m">SoulSync doesn’t ship logo art. Install Kometa’s public set — ' +
+            '<div class="voe-lp-m">Commissary doesn’t ship logo art. Install Kometa’s public set — ' +
                 'resolution, audio codec, source, HDR, aspect, plus streaming / network / studio logos — ' +
                 'copied into your own library. Or drop your own PNGs in the logos folder.</div>' +
             '<div class="voe-lp-prog" data-lp-prog hidden><div class="voe-apply-bar"><div class="voe-apply-bar-fill" data-lp-fill></div></div>' +

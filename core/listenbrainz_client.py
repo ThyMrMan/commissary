@@ -29,7 +29,7 @@ class ListenBrainzClient:
         # Create a session for connection pooling
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'SoulSync/1.0'
+            'User-Agent': 'Commissary/1.0'
         })
 
         if self.token:
@@ -224,7 +224,7 @@ class ListenBrainzClient:
             return result
 
         create_body = {"playlist": {
-            "title": (title or "SoulSync Export").strip() or "SoulSync Export",
+            "title": (title or "Commissary Export").strip() or "Commissary Export",
             "extension": {self._PLAYLIST_EXT: {"public": bool(public)}},
         }}
         try:
@@ -290,7 +290,7 @@ class ListenBrainzClient:
         try:
             self._make_request_with_retry(
                 "POST", f"{self.base_url}/playlist/edit/{playlist_mbid}",
-                json={"playlist": {"title": (title or "SoulSync Export").strip() or "SoulSync Export"}},
+                json={"playlist": {"title": (title or "Commissary Export").strip() or "Commissary Export"}},
                 headers=headers,
             )
         except Exception as e:
@@ -302,7 +302,7 @@ class ListenBrainzClient:
     def create_or_update_playlist(self, title: str, tracks: List[Dict],
                                   existing_mbid: str = None, public: bool = False) -> Dict:
         """Update the existing LB playlist in place when we've pushed this one before, else
-        create a fresh one — so re-exporting the same SoulSync playlist never duplicates it.
+        create a fresh one — so re-exporting the same Commissary playlist never duplicates it.
         Falls back to create if the remembered playlist was deleted on LB."""
         if existing_mbid:
             res = self.update_playlist(existing_mbid, title, tracks, public)

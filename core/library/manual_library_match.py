@@ -1,7 +1,7 @@
 """Manual library match service.
 
 Lets users explicitly link a source track (wishlist/sync-history candidate) to
-an existing library track so SoulSync stops trying to re-download it.
+an existing library track so Commissary stops trying to re-download it.
 """
 
 from __future__ import annotations

@@ -42,7 +42,7 @@ const HELPER_CONTENT = {
     },
     '.nav-button[data-page="sync"]': {
         title: 'Playlist Sync',
-        description: 'Mirror playlists from Spotify, YouTube, Tidal, Deezer, ListenBrainz, and Beatport. SoulSync matches each track to your download sources and downloads what\'s missing from your library.',
+        description: 'Mirror playlists from Spotify, YouTube, Tidal, Deezer, ListenBrainz, and Beatport. Commissary matches each track to your download sources and downloads what\'s missing from your library.',
         tips: [
             'Select playlists from the left panel to begin syncing',
             'Real-time progress shows matched, pending, and failed tracks',
@@ -125,7 +125,7 @@ const HELPER_CONTENT = {
     },
     '.nav-button[data-page="import"]': {
         title: 'Music Import',
-        description: 'Import music files from your import folder. SoulSync identifies tracks using AcoustID fingerprinting, matches them to metadata, and organizes them into your library with proper tagging.',
+        description: 'Import music files from your import folder. Commissary identifies tracks using AcoustID fingerprinting, matches them to metadata, and organizes them into your library with proper tagging.',
         docsId: 'import'
     },
     '.nav-button[data-page="settings"]': {
@@ -167,11 +167,11 @@ const HELPER_CONTENT = {
     },
     '.version-button': {
         title: 'Version & Changelog',
-        description: 'Shows the current SoulSync version. Click to see the full release notes, changelog, and what\'s new.',
+        description: 'Shows the current Commissary version. Click to see the full release notes, changelog, and what\'s new.',
     },
     '.support-button': {
         title: 'Support & Community',
-        description: 'Links to the SoulSync community Discord, GitHub issues for bug reports, and documentation resources.',
+        description: 'Links to the Commissary community Discord, GitHub issues for bug reports, and documentation resources.',
     },
     '#metadata-source-indicator': {
         title: 'Metadata Source',
@@ -185,7 +185,7 @@ const HELPER_CONTENT = {
     },
     '#media-server-indicator': {
         title: 'Media Server',
-        description: 'Connection to your music server where your library lives. SoulSync reads your collection from here and triggers scans after new downloads.',
+        description: 'Connection to your music server where your library lives. Commissary reads your collection from here and triggers scans after new downloads.',
         tips: [
             'Supports Plex, Jellyfin, and Navidrome',
             'Configure in Settings → Media Server Setup',
@@ -208,7 +208,7 @@ const HELPER_CONTENT = {
 
     '#watchlist-button': {
         title: 'Watchlist',
-        description: 'Artists you\'re following for new releases. SoulSync periodically scans for new albums and singles from these artists and adds them to your Wishlist for download.',
+        description: 'Artists you\'re following for new releases. Commissary periodically scans for new albums and singles from these artists and adds them to your Wishlist for download.',
         tips: [
             'Add artists from the Artists page or Library page',
             'Badge shows total watched artist count',
@@ -252,7 +252,7 @@ const HELPER_CONTENT = {
     },
     '#media-server-service-card': {
         title: 'Media Server Status',
-        description: 'Detailed connection info for your media server. Verifies SoulSync can communicate with Plex, Jellyfin, or Navidrome for library scanning and audio streaming.',
+        description: 'Detailed connection info for your media server. Verifies Commissary can communicate with Plex, Jellyfin, or Navidrome for library scanning and audio streaming.',
         tips: [
             '"Test Connection" verifies the server URL and credentials',
             'Select your Music Library in Settings after first connecting',
@@ -299,20 +299,20 @@ const HELPER_CONTENT = {
     },
     '#uptime-card': {
         title: 'System Uptime',
-        description: 'Time since last SoulSync restart. Background workers (metadata enrichment, watchlist scanner, repair jobs) run continuously during uptime.',
+        description: 'Time since last Commissary restart. Background workers (metadata enrichment, watchlist scanner, repair jobs) run continuously during uptime.',
     },
     '#memory-card': {
         title: 'Memory Usage',
-        description: 'RAM consumed by the SoulSync process. Includes web server, all background workers, metadata caches, and WebSocket connections.',
+        description: 'RAM consumed by the Commissary process. Includes web server, all background workers, metadata caches, and WebSocket connections.',
     },
 
     // ─── DASHBOARD: TOOL CARDS ──────────────────────────────────────
 
     '#db-updater-card': {
         title: 'Database Updater',
-        description: 'Syncs your media server\'s library into SoulSync\'s database. Three modes: Incremental (fast, new content only), Full Refresh (rebuilds everything), and Deep Scan (finds stale entries).',
+        description: 'Syncs your media server\'s library into Commissary\'s database. Three modes: Incremental (fast, new content only), Full Refresh (rebuilds everything), and Deep Scan (finds stale entries).',
         tips: [
-            'Run after adding music outside of SoulSync',
+            'Run after adding music outside of Commissary',
             'Incremental runs in seconds; Full Refresh takes longer',
             'Deep Scan removes tracks deleted from your media server'
         ],
@@ -359,7 +359,7 @@ const HELPER_CONTENT = {
     },
     '#media-scan-card': {
         title: 'Media Server Scan',
-        description: 'Manually trigger a library scan on your media server. SoulSync auto-scans after downloads, but this is useful after bulk imports or external changes.',
+        description: 'Manually trigger a library scan on your media server. Commissary auto-scans after downloads, but this is useful after bulk imports or external changes.',
         tips: [
             'Plex: triggers partial scan of music library section',
             'Jellyfin: triggers full library refresh task',
@@ -431,7 +431,7 @@ const HELPER_CONTENT = {
     },
     '.watchlist-artist-card': {
         title: 'Watched Artist',
-        description: 'An artist on your watchlist. SoulSync monitors this artist for new releases and adds them to your Wishlist. Click the gear icon to configure which release types to monitor.',
+        description: 'An artist on your watchlist. Commissary monitors this artist for new releases and adds them to your Wishlist. Click the gear icon to configure which release types to monitor.',
         tips: [
             'Gear icon opens per-artist download preferences',
             'Configure which release types (Albums, EPs, Singles) to monitor',
@@ -481,7 +481,7 @@ const HELPER_CONTENT = {
     },
     '#watchlist-linked-provider-section': {
         title: 'Linked Artist',
-        description: 'Shows which metadata provider artist is linked to this watchlist entry. SoulSync uses this link to look up releases. If the wrong artist is linked, the scan will find incorrect releases.',
+        description: 'Shows which metadata provider artist is linked to this watchlist entry. Commissary uses this link to look up releases. If the wrong artist is linked, the scan will find incorrect releases.',
         tips: [
             'The linked artist is matched automatically when you add to watchlist',
             'If releases look wrong, the link may point to the wrong artist',
@@ -568,7 +568,7 @@ const HELPER_CONTENT = {
     },
     '.playlist-modal-btn-warning': {
         title: 'Cleanup Wishlist',
-        description: 'Removes tracks that already exist in your library. Useful after manual imports or when tracks were downloaded outside of SoulSync.',
+        description: 'Removes tracks that already exist in your library. Useful after manual imports or when tracks were downloaded outside of Commissary.',
     },
 
     // ─── WISHLIST: TRACK LIST VIEW ─────────────────────────────────
@@ -1015,7 +1015,7 @@ const HELPER_CONTENT = {
     },
     '#discover-hero-add': {
         title: 'Add to Watchlist',
-        description: 'Add this artist to your Watchlist. SoulSync will scan for their new releases and add them to your Wishlist for download.',
+        description: 'Add this artist to your Watchlist. Commissary will scan for their new releases and add them to your Wishlist for download.',
     },
     '#discover-hero-watch-all': {
         title: 'Watch All',
@@ -1078,7 +1078,7 @@ const HELPER_CONTENT = {
     // Build a Playlist — section container and all inner elements
     '.build-playlist-container': {
         title: 'Build a Playlist',
-        description: 'Create a custom playlist by selecting seed artists. SoulSync finds similar artists, pulls their albums, and assembles a 50-track playlist mixing your picks with new discoveries.',
+        description: 'Create a custom playlist by selecting seed artists. Commissary finds similar artists, pulls their albums, and assembles a 50-track playlist mixing your picks with new discoveries.',
         tips: [
             'Search and select 1-5 seed artists',
             'Hit Generate for a fresh playlist every time',
@@ -1088,7 +1088,7 @@ const HELPER_CONTENT = {
     },
     '#bp-info-panel': {
         title: 'How Build a Playlist Works',
-        description: 'Search for seed artists → SoulSync finds similar artists → pulls their albums → picks random tracks → creates a 50-track playlist. More seed artists = more variety.',
+        description: 'Search for seed artists → Commissary finds similar artists → pulls their albums → picks random tracks → creates a 50-track playlist. More seed artists = more variety.',
         docsId: 'disc-build'
     },
     '#build-playlist-search': {
@@ -1672,7 +1672,7 @@ const HELPER_CONTENT = {
     },
     '#stats-db-storage-chart': {
         title: 'Database Storage',
-        description: 'Breakdown of your SoulSync database size by category: library data, metadata cache, discovery pool, settings, and more.',
+        description: 'Breakdown of your Commissary database size by category: library data, metadata cache, discovery pool, settings, and more.',
     },
 
     // ─── IMPORT PAGE ────────────────────────────────────────────────
@@ -1702,7 +1702,7 @@ const HELPER_CONTENT = {
     },
     '#import-page-tab-singles': {
         title: 'Singles Tab',
-        description: 'Import individual audio files as single tracks. Select files, and SoulSync identifies them using AcoustID fingerprinting or filename matching.',
+        description: 'Import individual audio files as single tracks. Select files, and Commissary identifies them using AcoustID fingerprinting or filename matching.',
         docsId: 'imp-singles'
     },
     '#import-page-suggestions-grid': {
@@ -1779,7 +1779,7 @@ const HELPER_CONTENT = {
     // Connections — Media Server
     '#plex-container': {
         title: 'Plex Configuration',
-        description: 'Connect your Plex server. Enter the URL and token, then select your Music Library. SoulSync reads your library from Plex and triggers scans after downloads.',
+        description: 'Connect your Plex server. Enter the URL and token, then select your Music Library. Commissary reads your library from Plex and triggers scans after downloads.',
         tips: [
             'URL format: http://IP:32400 (or your custom port)',
             'Token: find in Plex settings or browser URL bar while logged in',
@@ -1912,13 +1912,13 @@ const HELPER_CONTENT = {
     // Library — Listening Stats
     '#listening-stats-enabled': {
         title: 'Listening Stats',
-        description: 'Track your listening activity from your media server. When enabled, SoulSync periodically syncs play history for the Stats page.',
+        description: 'Track your listening activity from your media server. When enabled, Commissary periodically syncs play history for the Stats page.',
     },
 
     // Advanced — API Keys
     '#api-keys-list': {
         title: 'API Keys',
-        description: 'Manage API keys for external access to SoulSync\'s REST API. Generate keys with labels for different integrations.',
+        description: 'Manage API keys for external access to Commissary\'s REST API. Generate keys with labels for different integrations.',
     },
 
     // Advanced — Discovery Pool
@@ -1934,7 +1934,7 @@ const HELPER_CONTENT = {
     // Appearance
     '#accent-preset': {
         title: 'Accent Color',
-        description: 'Choose a color theme for the entire app. Affects buttons, badges, highlights, and interactive elements throughout SoulSync.',
+        description: 'Choose a color theme for the entire app. Affects buttons, badges, highlights, and interactive elements throughout Commissary.',
     },
     '#sidebar-visualizer-type': {
         title: 'Sidebar Visualizer',
@@ -2333,7 +2333,7 @@ const HELPER_TOURS = {
         icon: '📊',
         steps: [
             // Header area (top of page)
-            { page: 'dashboard', selector: '.dashboard-header', title: 'Welcome to SoulSync', description: 'This is your Music Dashboard — the central hub for monitoring your music system. Let\'s walk through everything from top to bottom.' },
+            { page: 'dashboard', selector: '.dashboard-header', title: 'Welcome to Commissary', description: 'This is your Music Dashboard — the central hub for monitoring your music system. Let\'s walk through everything from top to bottom.' },
             { page: 'dashboard', selector: '.dashboard-header .header-actions', title: 'Enrichment Worker Orbs', description: 'Each orb is a live metadata worker — MusicBrainz, AudioDB, Deezer, Spotify, iTunes, Last.fm, Genius and friends. They pulse while enriching your library; hover one for its current status and progress.' },
             { page: 'dashboard', selector: '#watchlist-button', title: 'Watchlist', description: 'Artists you follow for new releases. Click to manage watched artists, run scans, and configure per-artist download preferences.' },
             { page: 'dashboard', selector: '#wishlist-button', title: 'Wishlist', description: 'Tracks queued for download. Failed downloads, watchlist discoveries, and manual additions all land here for retry.' },
@@ -2348,7 +2348,7 @@ const HELPER_TOURS = {
             { page: 'dashboard', selector: '#enrichment-pills-section', title: 'Enrichment Services', description: 'Per-service enrichment coverage — how much of your library each metadata service has processed, with controls to manage priorities and intervals.' },
 
             // The shell around every page
-            { page: 'dashboard', selector: '.side-toggle', title: 'Music / Video Toggle', description: 'SoulSync has two whole sides. This switch flips between the MUSIC app and the VIDEO app (movies + TV) — each has its own pages, library, and settings.' },
+            { page: 'dashboard', selector: '.side-toggle', title: 'Music / Video Toggle', description: 'Commissary has two whole sides. This switch flips between the MUSIC app and the VIDEO app (movies + TV) — each has its own pages, library, and settings.' },
             { page: 'dashboard', selector: '#profile-indicator', title: 'Your Profile', description: 'Who\'s signed in. Click to switch profiles; the small icons open My Accounts (per-profile streaming logins) and My Settings.' },
             { page: 'dashboard', selector: '.nav-section-label[data-section="find"]', title: 'Find', description: 'Discovery lives here — Search, Discover, and the Artist Map. Section headers collapse if you like a tidy sidebar.' },
             { page: 'dashboard', selector: '.nav-section-label[data-section="music"]', title: 'Music', description: 'Your collection: Library, Playlists & Sync, Downloads, and Import for files you already have.' },
@@ -3177,7 +3177,7 @@ async function openSetupPanel() {
                     </div>`;
             }).join('')}
         </div>
-        ${pct === 100 ? '<div class="helper-setup-done">All set! SoulSync is fully configured. 🎉</div>' : ''}
+        ${pct === 100 ? '<div class="helper-setup-done">All set! Commissary is fully configured. 🎉</div>' : ''}
     `;
 
     document.body.appendChild(panel);
@@ -3483,7 +3483,23 @@ const WHATS_NEW = {
     // Convention: keep only the CURRENT release here, plus a single brief
     // "Earlier versions" summary entry. Don't accumulate old per-version blocks.
     // Versions are this fork's own (see _SOULSYNC_BASE_VERSION in web_server.py);
-    // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set.
+    // 1.0.0 was the baseline, carrying upstream's 3.1.5 feature set, and 2.0.0
+    // is the rename to Commissary.
+    //
+    // NOTE for future editors: entries below 2.0.0 describe work that shipped
+    // while the app was called SoulSync, and now read "Commissary" throughout.
+    // That is deliberate — it is the same app's own history. References to
+    // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
+    // claiming this fork wrote the thing it forked.
+    '2.0.0': [
+        { date: 'August 2026 · 2.0.0' },
+        { title: 'SoulSync is now Commissary', desc: 'the app has a name of its own. This fork branched from <strong>SoulSync 3.1.5</strong> and has been diverging for 130-odd releases — multi-user profiles with request approval, multiple libraries per content kind, the Purchased page, a security pass, and a video side that has gone its own way — while still answering to someone else\'s name and pointing at someone else\'s bug tracker. Nothing about how it works changed in this release. It is a rename, and a major version because the published image moved with it.' },
+        { title: 'Nothing you have configured needs touching', desc: 'this was scoped to the <em>name</em>, not your install. The Docker volume, the compose service, the config path, the <code>SOULSYNC_*</code> environment variables and the standalone-server value stored against your library rows all keep their original names — renaming any of those would point a working install at an empty database or orphan rows nothing could read again. Upgrade normally; there is no migration.' },
+        { title: 'One thing to change: the image you pull', desc: 'the image is now <code>ghcr.io/thymrman/commissary</code>. Edit the <code>image:</code> line in your <code>docker-compose.yml</code> and run <code>docker-compose pull && docker-compose up -d</code>. On Unraid the template moved to <code>commissary.xml</code> and the container\'s Repository field needs the same change. The old name is not being updated any more.' },
+        { title: 'Your Navidrome player is still called SoulSync', desc: 'and that is on purpose. Navidrome creates a player entry per client name and hangs settings off it — including <strong>Report Real Path</strong>, which is what lets Commissary resolve the file behind a track it streams. Renaming the client would have quietly registered a second, unconfigured player and broken playback paths on every existing install. The setting you already enabled keeps working, and the help text still names the entry you will actually see in the list.' },
+        { title: 'Bug reports come here now', desc: 'the in-app links and the Copy Debug Info footer point at <strong>this fork\'s</strong> issue tracker rather than upstream\'s. Upstream cannot reproduce changes made here, and several subsystems now behave differently on purpose — reporting a Commissary bug there wastes everyone\'s time. Upstream keeps all the credit for the foundation and none of the blame for anything since.' },
+        { title: 'The README says what this actually is now', desc: 'it had been describing upstream\'s feature set, upstream\'s two Docker release channels and upstream\'s branch workflow, none of which are true here — this fork publishes one image, manually, from a single branch. It now opens with the fork relationship, what has changed since 3.1.5, and an install section that matches reality.' },
+    ],
     '1.9.23': [
         { date: 'August 2026 · 1.9.23' },
         { title: 'Fixed: the first download of a new Anime show decided its home — wrongly, and forever', desc: 'diagnosed against your actual library. A show you do not own yet has no library row, so nothing could say which shelf it belonged on: the wishlist entry the airing automation creates carried no Library, resolution found nothing, and it fell back to the <strong>primary</strong> TV Library. It downloaded there, Plex scanned it into TV Shows, and the next library scan stamped that Library onto the show permanently — so every later episode resolved "correctly" to the wrong place. One wrong first grab, cemented.' },
@@ -3497,9 +3513,9 @@ const WHATS_NEW = {
     ],
     '1.9.22': [
         { date: 'August 2026 · 1.9.22' },
-        { title: 'Fixed: a manually matched track could vanish for good', desc: 'when you link a track to a file in your library by hand, SoulSync stores that as a row in a table — and then treated the row\'s <em>existence</em> as proof the file was still there. Delete or move that file and the track entered a closed trap: the download was skipped as "already matched", the wishlist drain removed it as a <strong>success</strong>, and adding it back was silently refused for the same reason. Three separate places, each individually reasonable, together making the song impossible to re-acquire. A match is now checked against the library before it counts, and a match whose id has gone stale is re-resolved by file path rather than thrown away.' },
+        { title: 'Fixed: a manually matched track could vanish for good', desc: 'when you link a track to a file in your library by hand, Commissary stores that as a row in a table — and then treated the row\'s <em>existence</em> as proof the file was still there. Delete or move that file and the track entered a closed trap: the download was skipped as "already matched", the wishlist drain removed it as a <strong>success</strong>, and adding it back was silently refused for the same reason. Three separate places, each individually reasonable, together making the song impossible to re-acquire. A match is now checked against the library before it counts, and a match whose id has gone stale is re-resolved by file path rather than thrown away.' },
         { title: 'Fixed: albums starting with a dot became invisible', desc: 'the name sanitiser trimmed dots from the <em>end</em> of a folder name, because that is what Windows rejects. Nothing trimmed the front, which is the Unix rule — a leading dot makes the entry hidden. So <code>...And Justice for All</code> imported perfectly into a folder your file manager, your terminal and your media server\'s scanner all skip. The same gap existed on the video side. Interior dots are untouched, so <code>Mr. Bungle</code> is still <code>Mr. Bungle</code>.' },
-        { title: 'Fixed: AcoustID took the first answer, not the best one', desc: 'fingerprint lookups were read from position zero of the results, but the results came back in whatever order the API sent them while the best score was tracked in a completely separate variable. So a remix, a live cut or a compilation entry listed ahead of the real recording had its metadata written to your file. Results are now sorted best-first, and — new — a match has to clear a confidence bar of 0.80 to be used at all. Below that SoulSync declines and leaves your existing tags alone, which for an ambiguous fingerprint is the right answer.' },
+        { title: 'Fixed: AcoustID took the first answer, not the best one', desc: 'fingerprint lookups were read from position zero of the results, but the results came back in whatever order the API sent them while the best score was tracked in a completely separate variable. So a remix, a live cut or a compilation entry listed ahead of the real recording had its metadata written to your file. Results are now sorted best-first, and — new — a match has to clear a confidence bar of 0.80 to be used at all. Below that Commissary declines and leaves your existing tags alone, which for an ambiguous fingerprint is the right answer.' },
         { title: 'Fixed: the wishlist processing API endpoint never worked', desc: '<code>POST /api/wishlist/process</code> called its own setup helper with an argument that helper has never accepted. Every single call raised a TypeError, which the route caught and returned as a generic 500 — so it failed identically whether or not the wishlist was busy, and looked like a conflict rather than a permanent break. Nothing in the UI used it; if you script against the API, it works now.' },
     ],
     '1.9.21': [
@@ -3510,7 +3526,7 @@ const WHATS_NEW = {
     ],
     '1.9.20': [
         { date: 'August 2026 · 1.9.20' },
-        { title: 'Fixed: songs downloaded for a playlist never joined the playlist', desc: 'reported as "a server playlist created in SoulSync doesn\'t sync properly with Plex — the songs get downloaded but don\'t get matched onto the playlist without manual intervention", and the log had it to the minute. A sync matches your library <em>at that moment</em>, writes the server playlist, and hands whatever is left to the wishlist. So the downloads start <strong>after</strong> the playlist is already written. Your log: a 50-track playlist synced with 3 matches at 09:06, 41 tracks downloaded and imported by 09:13, the library database caught up at 09:20 — and then nothing, for the remaining hour. The playlist still held 3 tracks while all 41 songs sat correctly in the library.' },
+        { title: 'Fixed: songs downloaded for a playlist never joined the playlist', desc: 'reported as "a server playlist created in Commissary doesn\'t sync properly with Plex — the songs get downloaded but don\'t get matched onto the playlist without manual intervention", and the log had it to the minute. A sync matches your library <em>at that moment</em>, writes the server playlist, and hands whatever is left to the wishlist. So the downloads start <strong>after</strong> the playlist is already written. Your log: a 50-track playlist synced with 3 matches at 09:06, 41 tracks downloaded and imported by 09:13, the library database caught up at 09:20 — and then nothing, for the remaining hour. The playlist still held 3 tracks while all 41 songs sat correctly in the library.' },
         { title: 'The chain now has its last link', desc: 'a finished download already triggers a media-server scan, and a finished scan already triggers a library database update. That chain then just... stopped, leaving the playlist to wait for whenever you next synced it by hand. A new <strong>Auto-Sync Playlists After Database Update</strong> automation closes it: the instant newly imported tracks become matchable, every playlist whose last sync came up short is re-synced. Playlists that already matched in full are left alone. A schedule could never have covered this — there are roughly 14 minutes between "sync queues the downloads" and "the downloads exist as far as a sync is concerned", so a periodic re-sync mostly lands inside that window and just re-confirms the tracks are missing.' },
         { title: 'And a sync that changes nothing now touches nothing', desc: 'the default <em>replace</em> mode deleted and recreated your Plex playlist on every sync, re-keying it and churning a "… Backup" copy each time, even when the result was identical to what was already there. Harmless at one sync a day; not harmless now that the chain above re-syncs after every database update. A playlist that already holds exactly the right tracks in the right order is now left untouched. Membership or order actually differing still rewrites, exactly as before.' },
         { title: 'One less red herring in the log', desc: 'every single successful playlist creation logged <code>ERROR — CreatePlaylist failed: Must include items to add when creating new playlist</code>. The retry on the very next line always succeeded, so nothing was ever wrong — but it sat at ERROR level right beside the real playlist problems, in exactly the file you would read to diagnose them. Demoted to debug; the rest of the fallback chain stays loud, because reaching those genuinely does mean something failed.' },
@@ -3518,7 +3534,7 @@ const WHATS_NEW = {
     '1.9.19': [
         { date: 'August 2026 · 1.9.19' },
         { title: 'Adapted from upstream 3.2.0: album torrents that stalled for hours', desc: 'the biggest fix in this batch, and six separate faults behind one symptom — an album grab sitting at 0% until the deadline, then failing with "no audio files found". The album flow preferred the <strong>magnet</strong> whenever the indexer offered both, and a magnet the client cannot resolve sits on "downloading metadata" forever; the stall timeout you had configured was wired into the per-track poll and <strong>never consulted for albums</strong>; nothing enforced a seeder floor, so a release with a dead swarm was still picked; and a stalled torrent was left running in your client, untracked, to be grabbed again as a duplicate next time.' },
-        { title: 'What that means in practice', desc: 'SoulSync now fetches the .torrent server-side and hands the file to your client the way Sonarr and Radarr do, keeping the magnet as a fallback. A stalled album gives up on your configured timeout and cleans up after itself, and — new — falls back to the per-track flow instead of ending the whole batch, so one dead release no longer sinks an album. There is a new <strong>minimum seeders</strong> setting (default 1) that drops releases known to have a dead swarm, while leaving alone anything whose seeder count the indexer simply does not report.' },
+        { title: 'What that means in practice', desc: 'Commissary now fetches the .torrent server-side and hands the file to your client the way Sonarr and Radarr do, keeping the magnet as a fallback. A stalled album gives up on your configured timeout and cleans up after itself, and — new — falls back to the per-track flow instead of ending the whole batch, so one dead release no longer sinks an album. There is a new <strong>minimum seeders</strong> setting (default 1) that drops releases known to have a dead swarm, while leaving alone anything whose seeder count the indexer simply does not report.' },
         { title: 'And the "no audio files found" at the end of it', desc: 'staging walked the save path plus the torrent\'s display name, but the folder on disk routinely differs from that name and the save path is shared with every other download running. It now asks qBittorrent directly where the release actually landed. A single-file torrent stages that one file rather than sweeping its parent — which was the shared download root, and could pull in a neighbouring download\'s audio. When a path genuinely cannot be read, the error now says so and names the path-mapping setting instead of claiming the release was empty.' },
         { title: 'Fixed: settings could vanish after a crash or a busy moment', desc: 'the configuration loader could not tell "this row is unreadable" from "there is no row" — and the no-row path regenerates defaults and writes them <strong>over your real settings</strong>. One locked database at startup, one I/O blip, and everything was gone. Absence now has to be positively established before anything overwrites; an unreadable row is retried, then the app runs on your config file with the stored row <em>protected</em> until a restart can read it. A corrupt row is copied aside to <code>config.corrupt-…json</code> the moment it is seen, rather than replaced.' },
         { title: 'Saving settings is now one write, not hundreds', desc: 'a single Save click wrote the entire configuration once per field — hundreds of encrypt-and-commit cycles for one form. That is what created the database contention that pushed saves onto the fallback file in the first place. And that fallback file was written with a truncate-on-open, so a crash mid-write left it empty; it is now written to a temp file and swapped into place, so the old contents survive until the new ones are safely on disk.' },
@@ -3549,7 +3565,7 @@ const WHATS_NEW = {
     ],
     '1.9.14': [
         { date: 'August 2026 · 1.9.14' },
-        { title: 'HiFi stops re-dialling instances it already knows are down', desc: 'the public HiFi instances are volunteer-run and outages are normal — but SoulSync had no memory of them. Every search walked all seven hosts and paid the full connection timeout on each, every time. In one 12-hour log that came to <strong>4,094 "all instances exhausted" errors and around 23,500 warnings</strong> — between them 47% of that log\'s errors and 80% of its warnings — with one search burning 16 seconds on a host the app had <em>already</em> declared dead moments earlier.' },
+        { title: 'HiFi stops re-dialling instances it already knows are down', desc: 'the public HiFi instances are volunteer-run and outages are normal — but Commissary had no memory of them. Every search walked all seven hosts and paid the full connection timeout on each, every time. In one 12-hour log that came to <strong>4,094 "all instances exhausted" errors and around 23,500 warnings</strong> — between them 47% of that log\'s errors and 80% of its warnings — with one search burning 16 seconds on a host the app had <em>already</em> declared dead moments earlier.' },
         { title: 'What changes', desc: 'each instance now gets a cooldown after it fails, and is skipped without opening a connection until that elapses. When every instance is cooling, HiFi is skipped instantly and your search falls through to your other sources. Measured on a fully dead pool: the first search still tries all seven and learns, the next ten make <strong>no network calls at all</strong>.' },
         { title: 'It recovers by itself', desc: 'the cooldown starts at a minute and doubles for an instance that keeps failing, capped at fifteen. When it elapses that host gets one probe, and a single success clears its record completely — a host that works is not "less broken", it is working. Editing your instance list or hitting Restore Defaults clears every cooldown immediately, so a change you make takes effect at once.' },
         { title: 'And the log says it once', desc: 'a whole-pool outage is now one warning per cooldown window telling you roughly how long HiFi will sit out, instead of thousands of identical lines burying it. The HiFi status endpoint also reports which instances are cooling and for how long, so a source that gets skipped can say why.' },
@@ -3570,7 +3586,7 @@ const WHATS_NEW = {
         { title: 'Fixed: a failing track could be retried forever, never backing off', desc: 'the wishlist has had a retry ladder for a while — a track that keeps failing earns a growing cooldown (4 hours, then a day, then weekly) instead of burning a search every cycle. In one 12-hour log it <strong>never engaged once</strong>. Re-adding a failed track created a second, duplicate wishlist row for the same album, and nothing ever recorded an attempt against that copy — so its counter sat at zero, it looked freshly-added on every pass, and it was retried indefinitely. The re-add now recognises a track it already has.' },
         { title: 'What that was costing you', desc: 'in the same log, <strong>34 files were downloaded and quarantined again and again — one of them 132 times</strong>. Each cycle re-fetched a file that had already failed its integrity check, threw it away for the same reason, and queued it up to do it again. Duplicate rows already in your wishlist are cleaned up once on upgrade; a track from a genuinely different album still gets its own entry, which is what that mechanism was for.' },
         { title: 'Downloads stopped reporting healthy batches as broken', desc: 'the batch self-check counted every finished track as an "orphaned task", so a perfectly normal download batch was declared damaged every 30 seconds for its entire life — one log had 1,499 of these warnings across 31 batches, with the "orphan" count simply climbing in step with progress. It now looks for the two things that are actually wrong: a batch whose tasks have all finished without it completing, and a queued task whose record has gone missing.' },
-        { title: 'Fixed: Deezer would stop working and never start again', desc: 'the gateway hands out a session token when you authenticate, and SoulSync kept that one token for as long as the app was running. Deezer expires it after a while — and from that moment every single Deezer download failed, forever, until you restarted. One log covering half a day showed <strong>669 consecutive failures, about 20 an hour</strong>, all of them the same rejected token. The client now notices that specific rejection, renews the session from your saved ARL, and retries the call.' },
+        { title: 'Fixed: Deezer would stop working and never start again', desc: 'the gateway hands out a session token when you authenticate, and Commissary kept that one token for as long as the app was running. Deezer expires it after a while — and from that moment every single Deezer download failed, forever, until you restarted. One log covering half a day showed <strong>669 consecutive failures, about 20 an hour</strong>, all of them the same rejected token. The client now notices that specific rejection, renews the session from your saved ARL, and retries the call.' },
         { title: 'Why it was invisible', desc: 'nothing marked the source as broken, so the connection light stayed green and Deezer stayed first in the download chain — being handed tracks it could only fail. Worse, the error you saw was <em>"impl returned None"</em>, while the only line that named a cause was a warning buried further up. A failed session now drops the source out of the chain honestly, and the real reason travels with the failure.' },
         { title: 'This is what jams the wishlist', desc: 'if your wishlist has been reporting the same number of failures every run and never shrinking, this is why. With Deezer first in the chain and silently dead, every track failed and went straight back on the list, so the next run tried the identical set and failed identically. The same log showed 22 consecutive runs of exactly 20 tracks, all failing.' },
         { title: 'Wishlist runs are logged honestly now', desc: 'the completion summary was written at ERROR level for every run — including runs where <em>nothing failed at all</em> — and read as "20 added to wishlist, 20 failed", which looks like 40 tracks with half of them fine. It is the same 20 tracks counted twice: the ones that failed, going back on the list. A clean run is now an ordinary info line, and a run with failures says so once.' },
@@ -3609,8 +3625,8 @@ const WHATS_NEW = {
         { title: 'Also in 1.9.4', desc: 'a failed import can no longer report itself as a success, and Music Libraries gained the same writability check.' },
         { title: 'Fixed: imports that failed reported themselves as successful', desc: 'the one that matters. Post-processing catches any error, re-queues the file and returns quietly so a download can be retried later — but a manual import has nothing watching it, so it read that quiet return as success. A user imported an eleven-track album into a folder the server had no permission to write to: every track logged <em>Permission denied</em>, every track notified "Track Imported", and not one file moved. A failed import now says so, <strong>and says why</strong> — the permission error appears in the UI instead of only in app.log.' },
         { title: 'Music Libraries are checked for writability', desc: 'the failure above was invisible until someone read the log, because a destination the server cannot write to looks exactly like a destination nothing has been sent to yet. Settings → Paths & Organization now marks any Music Library the server cannot write into with <strong>NOT WRITABLE</strong>, and hovering it explains what to check. It tests by creating and removing a folder, not by reading permission bits — bits are the wrong answer under container UID remapping, NFS root-squash and ACLs, which is where this actually goes wrong.' },
-        { title: 'If you see NOT WRITABLE', desc: 'the folder exists but the user SoulSync runs as cannot create anything inside it. Compare the folder\'s owner with the PUID/PGID your container runs as — on Unraid, shares are usually <em>nobody:users</em> (99:100) while the image defaults to 1000:1000. A folder created by a different user or another container is the usual cause. Note that video working on the same base folder proves nothing: permissions are per-folder.' },
-        { title: 'Your Music Library Folder repairs itself on start-up', desc: '1.9.3 fixed editing that field, but only from the next save onwards — anyone already caught by the 1.9.2 bug stayed broken, with the field showing the right path and imports still going somewhere else, and no reason to ever re-save. SoulSync now re-aligns the two when it starts, keeps your label, and writes the old path to the log so you can find anything already misfiled.' },
+        { title: 'If you see NOT WRITABLE', desc: 'the folder exists but the user Commissary runs as cannot create anything inside it. Compare the folder\'s owner with the PUID/PGID your container runs as — on Unraid, shares are usually <em>nobody:users</em> (99:100) while the image defaults to 1000:1000. A folder created by a different user or another container is the usual cause. Note that video working on the same base folder proves nothing: permissions are per-folder.' },
+        { title: 'Your Music Library Folder repairs itself on start-up', desc: '1.9.3 fixed editing that field, but only from the next save onwards — anyone already caught by the 1.9.2 bug stayed broken, with the field showing the right path and imports still going somewhere else, and no reason to ever re-save. Commissary now re-aligns the two when it starts, keeps your label, and writes the old path to the log so you can find anything already misfiled.' },
         { title: 'Also in 1.9.3', desc: 'the Music Library Folder regression, honest per-track import messages, and Deep Scan learning about libraries.' },
         { title: 'Fixed: changing your Music Library Folder did nothing', desc: 'a 1.9.2 regression, and the worst kind — nothing looked broken. Music Library Folder and the first entry under Music Libraries are the same setting shown twice, and the importer reads the entry. Editing the folder in Settings left the entry on the old path, so downloads kept landing where you had moved away from while Settings insisted otherwise. Saving Settings now moves the library with it. <strong>If an album went missing after updating to 1.9.2, look at the first path under Music Libraries — that is where it went.</strong>' },
         { title: 'Fixed: "Album Imported (1/1 tracks)" on an 11-track album', desc: 'the Import page submits an album one track per request, so that message fired once per track and each one claimed to be the whole album. An eleven-track import looked like it had found a single file. It now says "Track Imported — <em>track</em> — <em>album</em>", and a track that failed says so instead of announcing an import that did not happen.' },
@@ -3623,12 +3639,12 @@ const WHATS_NEW = {
         { title: 'Each library can name files its own way', desc: 'and use its own quality profile. Leave both blank — which is how they start — and the library inherits your global settings. A library profile governs the whole pipeline for files going there, not just search ranking: the quality gate, the fingerprint check, deep verify, replace-lower, downsampling.' },
         { title: 'Reorganize keeps files where they live', desc: 'worth calling out because the opposite would be quiet and destructive: reorganizing a file that sits in one library re-files it <em>within that library</em>. It does not pull everything back into the default one. Moving something between libraries is still possible — it just has to be asked for.' },
         { title: 'Your library folder and the first entry are the same thing', desc: 'Music Library Folder above the list is the first library, and editing either updates the other. Two settings quietly disagreeing about where music goes is exactly the kind of thing that wastes an afternoon.' },
-        { title: 'The old extras list is now called Additional Read-Only Paths', desc: 'it was "Additional Music Libraries", which now reads like it means destinations — it never did. Those are folders SoulSync reads but never files anything into, and the section says so.' },
+        { title: 'The old extras list is now called Additional Read-Only Paths', desc: 'it was "Additional Music Libraries", which now reads like it means destinations — it never did. Those are folders Commissary reads but never files anything into, and the section says so.' },
         { title: 'Also in 1.9.1', desc: 'importing from any of your download folders instead of only the Import folder.' },
         { title: 'Import from any of your download folders', desc: 'Import only ever read one folder — the Import folder in Settings — so anything sitting where your download client left it had to be moved there by hand before it could be imported at all. There is now a "Change folder" button on the Import page: browse your download, import and library folders, pick the one you want, and the scan reads that instead.' },
         { title: 'It opens where your downloads land', desc: 'no path typing. The picker starts on your download folder with shortcuts to every configured root, and tells you how many audio files are directly in whatever folder you are looking at before you commit to it — a folder with none can still be the right pick, since subfolders are scanned too.' },
         { title: 'Your choice sticks while you work', desc: 'switching between the Albums, Singles and Auto-Import tabs keeps the folder you chose. The header says "Scanning: …" instead of "Import: …" whenever you are somewhere other than the configured Import folder, so an empty result is never mistaken for your Import folder having broken. "Back to Import folder" returns you to the default.' },
-        { title: 'Where it will and will not go', desc: 'the browser is limited to the folders SoulSync already knows about — your download folder, the torrent and usenet completed paths, the Import folder, your music library and any extra library paths. It will not walk the rest of the machine, and it stops offering "up" at the edge of those rather than leading you somewhere the scan would then refuse. Admin only, like the rest of the Import page.' },
+        { title: 'Where it will and will not go', desc: 'the browser is limited to the folders Commissary already knows about — your download folder, the torrent and usenet completed paths, the Import folder, your music library and any extra library paths. It will not walk the rest of the machine, and it stops offering "up" at the edge of those rather than leading you somewhere the scan would then refuse. Admin only, like the rest of the Import page.' },
         { title: 'Changing folder clears the matching you had in progress', desc: 'deliberately. A selected album and its per-track matches name files in the folder you just left, so carrying them across would let you import a match built against files that are no longer on screen.' },
         { title: 'Also in 1.9.0', desc: 'every connected source became searchable, and albums got a release picker.' },
         { title: 'Every source you have connected is now searchable', desc: 'the source list behind manual search was filtered by your download mode: in Hybrid it offered only the sources in your fallback chain, and in single-source mode it offered exactly one. But that setting is about which source the AUTOMATIC cascade downloads from — it was never a statement that the others do not work. A source you had connected and could download from was simply invisible unless you also re-ordered your fallback chain to see it. Every configured source is now offered; your chain order still leads the list, it just no longer excludes.' },
@@ -3642,7 +3658,7 @@ const WHATS_NEW = {
         { title: 'Where the button is', desc: 'Search results get "Sources" next to Stream and Download. Album tracks get it whether you own them or not — for a missing track it is a way to fill the gap, for one you own it is a way to swap in a better copy. And every wishlist row gets one, which is the useful one when something has been sitting there not downloading.' },
         { title: 'It gives you a way out, not an explanation', desc: 'worth being straight about: this lets you rescue a stuck item by hand, but it still does not tell you why it was stuck. If something has been on your wishlist a long time, check the Ignored list first — removing a track or cancelling its download quietly stops the automation re-adding it for thirty days, and that is invisible from the wishlist itself.' },
         { title: 'Also in 1.8.18', desc: 'downloads filed into category folders now import, and manual placement stopped reporting failures for files it had placed.' },
-        { title: 'Downloads sorted into category folders now import', desc: 'if your download client files finished downloads into folders — the usual "complete/Movies/…" or "complete/TV/…" — SoulSync could not find them. It looked exactly one folder below each download root, and a category layout puts the release two down, so the download simply sat there and never imported. It now looks three levels deep.' },
+        { title: 'Downloads sorted into category folders now import', desc: 'if your download client files finished downloads into folders — the usual "complete/Movies/…" or "complete/TV/…" — Commissary could not find them. It looked exactly one folder below each download root, and a category layout puts the release two down, so the download simply sat there and never imported. It now looks three levels deep.' },
         { title: 'Still bounded, so it stays quick', desc: 'the old one-level limit existed to stop a download root turning into a directory crawl, which is a fair worry. The search is capped by depth and by how many folders it will look at, so it reaches your releases without wandering. Adjustable with download_source.import_search_depth if your layout is deeper.' },
         { title: '"Couldn\'t place the file" — when it had, in fact, placed the file', desc: 'manual import placement copied the file while your browser waited, and a large file over a network share takes minutes. If anything along the way gave up waiting, you got an error — while the server quietly finished the copy perfectly. The page then kept the item on screen as though nothing had happened, and trying again gave a different error still.' },
         { title: 'Placement now happens in the background', desc: 'small files finish instantly and behave exactly as before. A big one hands you back the page and reports progress, so nothing can time out and misreport it. And the page never calls a placement failed without checking what actually happened first.' },
@@ -3652,13 +3668,13 @@ const WHATS_NEW = {
         { title: 'The setting never said that, because the label kept disappearing', desc: 'there was a note explaining it was only a preference, but it lived on a text box that gets hidden the moment the tracker checkboxes appear. So the one sentence describing the behaviour vanished exactly when the control it described showed up, leaving an unlabelled list of trackers that reads as "search these". Both tracker settings now carry a caption you can actually see.' },
         { title: 'Two more places were ignoring your tracker choices', desc: 'found while fixing the first. The RSS pass — the job that watches for new releases — polled every indexer even when "Restrict to indexer IDs" named a few, so a release from an excluded tracker could be picked up and grabbed unattended. And a manual search worked out which Library you had picked only AFTER searching, so it could re-order results but never limit where they came from.' },
         { title: 'You can tick the indexers instead of typing their numbers', desc: 'Settings → Indexers listed your indexers with their IDs, above a box asking you to type those same IDs in by hand. The list is now clickable and fills the box for you. The box stays visible and in sync rather than being hidden — that is the mistake that caused the confusion above.' },
-        { title: 'How the two settings combine', desc: 'the global "Restrict to indexer IDs" is the outer limit; a Library\'s own choice narrows it further and can never widen it. If you pick trackers a Library is globally barred from, nothing is left to search — rather than quietly falling back to searching everything, SoulSync now tells you the two settings contradict each other.' },
+        { title: 'How the two settings combine', desc: 'the global "Restrict to indexer IDs" is the outer limit; a Library\'s own choice narrows it further and can never widen it. If you pick trackers a Library is globally barred from, nothing is left to search — rather than quietly falling back to searching everything, Commissary now tells you the two settings contradict each other.' },
         { title: 'Worth a look after updating', desc: 'if you have ticked trackers on a Library expecting a preference, that selection now binds. A Library whose ticked trackers have no results will come up empty instead of falling back to the others.' },
         { title: 'Also in 1.8.16', desc: 'renaming files from a show\'s own page, plus two download fixes.' },
         { title: 'Rename a show or film’s files from its own page', desc: 'a Rename Files button on any show or movie you own. It shows the naming template, every $variable you can use — each with the value it takes for that title, so $episodetitle reads "Pilot" rather than a generic legend — and a live list of every file with its current name and the name it would get. Nothing moves until you confirm.' },
         { title: 'Type a name and watch it update', desc: 'edit the template and the preview re-renders as you type; click a variable to insert it. The template you type here is a one-off for that rename — your saved naming template in Settings is not changed.' },
         { title: 'It was already possible, just not findable', desc: 'the rename engine existed but only ran across your entire library from the Tools page, with no way to see the variables or aim it at one title. Same engine underneath: sidecars still travel with the file, a name that is already taken is skipped rather than overwritten, and the database follows the move.' },
-        { title: 'Torrents are no longer imported while still being written', desc: 'reaching 100% means the bytes are in, not that the client has finished putting them where SoulSync is about to read. qBittorrent reports 100% while "moving" a finished download from the incomplete folder to the complete one, and the import could read a file mid-copy. Usenet repair and unpack have the same shape — both write long after the download says it is done.' },
+        { title: 'Torrents are no longer imported while still being written', desc: 'reaching 100% means the bytes are in, not that the client has finished putting them where Commissary is about to read. qBittorrent reports 100% while "moving" a finished download from the incomplete folder to the complete one, and the import could read a file mid-copy. Usenet repair and unpack have the same shape — both write long after the download says it is done.' },
         { title: 'It now waits for the writing to stop', desc: 'the import holds until the file reads identically twice in a row, about three seconds apart. Checking the download state alone could not fix this: clients report "moving" and "finished, queued to seed" as the same thing, and refusing to import on that would strand every seeding torrent at 100% forever.' },
         { title: 'YouTube: the last download retry no longer fetches the video', desc: 'the music downloader has always taken audio only — but its third retry deliberately switched to a combined video+audio stream, downloading the whole video so ffmpeg could throw the picture away. That fallback was redundant as well as wasteful, and it is gone.' },
         { title: 'And you can now keep YouTube’s original audio', desc: 'Settings → Downloads → YouTube Audio Format. MP3 320 stays the default, but YouTube serves Opus at roughly 130–160kbps, so converting it is a lossy-to-lossy transcode: a bigger file that sounds slightly worse. "Original" keeps the stream untouched — smaller and better. Note that a quality profile targeting MP3 will stop matching YouTube if you switch, because the file genuinely will not be an MP3.' },
@@ -3671,7 +3687,7 @@ const WHATS_NEW = {
         { title: 'Nothing here touches your files', desc: 'unchanged, and worth repeating: approving a Wishlist Audit finding removes the wishlist row and nothing else.' },
         { title: 'Also in 1.8.14', desc: 'signing in survives closing the browser — it never did before.' },
         { title: 'Signing in now survives closing the browser', desc: 'it never did. Nothing had ever configured how long a sign-in lasts, so the browser threw it away the moment you closed it. That went unnoticed while the account picker let anyone click straight back into any profile — once 1.8.13 required actually having signed in, it meant redoing the whole Plex link every time you reopened your browser.' },
-        { title: 'Thirty days, and it renews as you use it', desc: 'keep using SoulSync and you stay signed in indefinitely; stop, and it lapses after a month. Adjustable with security.session_days if you want it shorter.' },
+        { title: 'Thirty days, and it renews as you use it', desc: 'keep using Commissary and you stay signed in indefinitely; stop, and it lapses after a month. Adjustable with security.session_days if you want it shorter.' },
         { title: 'So "Log out" had to start meaning it', desc: 'logging out only forgot which profile you were using — it kept the record of every account you had signed into on that device. That did no harm while everything vanished on browser close. With a sign-in that lasts a month it would have meant logging out on a shared computer still handing the next person your accounts. It now clears the lot.' },
         { title: 'Nothing changes for HTTPS or plain-http installs', desc: 'the cookie is still marked Secure only when you have turned on reverse-proxy mode, exactly as before. Forcing it on a normal home install would stop the browser sending it at all — which is this same bug, permanently.' },
         { title: 'Also in 1.8.13', desc: 'the account switcher listed every profile on the server and let you into any of them; it now shows only accounts signed in on that device. Plus two Manage Profiles fixes.' },
@@ -3718,9 +3734,9 @@ const WHATS_NEW = {
         { title: 'Adding to the wishlist works again for everyone', desc: 'the opposite problem: a profile without download permission was blocked from ADDING to the wishlist, so members had no way to ask for anything. Asking is not downloading — a member adds a title and your automation, or you, decides whether it is actually fetched.' },
         { title: 'A clear button on the search fields', desc: 'the Library, Music Library and Purchased search boxes have an × once you type in them. Escape clears too. Whatever filtering the page already does runs exactly as if you had deleted the text by hand.' },
         { title: 'Also in 1.8.7', desc: 'a torrent that had been added stopped reporting as rejected, Manual Search stopped returning nothing until you searched in Prowlarr first, and Grab season now fetches a single season pack.' },
-        { title: 'Fixed: a torrent that WAS added reported as rejected', desc: 'the grab said "the torrent client didn\'t accept the release" while the torrent sat there downloading. SoulSync worked out the new torrent\'s identity by listing the client\'s torrents before and after and spotting the difference, waiting about five seconds. qBittorrent often needs longer — resolving a magnet, or simply busy — and when the wait ran out a perfectly good add was called a failure.' },
-        { title: 'Why that mattered more than the message', desc: 'a grab recorded as failed is never watched, so when the download finished nothing imported it. The file arrived and SoulSync did not know it existed. It now works out the torrent\'s identity from the magnet or the torrent file itself, before adding it, so there is nothing to race. Re-adding something the client already has now resolves properly too, instead of looking like a rejection.' },
-        { title: 'Fixed: Manual Search finding nothing until you searched in Prowlarr first', desc: 'a first search across many indexers is slow — Prowlarr queries each one and some have to log in — and SoulSync gave up after fifteen seconds, the same short limit it uses for quick status checks. Worse, it could not tell a search that timed out from a search that found nothing, so it reported "No matching releases found". Searching in Prowlarr first made its cache answer instantly, which is why that appeared to fix it.' },
+        { title: 'Fixed: a torrent that WAS added reported as rejected', desc: 'the grab said "the torrent client didn\'t accept the release" while the torrent sat there downloading. Commissary worked out the new torrent\'s identity by listing the client\'s torrents before and after and spotting the difference, waiting about five seconds. qBittorrent often needs longer — resolving a magnet, or simply busy — and when the wait ran out a perfectly good add was called a failure.' },
+        { title: 'Why that mattered more than the message', desc: 'a grab recorded as failed is never watched, so when the download finished nothing imported it. The file arrived and Commissary did not know it existed. It now works out the torrent\'s identity from the magnet or the torrent file itself, before adding it, so there is nothing to race. Re-adding something the client already has now resolves properly too, instead of looking like a rejection.' },
+        { title: 'Fixed: Manual Search finding nothing until you searched in Prowlarr first', desc: 'a first search across many indexers is slow — Prowlarr queries each one and some have to log in — and Commissary gave up after fifteen seconds, the same short limit it uses for quick status checks. Worse, it could not tell a search that timed out from a search that found nothing, so it reported "No matching releases found". Searching in Prowlarr first made its cache answer instantly, which is why that appeared to fix it.' },
         { title: 'Searches now get their own, much longer limit', desc: 'ninety seconds by default, adjustable. And a search that fails now says what went wrong instead of claiming there are no releases — being told nothing exists is worse than being told it was slow.' },
         { title: 'Grab season now looks for a season pack', desc: 'it used to search for and grab every missing episode separately: a dozen searches and a dozen downloads for one season, hard on the indexers, and it often ended up assembling a season from a dozen unrelated releases at different qualities. It now finds one release covering the whole season and grabs that; the import splits it into episodes exactly as before.' },
         { title: 'And it tells you when there isn\'t one', desc: 'if no season pack exists it says so and grabs nothing, rather than quietly going back to downloading episodes one by one. Auto on an individual episode still does that whenever you want it.' },
@@ -3730,7 +3746,7 @@ const WHATS_NEW = {
         { title: 'Manual import can take a whole season folder', desc: 'the automatic side has unpacked season packs since 1.8.0, but manual import could only take one file at a time — so a pack that arrived any other way had to be placed episode by episode, answering "which show is this?" on every one. Point it at the folder instead and answer once.' },
         { title: 'It shows you what it will do first', desc: 'browsing into a folder with two or more numbered episodes offers "Import this whole folder". The Place dialog then lists every file and the episode it read from each name, before you commit. Each file keeps its own episode number — the dialog only supplies the show.' },
         { title: 'Manual Search was quietly discarding results', desc: 'it kept the best 40 releases and 15 rejected ones, and threw the rest away after they had already been found and ranked. That is why a popular title only ever showed so many. Now 100 and 40, and both are configurable, along with how many results are asked for in the first place.' },
-        { title: 'Click a release name to see where it came from', desc: 'the title now links to the indexer\'s own page for that release, when the indexer provides one. Links open in a new tab and are checked before being shown — a tracker cannot use one to run anything inside SoulSync.' },
+        { title: 'Click a release name to see where it came from', desc: 'the title now links to the indexer\'s own page for that release, when the indexer provides one. Links open in a new tab and are checked before being shown — a tracker cannot use one to run anything inside Commissary.' },
         { title: 'And you can filter the results', desc: 'by name, quality, source, minimum seeders, or only those that meet your quality profile. Filtering happens instantly on results already fetched, and the header always says how many rows are being hidden so a short list is never a mystery.' },
         { title: 'Also in 1.8.5', desc: 'the unattended background jobs stopped re-creating episode rows the clean-up had just removed, and the episode buttons no longer name a database they might not be using.' },
         { title: 'The background passes no longer undo your clean-up', desc: 'the important fix here. Two unattended jobs — the one that matches a show and the one that fills in full episode lists — always took their season numbers from TMDB, whatever a show was actually set to use. On a show using TVDB numbering they would quietly re-create the exact rows the out-of-place check had just removed. The repair looked like it worked, then reverted with nothing on screen to explain it.' },
@@ -3740,17 +3756,17 @@ const WHATS_NEW = {
         { title: 'The duplicate check never asked a database at all', desc: 'it compares your library against itself, pairing episodes by air date. Its description used to blame "your server and TMDB", which was wrong twice over. It now says what it actually does.' },
         { title: 'TVDB episode lists were being read one page deep', desc: 'that endpoint returns the whole series in pages. For a show as long as Bleach — over 400 episodes — later seasons fell past the first page and came back empty, and an empty season reads exactly like "this season has no episodes", so everything downstream quietly did nothing.' },
         { title: 'Manage shows which database is in use, and why', desc: 'under the Episode numbering box: "Using TVDB — it covers 100% of your server\'s seasons (the other is missing seasons 3, 4, 5…)". Auto was previously impossible to check — when a re-scan did nothing there was no way to tell whether it chose what you expected or fell back to the default because a lookup failed.' },
-        { title: 'A deeper diagnostic', desc: 'tools/diagnose_show.py --check runs SoulSync\'s own resolution against your real API keys and prints what each database returned, the decision and its scores, and per season what the clean-up would remove — flagging any season that came back empty.' },
-        { title: 'SoulSync now uses the episode numbering your server uses', desc: 'the actual cause of the Bleach problem, found by dumping the rows instead of reasoning about them. TMDB has Bleach as three seasons — specials, the 366-episode original run, and Thousand-Year Blood War. TVDB has seventeen, which is what Plex reports. SoulSync always took its season numbers from TMDB, so TMDB\'s "season 2" (the 2022 run) was written on top of the 2005 season.' },
+        { title: 'A deeper diagnostic', desc: 'tools/diagnose_show.py --check runs Commissary\'s own resolution against your real API keys and prints what each database returned, the decision and its scores, and per season what the clean-up would remove — flagging any season that came back empty.' },
+        { title: 'Commissary now uses the episode numbering your server uses', desc: 'the actual cause of the Bleach problem, found by dumping the rows instead of reasoning about them. TMDB has Bleach as three seasons — specials, the 366-episode original run, and Thousand-Year Blood War. TVDB has seventeen, which is what Plex reports. Commissary always took its season numbers from TMDB, so TMDB\'s "season 2" (the 2022 run) was written on top of the 2005 season.' },
         { title: 'The evidence was exact', desc: 'every season with invented rows was a season TMDB has (0, 1 and 2). Every season with none was one TMDB does not have (3 to 17). Seasons 3 to 16 were untouched the whole time.' },
-        { title: 'It is also why Season 17 never filled', desc: 'TMDB has no season 17, so nothing could ever add episodes to the season where your library actually keeps that run. Not a separate problem — the same one. SoulSync can now fill it, because it takes the episode list from the database whose seasons match yours.' },
+        { title: 'It is also why Season 17 never filled', desc: 'TMDB has no season 17, so nothing could ever add episodes to the season where your library actually keeps that run. Not a separate problem — the same one. Commissary can now fill it, because it takes the episode list from the database whose seasons match yours.' },
         { title: 'How it decides', desc: 'it scores each database on how much of your server\'s season structure it can actually serve, and only switches when the difference is decisive. A show both agree on — nearly all of them — carries on using TMDB exactly as before. Nothing is rearranged quietly.' },
         { title: 'And you can overrule it', desc: 'Manage on a TV show has an "Episode numbering" box: Auto, TMDB or TVDB. An explicit choice is obeyed even if the automatic guess disagrees, which is the entire point of having it. Re-scan afterwards to apply it.' },
         { title: 'The out-of-place check now asks the right database', desc: 'it was comparing against TMDB, which for a show like this considers your correct season wrong and the invented rows right — exactly backwards, and why it reported nothing to do. It now checks against whichever database owns that show\'s numbering.' },
         { title: 'A correction to 1.8.3', desc: 'that release blamed TVDB and stopped it adding episodes. It was the wrong database: TVDB is the one that agrees with Plex here, and blocking it removed the only source that could fill Season 17 while leaving the real cause running. Reverted.' },
         { title: 'Also in 1.8.3', desc: 'a clean-up for episodes filed under a season they do not belong to, and a read-only diagnostic script (tools/diagnose_show.py) that dumps a show\'s rows — it is what found the real cause.' },
-        { title: 'Episodes filed under a season they never belonged to', desc: 'the real cause of the Bleach problem, and it was not what 1.8.2 assumed. TMDB calls Bleach season 2 the 2005 arc; TVDB calls its season 2 the 2022 Thousand-Year Blood War run. SoulSync read the season list from TMDB and then asked TVDB for those same season numbers — so TVDB\'s season 2 was written into TMDB\'s, putting seventeen 2023-2026 episodes inside a 21-episode season from 2005.' },
-        { title: 'Why it stopped things being found', desc: 'an episode filed under a season number no release uses can never be matched. That is why the missing episodes were hunted for months and never turned up — SoulSync was searching for season 2, episode 41, which does not exist anywhere.' },
+        { title: 'Episodes filed under a season they never belonged to', desc: 'the real cause of the Bleach problem, and it was not what 1.8.2 assumed. TMDB calls Bleach season 2 the 2005 arc; TVDB calls its season 2 the 2022 Thousand-Year Blood War run. Commissary read the season list from TMDB and then asked TVDB for those same season numbers — so TVDB\'s season 2 was written into TMDB\'s, putting seventeen 2023-2026 episodes inside a 21-episode season from 2005.' },
+        { title: 'Why it stopped things being found', desc: 'an episode filed under a season number no release uses can never be matched. That is why the missing episodes were hunted for months and never turned up — Commissary was searching for season 2, episode 41, which does not exist anywhere.' },
         { title: 'TVDB now enriches, never invents', desc: 'TVDB is still used, and still valuable — it is often first with titles and synopses for episodes that just aired. It can now fill in details for an episode TMDB already lists. It can no longer decide which episodes exist, because a season number does not mean the same thing in two different databases.' },
         { title: 'A clean-up for episodes already filed wrongly', desc: 'Manage on a TV show gains "Check for out-of-place episodes". It asks TMDB which episode numbers belong to each season and offers to remove rows TMDB does not list. Two clicks, like the other one, and it only ever touches rows with no file and nothing from your server.' },
         { title: 'It refuses if it cannot check', desc: 'if TMDB cannot be reached, it removes nothing at all. An empty answer would make every episode you do not own look out of place, which would be the worst possible time to start deleting.' },
@@ -3758,21 +3774,21 @@ const WHATS_NEW = {
         { title: 'Also in 1.8.2', desc: 'every Wishlist card gained a Library box, so a title you do not own yet can be pointed at the right Library instead of always landing in the primary one.' },
         { title: 'Send a wished title to the right Library', desc: 'every card on the Wishlist now has a Library box. Until now a title you did not already own had nowhere to record where it belonged, so anything the automation grabbed landed in your primary Movies or TV folder regardless. Pick a Library and the next grab goes there. Nothing on disk moves.' },
         { title: 'It shows where a title is actually headed', desc: 'not just whether someone has set it. A show already filed under Anime reads "Anime" rather than "Default". The box only appears when you have more than one Library of that kind — with one there is no choice to make.' },
-        { title: 'Episodes listed twice under two season numbers', desc: 'reported on Bleach: the newest episodes appeared under Season 2 AND again under Season 17, and the ones being hunted were never found. Plex files that run as S2, TMDB calls it S17 — both are right, and SoulSync was storing both as separate episodes. It no longer creates the second copy when your server already has that episode under another season number.' },
+        { title: 'Episodes listed twice under two season numbers', desc: 'reported on Bleach: the newest episodes appeared under Season 2 AND again under Season 17, and the ones being hunted were never found. Plex files that run as S2, TMDB calls it S17 — both are right, and Commissary was storing both as separate episodes. It no longer creates the second copy when your server already has that episode under another season number.' },
         { title: 'A tool for the duplicates you already have', desc: 'the fix above only helps from now on, and a re-scan never removes them. Manage on a TV show now has "Check for duplicate episodes". It shows you what it found — "S17E1 (you have it as S2E1)" — and only removes anything on a second click.' },
         { title: 'It refuses far more than it removes', desc: 'a row only goes if your server has that same episode under a different season number and the air date identifies exactly one of them. Anything ambiguous — a streaming season sharing one date, an episode with no date, two candidates on the same day — is left alone. Nothing on disk is ever touched: these are placeholders for episodes you do not have.' },
         { title: 'Also in 1.8.1', desc: 'search stopped stopping at the first page of TMDB results, typing a year no longer returns nothing at all, and TV shows gained a "Re-scan episodes from TMDB" button for seasons that look short.' },
         { title: 'Search looks past the first page of results', desc: 'it only ever read the first twenty matches TMDB returned, ordered by popularity — so a title sharing its name with something better known was simply unfindable. It now reads further down the list.' },
-        { title: 'Typing a year works instead of returning nothing', desc: 'searching "Another World 2025" used to come back completely empty, because the year was sent as part of the title. If what you type finds nothing and it ends in a year, SoulSync now searches the name on its own and puts that year\'s match at the top. Titles that genuinely end in a year, like Blade Runner 2049, are unaffected.' },
-        { title: 'Re-scan a show\'s episodes from TMDB', desc: 'a new button in Manage for TV shows. SoulSync reads a show\'s episode list once and never looks again, so episodes added to TMDB later — a season still airing, a late batch — stayed invisible with no way to ask for them. This reads every season again and tells you how many it added.' },
+        { title: 'Typing a year works instead of returning nothing', desc: 'searching "Another World 2025" used to come back completely empty, because the year was sent as part of the title. If what you type finds nothing and it ends in a year, Commissary now searches the name on its own and puts that year\'s match at the top. Titles that genuinely end in a year, like Blade Runner 2049, are unaffected.' },
+        { title: 'Re-scan a show\'s episodes from TMDB', desc: 'a new button in Manage for TV shows. Commissary reads a show\'s episode list once and never looks again, so episodes added to TMDB later — a season still airing, a late batch — stayed invisible with no way to ask for them. This reads every season again and tells you how many it added.' },
         { title: 'What that button is NOT', desc: '"Sync show now" checks your Plex/Jellyfin server, so it can never find episodes your server does not have. This one asks TMDB. If a season looks short compared to TMDB, this is the button.' },
         { title: 'Also in 1.8.0', desc: 'season packs now unpack and file every episode instead of stalling after the download, and Manage gained a Library box so a movie or show filed in the wrong place can be corrected.' },
-        { title: 'Season packs now actually finish', desc: 'you could already search for and grab a whole season — but it would download and then stop, asking to be imported by hand. SoulSync now unpacks it: every episode in the pack is renamed and filed individually, exactly as if you had downloaded them one at a time.' },
+        { title: 'Season packs now actually finish', desc: 'you could already search for and grab a whole season — but it would download and then stop, asking to be imported by hand. Commissary now unpacks it: every episode in the pack is renamed and filed individually, exactly as if you had downloaded them one at a time.' },
         { title: 'A part-full pack is still a win', desc: 'a pack labelled as a full season that only ships some episodes, or one where you already own a few at better quality, imports what is useful and tells you what it did. Samples, extras and trailers are left behind.' },
         { title: 'The hourly automation can use packs too', desc: 'when several episodes of a season are missing it can grab one pack instead of chasing them one by one. Off until you turn it on, in Settings — one pack can be tens of gigabytes and the automation runs unattended.' },
         { title: 'Put a movie in the right Library', desc: 'Manage now has a Library box for movies and TV shows alike, so a title filed in the wrong place can be corrected. New downloads and upgrades for it go to the Library you pick; files already on disk stay where they are.' },
-        { title: 'Before you open SoulSync to the internet', desc: 'turn on Settings → Security → Require login. Without it SoulSync treats anyone who can reach it as the admin, which is fine on your home network and not fine on a public address. Put it behind HTTPS too, and switch on "Trust reverse proxy".' },
-        { title: 'Earlier versions', desc: '1.7.2 and 1.7.1 quietened the login screen — it had been firing dozens of requests a minute at parts of SoulSync you are not signed in to yet, and now sends the two the sign-in page actually needs — and fixed Sign in with Plex appearing to do nothing with "Require login" on (the panel showing your plex.tv code was hidden behind the lock screen). 1.7.0 was a security release: requests from other websites are refused while you are signed in (with a switch in Settings → Security), a first-run shortcut that could hand out an API key without asking who you were now needs a signed-in admin, the artwork fetcher no longer follows any address it is given, and the Stop button in Server Activity is shown only to admins who could actually use it. 1.6.13 opened Manage for shows not yet in Plex (so Series type and "Also known as" can be set before the first episode arrives) and fixed watchlist posters that would sometimes stay blank, routing that art through SoulSync\'s own cache. 1.6.12 added an "Also known as" box on any movie or show for the names releases actually use, feeding the hourly automation, instant-grab and manual searches alike, without ever writing those names to Plex or Jellyfin. 1.6.11 stopped anime and daily episodes being rejected in manual searches — releases with no S01E03 in the name failed while the automation grabbed them fine — and replaced the misleading "Not a single episode" message. 1.6.10 turned Preferred trackers into a pick-list of your real indexers — it stored ID numbers the app never showed you, so typing a tracker name saved as blank — and made manual searches match alternative and original titles the way the automation already did. 1.6.9 compressed everything the browser downloads (3.90 MB of text became 0.64 MB), stopped the page itself being re-downloaded on every visit, cached posters on disk instead of re-fetching them from Plex/TMDB each time, and deferred off-screen images. 1.6.8 replaced typing a full file path in manual import with a folder browser that opens on your download folder. 1.6.7 let users without download rights follow a show — it lands on the Watchlist as "Awaiting approval" until an admin approves — kept the monitor choice they asked for, gave Plex sign-ins the video side with downloads still off, and tightened the endpoints that opened up. 1.6.6 made downloads land in the Library the title actually lives in (an Anime episode was saving into the standard TV folder), stopped releases carrying a work\'s full colon-subtitle name being rejected as wrong titles, gave new wishlist titles their own Library, stopped saving Libraries from deleting the YouTube folder, and scoped the library filter dropdowns to the tab you are on. 1.6.5 stopped Library tabs reading as duplicates (All Movies / All TV / All Shows), gave each per-Library tab a count, and fixed Place this file never finding shows. 1.6.4 added Preferred Groups and per-Library preferred trackers, moved the Wishlist/Download History Library filters into the tab strips (they had rendered blank and only worked for admins), gave the dashboard Library widget one tile per Library with its own disk usage, and fixed the app version having been stuck at 1.6.1 since 1.6.2 — which had also been silently hiding the release notes. 1.6.3 added manual import for any on-disk file, fixed fansub-style anime releases being rejected as title mismatches, and root-caused dashboard customisation being dead on the Video side. 1.6.2 made unattended grabs respect each title\'s own Library. 1.6.1 fixed torrent/usenet downloads stuck at 100% when the release was a single bare file. 1.6.0 folded in 38 fixes from upstream SoulSync (through 3.1.8), led by a security fix for indexer URLs leaking to the browser. 1.5.0 removed the Soulseek chat feature and the Support button, and gave Plex a stable device identity. 1.4.0 let every user drag and resize their own dashboard cards, and accepted more than one completed-downloads folder. 1.3.2 made your video Libraries drive the health checks, recycle bin, moved-file resolver and naming-repair job. 1.3.1 added collapsible albums in Purchased. 1.3.0 extended the standard-user policy to the sidebar. 1.2.0 let admins choose which dashboard cards standard users see. 1.1.0 brought the Purchased page. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
+        { title: 'Before you open Commissary to the internet', desc: 'turn on Settings → Security → Require login. Without it Commissary treats anyone who can reach it as the admin, which is fine on your home network and not fine on a public address. Put it behind HTTPS too, and switch on "Trust reverse proxy".' },
+        { title: 'Earlier versions', desc: '1.7.2 and 1.7.1 quietened the login screen — it had been firing dozens of requests a minute at parts of Commissary you are not signed in to yet, and now sends the two the sign-in page actually needs — and fixed Sign in with Plex appearing to do nothing with "Require login" on (the panel showing your plex.tv code was hidden behind the lock screen). 1.7.0 was a security release: requests from other websites are refused while you are signed in (with a switch in Settings → Security), a first-run shortcut that could hand out an API key without asking who you were now needs a signed-in admin, the artwork fetcher no longer follows any address it is given, and the Stop button in Server Activity is shown only to admins who could actually use it. 1.6.13 opened Manage for shows not yet in Plex (so Series type and "Also known as" can be set before the first episode arrives) and fixed watchlist posters that would sometimes stay blank, routing that art through Commissary\'s own cache. 1.6.12 added an "Also known as" box on any movie or show for the names releases actually use, feeding the hourly automation, instant-grab and manual searches alike, without ever writing those names to Plex or Jellyfin. 1.6.11 stopped anime and daily episodes being rejected in manual searches — releases with no S01E03 in the name failed while the automation grabbed them fine — and replaced the misleading "Not a single episode" message. 1.6.10 turned Preferred trackers into a pick-list of your real indexers — it stored ID numbers the app never showed you, so typing a tracker name saved as blank — and made manual searches match alternative and original titles the way the automation already did. 1.6.9 compressed everything the browser downloads (3.90 MB of text became 0.64 MB), stopped the page itself being re-downloaded on every visit, cached posters on disk instead of re-fetching them from Plex/TMDB each time, and deferred off-screen images. 1.6.8 replaced typing a full file path in manual import with a folder browser that opens on your download folder. 1.6.7 let users without download rights follow a show — it lands on the Watchlist as "Awaiting approval" until an admin approves — kept the monitor choice they asked for, gave Plex sign-ins the video side with downloads still off, and tightened the endpoints that opened up. 1.6.6 made downloads land in the Library the title actually lives in (an Anime episode was saving into the standard TV folder), stopped releases carrying a work\'s full colon-subtitle name being rejected as wrong titles, gave new wishlist titles their own Library, stopped saving Libraries from deleting the YouTube folder, and scoped the library filter dropdowns to the tab you are on. 1.6.5 stopped Library tabs reading as duplicates (All Movies / All TV / All Shows), gave each per-Library tab a count, and fixed Place this file never finding shows. 1.6.4 added Preferred Groups and per-Library preferred trackers, moved the Wishlist/Download History Library filters into the tab strips (they had rendered blank and only worked for admins), gave the dashboard Library widget one tile per Library with its own disk usage, and fixed the app version having been stuck at 1.6.1 since 1.6.2 — which had also been silently hiding the release notes. 1.6.3 added manual import for any on-disk file, fixed fansub-style anime releases being rejected as title mismatches, and root-caused dashboard customisation being dead on the Video side. 1.6.2 made unattended grabs respect each title\'s own Library. 1.6.1 fixed torrent/usenet downloads stuck at 100% when the release was a single bare file. 1.6.0 folded in 38 fixes from upstream SoulSync (through 3.1.8), led by a security fix for indexer URLs leaking to the browser. 1.5.0 removed the Soulseek chat feature and the Support button, and gave Plex a stable device identity. 1.4.0 let every user drag and resize their own dashboard cards, and accepted more than one completed-downloads folder. 1.3.2 made your video Libraries drive the health checks, recycle bin, moved-file resolver and naming-repair job. 1.3.1 added collapsible albums in Purchased. 1.3.0 extended the standard-user policy to the sidebar. 1.2.0 let admins choose which dashboard cards standard users see. 1.1.0 brought the Purchased page. 1.0.0 was this fork\'s baseline, carrying upstream SoulSync 3.1.5.' },
     ],
 };
 
@@ -3802,6 +3818,20 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.0.0: SoulSync is now Commissary",
+        description: "a rename, and nothing else. This fork branched from SoulSync 3.1.5 and has diverged steadily since — it was overdue a name of its own, and a bug tracker of its own. No behaviour changed in this release.",
+        features: [
+            "the app, its window title, its PWA entry and every screen inside it now say Commissary",
+            "the published image is ghcr.io/thymrman/commissary — the one thing you have to change on upgrade",
+            "in-app bug reporting and the Copy Debug Info footer point at this fork's issues instead of upstream's",
+            "your Docker volume, compose service, config path and SOULSYNC_* environment variables are UNCHANGED — renaming those would point a working install at an empty database",
+            "the value stored against standalone library rows is still 'soulsync', so nothing you have imported needs re-scanning",
+            "your Navidrome player entry is still called SoulSync, deliberately — renaming it would have registered a second player without your 'Report Real Path' setting and broken stream paths",
+            "the README now describes this fork rather than upstream: what changed since 3.1.5, one manual image channel instead of upstream's two, and a single-branch workflow",
+        ],
+        usage_note: "Edit the image: line in your docker-compose.yml to ghcr.io/thymrman/commissary:latest, then docker-compose pull && docker-compose up -d. On Unraid, change the container's Repository field to the same. Everything else — config, database, libraries, profiles — carries over untouched; there is no migration step.",
+    },
     {
         title: "1.9.23: Anime and TV stop leaking into each other",
         description: "diagnosed against your real video_library.db. Nothing was mis-filed at rest — the bug fires exactly once per show, on its FIRST download, and the library scan then makes that mistake permanent.",
@@ -3890,7 +3920,7 @@ const VERSION_MODAL_SECTIONS = [
     },
     {
         title: "1.9.16: a replacement download could hang its whole album",
-        description: "reported as \"music download replacements seem to get stuck in a Downloading state\". When a downloaded track fails its integrity check, SoulSync goes back for a better copy — and one of those replacements could quietly finish without telling the batch it belonged to, which holds the entire album open.",
+        description: "reported as \"music download replacements seem to get stuck in a Downloading state\". When a downloaded track fails its integrity check, Commissary goes back for a better copy — and one of those replacements could quietly finish without telling the batch it belonged to, which holds the entire album open.",
         features: [
             "from the reported log: a 9-track album, three tracks retried on a duration mismatch, and sixteen seconds later one worker slot leaked and never came back",
             "\"reported=3, actual=2\" every pass for 80 seconds, then \"all 9 task(s) finished but the batch never completed\" — a batch cannot finish until its active count reaches zero",
@@ -3932,7 +3962,7 @@ const VERSION_MODAL_SECTIONS = [
     },
     {
         title: "1.9.14: HiFi stops re-dialling instances it already knows are down",
-        description: "the public HiFi instances are volunteer-run and outages are normal — but SoulSync kept no memory of them, so every search walked all seven hosts and paid the full timeout on each. One 12-hour log: 4,094 \"all instances exhausted\" errors and ~23,500 warnings, which was 47% of its errors and 80% of its warnings.",
+        description: "the public HiFi instances are volunteer-run and outages are normal — but Commissary kept no memory of them, so every search walked all seven hosts and paid the full timeout on each. One 12-hour log: 4,094 \"all instances exhausted\" errors and ~23,500 warnings, which was 47% of its errors and 80% of its warnings.",
         features: [
             "each instance gets a cooldown after it fails and is skipped without opening a connection until that elapses",
             "when every instance is cooling, HiFi is skipped instantly and the search falls through to your other sources",
@@ -3969,7 +3999,7 @@ const VERSION_MODAL_SECTIONS = [
             "defaults untouched and every $variable still works; the two styles can be mixed in one template",
             "the example under each template box is now rendered by the real naming code instead of a JavaScript copy of it, so the preview cannot drift from what lands on disk",
         ],
-        usage_note: "Settings → Library Organization. Load the preset, watch the example update, then click away to save. {Preferred Words} is the one guide token not supported — SoulSync has no equivalent setting, so it is left visible rather than silently dropped.",
+        usage_note: "Settings → Library Organization. Load the preset, watch the example update, then click away to save. {Preferred Words} is the one guide token not supported — Commissary has no equivalent setting, so it is left visible rather than silently dropped.",
     },
     {
         title: "1.9.11: the wishlist stops retrying the same failures forever",
@@ -4082,7 +4112,7 @@ const VERSION_MODAL_SECTIONS = [
             "two Libraries pointing at the same folder probe it once, rather than creating and removing a folder there twice per page load",
             "the endpoint is admin-only: it returns filesystem paths, which the Library tab bar's own payload deliberately withholds from non-admins",
         ],
-        usage_note: "NOT WRITABLE means the folder exists but the user SoulSync runs as cannot create anything inside it. Compare the folder's owner against your container's PUID/PGID — Unraid shares are usually nobody:users (99:100) while the image defaults to 1000:1000. One Library working does not vouch for another; permissions are per-folder.",
+        usage_note: "NOT WRITABLE means the folder exists but the user Commissary runs as cannot create anything inside it. Compare the folder's owner against your container's PUID/PGID — Unraid shares are usually nobody:users (99:100) while the image defaults to 1000:1000. One Library working does not vouch for another; permissions are per-folder.",
     },
     {
         title: "1.9.4: a failed import can no longer call itself a success",
@@ -4092,9 +4122,9 @@ const VERSION_MODAL_SECTIONS = [
             "a failed import now reports the actual reason, so \"Permission denied: /media/completed/listening/music/IVE\" reaches you instead of sitting in app.log",
             "Music Libraries the server cannot write into are marked NOT WRITABLE in Settings, with the reason on hover",
             "the check creates and removes a folder rather than reading permission bits — bits give the wrong answer under container UID remapping, NFS root-squash and ACLs, which is exactly where this breaks. It probes with a folder, not a file, because creating the artist folder is the step that fails",
-            "the Music Library Folder / default library mismatch from 1.9.2 now repairs itself when SoulSync starts, instead of waiting for a settings save you have no reason to perform",
+            "the Music Library Folder / default library mismatch from 1.9.2 now repairs itself when Commissary starts, instead of waiting for a settings save you have no reason to perform",
         ],
-        usage_note: "NOT WRITABLE means the folder exists but the user SoulSync runs as cannot create anything in it. Compare the folder's owner against your container's PUID/PGID — Unraid shares are usually nobody:users (99:100) and the image defaults to 1000:1000. Video working on the same base folder does not rule this out; permissions are per-folder.",
+        usage_note: "NOT WRITABLE means the folder exists but the user Commissary runs as cannot create anything in it. Compare the folder's owner against your container's PUID/PGID — Unraid shares are usually nobody:users (99:100) and the image defaults to 1000:1000. Video working on the same base folder does not rule this out; permissions are per-folder.",
     },
     {
         title: "1.9.3: fixes for 1.9.2, and Deep Scan learns about libraries",
@@ -4119,13 +4149,13 @@ const VERSION_MODAL_SECTIONS = [
             "reorganizing a file re-files it WITHIN the library it lives in rather than pulling everything into the default one; moving between libraries is still possible, it just has to be asked for",
             "Music Library Folder above the list is the first library — editing either updates the other, so the two can't disagree about where music goes",
         ],
-        usage_note: "The old \"Additional Music Libraries\" section is now \"Additional Read-Only Paths\" — it always meant folders SoulSync reads but never writes to, and that name would now read like it meant destinations.",
+        usage_note: "The old \"Additional Music Libraries\" section is now \"Additional Read-Only Paths\" — it always meant folders Commissary reads but never writes to, and that name would now read like it meant destinations.",
     },
     {
         title: "1.9.1: import from any of your download folders",
         description: "Import read one folder and only one — the Import folder in Settings. Anything a download client left elsewhere had to be moved there by hand first. Now you can point the scan at any of your download, import or library folders.",
         features: [
-            "a Change folder button on the Import page opens a browser over the folders SoulSync already knows about — download folder, torrent and usenet completed paths, Import folder, music library, extra library paths",
+            "a Change folder button on the Import page opens a browser over the folders Commissary already knows about — download folder, torrent and usenet completed paths, Import folder, music library, extra library paths",
             "it starts on your download folder, so the usual case needs no path typing, and tells you how many audio files are directly in the folder you're looking at before you commit",
             "a folder with no audio directly in it can still be the right pick — subfolders are scanned too, which is exactly the 'complete/Artist - Album/' case",
             "the folder you choose survives switching between the Albums, Singles and Auto-Import tabs",
@@ -4136,7 +4166,7 @@ const VERSION_MODAL_SECTIONS = [
     },
     {
         title: "1.9.0: every source is searchable, and albums get a release picker",
-        description: "1.8.19 let you search your sources by hand for a track. This opens that up — every source you have connected is now offered, not just the ones in your fallback chain — and gives albums their own picker so you choose the release instead of SoulSync guessing.",
+        description: "1.8.19 let you search your sources by hand for a track. This opens that up — every source you have connected is now offered, not just the ones in your fallback chain — and gives albums their own picker so you choose the release instead of Commissary guessing.",
         features: [
             "your download mode filtered which sources manual search would even offer: Hybrid showed only your fallback chain, single-source showed exactly one. That setting governs the AUTOMATIC cascade — it was never a claim that your other sources don't work. Every configured source is now searchable; your chain order still leads the list, it just no longer excludes",
             "albums and singles get a Sources button of their own. It asks every source that indexes whole albums what it has — format, track count, size, seeders — and downloads the exact release you pick",
@@ -4163,7 +4193,7 @@ const VERSION_MODAL_SECTIONS = [
         title: "1.8.18: downloads in category folders finally import",
         description: "two import fixes: a release filed under a category folder was never found, and manual placement reported failure for files it had actually placed.",
         features: [
-            "if your download client sorts finished downloads into folders — 'complete/Movies/…' and the like — SoulSync could not find them. It looked exactly one folder below each download root, and a category layout puts the release two down, so the download sat there and never imported. It now looks three levels deep",
+            "if your download client sorts finished downloads into folders — 'complete/Movies/…' and the like — Commissary could not find them. It looked exactly one folder below each download root, and a category layout puts the release two down, so the download sat there and never imported. It now looks three levels deep",
             "still bounded by depth and by how many folders it will examine, so a download root can't turn into a directory crawl. Adjustable with download_source.import_search_depth for a deeper layout",
             "manual placement copied the file while your browser waited, and a large file over a network share takes minutes — so if anything gave up waiting you got an error while the server quietly finished the copy. It now runs in the background, and the page checks what actually happened before calling anything failed",
             "small placements still finish instantly and behave exactly as before; only a slow copy hands the page back and reports progress",
@@ -4179,7 +4209,7 @@ const VERSION_MODAL_SECTIONS = [
             "the setting never said otherwise because the note explaining it lived on a text box that gets hidden the moment the checkboxes appear — so the explanation vanished exactly when the control showed up. Both tracker settings now carry a caption you can see",
             "two more places were ignoring your choices: the RSS pass polled every indexer even when Restrict to indexer IDs named a few, and manual search resolved the picked Library only after searching",
             "Settings → Indexers: the indexer list is clickable now and fills the Restrict box for you, instead of listing IDs you had to type in by hand",
-            "the global Restrict setting is the outer limit and a Library narrows it, never widens it. Pick trackers a Library is globally barred from and SoulSync says the two contradict each other rather than quietly searching everything",
+            "the global Restrict setting is the outer limit and a Library narrows it, never widens it. Pick trackers a Library is globally barred from and Commissary says the two contradict each other rather than quietly searching everything",
         ],
         usage_note: "If you ticked trackers expecting a preference, that selection now binds — a Library whose trackers have no results will come up empty rather than falling back.",
     },
@@ -4211,7 +4241,7 @@ const VERSION_MODAL_SECTIONS = [
         title: "1.8.14: signing in survives closing the browser",
         description: "it never did. Nothing had ever configured how long a sign-in lasts, so the browser discarded it on close — invisible while the picker let anyone click back into any profile, and painful once 1.8.13 required having actually signed in.",
         features: [
-            "a sign-in now lasts thirty days and renews as you use it: keep using SoulSync and you stay signed in, stop and it lapses after a month. Adjustable with security.session_days",
+            "a sign-in now lasts thirty days and renews as you use it: keep using Commissary and you stay signed in, stop and it lapses after a month. Adjustable with security.session_days",
             "Plex users no longer redo the Plex link every time they reopen their browser — the reason this surfaced at all",
             "\"Log out\" had to start meaning it. It previously forgot only which profile you were using and kept the record of every account signed in on that device. Harmless when everything vanished on browser close; with a month-long sign-in it would have handed the next person your accounts on a shared computer. It now clears the lot",
             "nothing changes for HTTPS or plain-http installs: the cookie is marked Secure only when reverse-proxy mode is on, exactly as before. Forcing it on a normal home install would stop the browser sending it at all — the same bug, permanently",
@@ -4329,10 +4359,10 @@ const VERSION_MODAL_SECTIONS = [
         title: "Earlier in 1.8.7 — two failures pretending to be answers",
         description: "both of these reported something confidently untrue: a torrent that had been added was called a rejection, and a search that never finished was called an empty result.",
         features: [
-            "the grab said \"the torrent client didn't accept the release\" while the torrent was downloading. SoulSync identified a new torrent by listing the client's torrents before and after and spotting the difference, waiting about five seconds — and qBittorrent frequently needs longer. It now derives the torrent's identity from the magnet or the torrent file BEFORE adding it, so there is no race to lose",
-            "that mattered more than the wording: a grab recorded as failed is never watched, so the finished download was never imported. The file arrived and SoulSync did not know it existed",
+            "the grab said \"the torrent client didn't accept the release\" while the torrent was downloading. Commissary identified a new torrent by listing the client's torrents before and after and spotting the difference, waiting about five seconds — and qBittorrent frequently needs longer. It now derives the torrent's identity from the magnet or the torrent file BEFORE adding it, so there is no race to lose",
+            "that mattered more than the wording: a grab recorded as failed is never watched, so the finished download was never imported. The file arrived and Commissary did not know it existed",
             "re-adding a torrent the client already has now resolves correctly as well — it produces no new entry to spot, so it always looked like a failure",
-            "Manual Search returned nothing until you searched for the same title in Prowlarr first. A cold search across many indexers takes longer than the fifteen seconds SoulSync allowed, and a timeout was indistinguishable from \"no releases exist\" — so it said there were none. Searching in Prowlarr warmed its cache and the next attempt answered in time",
+            "Manual Search returned nothing until you searched for the same title in Prowlarr first. A cold search across many indexers takes longer than the fifteen seconds Commissary allowed, and a timeout was indistinguishable from \"no releases exist\" — so it said there were none. Searching in Prowlarr warmed its cache and the next attempt answered in time",
             "searches now get ninety seconds by default (adjustable), and a failed search says what went wrong rather than reporting an empty result",
         ],
     },
@@ -4352,7 +4382,7 @@ const VERSION_MODAL_SECTIONS = [
         description: "results were being thrown away after they had already been found, a release name told you nothing about where it came from, and a long list could not be narrowed down.",
         features: [
             "the search kept the best 40 releases and 15 rejected ones and discarded the rest — after ranking them. That is why a popular title only ever showed so many. Now 100 and 40, both configurable, along with how many results are requested from Prowlarr in the first place",
-            "the release name links to the indexer's own page for it. Links open in a new tab, and the address is checked before it is shown — a tracker cannot use one to run anything inside SoulSync, and the tracker learns nothing about your install from the click",
+            "the release name links to the indexer's own page for it. Links open in a new tab, and the address is checked before it is shown — a tracker cannot use one to run anything inside Commissary, and the tracker learns nothing about your install from the click",
             "filter by name, quality, source, minimum seeders, or only releases that meet your quality profile. It works on results already fetched, so it is instant, and it survives a search still streaming in underneath it",
             "the header always says how many rows are hidden, so a short list is never a mystery",
         ],
@@ -4379,7 +4409,7 @@ const VERSION_MODAL_SECTIONS = [
     },
     {
         title: "Earlier in 1.8.5 — the repair no longer undoes itself",
-        description: "1.8.4 taught SoulSync to take episode numbering from the database your media server agrees with. This closes the paths that were still ignoring that — including two unattended jobs that would quietly put the bad rows back.",
+        description: "1.8.4 taught Commissary to take episode numbering from the database your media server agrees with. This closes the paths that were still ignoring that — including two unattended jobs that would quietly put the bad rows back.",
         features: [
             "the show-match pass and the full episode-list sync both took their season numbers from TMDB regardless of what a show was set to use. On a TVDB-numbered show they re-created exactly the rows the out-of-place check had just removed — unattended, so the repair appeared to work and then reverted with nothing on screen to explain it",
             "that check errs towards writing: if it cannot be resolved the episode list is still written. A list that should not exist is visible and fixable; one that was never written is a silent hole",
@@ -4392,12 +4422,12 @@ const VERSION_MODAL_SECTIONS = [
     },
     {
         title: "Earlier in 1.8.4 — episode numbering follows your server",
-        description: "the real cause, found by dumping the rows rather than reasoning about them. Two databases split Bleach differently, and SoulSync had always taken the numbering from the one that disagrees with Plex.",
+        description: "the real cause, found by dumping the rows rather than reasoning about them. Two databases split Bleach differently, and Commissary had always taken the numbering from the one that disagrees with Plex.",
         features: [
-            "TMDB has Bleach as three seasons — specials, the 366-episode 2004-2012 run, and Thousand-Year Blood War. TVDB has seventeen, which is what Plex reports. SoulSync used TMDB's numbers, so TMDB's \"season 2\" (the 2022 run) was written on top of the 2005 season",
+            "TMDB has Bleach as three seasons — specials, the 366-episode 2004-2012 run, and Thousand-Year Blood War. TVDB has seventeen, which is what Plex reports. Commissary used TMDB's numbers, so TMDB's \"season 2\" (the 2022 run) was written on top of the 2005 season",
             "the evidence was exact: every season carrying invented rows was a season TMDB has (0, 1, 2); every season with none was one it does not (3 to 17)",
             "the same fault is why Season 17 never filled — TMDB has no season 17, so nothing could ever add episodes to the season where the library actually keeps that run. It can fill now",
-            "SoulSync scores each database on how much of your server's season structure it can serve, and switches only when the difference is decisive. A show both agree on — nearly all of them — keeps using TMDB exactly as before",
+            "Commissary scores each database on how much of your server's season structure it can serve, and switches only when the difference is decisive. A show both agree on — nearly all of them — keeps using TMDB exactly as before",
             "Manage → \"Episode numbering\" (Auto / TMDB / TVDB) overrules it per show. An explicit choice is obeyed even when the automatic guess disagrees",
             "the out-of-place check now asks whichever database owns that show's numbering. It had been asking TMDB, which for a show like this treats your correct season as the wrong one",
         ],
@@ -4416,7 +4446,7 @@ const VERSION_MODAL_SECTIONS = [
         title: "Earlier in 1.8.3 — the first attempt",
         description: "1.8.2 shipped a theory about why a show's episodes were listed under two different season numbers. A dump of the actual rows showed the theory was wrong, and the real cause was one line handing one database's season numbers to a different database.",
         features: [
-            "TMDB's Bleach season 2 is the 2005 arc. TVDB's season 2 is the 2022 Thousand-Year Blood War run. SoulSync read its season list from TMDB, then asked TVDB for episodes using those same numbers — so TVDB's season 2 landed inside TMDB's, putting seventeen episodes dated 2023-2026 inside a season from 2005",
+            "TMDB's Bleach season 2 is the 2005 arc. TVDB's season 2 is the 2022 Thousand-Year Blood War run. Commissary read its season list from TMDB, then asked TVDB for episodes using those same numbers — so TVDB's season 2 landed inside TMDB's, putting seventeen episodes dated 2023-2026 inside a season from 2005",
             "that is why the missing episodes were never found: they were being searched for as season 2 episode 41, a thing no release will ever be labelled. Meanwhile the library already had the whole run correctly under season 17",
             "TVDB is still used and still valuable — it is usually first with titles and synopses for a just-aired episode. It may now enrich an episode TMDB already listed. It may not decide which episodes exist",
             "Manage → \"Check for out-of-place episodes\" clears rows already written this way. It asks TMDB which episode numbers belong to each season, shows you what it found, and removes nothing until a second click — and nothing that has a file or came from your server",
@@ -4439,7 +4469,7 @@ const VERSION_MODAL_SECTIONS = [
         features: [
             "every Wishlist card now has a Library box. Until a title exists on disk there was no row to hold that choice, which is why unattended grabs all landed in All Movies / All TV however your Libraries were set up. Pick one and the next grab goes there — nothing already on disk moves",
             "the box shows where a title is actually headed, not merely whether someone set it: a show already filed under Anime reads \"Anime\". It appears only when you have more than one Library of that kind",
-            "Bleach's newer run is Season 2 to Plex and Season 17 to TMDB. Both are right, and SoulSync kept both — so the episodes being hunted were filed under a number no release uses, and never matched. It no longer creates the second copy when your server already has that episode elsewhere",
+            "Bleach's newer run is Season 2 to Plex and Season 17 to TMDB. Both are right, and Commissary kept both — so the episodes being hunted were filed under a number no release uses, and never matched. It no longer creates the second copy when your server already has that episode elsewhere",
             "for libraries already carrying them: Manage → \"Check for duplicate episodes\". It reports what it found in your terms (\"S17E1 (you have it as S2E1)\") and removes nothing until you click again",
             "the clean-up is deliberately timid. A row goes only when the air date pairs it to exactly one episode you own under a different season. A streaming season sharing one date, a missing date, two candidates on one day — all left alone. It touches no files: these rows are placeholders for episodes you do not have",
         ],
@@ -4458,7 +4488,7 @@ const VERSION_MODAL_SECTIONS = [
     },
     {
         title: "Earlier in 1.8.0 — season packs, start to finish",
-        description: "grabbing a whole season already half-worked — SoulSync could find a pack and match it correctly, then download it and stop, because the import step only knew how to place a single file. It now unpacks one.",
+        description: "grabbing a whole season already half-worked — Commissary could find a pack and match it correctly, then download it and stop, because the import step only knew how to place a single file. It now unpacks one.",
         features: [
             "every episode inside the pack is renamed and filed on its own, using the same import that a single episode goes through — so naming, quality upgrades, subtitles, the recycle bin and torrent seeding all behave exactly as they already did. Nothing about packs is a special case once they are open",
             "a pack that ships fewer episodes than it claims, or one where you already own some at better quality, imports what is useful rather than failing. Samples, extras and trailers are recognised and left behind",
@@ -4484,7 +4514,7 @@ const VERSION_MODAL_SECTIONS = [
         features: [
             "about fifteen modules each fetch something once at boot — the video dashboard, libraries, scan status, issue and watchlist counts, YouTube channels, search sources. None of them can know yet whether you are signed in, because that answer only arrives with the first reply from the server, so with Require login on they all went out and were all refused. They now wait for that answer",
             "they WAIT rather than fail. That distinction is the whole point: on an install without Require login, auth is briefly unknown too, so failing fast would have made those same requests give up and paint an empty state that never refills. Deferring means an ordinary install sees no change at all — verified, twenty-five requests, all returning real data",
-            "if the answer never comes, the wait ends after ten seconds and everything proceeds as it used to. A bug in this cannot leave SoulSync unable to talk to itself",
+            "if the answer never comes, the wait ends after ten seconds and everything proceeds as it used to. A bug in this cannot leave Commissary unable to talk to itself",
             "measured on the sign-in screen: seventeen requests before, two after — and those two are the ones the screen genuinely needs",
         ],
     },
@@ -4498,15 +4528,15 @@ const VERSION_MODAL_SECTIONS = [
     },
     {
         title: "Earlier in 1.7.0 — ready to be reachable from outside your network",
-        description: "a security pass over the whole app, done before opening it up to people outside the house. Three real holes closed and one control that disagreed with its own rule. Nothing here changes how SoulSync works day to day.",
+        description: "a security pass over the whole app, done before opening it up to people outside the house. Three real holes closed and one control that disagreed with its own rule. Nothing here changes how Commissary works day to day.",
         features: [
-            "another website can no longer act as you. While you were signed in, any page you visited could make your browser fire commands at SoulSync — add downloads, change settings — and SoulSync would carry them out, because your session cookie went along for the ride. Requests coming from somewhere other than SoulSync are now refused",
+            "another website can no longer act as you. While you were signed in, any page you visited could make your browser fire commands at Commissary — add downloads, change settings — and Commissary would carry them out, because your session cookie went along for the ride. Requests coming from somewhere other than Commissary are now refused",
             "a first-run shortcut used to hand out an API key to anyone who asked, without signing in, even with \"Require login\" on — and that key could then turn login back off. It now needs an admin who is actually signed in",
             "the artwork fetcher had a safety check that let everything through, so it could be aimed at devices on your home network instead of at posters. It now reaches only your own media servers and public artwork sites; Plex and Jellyfin art on a LAN address is unaffected",
             "the Stop button in Server Activity was shown to every user, though the server had always refused anyone but an admin. Non-admins no longer see a button that only fails",
             "checked and found clean: how passwords are stored, protection against password guessing, database query safety, and the permission rules that keep standard users out of the admin pages",
         ],
-        usage_note: "Before putting SoulSync on a public address: turn on Settings → Security → Require login. Without it, SoulSync trusts anyone who can reach it as the admin — fine at home, not fine on the internet. Then put it behind HTTPS and turn on \"Trust reverse proxy\".",
+        usage_note: "Before putting Commissary on a public address: turn on Settings → Security → Require login. Without it, Commissary trusts anyone who can reach it as the admin — fine at home, not fine on the internet. Then put it behind HTTPS and turn on \"Trust reverse proxy\".",
     },
     {
         title: "Earlier in 1.6.13 — set a show up before you own it",
@@ -4525,7 +4555,7 @@ const VERSION_MODAL_SECTIONS = [
         features: [
             "a follow stored a SNAPSHOT of its poster. Following a show you own saved a link to that library entry, and those links break when Plex re-keys an item during a scan — so the art silently died some time after you followed it. Posters now come from the live library entry, re-resolved on every load, which also fixes the status and episode counts that were going blank alongside them",
             "following a show you did not own yet saved no art at all, and nothing ever filled it in once the show arrived. It does now",
-            "some posters were loaded by your BROWSER straight from TMDB, depending on which page you clicked Follow from — the detail page went through SoulSync, the search and discover cards did not. Those failed on any device that could reach SoulSync but not TMDB. All of it now goes through SoulSync and is cached on disk",
+            "some posters were loaded by your BROWSER straight from TMDB, depending on which page you clicked Follow from — the detail page went through Commissary, the search and discover cards did not. Those failed on any device that could reach Commissary but not TMDB. All of it now goes through Commissary and is cached on disk",
             "when a poster did fail, the card hid the broken image and left an empty tile rather than falling back to its placeholder — which is what made a missing poster look like a broken card",
         ],
     },
@@ -4555,7 +4585,7 @@ const VERSION_MODAL_SECTIONS = [
         title: "Earlier in 1.6.10 — trackers you can pick, titles that actually match",
         description: "two reported bugs, both of which turned out to be the app asking you for information it never gave you.",
         features: [
-            "\"Preferred trackers\" appeared not to save. It stores Prowlarr indexer IDS, and nothing in SoulSync ever displayed those ids — so the natural thing, typing a tracker's name, was silently discarded and the field redrew empty. It's a pick-list of your real indexers now. The stored value is still ids, so nothing downstream changed",
+            "\"Preferred trackers\" appeared not to save. It stores Prowlarr indexer IDS, and nothing in Commissary ever displayed those ids — so the natural thing, typing a tracker's name, was silently discarded and the field redrew empty. It's a pick-list of your real indexers now. The stored value is still ids, so nothing downstream changed",
             "a manual search compared releases against ONE title, while the hourly drain compared against the full alternative-title list. That's backwards — the manual path is where you're watching and expecting it to work. All four search entry points now use the same list",
             "a show's ORIGINAL title is now part of that list. It was never included, which mattered most for anime released under a translation of the original rather than the name shown here",
             "every fallback keeps the previous behaviour: no Prowlarr means the old ID box, and an unreachable TMDB means matching on the primary title alone — never on nothing, which would have disabled the check entirely",
@@ -4640,10 +4670,10 @@ const VERSION_MODAL_SECTIONS = [
     },
     {
         title: "Earlier in 1.6.3 — import anything, filter by Library, and a dashboard that finally responds",
-        description: "manual import no longer needs SoulSync to have failed a download first, two bugs surfaced while chasing a failed grab got fixed, and dashboard customisation on the Video side turned out to have never worked at all.",
+        description: "manual import no longer needs Commissary to have failed a download first, two bugs surfaced while chasing a failed grab got fixed, and dashboard customisation on the Video side turned out to have never worked at all.",
         features: [
             "Add file… on the Import page queues ANY video file on disk for placement — one moved in by hand, or left over from another tool — through the same place/dismiss queue, with no prior download needed",
-            "fixed a real risk that surfaced alongside it: after a copy-mode import, SoulSync reclaimed (deleted) the source file. A file you added yourself is your own copy, not a download client's temp file — placing it now never deletes your original",
+            "fixed a real risk that surfaced alongside it: after a copy-mode import, Commissary reclaimed (deleted) the source file. A file you added yourself is your own copy, not a download client's temp file — placing it now never deletes your original",
             "fansub anime releases stopped being rejected: '[SubsPlease] Title - 40 [1080p]' was thrown out as a title mismatch because the group tag and the glued-on episode number leaked into the parsed title. Scoped narrowly to bracket-tagged releases, so ordinary names that legitimately end in a number — 'Moana 2' — are untouched",
             "grab failures say why: every one of the four video download helpers threw away the backend's error message on a failed request, so every cause produced the same blank \"Grab failed\" toast",
             "Download History, Wishlist and the Library page gained per-Library filtering, and shows gained an Airing / Ended / Upcoming filter",
@@ -4676,8 +4706,8 @@ const VERSION_MODAL_SECTIONS = [
         title: "Earlier in 1.6.0 — upstream's fixes, folded in",
         description: "this fork branched from upstream SoulSync 3.1.5, which has since shipped three releases. 38 of their fixes are now here — a security fix, several that stop half-written downloads being imported, and a long tail of tagging and organising corrections. None of their chat work came with it.",
         features: [
-            "SECURITY: torrent and usenet search results used to carry the raw indexer download URL — API key included — all the way into the browser, where it lived in DevTools and history, and the download endpoint would accept any URL sent back to it. Results now carry an opaque server-side token, so a client can no longer make SoulSync forward an arbitrary URL to SABnzbd, NZBGet or qBittorrent",
-            "half-written imports: a client reporting \"finished\" doesn't mean it has stopped writing — unpack and repair can still be working in the staging folder. SoulSync now waits for that folder to actually stop changing before importing, and video files land in the library atomically and size-verified (this is the cause of files that played back skipping)",
+            "SECURITY: torrent and usenet search results used to carry the raw indexer download URL — API key included — all the way into the browser, where it lived in DevTools and history, and the download endpoint would accept any URL sent back to it. Results now carry an opaque server-side token, so a client can no longer make Commissary forward an arbitrary URL to SABnzbd, NZBGet or qBittorrent",
+            "half-written imports: a client reporting \"finished\" doesn't mean it has stopped writing — unpack and repair can still be working in the staging folder. Commissary now waits for that folder to actually stop changing before importing, and video files land in the library atomically and size-verified (this is the cause of files that played back skipping)",
             "tagging stopped overwriting you: simple downloads now only fill blank or placeholder tags instead of replacing real ones, and two rounds of false-positive retag warnings are gone",
             "the reorganiser behaves: no more cosmetic casing churn on files it already organised, your own album year survives instead of being replaced by the source's, featured-artist credits stay in the title and filename, and single-disc albums stop getting a bogus disc prefix",
             "Plex deep scans survive a slow library: one slow page used to hit a hard 15-second timeout and zero the whole scan, reported as \"zero artists\". Now 30 seconds, configurable, with retries on the bulk fetches",
@@ -4687,12 +4717,12 @@ const VERSION_MODAL_SECTIONS = [
     },
     {
         title: "Earlier in 1.5.0 — less to carry",
-        description: "the Soulseek chat feature and the upstream donation button are removed, and Plex now recognises SoulSync across restarts instead of announcing a new device every time the container starts.",
+        description: "the Soulseek chat feature and the upstream donation button are removed, and Plex now recognises Commissary across restarts instead of announcing a new device every time the container starts.",
         features: [
             "chat removed completely: the rooms and private-message page, the nav entries on both the Music and Video sidebars, the \"message this user on Soulseek\" buttons on search results and uploader credits, and the stored message archive — the database sheds that table on upgrade",
             "your Soulseek connection is unaffected. Search, browsing and transfers ride the same slskd link they always have; only the chat endpoints are gone",
-            "the Support SoulSync button and its donation links are removed from the sidebar, the README and the Unraid template. Docker image names in the install docs are untouched — those are pull commands, not donations",
-            "Plex device identity is now stable: SoulSync previously identified itself with the machine's MAC address and hostname, which Docker regenerates on every container start — so Plex saw a brand-new device after each reboot and mailed you about it, filling your device list with anonymous \"Linux\" entries. It now mints one identifier, keeps it in your config, and reports itself as \"SoulSync\"",
+            "the Support Commissary button and its donation links are removed from the sidebar, the README and the Unraid template. Docker image names in the install docs are untouched — those are pull commands, not donations",
+            "Plex device identity is now stable: Commissary previously identified itself with the machine's MAC address and hostname, which Docker regenerates on every container start — so Plex saw a brand-new device after each reboot and mailed you about it, filling your device list with anonymous \"Linux\" entries. It now mints one identifier, keeps it in your config, and reports itself as \"Commissary\"",
             "expect one final new-device notification the first time you start this version — after that Plex recognises it",
         ],
         usage_note: "Nothing to configure. If you want to tidy up, the old anonymous Linux entries can be removed from plex.tv → Settings → Authorized Devices.",
@@ -4704,7 +4734,7 @@ const VERSION_MODAL_SECTIONS = [
             "Customize (dashboard header): drag a card to reorder it, drag its right edge — or focus the handle and press ←/→ — to set it 1, 2 or 3 columns wide. Reset restores the shipped arrangement. Music and Video keep separate layouts, and it's saved per browser",
             "available to EVERY user, not just admins — this is a personal view preference, not a permission. The admin's hide/show policy still applies on top: a card an admin has hidden can't be moved or resized because it isn't there",
             "widths survive narrow screens properly: a card you widened on a desktop clamps to the row on a 2-column layout and goes full-width on a phone, instead of overflowing the grid",
-            "multiple completed-downloads paths (torrent AND usenet): clients sort finished downloads into category folders like /downloads/complete/Movies and …/TV-Shows, but only one folder could be configured and only one level was searched — so the release sat there finished and never imported. Add a row per folder, or just name the parent and let SoulSync look one level inside it, so a category you add later still resolves",
+            "multiple completed-downloads paths (torrent AND usenet): clients sort finished downloads into category folders like /downloads/complete/Movies and …/TV-Shows, but only one folder could be configured and only one level was searched — so the release sat there finished and never imported. Add a row per folder, or just name the parent and let Commissary look one level inside it, so a category you add later still resolves",
             "the deeper search is still content-checked and exactly one level deep — it won't grab a same-named folder from the wrong category, and it won't crawl your whole download disk",
         ],
         usage_note: "Customize is in the top-right of each dashboard, next to Watchlist/Wishlist. The download paths are in Settings → Downloads, in the Torrent and Usenet client sections.",
@@ -4782,7 +4812,7 @@ const VERSION_MODAL_SECTIONS = [
             "replaygain target loudness (#1060): set the reference (default -18 LUFS) every RG write analyzes against, plus an opt-in re-run over tracks computed against a different target; genre tag cleanup (#1057): re-check genres stored before strict filtering was enabled, removal-only",
             "fix all actually fixes all: the Tools bulk-fix silently skipped some finding types its own counter included ('fixed 0 of N') — the fixable set is now derived from the fix handlers; artist pictures on findings click through to the artist's page",
             "video requests, best in class: approved requests show 'Acquiring…' until the title lands in your library then flip to 'In library', status tabs with counts, removable history + a Clear-resolved sweep, and no more success toast while the row still says Approve",
-            "seed limits your client enforces (thanks TheHomeGuy): an 'Enforced by' toggle (music + video) writes ratio/time goals into the torrent as native share limits so the client stops seeding on its own even if SoulSync is down — and stall-pause works on qBittorrent 5.x",
+            "seed limits your client enforces (thanks TheHomeGuy): an 'Enforced by' toggle (music + video) writes ratio/time goals into the torrent as native share limits so the client stops seeding on its own even if Commissary is down — and stall-pause works on qBittorrent 5.x",
             "the wishlist failing hub (thanks LiveLeak): a '⚠ Failing' filter chip on the video wishlist, a manual release picker on every movie/season/episode, and music's 'Search manually' now lands on the actual soulseek search prefilled",
             "every logo ships with the app: ~86 hotlinked images from 10+ external CDNs now load from your own server — no more broken logos from rate limits, dead URLs, or LAN-only installs",
             "reported fixes: downloads freezing mid-batch + a metadata identity guard (jadux), re-releases finally download — analysis respects release years (5BILLION), deep scan removes artists on an empty Navidrome (5BILLION), unchecking chat auto-join actually leaves (popwaffle9000), $year renders for TV renames (musicagine), a source-search timeout knob (#1056), airing shows catch up missed days",
@@ -4792,7 +4822,7 @@ const VERSION_MODAL_SECTIONS = [
     },
     {
         title: "Earlier in 3.1.3 — follow record labels",
-        description: "follow a record label the same way you follow an artist and SoulSync watches it for new releases — plus music torrents can now seed on a leash, and two reported fixes (multi-disc display + write-tags efficiency).",
+        description: "follow a record label the same way you follow an artist and Commissary watches it for new releases — plus music torrents can now seed on a leash, and two reported fixes (multi-disc display + write-tags efficiency).",
         features: [
             "follow record labels: search finds labels, and each label gets a real refreshable page showing its whole catalog newest-first in album cards, with an ownership overlay for what you already have, filters and sort, and every release linking through to the real artist (never the label)",
             "the watchlist page gets a Labels tab with follow / backlog controls, and the normal watchlist scan now checks your followed artists AND labels in one pass with one live display — the scheduled watchlist automation included. follow no labels and nothing changes",
@@ -4803,10 +4833,10 @@ const VERSION_MODAL_SECTIONS = [
         usage_note: "labels: search a label name, open it, and hit follow. seeding goals and torrent settings live under Settings → Downloads.",
     },
     {
-        title: "Earlier in 3.1.2 — SoulSync gets a chat",
-        description: "a full Soulseek chat page — the community 'SoulSync' room + private messages, Discord-class — plus the artist photo picker finally works, SoundCloud links resolve anywhere, and two long-standing reported bugs die.",
+        title: "Earlier in 3.1.2 — Commissary gets a chat",
+        description: "a full Soulseek chat page — the community 'Commissary' room + private messages, Discord-class — plus the artist photo picker finally works, SoundCloud links resolve anywhere, and two long-standing reported bugs die.",
         features: [
-            "Chat (System section, both sides): the community 'SoulSync' room and private messages, proxied through slskd. rich messages other Soulseek clients can't read (bold / code / spoilers / emoji, image + YouTube embeds, SoulSync deep links), @mentions with autocomplete, replies, reactions, GIF search, a local archive that survives slskd restarts, and an auto-responder for anti-leech bots. sending is admin-only by default",
+            "Chat (System section, both sides): the community 'Commissary' room and private messages, proxied through slskd. rich messages other Soulseek clients can't read (bold / code / spoilers / emoji, image + YouTube embeds, Commissary deep links), @mentions with autocomplete, replies, reactions, GIF search, a local archive that survives slskd restarts, and an auto-responder for anti-leech bots. sending is admin-only by default",
             "the artist photo picker actually delivers photos now (Deezer, Spotify authed OR free, iTunes, AudioDB, Discogs, plus paste-a-URL), and one transient source hiccup no longer sticks 'no photos found' for 15 minutes",
             "SoundCloud links resolve wherever you paste them, including unlisted/private share links (#865 follow-up); deep scan removes artists after switching to an empty Navidrome library, and re-releases stop showing as owned on the library page (both from 5BILLION's reports)",
         ],
@@ -4921,9 +4951,9 @@ const VERSION_MODAL_SECTIONS = [
     },
     {
         title: "Earlier in 2.8.7",
-        description: "the SoulSync discovery playlists become first-class Auto-Sync items, plus a credential-wipe fix.",
+        description: "the Commissary discovery playlists become first-class Auto-Sync items, plus a credential-wipe fix.",
         features: [
-            "the SoulSync discovery playlists (Time Machine, Genre, Seasonal, Daily Mix, Popular Picks / Hidden Gems / The Archives / Fresh Tape / Discovery Shuffle) now schedule straight from Auto-Sync — turn one on and it generates itself on the first run and keeps syncing on your interval",
+            "the Commissary discovery playlists (Time Machine, Genre, Seasonal, Daily Mix, Popular Picks / Hidden Gems / The Archives / Fresh Tape / Discovery Shuffle) now schedule straight from Auto-Sync — turn one on and it generates itself on the first run and keeps syncing on your interval",
             "#992 — a settings-save could wipe a stored API secret (surfaced as Spotify \"invalid_client\", and could clear Last.fm / Genius / Discogs keys too); a save can no longer blank a saved secret",
             "#993 — mirrored playlists push their cover art to Navidrome on sync; and artist discography hides non-studio releases (live, compilations, singles) by default",
         ],
@@ -5224,7 +5254,7 @@ const TROUBLESHOOT_RULES = [
         steps: [
             'Check that your media server (Plex/Jellyfin/Navidrome) is running',
             'Verify the server URL and API token in Settings → Connections',
-            'Ensure the server is accessible from the SoulSync host machine',
+            'Ensure the server is accessible from the Commissary host machine',
             'Try clicking "Test Connection" on the service card'
         ],
         action: { label: 'Open Settings', fn: () => navigateToPage('settings') }

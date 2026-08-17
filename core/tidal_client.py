@@ -168,7 +168,7 @@ class TidalClient:
         """Setup requests session with headers"""
         self.session.headers.update({
             'Accept': 'application/vnd.api+json',
-            'User-Agent': 'SoulSync/1.0'
+            'User-Agent': 'Commissary/1.0'
         })
     
     def _load_saved_tokens(self):
@@ -346,7 +346,7 @@ class TidalClient:
                     handler_self.send_response(200)
                     handler_self.send_header('Content-type', 'text/html')
                     handler_self.end_headers()
-                    handler_self.wfile.write(b'<h1>Success!</h1><p>You can close this window and return to SoulSync.</p>')
+                    handler_self.wfile.write(b'<h1>Success!</h1><p>You can close this window and return to Commissary.</p>')
                 elif 'error' in query_params:
                     # Handle OAuth errors
                     error = query_params.get('error', ['unknown'])[0]

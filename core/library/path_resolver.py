@@ -2,11 +2,11 @@
 
 Database track rows store file paths as the media server reported them
 (`/music/Artist/Album/track.flac`, `H:\\Music\\Artist\\...`, etc). When
-SoulSync runs in Docker, those paths don't exist as-is inside the
+Commissary runs in Docker, those paths don't exist as-is inside the
 container — the user's library is bind-mounted at a container path
 (commonly `/music`) that has nothing to do with what Plex/Jellyfin
 recorded. Same problem for native installs that point at a NAS via SMB:
-the path the media server scanned isn't the path SoulSync reads.
+the path the media server scanned isn't the path Commissary reads.
 
 The resolver tries the raw path first (cheap happy-path), then walks
 progressively shorter suffixes against every configured base directory:
@@ -115,7 +115,7 @@ def _collect_base_dirs(
             logger.debug("soulseek paths read failed: %s", e)
 
     # Plex-reported library locations (handles "Plex scanned at /music but
-    # SoulSync mounts at /library" cases).
+    # Commissary mounts at /library" cases).
     if plex_client is not None:
         try:
             server = getattr(plex_client, "server", None)
@@ -257,7 +257,7 @@ def resolve_library_file_path_with_diagnostic(
     # Try progressively shorter path suffixes against each base dir.
     #
     # Start at index 0 so a clean RELATIVE library path is tried in FULL first.
-    # SoulSync's own library scanner stores paths like
+    # Commissary's own library scanner stores paths like
     # "Asketa/Another Side/01 - Track.flac" (no leading slash) — index 0 is the
     # artist folder and dropping it (the old range(1, ...)) meant the artist
     # segment was never joined, so nothing under transfer/ ever resolved and

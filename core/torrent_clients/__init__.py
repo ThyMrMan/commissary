@@ -2,7 +2,7 @@
 
 Each adapter wraps one BitTorrent client (qBittorrent, Transmission,
 Deluge) behind the ``TorrentClientAdapter`` Protocol so the rest of
-SoulSync can talk to whichever client the user picked through one
+Commissary can talk to whichever client the user picked through one
 uniform surface.
 
 The active adapter is selected at runtime by the ``torrent_client.type``

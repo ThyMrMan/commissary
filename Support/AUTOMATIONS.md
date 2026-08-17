@@ -47,7 +47,7 @@ Action blocks have an optional **Delay** field (in minutes). The action waits th
 
 | Trigger | Fires When | Condition Fields | Variables |
 |---------|-----------|-----------------|-----------|
-| **App Started** | SoulSync starts up | — | — |
+| **App Started** | Commissary starts up | — | — |
 | **Track Downloaded** | A track finishes downloading | artist, title, album, quality | artist, title, album, quality |
 | **Batch Complete** | An album/playlist download finishes | playlist_name | playlist_name, total_tracks, completed_tracks, failed_tracks |
 | **New Release Found** | Watchlist detects new music | artist | artist, new_tracks, added_to_wishlist |
@@ -117,7 +117,7 @@ Downloaded {title} by {artist} from {album} — quality: {quality}
 
 ## System Automations
 
-SoulSync includes two built-in system automations that cannot be deleted:
+Commissary includes two built-in system automations that cannot be deleted:
 
 | Automation | Schedule | Initial Delay |
 |-----------|----------|---------------|

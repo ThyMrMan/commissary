@@ -152,7 +152,7 @@ def test_record_soulsync_library_entry_writes_artist_album_and_track(tmp_path, m
     assert track_row["album_id"] == album_row["id"]
     assert track_row["file_path"] == str(final_path)
     # File size in bytes — populates the Library Disk Usage card on Stats.
-    # Read via os.path.getsize at insert time since SoulSync standalone is
+    # Read via os.path.getsize at insert time since Commissary standalone is
     # the only flow where the file is local at the moment we write the row.
     assert track_row["file_size"] == os.path.getsize(str(final_path))
     # No override on this item — NULL means "follow the app-wide default at
@@ -330,7 +330,7 @@ def test_record_soulsync_library_entry_ignores_numeric_spotify_ids(tmp_path, mon
 
 
 # ---------------------------------------------------------------------------
-# SoulSync standalone parity — auto-import / direct download must write the
+# Commissary standalone parity — auto-import / direct download must write the
 # same field richness a Plex/Jellyfin/Navidrome scan would write. Pin the
 # per-recording identifier columns (`musicbrainz_recording_id`, `isrc`)
 # AND the source-aware ID columns (`deezer_id`, etc.) for non-Spotify
@@ -529,7 +529,7 @@ def test_library_history_labels_release_and_staging_sources(monkeypatch, usernam
 def test_album_duration_uses_album_total_not_single_track(tmp_path, monkeypatch):
     """Pre-fix `record_soulsync_library_entry` wrote
     `track_info.duration_ms` (one track's duration) into the album row's
-    `duration` column. SoulSync standalone scanner sums every track's
+    `duration` column. Commissary standalone scanner sums every track's
     duration to populate that column — mirror it. This test passes
     `album.duration_ms` explicitly on the context (the worker computes
     it as `sum(match['track']['duration_ms'])`) and verifies the album

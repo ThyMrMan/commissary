@@ -1,7 +1,7 @@
 """Config export/import — one portable bundle for both sides (Kazimir's
 "checkout" menu for migrating installs).
 
-A SoulSync install's settings live in two places: the music side's
+A Commissary install's settings live in two places: the music side's
 ``config.json`` (connections, download sources, enrichment, organization…)
 and the video side's ``video_settings`` KV (quality profiles, custom
 formats, import lists, notifications, organization templates…). This
@@ -60,14 +60,14 @@ def build_bundle(config_manager, video_db, *, include_secrets: bool,
 
 
 def validate_bundle(data: Any) -> Tuple[bool, str]:
-    """Is ``data`` a SoulSync config bundle we can import? Returns (ok, reason)."""
+    """Is ``data`` a Commissary config bundle we can import? Returns (ok, reason)."""
     if not isinstance(data, dict):
         return False, "Not a JSON object."
     if not data.get(BUNDLE_MARKER):
-        return False, "This file isn't a SoulSync config export."
+        return False, "This file isn't a Commissary config export."
     ver = data.get("bundle_version")
     if not isinstance(ver, int) or ver > BUNDLE_VERSION:
-        return False, "This export was made by a newer SoulSync; update first."
+        return False, "This export was made by a newer Commissary; update first."
     if not isinstance(data.get("music"), dict) or not isinstance(data.get("video"), dict):
         return False, "The export is missing its music/video sections."
     return True, ""

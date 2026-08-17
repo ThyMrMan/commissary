@@ -1,6 +1,6 @@
 """Server-side .torrent fetch + smart add (core.torrent_clients.base).
 
-SoulSync used to hand the torrent client Prowlarr's download URL and let the
+Commissary used to hand the torrent client Prowlarr's download URL and let the
 CLIENT fetch it. In split-container setups (each app in its own LXC/Docker
 with different DNS) the client can't resolve Prowlarr's hostname, the fetch
 dies inside the client, and the add fails silently ("accepted the request but

@@ -217,7 +217,7 @@ def test_check_connection_returns_false_on_http_error() -> None:
 def test_default_music_categories_match_newznab_tree() -> None:
     """The Newznab Music category IDs are a stable convention across
     Prowlarr / Jackett / every indexer. Pin the defaults so a typo
-    here doesn't silently broaden / narrow what SoulSync queries."""
+    here doesn't silently broaden / narrow what Commissary queries."""
     assert 3000 in DEFAULT_MUSIC_CATEGORIES   # Audio (parent)
     assert 3010 in DEFAULT_MUSIC_CATEGORIES   # MP3
     assert 3040 in DEFAULT_MUSIC_CATEGORIES   # Lossless

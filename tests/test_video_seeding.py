@@ -217,7 +217,7 @@ def test_client_mode_pushes_limit_and_releases(db, monkeypatch):
 
 def test_client_mode_push_failure_falls_back_to_soulsync(db, monkeypatch):
     """A failed/unsupported client push must NOT leave the grab unmanaged (e.g. a
-    non-qBit client) — SoulSync takes over (poll + remove per goals)."""
+    non-qBit client) — Commissary takes over (poll + remove per goals)."""
     from core.video.download_config import save
     save(db, {"seed_time_goal_hours": 408, "seed_mode": "client"})
     _torrent_row(db, ref="abc")

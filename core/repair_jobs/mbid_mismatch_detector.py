@@ -4,7 +4,7 @@ don't match the track's actual title/artist.
 When a wrong MBID is embedded, media servers like Navidrome use it to look up
 metadata from MusicBrainz, overriding the file's correct title/artist tags.
 This causes tracks to display with wrong names in the media server even though
-SoulSync shows them correctly.
+Commissary shows them correctly.
 """
 
 import os
@@ -307,7 +307,7 @@ class MbidMismatchDetectorJob(RepairJob):
         'When a wrong MBID is embedded in an audio file, media servers like Navidrome '
         'use it to look up metadata from MusicBrainz, overriding the file\'s correct '
         'title and artist tags. This causes tracks to display with wrong names in the '
-        'media server even though SoulSync shows them correctly.\n\n'
+        'media server even though Commissary shows them correctly.\n\n'
         'The fix action removes the bad MBID tag from the audio file, allowing the media '
         'server to fall back to the file\'s actual title/artist tags.\n\n'
         'This job reads each audio file\'s tags and queries MusicBrainz to verify the '

@@ -126,7 +126,7 @@ class MediaServerRegistry:
 
 
 def build_default_registry() -> MediaServerRegistry:
-    """Construct the registry with SoulSync's four built-in media
+    """Construct the registry with Commissary's four built-in media
     servers. Called once during MediaServerEngine construction.
 
     Adding a server (e.g. Subsonic, Emby) = one ``register`` call
@@ -137,6 +137,6 @@ def build_default_registry() -> MediaServerRegistry:
     registry.register(ServerSpec(name='plex',      factory=PlexClient,      display_name='Plex'))
     registry.register(ServerSpec(name='jellyfin',  factory=JellyfinClient,  display_name='Jellyfin'))
     registry.register(ServerSpec(name='navidrome', factory=NavidromeClient, display_name='Navidrome'))
-    registry.register(ServerSpec(name='soulsync',  factory=SoulSyncClient,  display_name='SoulSync Library'))
+    registry.register(ServerSpec(name='soulsync',  factory=SoulSyncClient,  display_name='Commissary Library'))
 
     return registry

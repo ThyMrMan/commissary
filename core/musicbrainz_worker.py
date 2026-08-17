@@ -12,7 +12,7 @@ logger = get_logger("musicbrainz_worker")
 class MusicBrainzWorker:
     """Background worker for enriching library with MusicBrainz IDs"""
 
-    def __init__(self, database: MusicDatabase, app_name: str = "SoulSync", app_version: str = "1.0", contact_email: str = ""):
+    def __init__(self, database: MusicDatabase, app_name: str = "Commissary", app_version: str = "1.0", contact_email: str = ""):
         self.db = database
         self.mb_service = MusicBrainzService(database, app_name, app_version, contact_email)
 

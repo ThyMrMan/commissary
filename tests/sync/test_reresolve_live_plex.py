@@ -1,5 +1,5 @@
 """Plex re-keys tracks on a metadata refresh, so a durable manual match's stored
-ratingKey (and the SoulSync DB id, which IS that ratingKey) can both go stale at
+ratingKey (and the Commissary DB id, which IS that ratingKey) can both go stale at
 once — every DB-side lookup lands on the same dead key and fetchItem 404s, so the
 manually-matched track gets dropped on sync (wolf39us). The fix re-resolves the
 match against LIVE Plex by the matched track's metadata, disambiguated by the

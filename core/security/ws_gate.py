@@ -3,7 +3,7 @@
 Flask's ``before_request`` — where the launch-PIN / login gate lives — does NOT
 run for the socketio handshake, so an unauthenticated client that removes the
 login/PIN overlay (Safari "Hide Distracting Items", devtools, curl) can still open
-a socket and receive the live data SoulSync streams over it (downloads, logs,
+a socket and receive the live data Commissary streams over it (downloads, logs,
 dashboard, notifications). The connect handler must therefore enforce the same
 check the HTTP gate does.
 

@@ -1,20 +1,20 @@
 <?xml version="1.0"?>
 <Container version="2">
-  <Name>SoulSync</Name>
-  <Repository>boulderbadgedad/soulsync:latest</Repository>
-  <Registry>https://hub.docker.com/r/boulderbadgedad/soulsync</Registry>
+  <Name>Commissary</Name>
+  <Repository>ghcr.io/thymrman/commissary:latest</Repository>
+  <Registry>https://github.com/ThyMrMan/soul-sync-thymrman-customized/pkgs/container/commissary</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>bash</Shell>
   <Privileged>false</Privileged>
-  <Support>https://github.com/Nezreka/SoulSync</Support>
-  <Project>https://github.com/Nezreka/SoulSync</Project>
-  <ReadMe>https://github.com/Nezreka/SoulSync/blob/main/README.md</ReadMe>
-  <Overview>Music discovery and automation platform. Find new music, curate playlists, sync libraries, and integrate with popular streaming services, Soulseek (slskd), and media servers.</Overview>
-  <Category>MediaApp:Music</Category>
+  <Support>https://github.com/ThyMrMan/soul-sync-thymrman-customized/issues</Support>
+  <Project>https://github.com/ThyMrMan/soul-sync-thymrman-customized</Project>
+  <ReadMe>https://github.com/ThyMrMan/soul-sync-thymrman-customized/blob/main/README.md</ReadMe>
+  <Overview>Music AND video discovery and automation platform, a fork of SoulSync by Nezreka. Find new music, curate playlists, sync libraries, and manage Movies, TV and YouTube alongside them — with multi-user profiles, per-user request approval and multiple libraries per content kind. Integrates with Soulseek (slskd), Prowlarr, the streaming services, and Plex / Jellyfin / Navidrome.</Overview>
+  <Category>MediaApp:Music MediaApp:Video</Category>
   <WebUI>http://[IP]:[PORT:8008]</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/Nezreka/SoulSync/main/templates/soulsync.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/Nezreka/SoulSync/main/templates/soulsync.png</Icon>
+  <TemplateURL>https://raw.githubusercontent.com/ThyMrMan/soul-sync-thymrman-customized/main/templates/commissary.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/ThyMrMan/soul-sync-thymrman-customized/main/templates/commissary.png</Icon>
   <ExtraParams/>
   <PostArgs/>
   <CPUset/>

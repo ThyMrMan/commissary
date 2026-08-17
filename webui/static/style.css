@@ -1,4 +1,4 @@
-/* SoulSync WebUI - Replicating PyQt6 GUI Styling */
+/* Commissary WebUI - Replicating PyQt6 GUI Styling */
 
 /* Accent Color Variables — overridden by JS when user picks a custom accent */
 :root {
@@ -3578,7 +3578,7 @@ body.helper-mode-active #dashboard-activity-feed:hover {
             rgba(var(--accent-light-rgb), 0.18) 100%);
 }
 
-/* SoulSync standalone info section */
+/* Commissary standalone info section */
 .soulsync-standalone-info {
     display: flex;
     gap: 14px;
@@ -44490,7 +44490,7 @@ div.artist-hero-badge {
 
 /* ============================================================================
    SOULID WORKER BUTTON + TOOLTIP
-   Uses SoulSync logo (whisoul.png) with rainbow spinner like repair worker
+   Uses Commissary logo (whisoul.png) with rainbow spinner like repair worker
    ============================================================================ */
 
 .soulid-button-container {
@@ -70842,7 +70842,7 @@ body.em-scroll-lock { overflow: hidden; }
     box-shadow: 0 0 0 2px color-mix(in srgb, var(--ss-brand) 45%, transparent); transition: box-shadow 0.16s;
 }
 .ss-card.active .ss-card-disc { box-shadow: 0 0 0 3px var(--ss-brand), 0 0 22px color-mix(in srgb, var(--ss-brand) 55%, transparent); }
-/* White/light wordmark logos (Plex, SoulSync) need a dark disc to be visible. */
+/* White/light wordmark logos (Plex, Commissary) need a dark disc to be visible. */
 .ss-disc--dark { background: #1f2329 !important; }
 .ss-card--locked { opacity: 0.38; cursor: not-allowed; }
 .ss-card[disabled] { cursor: default; }
@@ -72140,7 +72140,7 @@ body.app-locked > *:not(#launch-pin-overlay):not(#login-overlay):not(#plex-signi
     .sact-prog-fill { transition: none; }
 }
 
-/* Server Activity — click-through to the SoulSync detail page */
+/* Server Activity — click-through to the Commissary detail page */
 .sact-card--link { cursor: pointer; }
 .sact-card--link .sact-title { color: rgb(var(--vd-accent-rgb, 88 101 242)); }
 .sact-card--link:hover .sact-title { filter: brightness(1.25); }

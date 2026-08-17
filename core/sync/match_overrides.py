@@ -142,7 +142,7 @@ def resolve_override_server_id(
     PLAYLIST (``valid_server_ids``).
 
     Why (wolf39us / Plex): a cache hit was previously returned unconditionally, so a
-    STALE entry — Plex reassigned the library ratingKey without a SoulSync rescan to
+    STALE entry — Plex reassigned the library ratingKey without a Commissary rescan to
     wipe the cache — short-circuited the durable path and the manual match silently
     never applied (resolve_match_overrides drops a server id that isn't in the
     playlist). Falling through to the durable match lets it self-heal the stale id

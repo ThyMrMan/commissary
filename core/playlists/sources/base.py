@@ -160,7 +160,7 @@ class PlaylistSource(ABC):
 
         Default behavior is usually identical to ``get_playlist``.
         Sources whose refresh has side effects (e.g. ListenBrainz cache
-        update, SoulSync Discovery regeneration) do real work here."""
+        update, Commissary Discovery regeneration) do real work here."""
 
     def discover_tracks(self, tracks: List[NormalizedTrack]) -> List[NormalizedTrack]:
         """Match raw tracks against a provider (Spotify / iTunes / etc.).

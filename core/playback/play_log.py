@@ -1,9 +1,9 @@
-"""Build a listening-history event from a SoulSync web-player play.
+"""Build a listening-history event from a Commissary web-player play.
 
 Pure, DB-agnostic. ``listening_history`` is otherwise populated only from the
 media server (Plex/Jellyfin/Navidrome) by ``listening_stats_worker``; this lets
 the WEB PLAYER record its own plays too, so "recently played" and the Phase-2
-smart-radio recency signal reflect what was actually played in SoulSync.
+smart-radio recency signal reflect what was actually played in Commissary.
 
 Kept as a pure function so it's unit-testable without a DB or Flask: it
 normalizes the player's track payload into the exact event shape
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-# Marks rows that came from the SoulSync web player (vs a media server), so they
+# Marks rows that came from the Commissary web player (vs a media server), so they
 # can be distinguished in queries / dedup if ever needed.
 WEB_PLAYER_SOURCE = "soulsync_web"
 

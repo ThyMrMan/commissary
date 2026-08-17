@@ -35,7 +35,7 @@ Two flows:
 
 Limitations:
 - ``save_path`` is the torrent client's view of the disk. If
-  SoulSync runs on a different host than qBit / Trans / Deluge,
+  Commissary runs on a different host than qBit / Trans / Deluge,
   the post-processing pipeline can't see those files. The plugin
   works fine for the all-on-one-box case (most users); remote
   setups will need a future sync step (rclone / SMB / Docker
@@ -403,7 +403,7 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
     def _cleanup_torrent(self, torrent_hash: str, action: str) -> None:
         """Remove (abandon) or pause a dead/stalled/timed-out torrent in the
         client so it isn't left ORPHANED — active in qbit but no longer tracked
-        here, which makes SoulSync re-grab the same dead torrent as a duplicate
+        here, which makes Commissary re-grab the same dead torrent as a duplicate
         on the next attempt (noldevin). Best-effort: a client error is logged,
         not raised, so the download still fails cleanly."""
         adapter = get_active_torrent_adapter()
@@ -820,7 +820,7 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
             result['fallback'] = True
             return result
         if not audio_files:
-            # Separate "SoulSync cannot read that path" — a remote-path-mapping
+            # Separate "Commissary cannot read that path" — a remote-path-mapping
             # problem — from "readable, and it holds no audio". They need
             # completely different things from the user.
             if not walk_root.is_dir():

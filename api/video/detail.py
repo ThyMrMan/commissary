@@ -90,7 +90,7 @@ def register_routes(bp):
         itself.
 
         Season numbers come from TMDB's own season list rather than the local
-        ``seasons`` table, so a season SoulSync has never seen is picked up too.
+        ``seasons`` table, so a season Commissary has never seen is picked up too.
         Returns the before/after counts so the caller can report what landed
         instead of just claiming success."""
         from . import get_video_db
@@ -185,7 +185,7 @@ def register_routes(bp):
 
         Kept out of /metadata deliberately, like /aka: that endpoint pushes edits
         to Plex/Jellyfin and locks the field there, and a media server has no
-        concept of SoulSync's Library registry.
+        concept of Commissary's Library registry.
 
         null clears the assignment — a real state, not an error. An unassigned
         title falls back to the primary Library for its kind, the pre-Libraries
@@ -211,7 +211,7 @@ def register_routes(bp):
         the tmdb id — the releases they fix are for titles you do NOT own yet, so
         there is frequently no library row to hang one off.
 
-        A SoulSync-LOCAL matching aid, deliberately not part of /metadata: that
+        A Commissary-LOCAL matching aid, deliberately not part of /metadata: that
         endpoint pushes edits to Plex/Jellyfin and locks the field there, which
         would be wrong for something the media server has no concept of. These
         titles only widen what the release-title gate accepts.

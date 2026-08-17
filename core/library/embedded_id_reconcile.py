@@ -3,7 +3,7 @@
 Enrichment workers (Spotify / iTunes / MusicBrainz / Deezer / Tidal /
 AudioDB / Genius / Last.fm) resolve each artist / album / track to a provider ID
 via API calls, gating their work queues on ``{provider}_match_status IS
-NULL``. But files that SoulSync (or MusicBrainz Picard) already tagged
+NULL``. But files that Commissary (or MusicBrainz Picard) already tagged
 carry those IDs in their metadata. Reading them back and gap-filling the
 ``{provider}_id`` + ``{provider}_match_status = 'matched'`` columns lets
 the workers skip the API lookup entirely — large API savings on an

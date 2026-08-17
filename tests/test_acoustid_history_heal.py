@@ -66,7 +66,7 @@ def test_idempotent_no_growth_on_rescan(db):
 
 
 def test_unknown_file_inserts_one_row_then_dedups(db):
-    # a file SoulSync never downloaded → first scan inserts one review-queue row...
+    # a file Commissary never downloaded → first scan inserts one review-queue row...
     ctx = types.SimpleNamespace(db=db)
     _scanner()._persist_status(ctx, track_id='t1', fpath=NEW, db_path=NEW,
                                status='unverified', write_tag=False,

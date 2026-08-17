@@ -1,23 +1,23 @@
-# 🐳 SoulSync Docker Installation Guide
+# 🐳 Commissary Docker Installation Guide
 
-Complete guide to running SoulSync in Docker with persistent data and proper configuration.
+Complete guide to running Commissary in Docker with persistent data and proper configuration.
 
 ## 🚀 Quick Start
 
 ```bash
 # Clone the repository
-git clone https://github.com/Nezreka/SoulSync
-cd SoulSync
+git clone https://github.com/ThyMrMan/soul-sync-thymrman-customized
+cd soul-sync-thymrman-customized
 
 # Start the container
 docker-compose up -d
 
-# Access SoulSync at http://localhost:8008
+# Access Commissary at http://localhost:8008
 ```
 
 ## 📋 Prerequisites
 
-Before running SoulSync in Docker, ensure you have:
+Before running Commissary in Docker, ensure you have:
 
 - **Docker & Docker Compose** installed on your system
 - **slskd** running on your host machine (port 5030)
@@ -28,7 +28,7 @@ Before running SoulSync in Docker, ensure you have:
 
 ### 1. Initial Configuration
 
-On first run, SoulSync will create a default config. You need to update it with your credentials:
+On first run, Commissary will create a default config. You need to update it with your credentials:
 
 1. Start the container: `docker-compose up -d`
 2. Open http://localhost:8008 in your browser
@@ -79,7 +79,7 @@ Docker automatically resolves `host.docker.internal` to your host machine.
 
 ## 📊 Data Persistence
 
-SoulSync Docker uses a named volume for the database:
+Commissary Docker uses a named volume for the database:
 
 - **Database**: Stored in `soulsync_database` volume (persists across container rebuilds)
 - **Config**: Stored in `./config/` folder (mapped to host)
@@ -90,16 +90,16 @@ SoulSync Docker uses a named volume for the database:
 ## 🛠️ Common Commands
 
 ```bash
-# Start SoulSync
+# Start Commissary
 docker-compose up -d
 
 # View logs
 docker-compose logs -f
 
-# Stop SoulSync
+# Stop Commissary
 docker-compose down
 
-# Restart SoulSync
+# Restart Commissary
 docker-compose restart
 
 # Update to latest image
@@ -140,7 +140,7 @@ docker-compose up -d
 ## 📁 Directory Structure
 
 ```
-SoulSync/
+Commissary/
 ├── config/           # Configuration files (mapped to container)
 ├── logs/             # Application logs (mapped to container)
 ├── docker-compose.yml
@@ -155,7 +155,7 @@ SoulSync/
 
 ## 🆕 Updates
 
-To update SoulSync:
+To update Commissary:
 
 ```bash
 # Pull latest image
@@ -176,11 +176,11 @@ Your configuration and database will be preserved.
 
 ## 🎵 Ready to Go!
 
-Once configured, SoulSync will:
+Once configured, Commissary will:
 - Automatically sync your playlists
 - Download missing tracks with FLAC priority
 - Organize files with proper metadata
 - Retry failed downloads every hour
 - Monitor watchlist artists for new releases
 
-Access your SoulSync instance at **http://localhost:8008**
+Access your Commissary instance at **http://localhost:8008**

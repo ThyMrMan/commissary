@@ -86,7 +86,7 @@ class SABnzbdAdapter:
         return bool(data and data.get('version'))
 
     async def category_exists(self, category: str) -> bool:
-        """Return whether SAB knows the category SoulSync will submit with.
+        """Return whether SAB knows the category Commissary will submit with.
 
         SAB silently rewrites an unknown category to ``*``.  Normal submits
         still retain their external job id, but a timed-out submit must be

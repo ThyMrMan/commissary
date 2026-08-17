@@ -1,5 +1,5 @@
 """Media server engine — central registry-backed access to the
-per-server clients (Plex, Jellyfin, Navidrome, SoulSync standalone).
+per-server clients (Plex, Jellyfin, Navidrome, Commissary standalone).
 
 Companion to the download engine refactor — same architectural
 shape applied to the read-side of the library. Pre-refactor

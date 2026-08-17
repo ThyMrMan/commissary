@@ -53,7 +53,7 @@ def auto_run_script(config: Dict[str, Any], deps: AutomationDeps) -> Dict[str, A
 
     deps.update_progress(automation_id, phase=f'Running {script_name}...', progress=10)
 
-    # Build environment with SoulSync context.
+    # Build environment with Commissary context.
     env = os.environ.copy()
     event_data = config.get('_event_data') or {}
     env['SOULSYNC_EVENT'] = str(event_data.get('type', ''))

@@ -4,7 +4,7 @@ The Audit Trail modal on the Library History view needs to show
 exactly what tags are currently embedded in a downloaded file —
 title/artist/album metadata, MusicBrainz/Spotify/Tidal IDs,
 ReplayGain values, ISRC, cover-art presence, lyrics, and anything
-else SoulSync or its background enrichment workers wrote.
+else Commissary or its background enrichment workers wrote.
 
 The file is the single source of truth. A persisted snapshot at
 post-process time would drift the moment a background worker

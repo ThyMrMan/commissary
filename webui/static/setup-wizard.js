@@ -1,5 +1,5 @@
 // ============================================
-// SoulSync Setup Wizard — First-Run Experience
+// Commissary Setup Wizard — First-Run Experience
 // ============================================
 
 const WIZARD_STEPS = ['welcome', 'metadata', 'download-source', 'paths', 'watchlist', 'first-download', 'done'];
@@ -206,8 +206,8 @@ function _renderWizard() {
 function _renderWelcome(el) {
     el.innerHTML = `
         <div class="setup-card">
-            <img src="/static/trans2.png" alt="SoulSync" class="setup-welcome-logo">
-            <h2>Welcome to SoulSync</h2>
+            <img src="/static/trans2.png" alt="Commissary" class="setup-welcome-logo">
+            <h2>Welcome to Commissary</h2>
             <p class="setup-welcome-tagline">Intelligent Music Discovery & Automation</p>
             <div class="setup-feature-list">
                 <div class="setup-feature-item">
@@ -266,9 +266,9 @@ function _renderMetadata(el) {
     el.innerHTML = `
         <div class="setup-card">
             <h2>Metadata Source</h2>
-            <p class="setup-subtitle">Where should SoulSync look up track info, album art, and metadata?</p>
+            <p class="setup-subtitle">Where should Commissary look up track info, album art, and metadata?</p>
             <div class="setup-info-box">
-                <strong>What is a metadata source?</strong> When you search for music or sync a playlist, SoulSync needs a catalog to look up track names, artists, album art, track numbers, and release dates. This source provides that information — it does not affect where music is downloaded from.
+                <strong>What is a metadata source?</strong> When you search for music or sync a playlist, Commissary needs a catalog to look up track names, artists, album art, track numbers, and release dates. This source provides that information — it does not affect where music is downloaded from.
             </div>
             <div class="setup-option-grid" style="grid-template-columns: 1fr 1fr 1fr;">
                 ${sources.map(s => `
@@ -360,11 +360,11 @@ function _renderDownloadSource(el) {
     el.innerHTML = `
         <div class="setup-card">
             <h2>Download Source</h2>
-            <p class="setup-subtitle">Choose where SoulSync downloads music files from.</p>
+            <p class="setup-subtitle">Choose where Commissary downloads music files from.</p>
             <div class="setup-info-box">
-                <strong>How downloads work:</strong> When you search for a track, SoulSync uses your metadata source to identify it, then searches your download source for the actual audio file. The matching engine automatically finds the best quality match.
+                <strong>How downloads work:</strong> When you search for a track, Commissary uses your metadata source to identify it, then searches your download source for the actual audio file. The matching engine automatically finds the best quality match.
                 <br><br>
-                <strong>Hybrid mode</strong> (available later in Settings) lets you set a priority order — if your primary source doesn't have a track, SoulSync automatically tries the next source in line.
+                <strong>Hybrid mode</strong> (available later in Settings) lets you set a priority order — if your primary source doesn't have a track, Commissary automatically tries the next source in line.
             </div>
             <div class="setup-option-grid" style="grid-template-columns: 1fr 1fr 1fr;">
                 ${sources.map(s => `
@@ -541,7 +541,7 @@ function _renderPaths(el) {
 
             <p class="setup-subtitle" style="margin-top: 20px; margin-bottom: 8px;">Connect a media server</p>
             <div class="setup-info-box" style="margin-bottom: 12px;">
-                Connecting a media server lets SoulSync trigger library scans after downloads, import your existing library, and display what you already own when searching. Select <strong>None</strong> if you don't use one.
+                Connecting a media server lets Commissary trigger library scans after downloads, import your existing library, and display what you already own when searching. Select <strong>None</strong> if you don't use one.
             </div>
             <div class="setup-server-grid">
                 ${['plex', 'jellyfin', 'navidrome', 'none'].map(s => `
@@ -775,7 +775,7 @@ function _renderFirstDownload(el) {
             <h2>Your First Download</h2>
             <p class="setup-subtitle">Try searching for a track to see the full pipeline in action.</p>
             <div class="setup-info-box">
-                <strong>How it works:</strong> Type a song name below. SoulSync searches your metadata source for the track, then finds the best matching audio file from your download source. The track is tagged with full metadata (artist, album, track number, artwork) and organized into your output folder.
+                <strong>How it works:</strong> Type a song name below. Commissary searches your metadata source for the track, then finds the best matching audio file from your download source. The track is tagged with full metadata (artist, album, track number, artwork) and organized into your output folder.
             </div>
             <div class="setup-search-wrapper">
                 <span class="setup-search-icon">
@@ -955,7 +955,7 @@ function _renderDone(el) {
                 </svg>
             </div>
             <h2>You're All Set!</h2>
-            <p class="setup-subtitle">SoulSync is configured and ready to go. Here's a quick overview of what's available.</p>
+            <p class="setup-subtitle">Commissary is configured and ready to go. Here's a quick overview of what's available.</p>
             <div class="setup-summary">
                 ${summaryRows.map(r => `
                     <div class="setup-summary-row">
@@ -967,7 +967,7 @@ function _renderDone(el) {
             <div class="setup-tips-grid">
                 <div class="setup-tip-card">
                     <div class="setup-tip-title">Sync Page</div>
-                    <div class="setup-tip-text">Mirror playlists from Spotify, Tidal, Deezer, YouTube, Beatport, and ListenBrainz. SoulSync matches and downloads missing tracks automatically.</div>
+                    <div class="setup-tip-text">Mirror playlists from Spotify, Tidal, Deezer, YouTube, Beatport, and ListenBrainz. Commissary matches and downloads missing tracks automatically.</div>
                 </div>
                 <div class="setup-tip-card">
                     <div class="setup-tip-title">Wishlist</div>
@@ -990,7 +990,7 @@ function _renderDone(el) {
                     <div class="setup-tip-text">Everything from this wizard plus much more — file organization templates, quality preferences, tag embedding, and advanced options.</div>
                 </div>
             </div>
-            <button class="setup-btn setup-btn-primary setup-btn-big" onclick="_wizardFinish()">Start Using SoulSync</button>
+            <button class="setup-btn setup-btn-primary setup-btn-big" onclick="_wizardFinish()">Start Using Commissary</button>
         </div>
     `;
 }
@@ -1045,7 +1045,7 @@ async function _wizardFinish() {
 
     // Reload settings into the main UI
     if (typeof loadSettings === 'function') loadSettings();
-    if (typeof showToast === 'function') showToast('Setup complete — welcome to SoulSync!', 'success');
+    if (typeof showToast === 'function') showToast('Setup complete — welcome to Commissary!', 'success');
 
     // Continue app initialization if wizard was shown on first run
     if (typeof window._onSetupWizardComplete === 'function') {

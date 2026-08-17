@@ -115,7 +115,7 @@ class TorrentClientAdapter(Protocol):
     ) -> Optional[str]:
         """Upload a raw ``.torrent`` payload. Same return as
         ``add_torrent``. Used when the indexer doesn't expose a
-        direct download URL and SoulSync had to fetch the file
+        direct download URL and Commissary had to fetch the file
         itself first."""
         ...
 

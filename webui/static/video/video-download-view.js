@@ -1,5 +1,5 @@
 /*
- * SoulSync — Download VIEW renderer (movie / TV show / YouTube).
+ * Commissary — Download VIEW renderer (movie / TV show / YouTube).
  *
  * NOT its own modal: it renders the direct-download content INTO a container the
  * caller owns — the get-modal swaps its detail body for this view (with a Back

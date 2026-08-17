@@ -422,7 +422,7 @@ def is_active_media_server_ready() -> tuple[bool, str]:
 
 
 def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[str, Any], album_info: Dict[str, Any]) -> None:
-    """Write imported media to the SoulSync library tables when the active server is SoulSync."""
+    """Write imported media to the Commissary library tables when the active server is Commissary."""
     try:
         if _get_config_manager().get_active_media_server() != "soulsync":
             return
@@ -509,7 +509,7 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
             logger.debug("bitrate read failed: %s", e)
 
         # File size on disk (powers Library Disk Usage card on Stats).
-        # SoulSync standalone is the only path where the file is local
+        # Commissary standalone is the only path where the file is local
         # at insert time, so we read it directly via os.path.getsize.
         # Mirrors what JellyfinTrack/NavidromeTrack pull from API
         # responses for the media-server flows.
@@ -732,6 +732,6 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
                         logger.debug("track source-id update failed: %s", e)
 
             conn.commit()
-            logger.info("[SoulSync Library] Added: %s / %s / %s", artist_name, album_name, track_name)
+            logger.info("[Commissary Library] Added: %s / %s / %s", artist_name, album_name, track_name)
     except Exception as exc:
-        logger.error("[SoulSync Library] Could not record library entry: %s", exc)
+        logger.error("[Commissary Library] Could not record library entry: %s", exc)

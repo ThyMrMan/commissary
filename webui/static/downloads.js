@@ -483,16 +483,16 @@ async function openDownloadMissingModalForYouTube(virtualPlaylistId, playlistNam
             virtualPlaylistId.startsWith('listenbrainz_') ? 'ListenBrainz' :
                 virtualPlaylistId.startsWith('spotify_public_') ? 'Spotify' :
                     virtualPlaylistId.startsWith('spotify:') ? 'Spotify' :
-                        virtualPlaylistId.startsWith('discover_') ? 'SoulSync' :
-                            virtualPlaylistId.startsWith('seasonal_') ? 'SoulSync' :
-                                virtualPlaylistId.startsWith('spotify_library_') ? 'SoulSync' :
-                                    virtualPlaylistId.startsWith('build_playlist_') ? 'SoulSync' :
-                                        virtualPlaylistId.startsWith('decade_') ? 'SoulSync' :
-                                            virtualPlaylistId === 'build_playlist_custom' ? 'SoulSync' :
+                        virtualPlaylistId.startsWith('discover_') ? 'Commissary' :
+                            virtualPlaylistId.startsWith('seasonal_') ? 'Commissary' :
+                                virtualPlaylistId.startsWith('spotify_library_') ? 'Commissary' :
+                                    virtualPlaylistId.startsWith('build_playlist_') ? 'Commissary' :
+                                        virtualPlaylistId.startsWith('decade_') ? 'Commissary' :
+                                            virtualPlaylistId === 'build_playlist_custom' ? 'Commissary' :
                                                 'YouTube';
 
     // Store metadata for discover download sidebar (will be added when Begin Analysis is clicked)
-    if (source === 'SoulSync' || virtualPlaylistId.startsWith('discover_lb_') || virtualPlaylistId.startsWith('listenbrainz_') || virtualPlaylistId.startsWith('wing_it_')) {
+    if (source === 'Commissary' || virtualPlaylistId.startsWith('discover_lb_') || virtualPlaylistId.startsWith('listenbrainz_') || virtualPlaylistId.startsWith('wing_it_')) {
         // Extract image URL from album context or first track's album cover
         let imageUrl = null;
         if (album && album.images && album.images.length > 0) {
@@ -3384,14 +3384,14 @@ async function openAlbumSourcePicker(album, artist, onPicked) {
             <div class="candidates-modal-body">
                 <div class="candidates-release-note">
                     Only sources that index whole albums appear here. Picking one downloads
-                    <strong>that exact release</strong> instead of letting SoulSync guess, then the
+                    <strong>that exact release</strong> instead of letting Commissary guess, then the
                     normal per-track matching imports the tracks you're missing from it.
                 </div>
                 <div class="candidates-manual-search-status" id="album-sources-status">Searching…</div>
                 <div id="album-sources-groups"></div>
                 <div class="album-sources-footer">
                     <button class="candidates-manual-search-btn" id="album-sources-auto">
-                        Let SoulSync choose
+                        Let Commissary choose
                     </button>
                 </div>
             </div>
@@ -3516,7 +3516,7 @@ async function openAlbumSourcePicker(album, artist, onPicked) {
                              'failed', true);
                 } else if (msg.type === 'done') {
                     statusEl.textContent = found === 0
-                        ? 'No source has this album as a single release — "Let SoulSync choose" still downloads it track by track.'
+                        ? 'No source has this album as a single release — "Let Commissary choose" still downloads it track by track.'
                         : `${found} release${found !== 1 ? 's' : ''}`;
                 }
             }
@@ -4213,7 +4213,7 @@ function processModalStatusUpdate(playlistId, data) {
         if (downloadFill) downloadFill.style.width = `${percent}%`;
         if (downloadText) {
             downloadText.textContent = _downloadModalBundleProgressText(bundle);
-            downloadText.title = 'SoulSync downloads one album release first, then matches the selected tracks from the staged files.';
+            downloadText.title = 'Commissary downloads one album release first, then matches the selected tracks from the staged files.';
         }
 
         const modal = document.getElementById(`download-missing-modal-${playlistId}`);
@@ -4223,7 +4223,7 @@ function processModalStatusUpdate(playlistId, data) {
                 if (!statusEl.textContent || statusEl.textContent === '-' || statusEl.textContent.includes('Pending')) {
                     statusEl.textContent = 'Waiting for release';
                     statusEl.classList.add('album-bundle-waiting');
-                    statusEl.title = 'The album release is downloading first. Tracks will move to processing once SoulSync can match files from it.';
+                    statusEl.title = 'The album release is downloading first. Tracks will move to processing once Commissary can match files from it.';
                 }
             });
         }
@@ -7544,8 +7544,8 @@ async function checkForUpdates() {
                 if (notified !== updateKey) {
                     sessionStorage.setItem('soulsync-update-notified', updateKey);
                     const what = data.latest_version
-                        ? `SoulSync v${data.latest_version} is available!`
-                        : 'A new SoulSync update is available!';
+                        ? `Commissary v${data.latest_version} is available!`
+                        : 'A new Commissary update is available!';
                     showToast(data.is_docker
                         ? what + ' The Docker image will be updated soon.'
                         : what, severity === 'critical' ? 'error' : 'info');
@@ -7599,7 +7599,7 @@ async function showVersionInfo() {
         : [];
     const versionData = {
         version,
-        title: "What's New in SoulSync",
+        title: "What's New in Commissary",
         subtitle: version ? `Version ${version} — Latest Changes` : 'Latest Changes',
         sections,
     };

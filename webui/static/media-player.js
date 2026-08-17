@@ -2254,7 +2254,7 @@ async function playQueueItem(index) {
                     album: track.album || '',
                     // Server song id (Navidrome/Subsonic) so playback can fall
                     // back to streaming via the server when the file isn't on
-                    // SoulSync's disk (#809).
+                    // Commissary's disk (#809).
                     track_id: track.id || null
                 })
             });
@@ -3136,7 +3136,7 @@ function initMediaSession() {
     } catch (e) { /* some browsers don't support seekto — handlers above still work */ }
 }
 
-// Log a SoulSync play once a track has been heard ~10s (the standard "counts
+// Log a Commissary play once a track has been heard ~10s (the standard "counts
 // as a play" threshold) — feeds 'recently played' + smart-radio recency.
 let npPlayLogged = false;
 function npMaybeLogPlay() {

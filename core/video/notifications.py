@@ -151,7 +151,7 @@ def _send(conn: Dict[str, Any], event_type: str, data: Dict[str, Any]) -> bool:
     msg = format_message(event_type, data)
     try:
         if conn["type"] == "discord":
-            r = requests.post(conn["url"], json={"content": msg, "username": "SoulSync"},
+            r = requests.post(conn["url"], json={"content": msg, "username": "Commissary"},
                               timeout=6)
         elif conn["type"] == "telegram":
             r = requests.post("https://api.telegram.org/bot%s/sendMessage" % conn["token"],
@@ -199,4 +199,4 @@ def test_connection(conn_raw: Any) -> bool:
     if not conn:
         return False
     return _send(conn, "video_download_completed",
-                 {"title": "SoulSync test notification", "quality": "it works"})
+                 {"title": "Commissary test notification", "quality": "it works"})

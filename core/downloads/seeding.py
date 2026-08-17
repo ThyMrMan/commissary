@@ -21,7 +21,7 @@ This sweep does exactly that for completed MUSIC torrent grabs.
     not a None) is left alone and retried next sweep, so a flaky/unreachable
     client can never trigger an erroneous release.
 
-Only ever touches torrents recorded in ``torrent_seed_grabs`` (grabs SoulSync
+Only ever touches torrents recorded in ``torrent_seed_grabs`` (grabs Commissary
 itself completed) — never a torrent the user added, and never the video side's
 grabs. Usenet never seeds; slskd has no concept of it — torrent grabs only.
 """

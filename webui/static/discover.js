@@ -6811,7 +6811,7 @@ function _artWebRenderLens() {
     if (_artistWeb.lens === 'discovery' && built.graph.order === 0) {
         const lg = document.getElementById('artist-web-legend');
         if (lg) lg.style.display = 'none';   // don't leave the prior lens's legend over the card
-        _artWebStateCard(host, 'No discovery candidates yet — add artists to your Watchlist so SoulSync can fetch similar artists to explore.', null);
+        _artWebStateCard(host, 'No discovery candidates yet — add artists to your Watchlist so Commissary can fetch similar artists to explore.', null);
         return;
     }
 
@@ -7987,7 +7987,7 @@ function _artWebShowGenre(node) {
 
 // ---- Discovery lens: candidate card with "Add to watchlist" ------------------------------------
 // Deliberately NO expand button here: similar_artists only has rows for artists whose similars
-// SoulSync fetched (owned/watchlist), so expanding an unowned candidate always returns empty
+// Commissary fetched (owned/watchlist), so expanding an unowned candidate always returns empty
 // (validated 0/176 on real data). The trail opens up after the candidate is watchlisted + scanned.
 function _artWebShowDiscovery(node) {
     const p = _artWebEnsurePanel();

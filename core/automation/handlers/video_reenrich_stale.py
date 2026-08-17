@@ -1,6 +1,6 @@
 """Automation handler: ``video_reenrich_stale`` action.
 
-Keeps SoulSync's metadata from going stale. Enrichment normally runs ONCE — a
+Keeps Commissary's metadata from going stale. Enrichment normally runs ONCE — a
 title is matched, its metadata gap-filled, and it's never looked at again. But
 the world moves: ratings drift, overviews get written, a just-released film gets
 its cast/backdrop, a reality episode finally gets an air date. Lazy on-view

@@ -113,7 +113,7 @@
         o.innerHTML =
             '<div class="ss-modal" role="dialog" aria-modal="true" aria-label="Video Sources" tabindex="-1">' +
                 '<div class="ss-topbar">' +
-                    '<div class="ss-topbar-icon"><img src="/static/trans2.png" alt="SoulSync" class="ss-topbar-logo"></div>' +
+                    '<div class="ss-topbar-icon"><img src="/static/trans2.png" alt="Commissary" class="ss-topbar-logo"></div>' +
                     '<div class="ss-topbar-titles">' +
                         '<h3 class="ss-topbar-title">Video Sources</h3>' +
                         '<div class="ss-topbar-sub">What the video side uses for metadata, server, and downloads</div>' +

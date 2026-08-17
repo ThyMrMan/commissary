@@ -104,8 +104,8 @@ def register_routes(bp):
                 start.isoformat(), end.isoformat(),
                 server_source=resolve_video_server(), watchlist_only=(scope != "all"))
             lines = ["BEGIN:VCALENDAR", "VERSION:2.0",
-                     "PRODID:-//SoulSync//Video Calendar//EN",
-                     "X-WR-CALNAME:SoulSync Airings", "CALSCALE:GREGORIAN"]
+                     "PRODID:-//Commissary//Video Calendar//EN",
+                     "X-WR-CALNAME:Commissary Airings", "CALSCALE:GREGORIAN"]
             for e in eps:
                 day = str(e.get("air_date") or "")[:10].replace("-", "")
                 if len(day) != 8:

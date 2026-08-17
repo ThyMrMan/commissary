@@ -3,7 +3,7 @@
 The Duplicate Cleaner moves de-duplicated files into ``<transfer>/deleted/``.
 If the user's media server scans the transfer folder (e.g. a ``/music`` root
 holding both the library and the transfer dir), those quarantined files get real
-rows in SoulSync's DB. Reorganize is purely DB-driven, so without a guard it
+rows in Commissary's DB. Reorganize is purely DB-driven, so without a guard it
 would move them back OUT of /deleted to the template location.
 
 These tests pin:

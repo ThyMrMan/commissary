@@ -94,7 +94,7 @@ def fetch_releases(repo: str, timeout: int = 10, limit: int = 15) -> List[Dict[s
     req = urllib.request.Request(
         f"https://api.github.com/repos/{repo}/releases?per_page={limit}",
         headers={'Accept': 'application/vnd.github.v3+json',
-                 'User-Agent': 'SoulSync-UpdateCheck'},
+                 'User-Agent': 'Commissary-UpdateCheck'},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode())

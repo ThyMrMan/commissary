@@ -11,6 +11,7 @@ from urllib.parse import quote
     [
         "/api/image-proxy?url=https%3A%2F%2Fexample.com%2Fcover.jpg",
         "/api/image-cache/" + ("a" * 64),
+        # c=SoulSync: the Subsonic client name is deliberately un-renamed.
         "http://host.docker.internal:4533/api/image-proxy?u=ketiska&t=abc&s=def&v=1.16.1&c=SoulSync&f=json",
     ],
 )
@@ -22,7 +23,7 @@ def test_normalize_image_url_leaves_existing_image_proxy_urls_alone(thumb_url):
 
 
 def test_normalize_image_url_registers_internal_http_urls_with_image_cache(monkeypatch):
-    """Raw internal image URLs should be routed through SoulSync's hashed cache URL."""
+    """Raw internal image URLs should be routed through Commissary's hashed cache URL."""
     from core.metadata import normalize_image_url
     from core.metadata import artwork
     import core.image_cache as image_cache

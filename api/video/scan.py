@@ -42,7 +42,7 @@ def register_routes(bp):
         from core.video.scanner import get_video_scanner
         return jsonify(get_video_scanner(get_video_db()).cancel())
 
-    # ── Server-side scan (distinct from the SoulSync-reads-server scan above) ──
+    # ── Server-side scan (distinct from the Commissary-reads-server scan above) ──
     # This tells the media server (Plex/Jellyfin) to rescan its OWN folders so
     # newly-downloaded files get indexed — the manual twin of the post-download
     # 'Scan Video Server' automation. media_type scopes it to Movies / TV / both.

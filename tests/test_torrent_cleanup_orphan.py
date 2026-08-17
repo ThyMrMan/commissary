@@ -1,5 +1,5 @@
 """noldevin: a dead torrent (metaDL stuck / errored / timed out) was left ORPHANED
-in qbit — cleared from SoulSync but still active in the client, then re-grabbed as
+in qbit — cleared from Commissary but still active in the client, then re-grabbed as
 a duplicate. The monitor's terminal exits now call _cleanup_torrent, which removes
 (abandon) or pauses it in the client."""
 

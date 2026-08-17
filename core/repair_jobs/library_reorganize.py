@@ -394,8 +394,8 @@ class LibraryReorganizeJob(RepairJob):
         """Load minimal album metadata (id, title, artist_id, artist_name)
         for albums on the active media server.
 
-        SoulSync's DB stores rows for every configured server (Plex +
-        Jellyfin + Navidrome + SoulSync standalone) distinguished by
+        Commissary's DB stores rows for every configured server (Plex +
+        Jellyfin + Navidrome + Commissary standalone) distinguished by
         the ``server_source`` column. The artist-detail reorganize
         modal only sees the active server's library; this job matches
         that scope so users don't accidentally try to reorganize the

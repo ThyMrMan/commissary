@@ -1,6 +1,6 @@
 # WebUI Hybrid Rendering
 
-SoulSync's web UI is in a transition phase:
+Commissary's web UI is in a transition phase:
 
 - most pages still render through the legacy vanilla JS shell
 - `/issues` is rendered by the new React app

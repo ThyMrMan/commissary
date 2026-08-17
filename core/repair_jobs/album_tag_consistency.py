@@ -236,7 +236,7 @@ class AlbumTagConsistencyJob(RepairJob):
                     )
 
             # Albums that were eligible but had <2 files actually readable from
-            # SoulSync's filesystem — a scanned album silently producing no
+            # Commissary's filesystem — a scanned album silently producing no
             # finding is indistinguishable from a healthy one to the user, so
             # count these and say so at the end (Docker mount mismatch is the
             # usual cause: the server's "/music/..." path isn't mounted here).
@@ -385,7 +385,7 @@ class AlbumTagConsistencyJob(RepairJob):
                 context.report_progress(
                     log_line=(
                         f'{unreadable_albums} album(s) skipped: their audio files '
-                        f'could not be read from SoulSync\'s filesystem — if your '
+                        f'could not be read from Commissary\'s filesystem — if your '
                         f'media server runs elsewhere (e.g. Docker), mount the music '
                         f'folder here at the same path the server reports'
                     ),

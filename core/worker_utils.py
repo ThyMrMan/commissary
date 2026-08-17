@@ -243,8 +243,8 @@ def set_album_api_track_count(cursor, album_id, count):
     Called by enrichment workers (Spotify / iTunes / Deezer / Discogs) after
     they fetch album metadata. The count is the EXPECTED total tracks
     according to that source — distinct from `albums.track_count`, which
-    server syncs (Plex `leafCount`, SoulSync standalone `len(tracks)`)
-    populate with the OBSERVED count SoulSync already has indexed. The
+    server syncs (Plex `leafCount`, Commissary standalone `len(tracks)`)
+    populate with the OBSERVED count Commissary already has indexed. The
     Album Completeness repair job reads `albums.api_track_count` as the
     expected total; populating it here during enrichment avoids a second
     round of API calls during the repair scan.

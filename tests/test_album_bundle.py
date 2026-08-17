@@ -467,7 +467,7 @@ def test_get_completed_no_path_window_falls_back_on_garbage() -> None:
 
 # ---------------------------------------------------------------------------
 # resolve_reported_save_path — downloader→local path translation. The arr
-# remote-path problem: SAB reports its own container path, SoulSync mounts
+# remote-path problem: SAB reports its own container path, Commissary mounts
 # the same files elsewhere.
 # ---------------------------------------------------------------------------
 
@@ -490,7 +490,7 @@ def test_resolve_returns_reported_path_verbatim_when_readable(tmp_path: Path) ->
 
 def test_resolve_uses_explicit_prefix_mapping(tmp_path: Path) -> None:
     """Sonarr/Radarr-style remote path mapping: SAB's prefix is rewritten
-    to a SoulSync-visible root."""
+    to a Commissary-visible root."""
     (tmp_path / "MyAlbum").mkdir()
     cfg = _cfg({'download_source.usenet_path_mappings': [
         {'from': '/data/downloads/music', 'to': str(tmp_path)},
@@ -501,7 +501,7 @@ def test_resolve_uses_explicit_prefix_mapping(tmp_path: Path) -> None:
 
 def test_resolve_basename_fallback_against_download_root(tmp_path: Path) -> None:
     """Zero-config shared-volume case: the album folder shows up under
-    SoulSync's own download root with the same name SAB reported."""
+    Commissary's own download root with the same name SAB reported."""
     (tmp_path / "MyAlbum").mkdir()
     cfg = _cfg({'soulseek.download_path': str(tmp_path)})
     resolved = resolve_reported_save_path('/data/downloads/music/MyAlbum', config_get=cfg)
@@ -520,7 +520,7 @@ def test_resolve_returns_a_readable_file_verbatim(tmp_path: Path) -> None:
 def test_resolve_basename_fallback_matches_a_bare_file(tmp_path: Path) -> None:
     """THE reported bug: a single-file release landing directly in a flat
     category folder (no per-release subfolder) — the client reports its own
-    container's path, and the exact same filename sits under SoulSync's
+    container's path, and the exact same filename sits under Commissary's
     configured torrent_download_path. Every existing basename check required
     a DIRECTORY, so this exact-match candidate was rejected purely for being
     a file, and the download stayed at 100% forever with no error."""
@@ -612,7 +612,7 @@ def test_resolve_skips_mapping_when_target_missing_then_tries_basename(tmp_path:
 def test_resolve_uses_custom_torrent_download_path(tmp_path: Path) -> None:
     """#857: the user's torrent client saves to a category folder (e.g. a
     'Music' category) mounted here at a custom in-container path. Setting
-    download_source.torrent_download_path lets SoulSync find the release there."""
+    download_source.torrent_download_path lets Commissary find the release there."""
     music_mount = tmp_path / "downloads" / "music"
     (music_mount / "MyAlbum").mkdir(parents=True)
     cfg = _cfg({'download_source.torrent_download_path': str(music_mount)})
@@ -631,7 +631,7 @@ def test_resolve_uses_custom_usenet_download_path(tmp_path: Path) -> None:
 
 def test_resolve_rejects_an_existing_but_contentless_verbatim_dir(tmp_path: Path) -> None:
     """TheHomeGuy's bug: the torrent client reports ITS OWN container's
-    '/downloads'; a directory by that name exists in SoulSync's namespace
+    '/downloads'; a directory by that name exists in Commissary's namespace
     too but doesn't hold this torrent. With the expected content name
     given, the verbatim short-circuit must NOT win — the configured root
     that actually contains the release does."""
@@ -1408,7 +1408,7 @@ def test_poll_get_status_exception_treated_as_transient_miss() -> None:
 # Multiple completed-download paths + the category-subfolder layout.
 #
 # Torrent/usenet clients sort finished downloads into CATEGORY folders —
-# downloads/complete/Movies/<release>, .../TV-Shows/<release>. SoulSync could
+# downloads/complete/Movies/<release>, .../TV-Shows/<release>. Commissary could
 # only be told about one completed-downloads folder per protocol and looked
 # exactly one level under it, so the release at <root>/<category>/<release>
 # was never found and the import silently never happened.

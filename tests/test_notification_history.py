@@ -102,5 +102,5 @@ def test_frontend_wiring():
     # panel filter chips + the persistent history modal
     assert '_setNotifFilter' in js and 'notif-filter-chip' in js and 'notif-filter-chip' in css
     assert '_openNotifHistory' in js and 'notif-history-modal' in css
-    # destructive clear goes through the SoulSync confirm dialog, never window.confirm
+    # destructive clear goes through the Commissary confirm dialog, never window.confirm
     assert 'showConfirmDialog' in js.split('function _clearServerNotifHistory')[1][:600]

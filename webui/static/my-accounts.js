@@ -54,7 +54,7 @@ function openMyAccountsModal() {
         overlay.innerHTML = `
             <div class="ma-modal" role="dialog" aria-modal="true" aria-label="My Accounts" tabindex="-1">
                 <div class="ma-topbar">
-                    <div class="ma-topbar-icon"><img src="/static/trans2.png" alt="SoulSync" class="ma-topbar-logo"></div>
+                    <div class="ma-topbar-icon"><img src="/static/trans2.png" alt="Commissary" class="ma-topbar-logo"></div>
                     <div class="ma-topbar-titles">
                         <h3 class="ma-topbar-title">My Accounts</h3>
                         <div class="ma-topbar-sub">Connect your own streaming accounts — used for your playlists, just for you.</div>

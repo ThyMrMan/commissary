@@ -162,7 +162,7 @@ def _warn_if_no_js_runtime():
         logger.warning(
             "No JavaScript runtime found (deno not on PATH). YouTube streaming and "
             "music-video downloads will fail with 'Requested format is not available'. "
-            "Install Deno (https://docs.deno.com/runtime/) and restart SoulSync. "
+            "Install Deno (https://docs.deno.com/runtime/) and restart Commissary. "
             "Windows: winget install DenoLand.Deno"
         )
 
@@ -1468,7 +1468,7 @@ class YouTubeClient(DownloadSourcePlugin):
                     logger.debug(f"   Genre: {genre}")
 
                 audio.tags.setall('COMM', [COMM(encoding=3, lang='eng', desc='',
-                               text=f'Downloaded via SoulSync (YouTube)\nSource: {yt_result.url}\nConfidence: {yt_result.confidence:.2f}')])
+                               text=f'Downloaded via Commissary (YouTube)\nSource: {yt_result.url}\nConfidence: {yt_result.confidence:.2f}')])
 
                 logger.debug(f"   Artist: {artist}")
                 logger.debug(f"   Album Artist: {album_artist}")

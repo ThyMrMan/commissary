@@ -30,9 +30,9 @@ logger = get_logger("plex_identity")
 IDENTIFIER_KEY = "plex.client_identifier"
 
 # What the user will see in Plex's Devices list, in place of "Linux".
-PLEX_PRODUCT = "SoulSync"
-PLEX_DEVICE = "SoulSync"
-PLEX_DEVICE_NAME = "SoulSync"
+PLEX_PRODUCT = "Commissary"
+PLEX_DEVICE = "Commissary"
+PLEX_DEVICE_NAME = "Commissary"
 
 
 def get_client_identifier() -> str:

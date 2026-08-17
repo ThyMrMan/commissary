@@ -11,7 +11,7 @@ whole Plex link on every browser restart — the earlier change did not break
 persistence, it made a pre-existing gap hurt.
 
 Sessions are now permanent with a sliding 30-day window
-(security.session_days), so someone who keeps using SoulSync is never signed out.
+(security.session_days), so someone who keeps using Commissary is never signed out.
 
 Persistence forces a second fix. /api/profiles/logout only popped 'profile_id',
 leaving login_authenticated and — the one that matters — the list of profiles

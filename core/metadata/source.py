@@ -300,7 +300,7 @@ def _process_musicbrainz_source(pp: dict, metadata: dict, cfg, runtime, track_ti
                 release_mbid = cached
             else:
                 # Persistent cache check BEFORE the live MB lookup. If a
-                # previous SoulSync run already resolved this album's
+                # previous Commissary run already resolved this album's
                 # release MBID, reuse it — guarantees every track of the
                 # same album gets the SAME MUSICBRAINZ_ALBUMID tag, even
                 # across server restarts and after the in-memory bounded
@@ -323,7 +323,7 @@ def _process_musicbrainz_source(pp: dict, metadata: dict, cfg, runtime, track_ti
                 if release_mbid:
                     _bounded_cache_set(mb_release_cache, rc_key_norm, release_mbid, _MB_RELEASE_CACHE_MAX_ENTRIES)
                     _bounded_cache_set(mb_release_cache, rc_key_exact, release_mbid, _MB_RELEASE_CACHE_MAX_ENTRIES)
-                    # Also persist for future SoulSync runs. Defensive
+                    # Also persist for future Commissary runs. Defensive
                     # try/except so a DB write failure can't block the
                     # in-memory store + tag write that follow.
                     try:

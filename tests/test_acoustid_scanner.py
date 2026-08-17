@@ -394,7 +394,7 @@ def test_load_db_tracks_falls_back_when_track_artist_empty_string():
 #
 # The audio file's ARTIST tag is ground truth for what's on disk:
 # Tidal/Spotify/Deezer all write the per-track artist into the file's
-# tag at download time, regardless of the SoulSync DB schema. Reading
+# tag at download time, regardless of the Commissary DB schema. Reading
 # it during the scan closes the gap without requiring a DB backfill
 # of the legacy rows. These tests pin:
 #   - File ARTIST tag trumps DB-resolved expected artist when present
@@ -944,7 +944,7 @@ def test_scan_pass_backfills_verified_status(monkeypatch):
 
 def test_scan_skip_marks_untagged_file_unverified(monkeypatch):
     # Title matches but the artist is ambiguous (cover/collab band?) → SKIP.
-    # An untagged file SoulSync never downloaded (no history row) gets a fresh
+    # An untagged file Commissary never downloaded (no history row) gets a fresh
     # 'unverified' row INSERTed so it surfaces in the Downloads-page review queue.
     updates, tag_writes, captured = _run_persistence_scan(
         monkeypatch, file_status=None,

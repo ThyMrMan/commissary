@@ -1414,7 +1414,7 @@ async function fetchAndCacheDeezerArlPlaylistTracks(arlPlaylistId, deezerPlaylis
 
 /**
  * Footer actions for Spotify/Deezer playlist details modals.
- * Standalone SoulSync has no media-server playlist sync — show Mirrored + re-analysis instead.
+ * Standalone Commissary has no media-server playlist sync — show Mirrored + re-analysis instead.
  */
 function playlistModalDownloadSyncFooterHtml(playlistId, options = {}) {
     const {

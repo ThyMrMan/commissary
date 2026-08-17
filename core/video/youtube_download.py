@@ -441,7 +441,7 @@ def _fetch_bytes(url: Any, timeout: int = 15) -> Optional[bytes]:
         return None
     try:
         import urllib.request
-        req = urllib.request.Request(u, headers={"User-Agent": "SoulSync"})
+        req = urllib.request.Request(u, headers={"User-Agent": "Commissary"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read()
     except Exception:   # noqa: BLE001 - a missing thumb just means the avatar backdrop

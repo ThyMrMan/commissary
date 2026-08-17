@@ -1,7 +1,7 @@
 """Regression tests for duplicate detector mount-path filter.
 
-When a user binds the same host music directory into both SoulSync
-and a media server (e.g. Plex at /media/Music, SoulSync at
+When a user binds the same host music directory into both Commissary
+and a media server (e.g. Plex at /media/Music, Commissary at
 /app/Transfer), the duplicate detector used to flag the two DB rows
 that point at the same physical file as a duplicate group. The new
 ``_is_same_physical_file`` helper filters those pairs out.
@@ -12,7 +12,7 @@ from core.repair_jobs.duplicate_detector import _is_same_physical_file
 
 class TestIsSamePhysicalFile:
     def test_same_file_at_different_mount_roots_is_filtered(self) -> None:
-        """The reported scenario: SoulSync container and Plex container
+        """The reported scenario: Commissary container and Plex container
         bind the same host directory at different mount points."""
         p1 = "/app/Transfer/The Smashing Pumpkins/MACHINA _ The Machines of God/15 - With Every Light.flac"
         p2 = "/media/Music/The Smashing Pumpkins/MACHINA _ The Machines of God/15 - With Every Light.flac"

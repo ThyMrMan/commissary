@@ -1,5 +1,5 @@
 /*
- * SoulSync — Import ytdl-sub / Kometa subscriptions (video, isolated).
+ * Commissary — Import ytdl-sub / Kometa subscriptions (video, isolated).
  *
  * Opened by [data-vwlp-import] on the watchlist Channels tab. Upload or paste a
  * subscriptions.yml → preview (parse, instant) → Import (background: resolve +
@@ -38,7 +38,7 @@
             '<div class="vsub-modal" role="dialog" aria-modal="true" aria-label="Import subscriptions">' +
                 '<div class="vsub-head">' +
                     '<div><h2 class="vsub-title">Import subscriptions</h2>' +
-                    '<p class="vsub-sub">Bring your ytdl-sub / Kometa channels &amp; playlists into SoulSync.</p></div>' +
+                    '<p class="vsub-sub">Bring your ytdl-sub / Kometa channels &amp; playlists into Commissary.</p></div>' +
                     '<button class="vsub-x" type="button" data-vsub-close aria-label="Close">&times;</button>' +
                 '</div>' +
                 '<div class="vsub-body" data-vsub-body></div>' +

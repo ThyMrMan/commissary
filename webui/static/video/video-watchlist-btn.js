@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video watchlist button (shared).
+ * Commissary — Video watchlist button (shared).
  *
  * One source of truth so every TV-show poster and person card gets the SAME
  * "add to watchlist" control + behaviour — the video mirror of the music

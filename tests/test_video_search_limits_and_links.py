@@ -160,7 +160,7 @@ def test_the_title_links_out_safely():
     js = _js()
     assert "vdl-r-title--link" in js
     # Third-party sites must not get window.opener or a referrer leaking the
-    # SoulSync URL.
+    # Commissary URL.
     assert 'rel="noopener noreferrer"' in js
     assert 'target="_blank"' in js
 

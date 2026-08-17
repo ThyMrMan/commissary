@@ -96,9 +96,9 @@ def run_delete(db, ids, source) -> dict:
     return {"ok": True, "deleted": deleted, "failed": failed}
 
 
-# ── adopt: bring a foreign server collection under SoulSync management ───────
+# ── adopt: bring a foreign server collection under Commissary management ───────
 def adopt_collections(db, items, *, source=None) -> dict:
-    """Convert existing server collections (Kometa's, hand-made) into SoulSync-
+    """Convert existing server collections (Kometa's, hand-made) into Commissary-
     managed definitions — the migration path that beats delete-and-rebuild.
 
     Per collection: read its CURRENT members, map them to library items, store a
@@ -133,7 +133,7 @@ def adopt_collections(db, items, *, source=None) -> dict:
         if not sid:
             continue
         if sid in managed:
-            skipped.append({"server_id": sid, "reason": "already managed by SoulSync"})
+            skipped.append({"server_id": sid, "reason": "already managed by Commissary"})
             continue
         try:
             member_ids = source.collection_member_ids(sid)

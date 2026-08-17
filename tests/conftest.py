@@ -1,4 +1,4 @@
-"""Shared pytest fixtures for SoulSync WebSocket tests.
+"""Shared pytest fixtures for Commissary WebSocket tests.
 
 Creates a minimal Flask+SocketIO app that replicates the relevant
 endpoints and event handlers without importing the full web_server.py

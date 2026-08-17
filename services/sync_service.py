@@ -58,8 +58,8 @@ def reresolve_manual_match_live_plex(cache_db, media_client, m, *, profile_id,
                                      source_track_id, server_source):
     """Re-resolve a manual match whose stored Plex ratingKey went stale.
 
-    Plex re-keys tracks on a metadata refresh/optimize, and the SoulSync DB id is
-    itself that old ratingKey — so until a SoulSync rescan, BOTH the stored
+    Plex re-keys tracks on a metadata refresh/optimize, and the Commissary DB id is
+    itself that old ratingKey — so until a Commissary rescan, BOTH the stored
     ``library_track_id`` and the file-path self-heal land on the same dead key and
     ``fetchItem`` 404s. The only live source of truth is Plex, so search it by the
     matched track's metadata, disambiguate by the stored file path (so the user's
@@ -112,7 +112,7 @@ def reresolve_manual_match_live_plex(cache_db, media_client, m, *, profile_id,
 
 def rescue_stale_plex_track(media_client, db_track, artist_name):
     """A fuzzy db match whose stored ratingKey went stale (Plex re-keys tracks
-    on a metadata refresh/optimize, and SoulSync's db id IS that old key).
+    on a metadata refresh/optimize, and Commissary's db id IS that old key).
 
     Same recipe as the manual-match self-heal: search live Plex by the matched
     track's metadata, prefer the exact file (basename of the db track's stored
@@ -184,7 +184,7 @@ class PlaylistSyncService:
         """Initialize the sync service.
 
         ``media_server_engine`` is the central MediaServerEngine that owns
-        the per-server clients (Plex / Jellyfin / Navidrome / SoulSync).
+        the per-server clients (Plex / Jellyfin / Navidrome / Commissary).
         Replaces the legacy per-server kwargs (plex_client / jellyfin_client
         / navidrome_client) — all media-server access now goes through
         ``self._engine.client(name)`` so swapping the active server doesn't
@@ -238,7 +238,7 @@ class PlaylistSyncService:
             elif active_server == "soulsync":
                 client = self._media_client('soulsync')
                 if not client:
-                    logger.error("SoulSync library client not provided to sync service")
+                    logger.error("Commissary library client not provided to sync service")
                     return None, "soulsync"
                 return client, "soulsync"
             else:  # Default to Plex
@@ -444,7 +444,7 @@ class PlaylistSyncService:
             media_client, server_type = self._get_active_media_client()
             unmatched_count = len(unmatched_tracks)
 
-            # SoulSync standalone has no server playlists — only library match +
+            # Commissary standalone has no server playlists — only library match +
             # wishlist for missing files. Previously we fell through to Plex here,
             # showed "Creating/updating Plex playlist", playlist write failed, and
             # failed_tracks was computed as total - 0 synced (= entire playlist).
@@ -724,7 +724,7 @@ class PlaylistSyncService:
 
                 def _materialize(server_track_id):
                     """Turn a stored library track id into the actual server item the
-                    sync needs (DB row for Jellyfin/Navidrome/SoulSync, Plex fetchItem)."""
+                    sync needs (DB row for Jellyfin/Navidrome/Commissary, Plex fetchItem)."""
                     if server_track_id is None:
                         return None
                     dbt = cache_db.get_track_by_id(server_track_id)
@@ -770,7 +770,7 @@ class PlaylistSyncService:
                         if not actual_track and m.get('library_file_path'):
                             new_id = cache_db.find_track_id_by_file_path(m['library_file_path'])
                             actual_track = _materialize(new_id)
-                        # Plex re-keys tracks on a metadata refresh, and the SoulSync
+                        # Plex re-keys tracks on a metadata refresh, and the Commissary
                         # DB id IS that ratingKey — so both lookups above can land on
                         # the same stale key and 404. Re-resolve against LIVE Plex by
                         # the matched track's metadata so a manual match is NEVER
@@ -853,7 +853,7 @@ class PlaylistSyncService:
                         # Fetch the actual track object from active media server using the database track ID
                         try:
                             if server_type in ("jellyfin", "navidrome", "soulsync"):
-                                # DB-backed servers — no remote fetchItem (SoulSync standalone included).
+                                # DB-backed servers — no remote fetchItem (Commissary standalone included).
                                 class DbTrackFromDB:
                                     def __init__(self, db_track):
                                         self.ratingKey = db_track.id

@@ -27,7 +27,7 @@ class DeadFileCleanerJob(RepairJob):
     description = 'Finds database entries pointing to missing files'
     help_text = (
         'Checks every track in your database to verify the actual audio file still exists '
-        'on disk. If a file has been moved, renamed, or deleted outside of SoulSync, the '
+        'on disk. If a file has been moved, renamed, or deleted outside of Commissary, the '
         'database entry becomes a "dead" reference.\n\n'
         'Each dead reference is reported as a finding. You can then resolve it by re-downloading '
         'the track or dismiss it to clean up the database entry.\n\n'
@@ -38,7 +38,7 @@ class DeadFileCleanerJob(RepairJob):
     default_interval_hours = 24
     default_settings = {
         # Mass-false-positive guard: if at least this fraction of tracks resolve
-        # to no file on disk, treat it as a path-mapping/mount problem (SoulSync
+        # to no file on disk, treat it as a path-mapping/mount problem (Commissary
         # can't SEE the library — e.g. Docker, or library.music_paths unset for
         # this environment) rather than thousands of individually-deleted files,
         # and abort without creating findings. Mirrors the transfer-folder abort.
@@ -149,7 +149,7 @@ class DeadFileCleanerJob(RepairJob):
                 context.update_progress(i + 1, total)
 
         # Mass-false-positive guard: a large fraction of unresolvable paths almost
-        # always means SoulSync can't SEE the library (Docker mount, or
+        # always means Commissary can't SEE the library (Docker mount, or
         # Settings → Library → Music Paths not set for this environment), NOT that
         # thousands of files were individually deleted. Refuse to flag and say so
         # — same principle as the transfer-folder abort above. (#828: a Plex-on-
@@ -166,7 +166,7 @@ class DeadFileCleanerJob(RepairJob):
             if context.report_progress:
                 context.report_progress(
                     phase='Aborted — too many unreachable paths',
-                    log_line=(f"{len(dead_rows)} of {result.scanned} tracks point to paths SoulSync "
+                    log_line=(f"{len(dead_rows)} of {result.scanned} tracks point to paths Commissary "
                               f"can't reach — almost always a path-mapping issue (Docker mount, or "
                               f"Settings → Library → Music Paths), not deleted files. No findings created."),
                     log_type='error'

@@ -2,7 +2,7 @@
 
 Prowlarr is the indexer manager component of the *arr stack. It exposes
 configured Usenet / torrent indexers behind a single Newznab-style API
-so downstream apps (Lidarr, Sonarr, Radarr, SoulSync) don't have to
+so downstream apps (Lidarr, Sonarr, Radarr, Commissary) don't have to
 implement an indexer integration per provider.
 
 This client is NOT a download source plugin. It does not implement

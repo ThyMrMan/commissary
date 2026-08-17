@@ -4,7 +4,7 @@
                                   movie/show results annotated with library_id
                                   if already owned.
 
-Everything resolves back into SoulSync — results link to the library detail
+Everything resolves back into Commissary — results link to the library detail
 (owned) or the TMDB-backed detail (not owned); people open the in-app person
 page. Reads only the video engine + video.db.
 """

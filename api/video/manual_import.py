@@ -9,8 +9,8 @@ lets the user place them by hand:
   POST /api/video/import/<id>/place      → force-import to the user's chosen identity
   POST /api/video/import/<id>/dismiss    → drop the row (optionally delete the file)
 
-``add`` exists so manual placement isn't gated on SoulSync having failed a download
-first — a file that was never grabbed through SoulSync at all (moved in by hand, left
+``add`` exists so manual placement isn't gated on Commissary having failed a download
+first — a file that was never grabbed through Commissary at all (moved in by hand, left
 over from another tool) gets the exact same ``import_failed`` row shape and rides the
 same queue/place/dismiss UI, no separate code path.
 

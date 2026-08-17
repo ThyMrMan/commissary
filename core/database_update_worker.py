@@ -13,7 +13,7 @@ from config.settings import config_manager
 logger = get_logger("database_update_worker")
 
 class DatabaseUpdateWorker:
-    """Worker for updating SoulSync database with media server library data."""
+    """Worker for updating Commissary database with media server library data."""
     
     def __init__(self, media_client, database_path: str = "database/music_library.db", full_refresh: bool = False, server_type: str = "plex", force_sequential: bool = False):
         # Force sequential processing for web server mode to avoid threading issues

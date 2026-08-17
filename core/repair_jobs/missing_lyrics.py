@@ -93,7 +93,7 @@ class MissingLyricsJob(RepairJob):
                 conn.close()
 
         # The stored file_path may not exist as-is in this process's filesystem view (docker mounts,
-        # a Plex/SoulSync path mismatch). The .lrc check below MUST run against the resolved on-disk
+        # a Plex/Commissary path mismatch). The .lrc check below MUST run against the resolved on-disk
         # path — exactly like the apply (_fix_missing_lyrics) and the Cover Art sibling already do.
         # Checking the raw DB path made every path-mapped user's tracks read as ".lrc missing" even
         # though the sidecar was right there (issue #955).

@@ -166,7 +166,7 @@ class RecentRelease:
     added_date: datetime
 
 class MusicDatabase:
-    """SQLite database manager for SoulSync music library data"""
+    """SQLite database manager for Commissary music library data"""
     
     def __init__(self, database_path: str = None):
         # Use env var if path is None OR if it's the default path
@@ -973,7 +973,7 @@ class MusicDatabase:
             # filesystem on every request. Populated by the deep scan from
             # whatever the media server reports (Plex MediaPart.size,
             # Jellyfin MediaSources[].Size, Navidrome <song size="...">,
-            # SoulSync standalone os.path.getsize). NULL on existing rows
+            # Commissary standalone os.path.getsize). NULL on existing rows
             # until the next deep scan fills them in — UI handles the
             # NULL case by showing "(run a Deep Scan to populate)".
             try:
@@ -2956,7 +2956,7 @@ class MusicDatabase:
                 columns_added = True
             # MusicBrainz exposes alternate-spelling aliases on every artist
             # record (Japanese kanji ↔ romanized, Cyrillic ↔ Latin, etc.).
-            # SoulSync's artist matching used to compare expected vs actual
+            # Commissary's artist matching used to compare expected vs actual
             # name with raw similarity — cross-script comparison scored 0%
             # and the file got quarantined even when MusicBrainz knew both
             # names belonged to the same artist (issue #442). Persist the
@@ -4839,7 +4839,7 @@ class MusicDatabase:
             # Albums: api_track_count — cached expected track count from the
             # metadata provider, separate from track_count which is the
             # OBSERVED count written by server syncs (Plex leafCount,
-            # SoulSync standalone len(tracks)). Without a separate column,
+            # Commissary standalone len(tracks)). Without a separate column,
             # the Album Completeness job can't tell apart "you have all the
             # tracks" from "Plex says this album has N tracks and you have
             # N tracks" — the latter looks complete but might be missing
@@ -4961,7 +4961,7 @@ class MusicDatabase:
                 conn.close()
 
     def record_web_player_play(self, event):
-        """Record a single SoulSync web-player play: insert the listening_history
+        """Record a single Commissary web-player play: insert the listening_history
         row AND bump tracks.play_count / last_played for the smart-radio recency
         signal. ``event`` is the dict from core.playback.play_log.build_play_event.
 
@@ -7334,7 +7334,7 @@ class MusicDatabase:
                     bitrate = track_obj.bitRate
                 if file_path is None and hasattr(track_obj, 'suffix') and track_obj.suffix:
                     file_path = f"{track_obj.title}.{track_obj.suffix}"
-                # File size: Jellyfin / Navidrome / SoulSync-standalone
+                # File size: Jellyfin / Navidrome / Commissary-standalone
                 # all set track_obj.file_size on their wrapper class.
                 # Plex came in via the media.parts[0].size path above —
                 # don't clobber that.
@@ -7421,7 +7421,7 @@ class MusicDatabase:
                 conn.commit()
 
                 # Backfill external metadata-source IDs from track_downloads
-                # provenance. SoulSync collected them at download time but the
+                # provenance. Commissary collected them at download time but the
                 # media-server scan can't see them — without this hook,
                 # tracks.spotify_track_id / itunes_track_id / etc. stay empty
                 # until the async enrichment workers eventually catch up
@@ -15000,7 +15000,7 @@ class MusicDatabase:
         number of columns updated. Called from
         ``insert_or_update_media_track`` immediately after the row is
         inserted/updated so freshly synced media-server rows pick up
-        whatever IDs SoulSync already knew at download time.
+        whatever IDs Commissary already knew at download time.
         """
         if not track_id or not file_path:
             return 0

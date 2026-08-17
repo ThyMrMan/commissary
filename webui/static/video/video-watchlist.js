@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video Watchlist page (isolated).
+ * Commissary — Video Watchlist page (isolated).
  *
  * The shows + people you follow, split by a Shows / People tab switcher.
  * Server-paged + searchable like the library (only a page of cards/posters

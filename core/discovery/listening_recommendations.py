@@ -86,7 +86,7 @@ def names_match(a: object, b: object) -> bool:
 def similarity_from_rank(rank: object, max_rank: int = 10) -> float:
     """Turn a stored ``similarity_rank`` (1 = most similar … 10 = least) into a 0–1 weight.
 
-    SoulSync stores each ``(seed → similar)`` edge with a 1–10 rank (``1`` is the closest
+    Commissary stores each ``(seed → similar)`` edge with a 1–10 rank (``1`` is the closest
     match). The ranker multiplies this into the score so a seed's *closest* matches count
     for more than its long-tail ones. Linear decay over the documented range: rank 1 → 1.0,
     rank 5 → 0.6, rank 10 → 0.1, with a 0.1 floor so a far match still contributes. A
@@ -147,7 +147,7 @@ def group_similars_by_seed(
     artist_name}`` for the library, built by the caller) and keeps only rows that resolve
     to one of the ``seeds``. Rows may be dataclass objects or dicts. Pure — no I/O.
 
-    ``id_to_name`` MUST be keyed by whatever id the edges actually store — for SoulSync that
+    ``id_to_name`` MUST be keyed by whatever id the edges actually store — for Commissary that
     is the artist's SOURCE id (Spotify/iTunes/Deezer/MusicBrainz), NOT the internal row id.
     When ``rank_attr`` is given, each row's rank is converted via :func:`similarity_from_rank`
     and carried as ``score`` so closer matches weigh more; without it every similar comes out

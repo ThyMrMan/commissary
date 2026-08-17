@@ -171,7 +171,7 @@ class TestGetProvenanceByFilePath:
 
     def test_basename_suffix_fallback(self, db):
         """Recorded path differs from queried path by mount root —
-        common when SoulSync container writes under /app/Transfer
+        common when Commissary container writes under /app/Transfer
         but Plex container reports the same file as /media/Music."""
         db.record_track_download(
             file_path='/app/Transfer/Artist/Album/Track.mp3',

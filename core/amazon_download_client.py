@@ -89,7 +89,7 @@ class AmazonDownloadClient(DownloadSourcePlugin):
         self._client = AmazonClient(preferred_codec=self._quality)
         self.session = http_requests.Session()
         self.session.headers.update({
-            "User-Agent": "SoulSync/1.0",
+            "User-Agent": "Commissary/1.0",
             "Accept": "*/*",
         })
 

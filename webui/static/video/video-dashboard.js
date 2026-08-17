@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video dashboard data layer.
+ * Commissary — Video dashboard data layer.
  *
  * ISOLATION CONTRACT: like video-side.js this is a self-contained IIFE (no
  * globals, no inline handlers, lives under static/video/ which the script-split
@@ -403,8 +403,8 @@
                 applyStats({
                     'uptime': d.uptime != null ? String(d.uptime) : '--',
                     'memory': d.memory_usage != null ? String(d.memory_usage) : '--',
-                    // Parity with the music dashboard: show SoulSync's own RSS in the subtitle.
-                    'memory_note': d.process_memory ? ('SoulSync · ' + d.process_memory) : 'Current usage'
+                    // Parity with the music dashboard: show Commissary's own RSS in the subtitle.
+                    'memory_note': d.process_memory ? ('Commissary · ' + d.process_memory) : 'Current usage'
                 });
             })
             .catch(function () { /* keep last-known values on a transient failure */ });

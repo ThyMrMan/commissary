@@ -98,7 +98,7 @@ def _sweep_inner() -> Dict[str, Any]:
 
     # Client mode (arr-style): hand the ratio/time goal to the torrent client so
     # IT enforces, then release the row. If the push fails or the client can't
-    # take share limits (non-qBit), fall through to SoulSync's own management so
+    # take share limits (non-qBit), fall through to Commissary's own management so
     # the goal still gets enforced — never leave a grab unmanaged.
     client_mode = cfg.get("seed_mode") == "client"
     adapter = None
@@ -120,7 +120,7 @@ def _sweep_inner() -> Dict[str, Any]:
             released += 1
             logger.info("seeding: handed '%s' to the torrent client (client mode)", dl.get("title"))
             continue
-        # soulsync mode, OR client-mode push failed → SoulSync polls + removes.
+        # soulsync mode, OR client-mode push failed → Commissary polls + removes.
 
         status = _get_status("torrent", ref)
         if status is None:

@@ -83,7 +83,7 @@ class GeniusClient:
         self.access_token = access_token
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'SoulSync/1.0',
+            'User-Agent': 'Commissary/1.0',
             'Accept': 'application/json'
         })
         # Separate session for web scraping (no auth header)

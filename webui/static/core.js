@@ -1,4 +1,4 @@
-// SoulSync WebUI JavaScript - Replicating PyQt6 GUI Functionality
+// Commissary WebUI JavaScript - Replicating PyQt6 GUI Functionality
 
 const PAGE_WILL_CHANGE_EVENT = 'ss:webui-page-will-change';
 
@@ -712,10 +712,10 @@ function handleDashboardStats(data) {
     updateStatCard('download-speed-card', data.download_speed, 'Combined speed');
     updateStatCard('active-syncs-card', data.active_syncs, 'Playlists syncing');
     updateStatCard('uptime-card', data.uptime, 'Application runtime');
-    // Headline is system memory %; subtitle shows SoulSync's own RSS so users can see the
+    // Headline is system memory %; subtitle shows Commissary's own RSS so users can see the
     // app's actual footprint (falls back to the generic label on older backends).
     updateStatCard('memory-card', data.memory_usage,
-        data.process_memory ? `SoulSync · ${data.process_memory}` : 'Current usage');
+        data.process_memory ? `Commissary · ${data.process_memory}` : 'Current usage');
 }
 
 function handleDashboardActivity(data) {

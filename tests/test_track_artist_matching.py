@@ -2,7 +2,7 @@
 
 The Discord-reported bug: a Vaiana OST track ("Where You Are" by
 Christopher Jackson) failed to match against a Plex/Emby library
-because the album's primary artist was Lin-Manuel Miranda. SoulSync's
+because the album's primary artist was Lin-Manuel Miranda. Commissary's
 DB stores the per-track artist in ``tracks.track_artist`` (from
 Plex's ``originalTitle`` or Jellyfin's ``ArtistItems[0]``), but the
 confidence scorer only compared against the album-artist JOIN and

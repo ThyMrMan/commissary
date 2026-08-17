@@ -376,7 +376,7 @@ class QBittorrentAdapter:
     def _stop_start(self, v5_path: str, v4_path: str, torrent_id: str) -> bool:
         """qBittorrent 5.0 renamed pause→stop / resume→start and REMOVED the old
         paths (they 404). Try the 5.x endpoint first, fall back to the 4.x one so
-        SoulSync pauses/resumes correctly on both — this is why a stalled torrent
+        Commissary pauses/resumes correctly on both — this is why a stalled torrent
         wasn't getting paused on qBit 5.x (the old /pause silently 404'd)."""
         resp = self._call('POST', v5_path, data={'hashes': torrent_id})
         if resp is not None and resp.status_code == 404:

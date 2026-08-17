@@ -1,7 +1,7 @@
 """Writing-system (script) compatibility helpers for metadata comparison.
 
 Issue #797 — AcoustID returns a recording's title/artist in their
-*original* script (e.g. ``久石譲`` for Joe Hisaishi) while SoulSync's
+*original* script (e.g. ``久石譲`` for Joe Hisaishi) while Commissary's
 expected metadata is romanized / English (``Joe Hisaishi``). A raw
 string-similarity comparison between two different writing systems
 scores ~0 even when they name the very same artist, so correct

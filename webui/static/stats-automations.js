@@ -106,7 +106,7 @@ function _importFileParseCsv(text, delimiter) {
 
 // Parse an M3U / M3U8 playlist into track objects. Handles both the simple form
 // (one media path per line) and the extended form (#EXTINF:<secs>,<artist> - <title>
-// followed by the path). SoulSync's own export is extended M3U and replaces the path
+// followed by the path). Commissary's own export is extended M3U and replaces the path
 // of an un-located track with a "# MISSING: ..." comment — those are exactly the
 // tracks a user imports to go match/download, so a pending #EXTINF is flushed even
 // when no path line follows it. Returns { tracks, playlistName }.
@@ -2256,7 +2256,7 @@ const VIDEO_HUB_GROUPS = [
     },
     {
         id: 'v-post-scan-studio', icon: '🎨', name: 'Post-Scan Studio Refresh',
-        desc: 'Event-driven presentation: the instant new media is read into SoulSync, re-apply overlays, then sync collections — no waiting for the nightly runs.',
+        desc: 'Event-driven presentation: the instant new media is read into Commissary, re-apply overlays, then sync collections — no waiting for the nightly runs.',
         category: 'Sync', badge: '2 automations', color: '#8b5cf6',
         steps: [
             { label: 'DB Updated', icon: '🗄️', type: 'action' },
@@ -2415,7 +2415,7 @@ const VIDEO_HUB_REFERENCE = {
         {
             group: 'Library Events', items: [
                 { type: 'video_library_scan_completed', label: 'Video Library Scan Done', desc: 'The media server finished rescanning' },
-                { type: 'video_database_update_completed', label: 'Video Database Updated', desc: 'SoulSync finished reading the server into its database' },
+                { type: 'video_database_update_completed', label: 'Video Database Updated', desc: 'Commissary finished reading the server into its database' },
                 { type: 'video_collections_synced', label: 'Collections Synced', desc: 'A collections sync pass finished' },
                 { type: 'video_overlays_applied', label: 'Overlays Applied', desc: 'An overlay apply pass finished' },
             ]
@@ -2435,7 +2435,7 @@ const VIDEO_HUB_REFERENCE = {
         },
         {
             group: 'Special', items: [
-                { type: 'app_started', label: 'App Started', desc: 'SoulSync just started up' },
+                { type: 'app_started', label: 'App Started', desc: 'Commissary just started up' },
                 { type: 'signal_received', label: 'Signal Received', desc: 'Another automation fired a named signal' },
                 { type: 'webhook_received', label: 'Webhook Received', desc: 'External POST to /api/v1/request' },
             ]
@@ -2462,7 +2462,7 @@ const VIDEO_HUB_REFERENCE = {
         {
             group: 'Library', items: [
                 { type: 'video_scan_server', label: 'Scan Video Server', desc: 'Ask the server to index new downloads, wait for it' },
-                { type: 'video_update_database', label: 'Update Video Database', desc: 'Read the server\'s library into SoulSync' },
+                { type: 'video_update_database', label: 'Update Video Database', desc: 'Read the server\'s library into Commissary' },
                 { type: 'video_deep_scan_movies', label: 'Deep Scan Movies', desc: 'Full movie-library reconcile' },
                 { type: 'video_deep_scan_tv', label: 'Deep Scan TV', desc: 'Full TV-library reconcile' },
             ]
@@ -2823,7 +2823,7 @@ const AUTO_HUB_GUIDES = [
         steps: [
             'In Discord, go to your channel\'s settings \u2192 <strong>Integrations \u2192 Webhooks</strong>.',
             'Create a webhook and copy the URL.',
-            'In SoulSync, go to <strong>Settings \u2192 Notifications</strong> and paste the Discord webhook URL.',
+            'In Commissary, go to <strong>Settings \u2192 Notifications</strong> and paste the Discord webhook URL.',
             'Go to <strong>Automations \u2192 New Automation</strong>.',
             'Set WHEN to <strong>Download Failed</strong> (or any event), DO to <strong>Notify Only</strong>, THEN to <strong>Discord</strong>.'
         ], relatedRecipes: ['download-failure-alert', 'batch-complete-notify']
@@ -2847,7 +2847,7 @@ const AUTO_HUB_GUIDES = [
             'In your first automation, add a THEN action \u2192 <strong>Fire Signal</strong> and name it (e.g., <code>step1_done</code>).',
             'Create a second automation with WHEN \u2192 <strong>Signal Received</strong> \u2192 signal name <code>step1_done</code>.',
             'The second automation will fire automatically when the first one completes.',
-            'Chain up to 5 levels deep (safety limit). SoulSync detects cycles automatically.',
+            'Chain up to 5 levels deep (safety limit). Commissary detects cycles automatically.',
             'Use descriptive signal names like <code>watchlist_scanned</code> or <code>cleanup_finished</code>.'
         ], relatedRecipes: ['quality-assurance', 'complete-new-release']
     },
@@ -2868,7 +2868,7 @@ const AUTO_HUB_TIPS = [
     { icon: '\u23F0', title: 'Stagger Your Schedules', body: 'If you have multiple timed automations, space them at least 1 hour apart. Running scan, process, and cleanup at the same time creates resource contention and can slow everything down.', tag: 'Performance' },
     { icon: '\uD83C\uDFAF', title: 'Use Conditions to Filter', body: 'Add conditions to event triggers to only fire on specific artists, formats, or quality levels. For example, trigger only when a downloaded track\'s artist matches "Radiohead".', tag: 'Filtering' },
     { icon: '\uD83D\uDCC1', title: 'Group Related Automations', body: 'Use the Group dropdown when creating automations to organize them. Groups like "Nightly", "Notifications", or "Pipeline" make it easy to find and manage related automations.', tag: 'Organization' },
-    { icon: '\uD83D\uDD04', title: 'Avoid Chain Loops', body: 'SoulSync has built-in cycle detection, but it\'s good practice to design signal names carefully. If A fires signal X and B listens for X and fires Y, make sure nothing fires X again downstream.', tag: 'Safety' },
+    { icon: '\uD83D\uDD04', title: 'Avoid Chain Loops', body: 'Commissary has built-in cycle detection, but it\'s good practice to design signal names carefully. If A fires signal X and B listens for X and fires Y, make sure nothing fires X again downstream.', tag: 'Safety' },
     { icon: '\uD83D\uDCDA', title: 'Stack THEN Actions', body: 'Each automation supports up to 3 THEN actions. Combine notification channels (Discord + Telegram) with a fire_signal to both notify yourself and trigger the next automation.', tag: 'Power' },
     { icon: '\u2699\uFE0F', title: 'System vs Custom', body: 'System automations handle core tasks like Spotify enrichment and are managed automatically. Create custom automations to extend their behavior \u2014 trigger on their completion events.', tag: 'Basics' },
     { icon: '\uD83E\uDDEA', title: 'Test with Notify Only', body: 'Set DO to <strong>Notify Only</strong> when testing a new trigger. You\'ll see when it fires without any side effects. Once you\'re confident in the timing, switch to the real action.', tag: 'Testing' },
@@ -2911,7 +2911,7 @@ const AUTO_HUB_REFERENCE = {
         },
         {
             group: 'Library & System', items: [
-                { type: 'app_started', label: 'App Started', desc: 'Fires once when SoulSync starts up' },
+                { type: 'app_started', label: 'App Started', desc: 'Fires once when Commissary starts up' },
                 { type: 'import_completed', label: 'Import Complete', desc: 'Fires when a library import operation finishes' },
                 { type: 'library_scan_completed', label: 'Library Scan Done', desc: 'Fires after a full library scan completes' },
                 { type: 'quality_scan_completed', label: 'Quality Scan Done', desc: 'Fires when a quality scan finishes' },

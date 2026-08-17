@@ -255,7 +255,7 @@ def test_aggregator_skips_implausibly_long_extension(db: MusicDatabase) -> None:
 
 
 def test_insert_or_update_media_track_persists_size_for_object_with_file_size(db: MusicDatabase) -> None:
-    """The Jellyfin/Navidrome/SoulSync track wrappers expose
+    """The Jellyfin/Navidrome/Commissary track wrappers expose
     `track_obj.file_size`. Verify insert_or_update_media_track reads
     it and persists to the new column."""
 

@@ -1,6 +1,6 @@
 """Listening Mix v2 generator (#913) — reads the scan's stored mix into Track records.
 
-The generator is what lets the Listening Mix appear on the Sync page's SoulSync
+The generator is what lets the Listening Mix appear on the Sync page's Commissary
 Discovery tab + flow through the mirror/Auto-Sync pipeline like the other kinds. It
 must hand back exactly what the scan stored under 'listening_recs_tracks_full', with
 NO pool hydration, and degrade to empty (never raise) when there's no mix yet.

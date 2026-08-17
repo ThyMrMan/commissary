@@ -1,7 +1,7 @@
 // ===================================================================
 // SOULSYNC DISCOVERY SYNC TAB (Phase 1c.3)
 // ===================================================================
-// Surfaces the user's persisted SoulSync Discovery / personalized
+// Surfaces the user's persisted Commissary Discovery / personalized
 // playlists (decade mixes, hidden gems, popular picks, daily mixes,
 // discovery shuffle, etc.) as a Sync-page tab so they participate
 // in the mirrored-playlist + Auto-Sync pipeline like every other
@@ -22,14 +22,14 @@ async function loadSoulsyncDiscoverySyncPlaylists() {
     const refreshBtn = document.getElementById('soulsync-discovery-sync-refresh-btn');
     if (!container) return;
 
-    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading SoulSync Discovery playlists...</div>`;
+    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading Commissary Discovery playlists...</div>`;
     if (refreshBtn) {
         refreshBtn.disabled = true;
         refreshBtn.textContent = '🔄 Loading...';
     }
 
     try {
-        // Existing generated rows + ALL registered singleton kinds, so every SoulSync
+        // Existing generated rows + ALL registered singleton kinds, so every Commissary
         // playlist (Listening Mix, Fresh Tape, Archives, Hidden Gems, Discovery Shuffle,
         // …) is clickable here — not just ones generated before. The Discover page fills
         // the legacy system, which never seeded these v2 rows, so without this the tab was
@@ -56,11 +56,11 @@ async function loadSoulsyncDiscoverySyncPlaylists() {
                          track_count: 0, is_stale: true, _never_generated: true }));
         _soulsyncDiscoverySyncRecords = [...existing, ...synthetic];
         renderSoulsyncDiscoverySyncPlaylists();
-        console.log(`✨ SoulSync Discovery Sync tab loaded: ${existing.length} generated + ${synthetic.length} available`);
+        console.log(`✨ Commissary Discovery Sync tab loaded: ${existing.length} generated + ${synthetic.length} available`);
     } catch (err) {
         container.innerHTML = `<div class="playlist-placeholder">❌ Error: ${err.message}</div>`;
         if (typeof showToast === 'function') {
-            showToast(`Error loading SoulSync Discovery: ${err.message}`, 'error');
+            showToast(`Error loading Commissary Discovery: ${err.message}`, 'error');
         }
     } finally {
         if (refreshBtn) {
@@ -75,7 +75,7 @@ function renderSoulsyncDiscoverySyncPlaylists() {
     if (!container) return;
 
     if (_soulsyncDiscoverySyncRecords.length === 0) {
-        container.innerHTML = `<div class="playlist-placeholder">No SoulSync Discovery playlists yet. Open the Discover page and generate a few personalized playlists first.</div>`;
+        container.innerHTML = `<div class="playlist-placeholder">No Commissary Discovery playlists yet. Open the Discover page and generate a few personalized playlists first.</div>`;
         return;
     }
 
@@ -223,7 +223,7 @@ async function handleSoulsyncDiscoverySyncCardClick(kind, variant, name, cardEl)
                 name: finalName,
                 tracks: normalizedTracks,
                 description: `Personalized ${kind}${variant ? ' · ' + variant : ''} — regenerates on Auto-Sync refresh.`,
-                owner: 'SoulSync',
+                owner: 'Commissary',
                 image_url: '',
             }),
         });
@@ -276,7 +276,7 @@ async function handleSoulsyncDiscoverySyncCardClick(kind, variant, name, cardEl)
         if (typeof showToast === 'function') {
             showToast(`Refresh failed: ${err.message}`, 'error');
         }
-        console.error('SoulSync Discovery refresh failed:', err);
+        console.error('Commissary Discovery refresh failed:', err);
     }
 }
 

@@ -4,7 +4,7 @@ clouddead89: "4000 albums but it only scans 1300" — the smaller number is the
 job's eligibility gate (2+ tracks with stored file paths), not a truncation,
 but the job reported the bare number and let users read it as a bug. It now
 says what was excluded and why, and separately counts eligible albums whose
-files couldn't actually be read from SoulSync's filesystem (Docker mount
+files couldn't actually be read from Commissary's filesystem (Docker mount
 mismatch) — those used to be silently indistinguishable from healthy albums.
 
 Everything runs on a temp DB + tmp_path FLAC files. No network, no services.

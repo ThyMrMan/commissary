@@ -1820,7 +1820,7 @@ async function exportServerPlaylistM3U() {
         document.body.removeChild(link);
         URL.revokeObjectURL(url);
         // `found` = server tracks resolved to a real library file path; any not in
-        // SoulSync's library are skipped (can't write a path for them).
+        // Commissary's library are skipped (can't write a path for them).
         const found = data.stats && data.stats.found != null ? data.stats.found : tracks.length;
         const note = found < tracks.length ? ` (${found}/${tracks.length} in library)` : ` (${found} tracks)`;
         showToast(`Exported M3U: ${st.playlistName}${note}`, 'success');

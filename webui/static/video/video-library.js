@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video Library page (isolated).
+ * Commissary — Video Library page (isolated).
  *
  * Reuses the music library's look + paging model: server-side search / A–Z /
  * sort / owned-wanted filter / pagination (75 per page) via /api/video/library,

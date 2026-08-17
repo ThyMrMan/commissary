@@ -1941,7 +1941,7 @@ function populateReleaseSection(sectionType, releases) {
 
 // ── discography gap-fill (#1067): "show me what my source is missing" ───────
 // A VIEW option (on-page chip, persisted per browser — same pattern as the
-// chat SoulSync-only filter). The base discography renders untouched; this
+// chat Commissary-only filter). The base discography renders untouched; this
 // only ever APPENDS a section of releases other sources know, each card
 // carrying its owning source so clicks flow through the existing per-source
 // machinery (see the _gap_source override in the card click handler).
@@ -4090,7 +4090,7 @@ function _artPickerCustomRow(body, grid, onSelect) {
 
 function openArtistArtPicker() {
     // Artist twin of openAlbumArtPicker: candidates from every CONNECTED
-    // metadata source; applying writes the pick to the SoulSync DB, the
+    // metadata source; applying writes the pick to the Commissary DB, the
     // active media server, and artist.jpg on disk (what Navidrome reads) —
     // so a wrong photo from an old mis-match gets corrected everywhere.
     const artistId = artistDetailPageState.currentArtistId;
@@ -4116,7 +4116,7 @@ function openArtistArtPicker() {
           '<div class="art-picker-header">' +
             '<div class="art-picker-titles">' +
               '<div class="art-picker-title">Choose artist photo</div>' +
-              '<div class="art-picker-subtitle">' + _esc(artistName) + ' · applies to SoulSync, your server, and artist.jpg on disk</div>' +
+              '<div class="art-picker-subtitle">' + _esc(artistName) + ' · applies to Commissary, your server, and artist.jpg on disk</div>' +
             '</div>' +
             '<button class="art-picker-close" aria-label="Close">' + _closeSvg + '</button>' +
           '</div>' +
@@ -7274,7 +7274,7 @@ function openHaveMissingTrackModal(track, album) {
         <div class="enhanced-bulk-modal-header">
             <div>
                 <h3>I Have This Track</h3>
-                <div class="enhanced-have-subtitle">Use an existing file as the source audio. SoulSync will copy it into this album.</div>
+                <div class="enhanced-have-subtitle">Use an existing file as the source audio. Commissary will copy it into this album.</div>
             </div>
             <button class="enhanced-bulk-modal-close" type="button">&times;</button>
         </div>
@@ -7294,7 +7294,7 @@ function openHaveMissingTrackModal(track, album) {
             <span>Selected</span>
             <strong></strong>
         </div>
-        <div class="enhanced-have-note">The selected file stays in its current album/folder. SoulSync copies it, writes the missing track's tags, and places the copy in this album.</div>
+        <div class="enhanced-have-note">The selected file stays in its current album/folder. Commissary copies it, writes the missing track's tags, and places the copy in this album.</div>
         <div class="enhanced-have-import-status" id="enhanced-have-import-status" hidden>
             <div class="enhanced-have-import-status-top">
                 <span class="enhanced-have-import-spinner"></span>
@@ -9089,7 +9089,7 @@ async function playLibraryTrack(track, albumTitle, artistName) {
         return;
     }
 
-    // Library tracks have authoritative metadata in the SoulSync DB —
+    // Library tracks have authoritative metadata in the Commissary DB —
     // any title / artist / album the caller passes in is downstream of
     // whatever modal triggered playback and may carry noise like the
     // ``<source_id>||<display>`` filename prefix from a Prowlarr result.
@@ -9180,7 +9180,7 @@ async function playLibraryTrack(track, albumTitle, artistName) {
                 artist: artistName || '',
                 album: albumTitle || '',
                 // Server song id so playback can stream via the media server
-                // when the file isn't on SoulSync's disk (#809).
+                // when the file isn't on Commissary's disk (#809).
                 track_id: track.id || null
             })
         });

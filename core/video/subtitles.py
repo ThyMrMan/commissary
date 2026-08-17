@@ -21,7 +21,7 @@ import urllib.request
 from typing import Any, Callable
 
 BASE = "https://api.opensubtitles.com/api/v1"
-_UA = "SoulSync v1.0"
+_UA = "Commissary v1.0"
 
 
 def parse_langs(raw: Any) -> list:

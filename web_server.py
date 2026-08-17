@@ -48,7 +48,11 @@ logger = setup_logging(_log_level, _log_path)
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
 # Reset to 1.0.0 as the baseline for this customized fork (tracks releases at
 # _GITHUB_REPO below, independent of upstream Nezreka/SoulSync's own versioning).
-_SOULSYNC_BASE_VERSION = "1.9.23"
+# 2.0.0 is the rename release: the app became Commissary. A major bump because
+# the published image moved (ghcr.io/thymrman/commissary) even though nothing
+# about the data changed — see tests/test_branding.py for what deliberately
+# kept its old `soulsync` name.
+_SOULSYNC_BASE_VERSION = "2.0.0"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -477,7 +481,7 @@ app.secret_key = _init_flask_secret_key()
 #
 # Sliding window: Flask re-sends the cookie on each request (SESSION_REFRESH_
 # EACH_REQUEST defaults on for permanent sessions), so someone who keeps using
-# SoulSync is never signed out, and one who stops is after this long.
+# Commissary is never signed out, and one who stops is after this long.
 #
 # The Secure/SameSite flags are NOT set here — core/security/reverse_proxy.py
 # owns those, and only marks the cookie Secure when the operator has opted into
@@ -1290,7 +1294,7 @@ IS_SHUTTING_DOWN = False
 # --- Initialize Core Application Components ---
 # Each client is initialized independently so one failure doesn't take down everything.
 # Previously, a single exception set ALL clients to None, breaking the entire app.
-logger.info("Initializing SoulSync services for Web UI...")
+logger.info("Initializing Commissary services for Web UI...")
 spotify_client = download_orchestrator = tidal_client = matching_engine = sync_service = web_scan_manager = media_server_engine = None
 
 try:
@@ -1333,7 +1337,7 @@ try:
         'plex':      _safe_init_media_client(PlexClient, "Plex"),
         'jellyfin':  _safe_init_media_client(JellyfinClient, "Jellyfin"),
         'navidrome': _safe_init_media_client(NavidromeClient, "Navidrome"),
-        'soulsync':  _safe_init_media_client(SoulSyncClient, "SoulSync library"),
+        'soulsync':  _safe_init_media_client(SoulSyncClient, "Commissary library"),
     })
     # Install as process-wide singleton so callers reaching via
     # get_media_server_engine() see the same instance web_server.py
@@ -1636,7 +1640,7 @@ playlist_pipeline_progress_lock = threading.Lock()
 
 
 def _register_automation_handlers():
-    """Register real SoulSync action handlers with the automation engine.
+    """Register real Commissary action handlers with the automation engine.
 
     Per-handler bodies live in ``core.automation.handlers``. This
     function wires the dependency-injection surface (clients,
@@ -3429,8 +3433,8 @@ def _build_system_stats():
     uptime_seconds = time.time() - start_time
     uptime = str(timedelta(seconds=int(uptime_seconds)))
 
-    # Get memory usage — global system %, plus SoulSync's own resident memory (RSS),
-    # so the dashboard can show "system load" and "how much RAM SoulSync itself uses".
+    # Get memory usage — global system %, plus Commissary's own resident memory (RSS),
+    # so the dashboard can show "system load" and "how much RAM Commissary itself uses".
     memory = psutil.virtual_memory()
     memory_usage = f"{memory.percent}%"
     try:
@@ -4280,7 +4284,7 @@ def prowlarr_indexers_endpoint():
 
     Drives the Indexers panel on Settings → Indexers & Downloaders so
     the user can see what they're searching against without leaving
-    SoulSync. Returns ``[]`` if Prowlarr isn't configured / reachable.
+    Commissary. Returns ``[]`` if Prowlarr isn't configured / reachable.
     """
     try:
         from core.prowlarr_client import ProwlarrClient
@@ -4893,7 +4897,7 @@ def import_config_bundle():
         logger.exception("config import failed")
         return jsonify({"success": False, "error": str(e)}), 500
     return jsonify({"success": True, **summary,
-                    "note": "Config imported. Restart SoulSync so every service picks it up."})
+                    "note": "Config imported. Restart Commissary so every service picks it up."})
 
 
 # ── Per-service verify cache ──
@@ -5964,7 +5968,7 @@ def auth_spotify():
                 <div class="warning">
                     <strong>Using a reverse proxy?</strong> Your redirect URI is set to <code style="display:inline; padding: 2px 6px;">{configured_uri}</code>
                     which uses port {callback_server_port}. If you're behind a reverse proxy (Caddy, Nginx, Traefik), change the
-                    redirect URI in SoulSync settings to use your proxy URL on the main port instead, e.g.:<br>
+                    redirect URI in Commissary settings to use your proxy URL on the main port instead, e.g.:<br>
                     <code style="display:inline; padding: 2px 6px; background: #e8f5e9;">https://{host}/callback</code><br>
                     Then update the same URI in your <a href="https://developer.spotify.com/dashboard" target="_blank">Spotify Dashboard</a>.
                     This avoids the need for manual URL editing below.
@@ -6065,7 +6069,7 @@ def auth_tidal():
         
         # Use the user's configured redirect_uri from settings, falling back
         # to the constructor default (``http://127.0.0.1:<port>/tidal/callback``).
-        # The settings UI displays the default as the placeholder, and SoulSync's
+        # The settings UI displays the default as the placeholder, and Commissary's
         # docs tell users to register THAT URI with their Tidal Developer App
         # — Tidal validates the redirect_uri sent in the authorize request
         # against the one in the portal, so sending anything else (e.g. a
@@ -6073,10 +6077,10 @@ def auth_tidal():
         # "Invalid redirect URI" and the user can't authenticate.
         #
         # Docker/remote-access workflow is preserved by the post-auth swap step
-        # in the instructions page below: SoulSync sends ``127.0.0.1:<port>``,
+        # in the instructions page below: Commissary sends ``127.0.0.1:<port>``,
         # Tidal redirects the user's browser to that URI (which fails locally),
         # the instructions tell the user to swap ``127.0.0.1`` for the host
-        # they're accessing SoulSync from, and the swapped URL hits the
+        # they're accessing Commissary from, and the swapped URL hits the
         # container's exposed callback port. Building the URI from request.host
         # at authorize time used to skip the swap entirely but broke users
         # who registered the documented default.
@@ -6318,7 +6322,7 @@ def spotify_callback():
                     invalidate_metadata_status_caches()
                     add_activity_item("", "Spotify Auth Warning", f"Profile {profile_id_from_state} completed OAuth but Spotify did not confirm an authenticated session", "Now")
                     return _spotify_auth_result_page(
-                        "Spotify authorization completed, but SoulSync could not confirm an authenticated Spotify session for this profile. You can close this window and try Authenticate again.",
+                        "Spotify authorization completed, but Commissary could not confirm an authenticated Spotify session for this profile. You can close this window and try Authenticate again.",
                         authenticated=False,
                     )
                 else:
@@ -6368,7 +6372,7 @@ def spotify_callback():
                 invalidate_metadata_status_caches()
                 add_activity_item("", "Spotify Auth Warning", "OAuth completed, but Spotify did not confirm an authenticated session", "Now")
                 return _spotify_auth_result_page(
-                    "Spotify authorization completed, but SoulSync could not confirm an authenticated Spotify session. You can close this window and try Authenticate again.",
+                    "Spotify authorization completed, but Commissary could not confirm an authenticated Spotify session. You can close this window and try Authenticate again.",
                     authenticated=False,
                 )
         else:
@@ -6479,7 +6483,7 @@ def tidal_callback():
             tidal_client = TidalClient()
             if tidal_enrichment_worker:
                 tidal_enrichment_worker.client = tidal_client
-            return "<h1>Tidal Authentication Successful!</h1><p>You can now close this window and return to the SoulSync application.</p>"
+            return "<h1>Tidal Authentication Successful!</h1><p>You can now close this window and return to the Commissary application.</p>"
         else:
             return "<h1>Tidal Authentication Failed</h1><p>Could not exchange authorization code for a token. Please try again.</p>", 400
     except Exception as e:
@@ -6507,7 +6511,7 @@ def auth_deezer():
         return f"""
         <html><body style="font-family:system-ui;max-width:600px;margin:40px auto;padding:20px;background:#111;color:#eee">
             <h1>Deezer Authorization</h1>
-            <p>Click the link below to authorize SoulSync with your Deezer account:</p>
+            <p>Click the link below to authorize Commissary with your Deezer account:</p>
             <p><a href="{auth_url}" style="color:#A238FF;font-size:18px">Authorize on Deezer →</a></p>
             <hr style="border-color:#333">
             <p style="color:#888;font-size:13px">If running remotely, replace <code>127.0.0.1</code> in the redirect URI with <code>{host}</code></p>
@@ -10924,7 +10928,7 @@ def write_artist_image_to_disk(artist_id):
 
     Issue #572 (rhwc): Navidrome has no API for setting an artist
     image — it reads `artist.jpg` from the artist's folder during
-    library scans. SoulSync's `update_artist_poster` for Navidrome
+    library scans. Commissary's `update_artist_poster` for Navidrome
     is a NO-OP today. This endpoint closes the gap by:
 
     1. Resolving the artist's folder on disk via any of their albums'
@@ -11613,7 +11617,7 @@ def _overwrite_cover_jpg(url, folder):
     """Download ``url`` and OVERWRITE cover.jpg in ``folder`` (the picker is *replacing* art, so the
     existing-file guard in download_cover_art doesn't apply). Returns True on success."""
     import urllib.request  # not bound at module level (only urllib.parse is); matches the local-import pattern used elsewhere
-    req = urllib.request.Request(url, headers={"User-Agent": "SoulSync/1.0", "Accept": "image/*"})
+    req = urllib.request.Request(url, headers={"User-Agent": "Commissary/1.0", "Accept": "image/*"})
     with urllib.request.urlopen(req, timeout=15) as resp:   # noqa: S310 (user-chosen art URL)
         data = resp.read()
     if not data:
@@ -11708,7 +11712,7 @@ def get_artist_art_options(artist_id):
 def set_artist_art(artist_id):
     """Apply a photo chosen in the artist image picker — everywhere:
 
-    1. SoulSync DB (``artists.thumb_url``; a non-empty value pins it, the
+    1. Commissary DB (``artists.thumb_url``; a non-empty value pins it, the
        enrichment workers only fill empty thumbs)
     2. the active media server (Plex/Jellyfin poster upload; Navidrome has no
        API and is covered by step 3)
@@ -11740,7 +11744,7 @@ def set_artist_art(artist_id):
         image_bytes = None
         try:
             import urllib.request
-            req = urllib.request.Request(url, headers={"User-Agent": "SoulSync/1.0",
+            req = urllib.request.Request(url, headers={"User-Agent": "Commissary/1.0",
                                                        "Accept": "image/*"})
             with urllib.request.urlopen(req, timeout=15) as resp:   # noqa: S310 (user-chosen art URL)
                 image_bytes = resp.read() or None
@@ -12871,8 +12875,8 @@ def reidentify_apply():
             logger.warning("[Re-identify] could not locate track %s file — stored=%s raw_exists=%s searched=[%s]",
                            library_track_id, stored_path, attempt.raw_path_existed, searched)
             return jsonify({"success": False, "error": (
-                f"SoulSync couldn't find this track's file on disk.\nStored path: {stored_path}\n"
-                f"Searched: {searched}.\nIf the file lives on a media server SoulSync can't read directly "
+                f"Commissary couldn't find this track's file on disk.\nStored path: {stored_path}\n"
+                f"Searched: {searched}.\nIf the file lives on a media server Commissary can't read directly "
                 f"(or the stored path is stale), re-identify isn't available for it.")}), 404
 
         # 3) Copy into staging + fingerprint the copy.
@@ -13611,7 +13615,7 @@ def get_write_tags_batch_status():
 
 # ── Reconcile embedded provider IDs (gap-fill DB from file tags) ──
 #
-# Files that SoulSync (or MusicBrainz Picard) already tagged carry Spotify /
+# Files that Commissary (or MusicBrainz Picard) already tagged carry Spotify /
 # iTunes / MusicBrainz / Deezer / Tidal / AudioDB / Genius IDs in their
 # metadata. Reading them back and gap-filling the {provider}_id +
 # {provider}_match_status='matched' columns lets the enrichment workers skip
@@ -14798,7 +14802,7 @@ def _resolve_library_file_path(file_path):
 
 def _build_library_stream_url(track_id, file_path):
     """Build a media-server stream URL for a library track that isn't on the
-    SoulSync filesystem (#809 — play via the server's API, no disk mount).
+    Commissary filesystem (#809 — play via the server's API, no disk mount).
 
     Navidrome/Subsonic only for now (it has a clean token-authed stream
     endpoint). ``track_id`` is the server's song id (the tracks-table id for a
@@ -14841,10 +14845,12 @@ def _get_file_not_found_error(file_path):
         # Fake paths look like: "Artist/Album/01 - Track.flac" or just "Track.flac"
         if file_path and ('/' not in file_path or not file_path.startswith('/')):
             return ('File not found — Navidrome may be sending virtual paths. '
+                    # The player is listed under the Subsonic client name, which is
+                    # deliberately still "SoulSync" (core/navidrome_client.py).
                     'Go to Navidrome → Profile → Players → select SoulSync → enable "Report Real Path", '
-                    'then run a full database refresh in SoulSync.')
+                    'then run a full database refresh in Commissary.')
         return ('File not found on disk — check that your Navidrome music folder '
-                'is mounted in the SoulSync container and that "Report Real Path" is enabled '
+                'is mounted in the Commissary container and that "Report Real Path" is enabled '
                 'in Navidrome\'s player settings.')
     return 'File not found on disk'
 
@@ -14867,7 +14873,7 @@ def library_play_track():
         else:
             # Not on disk. For a streaming server (Navidrome/Subsonic) we can
             # play it through the server's own stream API instead of requiring
-            # the library to be mounted into the SoulSync container (#809).
+            # the library to be mounted into the Commissary container (#809).
             stream_url = _build_library_stream_url(data.get('track_id'), file_path)
             if not stream_url:
                 return jsonify({"success": False, "error": _get_file_not_found_error(file_path)}), 404
@@ -14905,7 +14911,7 @@ def library_play_track():
 
 @app.route('/api/library/log-play', methods=['POST'])
 def library_log_play():
-    """Record a SoulSync web-player play into listening_history + bump the
+    """Record a Commissary web-player play into listening_history + bump the
     track's play_count/last_played (feeds 'recently played' and smart radio).
 
     Fire-and-forget from the frontend ~10s into a track. Best-effort: a logging
@@ -18678,7 +18684,7 @@ def _check_for_updates():
         import json as _json
         req = urllib.request.Request(
             f"https://api.github.com/repos/{_GITHUB_REPO}/commits/main",
-            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'SoulSync-UpdateCheck'}
+            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'Commissary-UpdateCheck'}
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = _json.loads(resp.read().decode())
@@ -19173,7 +19179,7 @@ def _resume_workers_after_scan():
     _workers_paused_by_scan = set()
 
 def _run_soulsync_full_refresh():
-    """Full refresh for SoulSync standalone — wipe all soulsync records, re-scan output folder, rebuild library from file tags."""
+    """Full refresh for Commissary standalone — wipe all soulsync records, re-scan output folder, rebuild library from file tags."""
     try:
         from core.soulsync_client import _read_tags, _stable_id
 
@@ -19182,7 +19188,7 @@ def _run_soulsync_full_refresh():
             _db_update_error_callback(f"Output folder not found: {transfer_path}")
             return
 
-        logger.info(f"[SoulSync Full Refresh] Starting — clearing soulsync data, re-scanning: {transfer_path}")
+        logger.info(f"[Commissary Full Refresh] Starting — clearing soulsync data, re-scanning: {transfer_path}")
         _db_update_phase_callback('Clearing library...')
 
         db = get_database()
@@ -19198,7 +19204,7 @@ def _run_soulsync_full_refresh():
                     audio_files.append(os.path.join(root, fname))
 
         total = len(audio_files)
-        logger.info(f"[SoulSync Full Refresh] Found {total} audio files, rebuilding library...")
+        logger.info(f"[Commissary Full Refresh] Found {total} audio files, rebuilding library...")
         if total == 0:
             _db_update_finished_callback(0, 0, 0, 0, 0)
             return
@@ -19278,11 +19284,11 @@ def _run_soulsync_full_refresh():
                                 successful += 1
                             except Exception as e:
                                 failed += 1
-                                logger.error(f"[SoulSync Full Refresh] Track insert error: {e}")
+                                logger.error(f"[Commissary Full Refresh] Track insert error: {e}")
 
                 conn.commit()
         except Exception as e:
-            logger.error(f"[SoulSync Full Refresh] DB error: {e}")
+            logger.error(f"[Commissary Full Refresh] DB error: {e}")
             _db_update_error_callback(f"Database error: {e}")
             return
 
@@ -19291,12 +19297,12 @@ def _run_soulsync_full_refresh():
         summary = f"Full refresh complete: {successful} tracks from {album_count} albums by {artist_count} artists"
         if failed > 0:
             summary += f" ({failed} failed)"
-        logger.info(f"[SoulSync Full Refresh] {summary}")
-        add_activity_item("", "SoulSync Full Refresh", summary, "Now")
+        logger.info(f"[Commissary Full Refresh] {summary}")
+        add_activity_item("", "Commissary Full Refresh", summary, "Now")
         _db_update_finished_callback(artist_count, album_count, total, successful, failed)
 
     except Exception as e:
-        logger.error(f"[SoulSync Full Refresh] {e}")
+        logger.error(f"[Commissary Full Refresh] {e}")
         import traceback
         traceback.print_exc()
         _db_update_error_callback(f"Full refresh failed: {e}")
@@ -19328,14 +19334,14 @@ def _music_scan_roots() -> list:
         for lib in get_database().list_music_libraries():
             _add(lib.get('label') or 'Music Library', lib.get('path'))
     except Exception as e:   # noqa: BLE001 - fall back rather than skip the scan
-        logger.warning("[SoulSync Deep Scan] Could not read music libraries: %s", e)
+        logger.warning("[Commissary Deep Scan] Could not read music libraries: %s", e)
     if not out:
         _add('Music Library', config_manager.get('soulseek.transfer_path', './Transfer'))
     return out
 
 
 def _run_soulsync_deep_scan():
-    """Deep scan for SoulSync standalone mode.
+    """Deep scan for Commissary standalone mode.
 
     1. Scans EVERY configured Music Library for audio files
     2. Compares against soulsync DB records (by file_path)
@@ -19361,7 +19367,7 @@ def _run_soulsync_deep_scan():
                 "No Music Library folder found — check Settings → Paths & Organization.")
             return
 
-        logger.info("[SoulSync Deep Scan] Starting — %d librar%s: %s",
+        logger.info("[Commissary Deep Scan] Starting — %d librar%s: %s",
                     len(roots), 'y' if len(roots) == 1 else 'ies',
                     ', '.join(f"{lbl} ({p})" for lbl, p in roots))
         _db_update_phase_callback('scanning')
@@ -19379,7 +19385,7 @@ def _run_soulsync_deep_scan():
                         found.add(os.path.join(root, filename))
             files_by_root[root_path] = (label, found)
             transfer_files |= found
-            logger.info("[SoulSync Deep Scan] %s: %d audio files", label, len(found))
+            logger.info("[Commissary Deep Scan] %s: %d audio files", label, len(found))
 
         # Phase 2: Get all soulsync file paths from DB
         db = get_database()
@@ -19392,9 +19398,9 @@ def _run_soulsync_deep_scan():
                     if row['file_path']:
                         db_paths.add(row['file_path'])
         except Exception as e:
-            logger.error(f"[SoulSync Deep Scan] Error reading DB paths: {e}")
+            logger.error(f"[Commissary Deep Scan] Error reading DB paths: {e}")
 
-        logger.info(f"[SoulSync Deep Scan] {len(db_paths)} tracks in soulsync DB")
+        logger.info(f"[Commissary Deep Scan] {len(db_paths)} tracks in soulsync DB")
 
         # Phase 3: Plan the untracked → Staging move, with the data-loss guard (#904).
         # A path-only diff treats EVERY file the DB doesn't know about as "a new arrival
@@ -19433,8 +19439,8 @@ def _run_soulsync_deep_scan():
                             f"out of sync with disk — or that this library was just added and has "
                             f"never been imported — not that you have {n} new files. NOTHING was "
                             f"moved. Import them, or enable 'Transfer is my permanent library'.")
-                logger.warning(f"[SoulSync Deep Scan] {warn}")
-                add_activity_item("", "SoulSync Deep Scan — move blocked", warn, "Now")
+                logger.warning(f"[Commissary Deep Scan] {warn}")
+                add_activity_item("", "Commissary Deep Scan — move blocked", warn, "Now")
                 continue
             if not os.path.isdir(staging_path):
                 continue
@@ -19450,7 +19456,7 @@ def _run_soulsync_deep_scan():
                     shutil.move(file_path, dest_path)
                     moved_count += 1
                 except Exception as e:
-                    logger.error(f"[SoulSync Deep Scan] Could not move {os.path.basename(file_path)}: {e}")
+                    logger.error(f"[Commissary Deep Scan] Could not move {os.path.basename(file_path)}: {e}")
 
             # Clean up empty directories left behind in THIS library
             for root, dirs, _files in os.walk(root_path, topdown=False):
@@ -19483,12 +19489,12 @@ def _run_soulsync_deep_scan():
         # design — skipping a cleanup costs nothing, deleting real rows does.
         if any_desync_block:
             if stale_track_ids:
-                logger.warning(f"[SoulSync Deep Scan] Skipping removal of {stale_count} 'stale' "
+                logger.warning(f"[Commissary Deep Scan] Skipping removal of {stale_count} 'stale' "
                                f"records — a library was blocked for desync, mapping is unreliable.")
             stale_track_ids = []
             stale_count = 0
         elif is_implausible_stale_removal(stale_count, len(db_paths)):
-            logger.warning(f"[SoulSync Deep Scan] Skipping removal of {stale_count}/{len(db_paths)} "
+            logger.warning(f"[Commissary Deep Scan] Skipping removal of {stale_count}/{len(db_paths)} "
                            f"'stale' records — implausibly large share, storage likely unreachable.")
             stale_track_ids = []
             stale_count = 0
@@ -19518,9 +19524,9 @@ def _run_soulsync_deep_scan():
                     conn.commit()
 
                     if orphan_albums > 0 or orphan_artists > 0:
-                        logger.warning(f"[SoulSync Deep Scan] Cleaned up {orphan_albums} orphaned albums, {orphan_artists} orphaned artists")
+                        logger.warning(f"[Commissary Deep Scan] Cleaned up {orphan_albums} orphaned albums, {orphan_artists} orphaned artists")
             except Exception as e:
-                logger.error(f"[SoulSync Deep Scan] Error cleaning stale records: {e}")
+                logger.error(f"[Commissary Deep Scan] Error cleaning stale records: {e}")
 
         summary = f"Deep scan complete: {len(transfer_files)} files scanned"
         if moved_count > 0:
@@ -19532,12 +19538,12 @@ def _run_soulsync_deep_scan():
         if moved_count == 0 and blocked_count == 0 and stale_count == 0:
             summary += " — library is clean"
 
-        logger.info(f"[SoulSync Deep Scan] {summary}")
-        add_activity_item("", "SoulSync Deep Scan", summary, "Now")
+        logger.info(f"[Commissary Deep Scan] {summary}")
+        add_activity_item("", "Commissary Deep Scan", summary, "Now")
         _db_update_finished_callback(0, 0, len(transfer_files), moved_count + stale_count, 0)
 
     except Exception as e:
-        logger.error(f"[SoulSync Deep Scan] {e}")
+        logger.error(f"[Commissary Deep Scan] {e}")
         import traceback
         traceback.print_exc()
         _db_update_error_callback(f"Deep scan failed: {e}")
@@ -19547,13 +19553,13 @@ def _run_db_update_task(full_refresh, server_type):
     """The actual function that runs in the background thread."""
     global db_update_worker
 
-    # SoulSync standalone
+    # Commissary standalone
     if server_type == "soulsync":
         if full_refresh:
             _run_soulsync_full_refresh()
         else:
             # Incremental: library updates at download/import time, nothing to do
-            logger.warning("[SoulSync Standalone] Incremental scan skipped — library updates at download time. Use Deep Scan or Full Refresh.")
+            logger.warning("[Commissary Standalone] Incremental scan skipped — library updates at download time. Use Deep Scan or Full Refresh.")
             _db_update_finished_callback(0, 0, 0, 0, 0)
         return
 
@@ -19617,7 +19623,7 @@ def _run_deep_scan_task(server_type):
     elif server_type == "navidrome":
         media_client = media_server_engine.client('navidrome')
     elif server_type == "soulsync":
-        # SoulSync standalone deep scan: find untracked files → move to Staging,
+        # Commissary standalone deep scan: find untracked files → move to Staging,
         # remove stale DB records where files no longer exist on disk
         _run_soulsync_deep_scan()
         return
@@ -20371,7 +20377,7 @@ def restore_backup_endpoint(filename):
                     "version_mismatch": True,
                     "backup_version": backup_version,
                     "current_version": SOULSYNC_VERSION,
-                    "error": f"This backup was created on SoulSync v{backup_version}, but you're running v{SOULSYNC_VERSION}. Restoring may cause issues. Send force=true to proceed."
+                    "error": f"This backup was created on Commissary v{backup_version}, but you're running v{SOULSYNC_VERSION}. Restoring may cause issues. Send force=true to proceed."
                 }), 409
             version_warning = f"Restored from v{backup_version} backup (current: v{SOULSYNC_VERSION})"
 
@@ -23320,7 +23326,7 @@ def server_playlist_remove_track(playlist_id):
 
 @app.route('/api/library/search-tracks', methods=['GET'])
 def library_search_tracks():
-    """Search SoulSync's local database for tracks (for manual match correction)."""
+    """Search Commissary's local database for tracks (for manual match correction)."""
     try:
         query = request.args.get('q', '').strip()
         # Optional source-artist relevance hint (Find & Add knows the artist of
@@ -23785,7 +23791,7 @@ def _latest_sync_status(*status_infos):
     return max(candidates, key=lambda s: _sync_status_timestamp(s) or datetime.min)
 
 def _mirrored_spotify_sync_status(playlist_id, sync_statuses, *, database=None, profile_id=None):
-    """Return auto-sync status for a Spotify playlist mirrored into SoulSync."""
+    """Return auto-sync status for a Spotify playlist mirrored into Commissary."""
     try:
         db = database or get_database()
         profile = profile_id if profile_id is not None else get_current_profile_id()
@@ -30900,7 +30906,7 @@ def _run_playlist_export(job_id, playlist_id, title, mode):
             job['stats'] = dict(stats)
 
         out = resolve_playlist_tracks(tracks, resolve_fn, on_progress=on_progress)
-        jspf, summary = build_jspf(title, out['resolved'], creator='SoulSync')
+        jspf, summary = build_jspf(title, out['resolved'], creator='Commissary')
         job['summary'] = summary
         job['jspf'] = jspf
         job['stats'] = out['stats']
@@ -30938,7 +30944,7 @@ def start_playlist_export_listenbrainz(playlist_id):
         mode = 'push' if body.get('mode') == 'push' else 'download'
         db = get_database()
         meta = db.get_mirrored_playlist(int(playlist_id)) or {}
-        title = (meta.get('name') or meta.get('title') or 'SoulSync Export').strip() or 'SoulSync Export'
+        title = (meta.get('name') or meta.get('title') or 'Commissary Export').strip() or 'Commissary Export'
 
         import uuid
         job_id = uuid.uuid4().hex
@@ -30980,7 +30986,7 @@ def start_playlist_export_service(playlist_id, service):
         backfill = bool(body.get('backfill'))
         db = get_database()
         meta = db.get_mirrored_playlist(int(playlist_id)) or {}
-        title = (meta.get('name') or meta.get('title') or 'SoulSync Export').strip() or 'SoulSync Export'
+        title = (meta.get('name') or meta.get('title') or 'Commissary Export').strip() or 'Commissary Export'
 
         import uuid
         job_id = uuid.uuid4().hex
@@ -35019,7 +35025,7 @@ def image_proxy():
         max_age = int(config_manager.get("image_cache.ttl_seconds", 2592000))
         response.headers['Cache-Control'] = f'private, max-age={max_age}'
         response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['X-SoulSync-Image-Cache'] = cached.status
+        response.headers['X-Commissary-Image-Cache'] = cached.status
         return response
     except Exception as exc:
         logger.debug("image proxy failed: %s", exc)
@@ -35028,7 +35034,7 @@ def image_proxy():
 
 @app.route('/api/image-cache/<cache_key>', methods=['GET'])
 def serve_cached_image(cache_key):
-    """Serve a registered image URL from SoulSync's disk cache."""
+    """Serve a registered image URL from Commissary's disk cache."""
     if not re.fullmatch(r'[a-f0-9]{64}', cache_key or ''):
         return '', 404
 
@@ -35040,7 +35046,7 @@ def serve_cached_image(cache_key):
         max_age = int(config_manager.get("image_cache.ttl_seconds", 2592000))
         response.headers['Cache-Control'] = f'private, max-age={max_age}'
         response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['X-SoulSync-Image-Cache'] = cached.status
+        response.headers['X-Commissary-Image-Cache'] = cached.status
         return response
     except Exception as exc:
         logger.debug("cached image serve failed for %s: %s", cache_key, exc)
@@ -39455,7 +39461,7 @@ def start_oauth_callback_servers():
                     self.send_response(200)
                     self.send_header('Content-type', 'text/plain')
                     self.end_headers()
-                    self.wfile.write(b'SoulSync Spotify OAuth callback server is running. Callback URL: /callback')
+                    self.wfile.write(b'Commissary Spotify OAuth callback server is running. Callback URL: /callback')
                     return
 
                 # Only process requests to /callback — ignore everything else
@@ -39531,7 +39537,7 @@ def start_oauth_callback_servers():
                                 self.send_header('Content-type', 'text/html')
                                 self.end_headers()
                                 self.wfile.write(_spotify_auth_result_page(
-                                    "Spotify authorization completed, but SoulSync could not confirm an authenticated Spotify session. You can close this window and try Authenticate again.",
+                                    "Spotify authorization completed, but Commissary could not confirm an authenticated Spotify session. You can close this window and try Authenticate again.",
                                     authenticated=False,
                                 ).encode("utf-8"))
                         else:
@@ -39705,7 +39711,7 @@ try:
     mb_db = MusicDatabase()
     mb_worker = MusicBrainzWorker(
         database=mb_db,
-        app_name="SoulSync",
+        app_name="Commissary",
         app_version="1.0",
         contact_email=""
     )
@@ -40041,7 +40047,7 @@ def lastfm_callback():
             return """
             <html><body style="background:#121212;color:#fff;font-family:sans-serif;text-align:center;padding-top:100px;">
                 <h2>Last.fm Scrobbling Authorized!</h2>
-                <p>You can close this window and return to SoulSync.</p>
+                <p>You can close this window and return to Commissary.</p>
                 <script>setTimeout(()=>window.close(),3000);</script>
             </body></html>
             """
@@ -41158,7 +41164,7 @@ def _import_browse_shortcuts():
     """Starting points for the import folder browser, ordered the way a user
     wants them: where downloads actually land first, then staging, then the
     libraries. Only folders that EXIST are offered — a shortcut to an unmounted
-    path is worse than no shortcut, because it reads as a SoulSync bug rather
+    path is worse than no shortcut, because it reads as a Commissary bug rather
     than a missing mount. Deduped by real path; first label wins.
 
     These double as the allowlist for ``_resolve_import_scan_path``, so
@@ -42908,7 +42914,7 @@ def start_runtime_services():
         if _runtime_started:
             return
 
-        logger.info("Starting SoulSync runtime services...")
+        logger.info("Starting Commissary runtime services...")
 
         # Dump SOULSYNC_* env vars for diagnostics (helps debug Docker/Unraid env issues)
         _soulsync_env = {k: v for k, v in os.environ.items() if k.startswith('SOULSYNC_')}
@@ -43060,7 +43066,7 @@ def start_runtime_services():
                 logger.error(f"Automation engine start error: {e}")
 
         # Add startup activity
-        add_activity_item("", "System Started", "SoulSync Web UI Server initialized", "Now")
+        add_activity_item("", "System Started", "Commissary Web UI Server initialized", "Now")
 
         # Start WebSocket background emitters
         logger.info("Starting WebSocket background emitters...")
@@ -43121,7 +43127,7 @@ if _DIRECT_RUN:
     web_run_host = os.environ.get('SOULSYNC_WEB_BIND_HOST', '0.0.0.0')
     web_run_port = int(os.environ.get('SOULSYNC_WEB_BIND_PORT', '8008'))
     display_host = '127.0.0.1' if web_run_host in {'0.0.0.0', '::'} else web_run_host
-    logger.info("Starting SoulSync Web UI Server...")
+    logger.info("Starting Commissary Web UI Server...")
     logger.info(f"Open your browser and navigate to http://{display_host}:{web_run_port}")
     logger.info("Tip: For production, use gunicorn -c gunicorn.conf.py wsgi:application")
     start_runtime_services()

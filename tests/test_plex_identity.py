@@ -86,8 +86,8 @@ def test_apply_rewrites_the_live_base_headers(fake_config):
 
     ident = fake_config.data[plex_identity.IDENTIFIER_KEY]
     assert plexapi.BASE_HEADERS["X-Plex-Client-Identifier"] == ident
-    assert plexapi.BASE_HEADERS["X-Plex-Product"] == "SoulSync"
-    assert plexapi.BASE_HEADERS["X-Plex-Device-Name"] == "SoulSync"
+    assert plexapi.BASE_HEADERS["X-Plex-Product"] == "Commissary"
+    assert plexapi.BASE_HEADERS["X-Plex-Device-Name"] == "Commissary"
     assert plexapi.BASE_HEADERS["X-Plex-Version"] == "9.9.9"
 
 

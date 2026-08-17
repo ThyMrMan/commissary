@@ -9,7 +9,7 @@ release" even though the torrent was sitting there downloading.
 
 That is worse than a wrong message. The grab is recorded as failed, so nothing
 ever polls it, and the finished download is never imported — the file arrives and
-SoulSync doesn't know it exists.
+Commissary doesn't know it exists.
 
 The hash is knowable up front in both cases: a magnet carries it, and a .torrent
 is the SHA-1 of its bencoded ``info`` value. Pure functions, no I/O.

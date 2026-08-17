@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video Downloads page.
+ * Commissary — Video Downloads page.
  *
  * Reuses the music downloads page's .adl-* layout + look (full-width, segmented
  * filter pills, compact rows, status dots) for visual parity, driven by video data

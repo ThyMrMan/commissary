@@ -1,9 +1,9 @@
 """
-Automation Engine — trigger → action → then scheduler for SoulSync.
+Automation Engine — trigger → action → then scheduler for Commissary.
 
 Architecture:
 - Triggers (WHEN): schedule timer, event-based, signal-based (signal_received)
-- Actions (DO): real SoulSync operations registered by web_server.py
+- Actions (DO): real Commissary operations registered by web_server.py
 - Then (THEN): 1–3 post-action steps — notifications (Discord/Pushbullet/Telegram) and/or fire_signal
 - Conditions: optional filters on event data (artist contains, title equals, etc.)
 - Signals: user-named events that chain automations together (fire_signal → signal_received)
@@ -247,7 +247,7 @@ SYSTEM_AUTOMATIONS = [
         'action_type': 'video_apply_overlays',
         'owned_by': 'video',
     },
-    # Daily: keep SoulSync-managed collections in sync with the library. Resolves
+    # Daily: keep Commissary-managed collections in sync with the library. Resolves
     # each enabled collection's members and pushes add/remove to the server,
     # skipping collections whose members + settings are unchanged. Runs at 4:30am,
     # after the overnight scans + overlay pass so it sees fresh library state.

@@ -1,4 +1,4 @@
-"""SoulSync Discovery (personalized playlists) source adapter.
+"""Commissary Discovery (personalized playlists) source adapter.
 
 Wraps ``core.personalized.manager.PersonalizedPlaylistManager``. Unlike
 ListenBrainz / Last.fm, personalized playlists already carry source

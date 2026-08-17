@@ -348,7 +348,7 @@ class DeezerClient:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'SoulSync/1.0',
+            'User-Agent': 'Commissary/1.0',
             'Accept': 'application/json'
         })
         self._access_token = None

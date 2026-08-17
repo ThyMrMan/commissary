@@ -74,7 +74,7 @@ def extract_external_ids(track: Any, source_hint: Optional[str] = None) -> Dict[
     as the Spotify track ID; Deezer tracks expose ``id`` as the Deezer
     track ID; iTunes tracks may use ``trackId`` or ``id``. The disamb-
     iguating field is ``provider`` / ``source`` / ``_source``. Tracks
-    coming from a SoulSync internal pipeline often carry every known ID
+    coming from a Commissary internal pipeline often carry every known ID
     set to its source-specific value — we just collect whatever's there.
 
     ``source_hint`` is the caller's known answer to "where did this
@@ -94,7 +94,7 @@ def extract_external_ids(track: Any, source_hint: Optional[str] = None) -> Dict[
     ids: Dict[str, str] = {}
 
     # Provider-neutral fields that carry their own name regardless of
-    # source. Most internal SoulSync tracks have these set; external
+    # source. Most internal Commissary tracks have these set; external
     # source responses usually only have one of them populated.
     direct_id_fields = {
         'spotify_id': ('spotify_id', 'spotify_track_id', 'SPOTIFY_TRACK_ID'),
@@ -214,7 +214,7 @@ def find_library_track_by_external_id(
 
 
 # Maps the conceptual ID name to the column on the ``track_downloads``
-# (provenance) table where SoulSync persists the IDs at download time.
+# (provenance) table where Commissary persists the IDs at download time.
 # Naming convention differs from ``tracks``: provenance uses the
 # explicit ``_track_id`` suffix to match the existing column shape.
 PROVENANCE_ID_COLUMNS: Dict[str, str] = {
@@ -242,7 +242,7 @@ def find_provenance_by_external_id(
     primary library tracks-table lookup misses (e.g. the row exists but
     the enrichment worker hasn't backfilled its IDs yet, or the row
     doesn't exist yet because the media-server scan hasn't run since the
-    download), this checks whether SoulSync downloaded the file recently
+    download), this checks whether Commissary downloaded the file recently
     enough that the IDs are sitting in the provenance table.
 
     Caller should typically also confirm the ``file_path`` on the

@@ -95,7 +95,7 @@ class AlbumCompletenessJob(RepairJob):
             # Build SELECT with available source ID columns.
             # NOTE: `al.track_count` is deliberately NOT selected. That
             # column holds the OBSERVED track count written by server syncs
-            # (Plex leafCount, SoulSync standalone len(tracks)) — always
+            # (Plex leafCount, Commissary standalone len(tracks)) — always
             # equal to COUNT(t.id), so it's worthless for completeness.
             # The expected total comes from `al.api_track_count` (cached
             # from metadata-source enrichment) or a live API lookup.

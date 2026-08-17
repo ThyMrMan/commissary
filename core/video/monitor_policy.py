@@ -1,6 +1,6 @@
 """Follow-time monitor policies for shows (arr-parity P2).
 
-Sonarr asks "what should I monitor?" when a series is added. SoulSync's follow
+Sonarr asks "what should I monitor?" when a series is added. Commissary's follow
 has always meant "future episodes" (the daily airing feeder wishes new ones as
 they air); back catalog was a manual detail-page action. A policy expands the
 back-catalog part AT FOLLOW TIME:

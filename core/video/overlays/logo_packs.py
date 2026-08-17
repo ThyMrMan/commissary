@@ -1,6 +1,6 @@
 """Kometa logo-pack installer — source brand art into the drop-in logo folders.
 
-SoulSync ships no logo art (trademarks). This module knows where Kometa keeps
+Commissary ships no logo art (trademarks). This module knows where Kometa keeps
 its public overlay images and, on the user's request, copies the relevant ones
 into ``<data>/video_poster_assets/logos/<field>/<ourname>.png`` — the same
 drop-in packs ``logos.py``/``AssetStore.read_logo`` already read. So a logo

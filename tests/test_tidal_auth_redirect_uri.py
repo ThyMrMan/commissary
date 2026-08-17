@@ -3,8 +3,8 @@
 Discord-reported (Foxxify): Tidal returned error 1002 ("Invalid
 redirect URI") on every authentication attempt. The user had
 ``http://127.0.0.1:8889/tidal/callback`` registered in his Tidal
-Developer Portal (matching the SoulSync UI default + docs), but
-SoulSync was sending a network-IP-derived URI like
+Developer Portal (matching the Commissary UI default + docs), but
+Commissary was sending a network-IP-derived URI like
 ``http://192.168.x.x:8889/tidal/callback`` because the empty-config
 fallback in /auth/tidal built the URI from ``request.host``. Tidal
 compares strings exactly, so the URIs didn't match and authentication
@@ -13,10 +13,10 @@ failed before the user could even see Tidal's consent screen.
 These tests pin:
 1. When ``tidal.redirect_uri`` is configured, that value is sent to
    Tidal verbatim.
-2. When the config is empty, SoulSync uses the constructor default
+2. When the config is empty, Commissary uses the constructor default
    (``http://127.0.0.1:<port>/tidal/callback``) — NOT a value built
    from request.host.
-3. Both cases work whether the user is accessing SoulSync via
+3. Both cases work whether the user is accessing Commissary via
    localhost or a network IP (the access path is independent from the
    authorize redirect_uri).
 """
@@ -83,7 +83,7 @@ class TestConfiguredRedirectUriIsHonored:
         self, auth_route_client, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The reported Foxxify scenario: user has 127.0.0.1:8889
-        registered in Tidal portal AND set in SoulSync config, accesses
+        registered in Tidal portal AND set in Commissary config, accesses
         the Web UI from his network IP. The authorize URL must contain
         the configured 127.0.0.1 URI, NOT a value built from
         request.host (which would mismatch the portal and yield
@@ -133,7 +133,7 @@ class TestConfiguredRedirectUriIsHonored:
         self, auth_route_client, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """User who deliberately registered their network IP with Tidal
-        and configured SoulSync to match — that registration must also
+        and configured Commissary to match — that registration must also
         be honored, not overridden."""
         client, _fake = auth_route_client
 
@@ -162,7 +162,7 @@ class TestEmptyConfigFallsBackToDefault:
     def test_empty_config_uses_constructor_default_not_request_host(
         self, auth_route_client, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The actual Foxxify case (his SoulSync UI display showed the
+        """The actual Foxxify case (his Commissary UI display showed the
         default but config was empty because the placeholder never got
         saved): empty config from a non-localhost request must NOT build
         a network-IP redirect URI. The constructor default (matching

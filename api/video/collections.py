@@ -1,5 +1,5 @@
 """Collections API (Collection Studio) — CRUD + live preview + sync for the
-SoulSync-managed movie/show collections. Admin-only (gated in __init__.py).
+Commissary-managed movie/show collections. Admin-only (gated in __init__.py).
 
     GET    /api/video/collections                 -> {collections:[...]}   (gallery)
     POST   /api/video/collections                 -> {ok,id}               (create)
@@ -503,7 +503,7 @@ def register_routes(bp):
     # ── server-side collections (cleanup view) ────────────────────────────────
     @bp.route("/collections/server", methods=["GET"])
     def collections_on_server():
-        """Everything that exists ON the media server right now — SoulSync-managed
+        """Everything that exists ON the media server right now — Commissary-managed
         AND foreign (old Kometa runs, hand-made). Managed ones are marked via the
         sync ledger so the cleanup view can target just the foreign leftovers."""
         from . import get_video_db
@@ -527,7 +527,7 @@ def register_routes(bp):
             c["definition_id"] = m.get("definition_id") if m else None
             c["definition_name"] = m.get("definition_name") if m else None
             # Provenance: Kometa labels its collections ('Kometa'/'PMM'); smart
-            # (filter-based) collections are never SoulSync's either.
+            # (filter-based) collections are never Commissary's either.
             labels = {str(x).strip().lower() for x in (c.get("labels") or [])}
             c["kometa"] = bool(labels & kometa_labels) and not c["managed"]
         cols.sort(key=lambda c: (c["managed"], not c.get("kometa"), (c.get("name") or "").casefold()))
@@ -559,7 +559,7 @@ def register_routes(bp):
 
     @bp.route("/collections/server/adopt", methods=["POST"])
     def collections_server_adopt():
-        """Bring existing server collections under SoulSync management (the
+        """Bring existing server collections under Commissary management (the
         Kometa migration path): membership snapshot + ledger binding. Append
         sync mode + the server's own poster are kept — adoption changes who
         manages the collection, not what it looks like."""

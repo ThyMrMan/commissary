@@ -4,7 +4,7 @@ Issue #442 — cross-script artist quarantines
 -----------------------------------------------------
 
 A file tagged with one spelling of an artist's name (e.g. the
-Japanese kanji `澤野弘之`) was being quarantined when SoulSync's
+Japanese kanji `澤野弘之`) was being quarantined when Commissary's
 expected-artist metadata used the romanized spelling
 (`Hiroyuki Sawano`). Raw similarity comparison scores 0% across
 scripts even though MusicBrainz already knows both names belong to

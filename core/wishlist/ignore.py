@@ -1,7 +1,7 @@
 """Wishlist ignore-list — a TTL'd skip-gate for the wishlist (#874).
 
 When a user removes a track from the wishlist or cancels an in-flight
-wishlist download, SoulSync would otherwise re-add it on the next
+wishlist download, Commissary would otherwise re-add it on the next
 automatic cycle (watchlist scan, failed-track capture, or the cancel
 handler's own re-add), so the same release downloads → fails/cancels →
 re-queues forever. The ignore list records the user's "stop

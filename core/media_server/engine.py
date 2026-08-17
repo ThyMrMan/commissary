@@ -67,7 +67,7 @@ class MediaServerEngine:
 
         Args:
             registry: Plugin registry. Defaults to the four built-in
-                servers (Plex, Jellyfin, Navidrome, SoulSync).
+                servers (Plex, Jellyfin, Navidrome, Commissary).
             active_server_resolver: Callable returning the current
                 active server name (e.g. ``'plex'``). Defaults to
                 ``config_manager.get_active_media_server``. Tests

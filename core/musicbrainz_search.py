@@ -137,7 +137,7 @@ class MusicBrainzSearchClient:
         # Client defaults to the project URL as its User-Agent contact,
         # which is what MusicBrainz wants. Version stays generic ("2") —
         # the exact UI minor version would add noise to every request.
-        self._client = MusicBrainzClient("SoulSync", "2")
+        self._client = MusicBrainzClient("Commissary", "2")
         # Per-instance cache for "top artist MBID for this query". The
         # backend fires artists/albums/tracks searches in parallel against
         # one client instance, and albums+tracks both need the same artist
@@ -1155,7 +1155,7 @@ class MusicBrainzSearchClient:
         prolific artists had ~85% of their catalogue silently dropped. That
         was the bug Sokhi reported: "a lot of albums are missing vs what's
         showing on the site" (e.g. Kendrick Lamar — 167 release-groups on
-        MB, only the first 25 ever reached SoulSync).
+        MB, only the first 25 ever reached Commissary).
 
         Unlike the search path there is NO `type` filter and NO studio-only
         filter here: the artist-detail page wants the *whole* catalogue —

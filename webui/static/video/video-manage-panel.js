@@ -1,5 +1,5 @@
 /*
- * SoulSync — Manage panel (per-item metadata editor).
+ * Commissary — Manage panel (per-item metadata editor).
  *
  *   VideoManage.open({kind, id})  — from "Manage" on a movie/show detail page.
  *
@@ -304,7 +304,7 @@
                       '<button class="vmg-btn-ghost" type="button" data-vmg-rescan-eps>' +
                           'Re-scan episode list</button>' +
                       '<div class="vmg-hint" data-vmg-rescan-note>Reads every season again ' +
-                          'from the database above. Use this when it lists episodes SoulSync ' +
+                          'from the database above. Use this when it lists episodes Commissary ' +
                           'is missing.</div>' +
                       // Your media server and TMDB can split a long-running show into
                       // seasons differently (Plex files Bleach's newer run as S2 where

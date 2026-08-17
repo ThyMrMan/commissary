@@ -1,5 +1,5 @@
 // ============================================================
-// SoulSync — VIDEO Worker Orbs (isolated copy of the music orbs)
+// Commissary — VIDEO Worker Orbs (isolated copy of the music orbs)
 //
 // ISOLATION: this is a byte-for-byte port of webui/static/worker-orbs.js, with
 // ONLY the wiring changed — it targets the VIDEO dashboard header + the video
@@ -81,7 +81,7 @@
     let collapseDelay = null;
     const COLLAPSE_DELAY_MS = 7000;
 
-    // SoulSync logo, drawn as the hub/nucleus once loaded
+    // Commissary logo, drawn as the hub/nucleus once loaded
     let hubImage = null;
     let hubImageReady = false;
 
@@ -856,7 +856,7 @@
                     (0.16 + energy * 0.16 + slow * 0.04 + stress * 0.08) * ember);
 
                 if (hubImageReady) {
-                    // SoulSync logo as the nucleus — fit to the pulsing radius while
+                    // Commissary logo as the nucleus — fit to the pulsing radius while
                     // preserving the image's natural aspect ratio (no stretch)
                     const natW = hubImage.naturalWidth || 1;
                     const natH = hubImage.naturalHeight || 1;

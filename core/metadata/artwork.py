@@ -174,9 +174,12 @@ def normalize_image_url(thumb_url: str | None) -> str | None:
                     salt = secrets.token_hex(6)
                     token = hashlib.md5((navidrome_password + salt).encode()).hexdigest()
 
-                    # Add authentication parameters to the URL
+                    # Add authentication parameters to the URL. `c` is the Subsonic
+                    # client name and is deliberately still "SoulSync" — see
+                    # core/navidrome_client.SUBSONIC_CLIENT_NAME for why.
+                    from core.navidrome_client import SUBSONIC_CLIENT_NAME
                     separator = '&' if '?' in path else '?'
-                    auth_params = f"u={navidrome_username}&t={token}&s={salt}&v=1.16.1&c=SoulSync&f=json"
+                    auth_params = f"u={navidrome_username}&t={token}&s={salt}&v=1.16.1&c={SUBSONIC_CLIENT_NAME}&f=json"
 
                     # Construct proper Navidrome Subsonic URL
                     fixed_url = f"{navidrome_base_url.rstrip('/')}{path}{separator}{auth_params}"
@@ -194,7 +197,7 @@ def normalize_image_url(thumb_url: str | None) -> str | None:
 
 
 def is_image_proxy_url(url: str) -> bool:
-    """Return True for SoulSync image proxy/cache URLs, absolute or relative."""
+    """Return True for Commissary image proxy/cache URLs, absolute or relative."""
     if not url:
         return False
 
@@ -230,7 +233,7 @@ def is_internal_image_host(url: str) -> bool:
 
 
 def _browser_safe_image_url(url: str) -> str:
-    """Return a browser-safe image URL, proxying internal hosts through SoulSync."""
+    """Return a browser-safe image URL, proxying internal hosts through Commissary."""
     if not url:
         return url
 

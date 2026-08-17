@@ -1,5 +1,5 @@
 /*
- * SoulSync — Rename Files panel (per-title, from a show/movie detail page).
+ * Commissary — Rename Files panel (per-title, from a show/movie detail page).
  *
  *   VideoRename.open({kind, id, title})   — from "Rename Files".
  *

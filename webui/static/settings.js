@@ -5027,7 +5027,7 @@ async function saveSettings(quiet = false) {
                 const n = parseInt(document.getElementById('torrent-min-seeders')?.value, 10);
                 return Number.isFinite(n) && n >= 0 ? n : 1;
             })(),
-            // In-container path(s) where SoulSync reads finished torrent/usenet
+            // In-container path(s) where Commissary reads finished torrent/usenet
             // downloads (#857). Rendered in the torrent/usenet client sections
             // as add/remove lists — clients sort into category folders, so one
             // path is rarely enough. `null` (group not in the DOM) is stripped
@@ -5326,7 +5326,7 @@ async function authorizeLastfmScrobbling() {
         const data = await resp.json();
         if (data.success && data.url) {
             window.open(data.url, '_blank', 'width=600,height=500');
-            showToast('Authorize SoulSync in the Last.fm window that opened', 'info');
+            showToast('Authorize Commissary in the Last.fm window that opened', 'info');
         } else {
             showToast(data.error || 'Could not generate auth URL', 'error');
         }

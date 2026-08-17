@@ -116,7 +116,7 @@ def test_reasons_are_classified_into_chips():
 def test_drawer_offers_delete_file_with_destructive_confirm():
     assert "data-vimp-delete" in _JS
     assert "delete_file: !!del" in _JS
-    assert "destructive: true" in _JS               # SoulSync confirm modal, red button
+    assert "destructive: true" in _JS               # Commissary confirm modal, red button
     assert ".vimp-btn--danger" in _CSS
 
 

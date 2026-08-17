@@ -1,4 +1,4 @@
-"""Decision logic for the SoulSync standalone Deep Scan's untracked → Staging move.
+"""Decision logic for the Commissary standalone Deep Scan's untracked → Staging move.
 
 The standalone deep scan (``_run_soulsync_deep_scan`` in web_server) walks the
 Transfer folder, diffs it against the ``soulsync`` rows in the DB, and relocates

@@ -1,5 +1,5 @@
 #!/bin/bash
-# SoulSync Docker Entrypoint Script
+# Commissary Docker Entrypoint Script
 # Handles PUID/PGID/UMASK configuration for proper file permissions
 
 set -e
@@ -9,7 +9,7 @@ PUID=${PUID:-1000}
 PGID=${PGID:-1000}
 UMASK=${UMASK:-022}
 
-echo "🐳 SoulSync Container Starting..."
+echo "🐳 Commissary Container Starting..."
 echo "📝 User Configuration:"
 echo "   PUID: $PUID"
 echo "   PGID: $PGID"
@@ -104,7 +104,7 @@ echo "👤 Running as:"
 echo "   User: $(id -u soulsync):$(id -g soulsync) ($(id -un soulsync):$(id -gn soulsync))"
 echo "   UMASK: $(umask)"
 echo ""
-echo "🚀 Starting SoulSync Web Server..."
+echo "🚀 Starting Commissary Web Server..."
 
 # Execute the main command as the soulsync user
 # If already running as the correct user (e.g. Podman rootless with keep-id), skip gosu

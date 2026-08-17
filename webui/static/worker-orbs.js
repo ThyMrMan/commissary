@@ -1,5 +1,5 @@
 // ============================================================
-// SoulSync — Worker Orbs
+// Commissary — Worker Orbs
 // Dashboard header buttons shrink to floating orbs, expand on hover
 // ============================================================
 
@@ -83,7 +83,7 @@
     let collapseDelay = null;
     const COLLAPSE_DELAY_MS = 7000;
 
-    // SoulSync logo, drawn as the hub/nucleus once loaded
+    // Commissary logo, drawn as the hub/nucleus once loaded
     let hubImage = null;
     let hubImageReady = false;
 
@@ -915,7 +915,7 @@
                     (0.16 + energy * 0.16 + slow * 0.04 + stress * 0.08) * ember);
 
                 if (hubImageReady) {
-                    // SoulSync logo as the nucleus — fit to the pulsing radius while
+                    // Commissary logo as the nucleus — fit to the pulsing radius while
                     // preserving the image's natural aspect ratio (no stretch)
                     const natW = hubImage.naturalWidth || 1;
                     const natH = hubImage.naturalHeight || 1;

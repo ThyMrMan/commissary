@@ -378,7 +378,7 @@ class DiscogsClient:
 
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'SoulSync/2.2 +https://github.com/Nezreka/SoulSync',
+            'User-Agent': 'Commissary/2.2 +https://github.com/ThyMrMan/soul-sync-thymrman-customized',
             'Accept': 'application/json',
         })
 

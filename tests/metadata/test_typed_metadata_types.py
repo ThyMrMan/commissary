@@ -17,7 +17,7 @@ responses) and pin:
 - Provider-specific quirks are normalized at the converter boundary
   (Discogs `(N)` disambiguation suffix, iTunes `100x100bb` artwork
   URLs, Deezer's nested `artist` object).
-- ``to_context_dict()`` produces the canonical SoulSync-internal
+- ``to_context_dict()`` produces the canonical Commissary-internal
   shape consumers currently expect.
 
 When a future PR adds a new provider, this file is where the

@@ -1,6 +1,6 @@
 """Automation handler: ``video_sync_collections`` action.
 
-Daily: resolve every ENABLED SoulSync-managed collection and sync it to the
+Daily: resolve every ENABLED Commissary-managed collection and sync it to the
 active video server — add/remove members, set art/summary/sort/pin — skipping
 collections whose resolved members + settings are unchanged since the last run.
 List/franchise collections with ``wishlist_missing`` feed the members you don't

@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video settings additions (isolated).
+ * Commissary — Video settings additions (isolated).
  *
  * The video side shows the real music settings page; this module only drives the
  * VIDEO-specific bits added to it — for now, the Movies/TV library mapping

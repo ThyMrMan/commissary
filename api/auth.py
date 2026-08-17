@@ -1,5 +1,5 @@
 """
-API key authentication for the SoulSync public API.
+API key authentication for the Commissary public API.
 """
 
 import hashlib

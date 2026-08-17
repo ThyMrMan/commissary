@@ -409,7 +409,7 @@ bootstrapServerAppearanceSettings();
 // so the managers' whole-document MutationObserver storms the main thread. A
 // captured DevTools trace (2026-06-29) showed Bitwarden's
 // bootstrap-autofill-overlay.js (setupOverlayOnField / setupOverlayListeners)
-// using ~6× the CPU of the entire SoulSync app — almost the whole freeze.
+// using ~6× the CPU of the entire Commissary app — almost the whole freeze.
 //
 // None of these fields are credentials (they're search boxes, filters, config),
 // so we mark them ignored and the managers skip them: once a field carries the
@@ -3022,7 +3022,7 @@ if ('serviceWorker' in navigator) {
 }
 
 document.addEventListener('DOMContentLoaded', async function () {
-    console.log('SoulSync WebUI initializing...');
+    console.log('Commissary WebUI initializing...');
 
     // Check if first-run setup wizard should be shown
     const params = new URLSearchParams(window.location.search);
@@ -3139,7 +3139,7 @@ function initApp() {
         }
     });
 
-    console.log('SoulSync WebUI initialized successfully!');
+    console.log('Commissary WebUI initialized successfully!');
 }
 
 // ===============================

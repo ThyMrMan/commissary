@@ -48,7 +48,7 @@ TRIGGERS: list[dict] = [
          {"key": "time", "type": "time", "label": "Time", "default": "03:00"},
          {"key": "day_of_month", "type": "number", "label": "Day of month", "default": 1, "min": 1, "max": 31}
      ]},
-    {"type": "app_started", "label": "App Started", "icon": "power", "scope": "both", "description": "When SoulSync starts up", "available": True},
+    {"type": "app_started", "label": "App Started", "icon": "power", "scope": "both", "description": "When Commissary starts up", "available": True},
     {"type": "track_downloaded", "label": "Track Downloaded", "icon": "download", "description": "When a track finishes downloading", "available": True,
      "has_conditions": True,
      "condition_fields": ["artist", "title", "album", "quality"],
@@ -205,7 +205,7 @@ TRIGGERS: list[dict] = [
      "description": "When an overlay apply pass finishes", "available": True,
      "variables": ["applied", "errors"]},
     {"type": "video_database_update_completed", "label": "Video Database Updated", "icon": "database", "scope": "video",
-     "description": "When SoulSync finishes reading the server's library into its database", "available": True,
+     "description": "When Commissary finishes reading the server's library into its database", "available": True,
      "variables": ["media_type", "mode"]},
 ]
 
@@ -293,7 +293,7 @@ ACTIONS: list[dict] = [
     # Tagged scope='video' so they appear ONLY on the video automation
     # builder, never the music one. Their handlers bridge into core.video.
     {"type": "video_scan_library", "label": "Scan Video Library", "icon": "refresh", "scope": "video",
-     "description": "Tell the media server to rescan your selected movie/TV sections, then read what it found into SoulSync", "available": True,
+     "description": "Tell the media server to rescan your selected movie/TV sections, then read what it found into Commissary", "available": True,
      "config_fields": [
          {"key": "mode", "type": "select", "label": "Mode",
           "options": [{"value": "full", "label": "Full (add + refresh)"},
@@ -322,7 +322,7 @@ ACTIONS: list[dict] = [
          {"key": "debounce_seconds", "type": "number", "label": "Fallback wait if status unknown (sec)", "default": 120, "min": 10}
      ]},
     {"type": "video_update_database", "label": "Update Video Database", "icon": "database", "scope": "video",
-     "description": "Read newly-indexed media from the server into SoulSync (incremental)", "available": True,
+     "description": "Read newly-indexed media from the server into Commissary (incremental)", "available": True,
      "config_fields": [
          {"key": "mode", "type": "select", "label": "Mode",
           "options": [{"value": "incremental", "label": "Incremental (recent only)"},

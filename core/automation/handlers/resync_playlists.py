@@ -7,7 +7,7 @@ Closes the last link of the post-download chain::
     database_update_completed -> resync_incomplete_playlists   <- THIS
 
 Up to the database update everything already worked: a wishlisted track is
-downloaded, imported, scanned by the media server, and read into SoulSync's
+downloaded, imported, scanned by the media server, and read into Commissary's
 library. But the server playlist it was downloaded FOR was written minutes
 earlier, back when the track was still missing — ``sync_playlist`` matches
 against what you own AT THAT MOMENT and only then hands the leftovers to the

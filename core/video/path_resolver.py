@@ -2,14 +2,14 @@
 
 The scanner stores what the media server reports (Plex ``part.file`` /
 Jellyfin ``Path``) — the path as seen from INSIDE the server's own container/
-host. From SoulSync's filesystem view that path often doesn't exist (different
+host. From Commissary's filesystem view that path often doesn't exist (different
 Docker mounts, drive letters, NAS exports). This is the video twin of the
 music side's ``core.library.path_resolver`` (the issue-#476 class of bugs):
 try the stored path as-is, then re-root its tail segments against the folders
-SoulSync actually knows about until a file exists.
+Commissary actually knows about until a file exists.
 
 Upgrades depend on this: replacing an owned copy means finding the REAL file,
-not the template location SoulSync would have chosen for a fresh import.
+not the template location Commissary would have chosen for a fresh import.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ def _setting(db, key) -> str:
 
 
 def library_roots(db, kind: str | None = None) -> list:
-    """Every folder SoulSync treats as a video library root.
+    """Every folder Commissary treats as a video library root.
 
     The Libraries registry (Settings → Connections) is the source of truth; the
     flat movies_path/tv_path/youtube_path settings (Settings → Downloads) are

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-SoulSync Database Module
+Commissary Database Module
 
 This module provides database functionality for storing and managing
 music library metadata from Plex. It includes:
@@ -36,4 +36,4 @@ __all__ = [
     'close_database'
 ]
 
-__version__ = '1.9.23'
+__version__ = '2.0.0'

@@ -253,7 +253,7 @@ def register_all(deps: AutomationDeps) -> None:
         'video_update_database',
         lambda config: auto_video_update_database(config, deps),
     )
-    # Same incremental update, but on an hourly SCHEDULE (not just after a SoulSync scan) —
+    # Same incremental update, but on an hourly SCHEDULE (not just after a Commissary scan) —
     # so manual library additions (which Plex auto-scans) show up within the hour instead of
     # waiting for the weekly deep scan. A distinct action_type because the seeder keys on it.
     engine.register_action_handler(
@@ -364,7 +364,7 @@ def register_all(deps: AutomationDeps) -> None:
         lambda config: auto_video_clean_plex_images(config, deps),
         lambda: __import__('core.video.overlays.cleanup', fromlist=['status']).status().get('running'),
     )
-    # Daily: sync SoulSync-managed collections to the server (add/remove members,
+    # Daily: sync Commissary-managed collections to the server (add/remove members,
     # art/sort/pin), skipping unchanged; list collections feed missing to wishlist.
     engine.register_action_handler(
         'video_sync_collections',

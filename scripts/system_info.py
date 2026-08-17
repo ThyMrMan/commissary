@@ -14,7 +14,7 @@ logger.info(f"Platform: {platform.system()} {platform.release()}")
 logger.info(f"Python: {platform.python_version()}")
 logger.info(f"Working Dir: {os.getcwd()}")
 
-# Disk usage for common SoulSync paths
+# Disk usage for common Commissary paths
 for path in ['/app/downloads', '/app/Transfer', '/app/data', './downloads', './Transfer']:
     if os.path.exists(path):
         usage = shutil.disk_usage(path)

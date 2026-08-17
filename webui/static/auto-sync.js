@@ -168,7 +168,7 @@ function autoSyncSourceLabel(source) {
         itunes_link: 'iTunes Link',
         listenbrainz: 'ListenBrainz',
         lastfm: 'Last.fm Radio',
-        soulsync_discovery: 'SoulSync Discovery',
+        soulsync_discovery: 'Commissary Discovery',
     };
     return labels[source] || source || 'Other';
 }
@@ -240,7 +240,7 @@ function autoSyncIsScheduleOwned(auto) {
     return group === 'Playlist Auto-Sync' || name.startsWith('Auto-Sync:');
 }
 
-// ── Personalized (SoulSync Discovery) rows in the Auto-Sync board ────────────
+// ── Personalized (Commissary Discovery) rows in the Auto-Sync board ────────────
 // Variant kinds (Time Machine per-decade, Genre, Seasonal, ...) and not-yet-
 // generated singletons don't exist as mirrored rows until generated. We surface
 // them as synthetic schedulable rows with NEGATIVE numeric ids: negatives never
@@ -259,7 +259,7 @@ function autoSyncKindLabel(k) {
         .trim() || (k && k.kind) || '';
 }
 
-// Tag already-generated SoulSync Discovery rows (real mirrored playlists) with
+// Tag already-generated Commissary Discovery rows (real mirrored playlists) with
 // the kind/variant parsed from their 'ssd_<kind>_<variant>' source id, so a
 // generated Time Machine decade groups under the same collapsible header as the
 // not-yet-generated ones. Rows whose kind is no longer registered (e.g. a
@@ -2342,7 +2342,7 @@ async function parseMirroredPipelineResponse(res, fallbackMessage) {
             data = JSON.parse(text);
         } catch (_err) {
             const detail = res.status === 404
-                ? 'Auto-Sync endpoint not found. Restart the SoulSync server so the new backend routes load.'
+                ? 'Auto-Sync endpoint not found. Restart the Commissary server so the new backend routes load.'
                 : fallbackMessage;
             throw new Error(detail);
         }
@@ -2354,7 +2354,7 @@ async function parseMirroredPipelineResponse(res, fallbackMessage) {
 }
 
 async function editMirroredCustomName(playlistId, originalName, currentCustom) {
-    // Custom alias: changes the name shown in SoulSync AND used when syncing to
+    // Custom alias: changes the name shown in Commissary AND used when syncing to
     // the media server, while staying tied to the original upstream playlist.
     // Blank clears the alias (falls back to the original name).
     const nextName = window.prompt(

@@ -1,4 +1,4 @@
-# SoulSync API Response Shapes
+# Commissary API Response Shapes
 
 Reference for the expected response shapes from `SpotifyClient` (which delegates to iTunes when Spotify is not authenticated).
 
@@ -573,7 +573,7 @@ iTunesClient(country: str = "US")
 ```
 
 - `country` is passed to every `_search()` and `_lookup()` call — determines which regional iTunes catalog is queried
-- Creates a `requests.Session` with `User-Agent: SoulSync/1.0` header
+- Creates a `requests.Session` with `User-Agent: Commissary/1.0` header
 - No authentication required
 
 ### `_clean_itunes_album_name(album_name)`

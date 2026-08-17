@@ -168,7 +168,7 @@
                         .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
                         .then(function (res) {
                             if (res.ok && res.j.success) {
-                                toast('Config imported — restart SoulSync to apply everywhere', 'success');
+                                toast('Config imported — restart Commissary to apply everywhere', 'success');
                                 close();
                             } else {
                                 toast((res.j && res.j.error) || 'Import failed', 'error');

@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video side shell controller.
+ * Commissary — Video side shell controller.
  *
  * ISOLATION CONTRACT: the music side never imports or references anything here.
  * This file is a self-contained IIFE (no globals) wired entirely via

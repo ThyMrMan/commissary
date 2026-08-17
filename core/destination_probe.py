@@ -53,7 +53,7 @@ def probe_destination_writable(path) -> dict:
     except PermissionError:
         return {"status": "unwritable", "writable": False,
                 "detail": "Permission denied — the server cannot create folders here. "
-                          "Check the folder's owner against the user SoulSync runs as "
+                          "Check the folder's owner against the user Commissary runs as "
                           "(PUID/PGID)."}
     except OSError as e:
         return {"status": "unwritable", "writable": False, "detail": str(e)}

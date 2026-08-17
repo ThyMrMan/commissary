@@ -374,9 +374,9 @@ def _normalize(text: str) -> str:
 def _is_same_physical_file(p1, p2, dur1, dur2) -> bool:
     """Detect when two DB rows point at the same file mounted at different paths.
 
-    When a user binds the same host music directory into both SoulSync
+    When a user binds the same host music directory into both Commissary
     (e.g. ``/app/Transfer``) and a media server like Plex (e.g.
-    ``/media/Music``), the SoulSync scan and the media-server library
+    ``/media/Music``), the Commissary scan and the media-server library
     sync each create a track row pointing at the same physical file
     via different mount paths. The two rows then look like a fuzzy-
     match duplicate to this job.

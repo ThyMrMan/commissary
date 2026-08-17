@@ -24,7 +24,7 @@ from core.musicbrainz_client import MusicBrainzClient, _escape_lucene
 
 @pytest.fixture
 def client():
-    c = MusicBrainzClient("SoulSync", "2")
+    c = MusicBrainzClient("Commissary", "2")
     # Replace the HTTP session with a mock returning an empty result set, so
     # we can inspect the query string without touching the network.
     resp = MagicMock()

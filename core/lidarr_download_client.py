@@ -9,7 +9,7 @@ This client provides:
 - Drop-in replacement compatible with Soulseek interface
 
 Requires a running Lidarr instance with configured indexers and download clients.
-Lidarr downloads full albums — SoulSync imports only the tracks it needs.
+Lidarr downloads full albums — Commissary imports only the tracks it needs.
 """
 
 import os
@@ -403,7 +403,7 @@ class LidarrDownloadClient(DownloadSourcePlugin):
 
             # Step 5: Find and import the wanted track.
             #
-            # Lidarr grabs whole albums; SoulSync's matched-context
+            # Lidarr grabs whole albums; Commissary's matched-context
             # post-processing wants the SPECIFIC track the user
             # requested. Old behavior copied every track in the album
             # and reported `imported_files[0]` as `file_path` — which

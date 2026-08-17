@@ -644,7 +644,7 @@ def poll_album_download(
                 # field never landed. Fall back to the in-progress dir so
                 # the bundle can still scan + stage the audio, rather than
                 # leaving the user stuck with a completed-in-SAB download
-                # that SoulSync never imports.
+                # that Commissary never imports.
                 if last_incomplete_path:
                     # Don't trust incomplete_path just because the window
                     # elapsed — the client's own post-processing may still
@@ -905,7 +905,7 @@ def resolve_reported_save_path(
     """Translate a downloader-reported save_path into one THIS process can read.
 
     Usenet / torrent clients report paths from inside THEIR OWN container
-    (e.g. SAB hands back ``/data/downloads/music/<album>``); SoulSync often
+    (e.g. SAB hands back ``/data/downloads/music/<album>``); Commissary often
     mounts the very same files at a different point (``/app/downloads/<album>``).
     Feeding the client's path straight to the audio walker then yields
     "No audio files found" even though the files are physically present —
@@ -920,8 +920,8 @@ def resolve_reported_save_path(
          — a list of ``{"from": "...", "to": "..."}`` (Sonarr/Radarr-style
          remote path mapping) for non-shared / oddly-mounted layouts.
       3. Basename fallback: a same-named folder OR file under a known
-         SoulSync download root. Zero-config for the standard shared-volume
-         setup — the release shows up under SoulSync's own ``./downloads``
+         Commissary download root. Zero-config for the standard shared-volume
+         setup — the release shows up under Commissary's own ``./downloads``
          mount with the same name the client reported.
 
     A candidate that turns out to be a FILE (single-file release, no folder)
@@ -955,8 +955,8 @@ def resolve_reported_save_path(
         name), an existing-but-content-less directory is the WRONG mount,
         not a resolution. TheHomeGuy's bug: qBittorrent reported its own
         container's '/downloads', a directory by that name happened to
-        exist in SoulSync's namespace too, and the verbatim short-circuit
-        accepted it — SoulSync then watched an empty folder instead of the
+        exist in Commissary's namespace too, and the verbatim short-circuit
+        accepted it — Commissary then watched an empty folder instead of the
         configured one that actually had the files."""
         if not expect_name:
             return True
@@ -1046,7 +1046,7 @@ def resolve_reported_save_path(
 
     # 4. The roots THEMSELVES. A torrent client reports its save DIRECTORY
     #    (e.g. '/downloads'), not a per-release folder — in the shared-mount
-    #    setup the release lands as '<SoulSync download root>/<name>', so the
+    #    setup the release lands as '<Commissary download root>/<name>', so the
     #    right resolution of '/downloads' is simply our own configured root.
     if expect_name:
         for root in roots:

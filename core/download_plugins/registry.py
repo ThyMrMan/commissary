@@ -202,7 +202,7 @@ class DownloadPluginRegistry:
 
 
 def build_default_registry() -> DownloadPluginRegistry:
-    """Construct the registry with SoulSync's eight built-in download
+    """Construct the registry with Commissary's eight built-in download
     sources. Called once during orchestrator init.
 
     Adding a new source (Usenet, etc.) means adding one ``register``

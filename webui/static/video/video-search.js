@@ -1,10 +1,10 @@
 /*
- * SoulSync — Video Search page (isolated, in-app).
+ * Commissary — Video Search page (isolated, in-app).
  *
  * Debounced multi-search via /api/video/search (movies / shows / people from
  * TMDB). Movie/show results link to the OWNED library detail when we already
  * have them (library_id), otherwise to the TMDB-backed detail. People open the
- * in-app person page. Everything stays inside SoulSync — no external links.
+ * in-app person page. Everything stays inside Commissary — no external links.
  *
  * Reuses the library card classes (.library-artist-card). Self-contained IIFE,
  * no globals, event-delegated, no inline handlers. Talks only to /api/video/*.

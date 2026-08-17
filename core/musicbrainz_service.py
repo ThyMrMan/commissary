@@ -13,7 +13,7 @@ logger = get_logger("musicbrainz_service")
 class MusicBrainzService:
     """Service layer for MusicBrainz integration with caching and matching logic"""
     
-    def __init__(self, database: MusicDatabase, app_name: str = "SoulSync", app_version: str = "1.0", contact_email: str = ""):
+    def __init__(self, database: MusicDatabase, app_name: str = "Commissary", app_version: str = "1.0", contact_email: str = ""):
         self.db = database
         self.mb_client = MusicBrainzClient(app_name, app_version, contact_email)
         self.retry_days = 30  # Retry 'not_found' items after 30 days
@@ -591,7 +591,7 @@ class MusicBrainzService:
 
         Issue #442 — Japanese kanji / Cyrillic / etc. spellings of an
         artist's name are stored as `aliases` on the MusicBrainz
-        artist record. Pull them so SoulSync can recognise that
+        artist record. Pull them so Commissary can recognise that
         `澤野弘之` and `Hiroyuki Sawano` refer to the same artist.
 
         Issue #586 — for some artists MB's CANONICAL `name` is the

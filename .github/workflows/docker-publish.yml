@@ -6,7 +6,7 @@ name: Build and Push Docker Image
 #
 # ONE-TIME SETUP after the first successful run: the package is created PRIVATE
 # and `docker pull` will fail for everyone until it is made public. Flip it at
-# github.com/users/ThyMrMan/packages/container/soul-sync-custom/settings →
+# github.com/users/ThyMrMan/packages/container/commissary/settings →
 # "Change visibility" → Public. GITHUB_TOKEN cannot do this, so no workflow step
 # can automate it.
 
@@ -17,9 +17,9 @@ on:
   workflow_dispatch:
     inputs:
       version_tag:
-        description: 'Version tag (e.g. 1.9.23). Also published as :latest.'
+        description: 'Version tag (e.g. 2.0.0). Also published as :latest.'
         required: true
-        default: '1.9.23'
+        default: '2.0.0'
 
 jobs:
   build-and-push:
@@ -62,7 +62,7 @@ jobs:
           # children, so the package page reads correctly for a multi-platform build.
           DOCKER_METADATA_ANNOTATIONS_LEVELS: index
         with:
-          images: ghcr.io/${{ env.OWNER }}/soul-sync-custom
+          images: ghcr.io/${{ env.OWNER }}/commissary
           tags: |
             type=raw,value=latest
             type=raw,value=${{ inputs.version_tag }},enable=${{ inputs.version_tag != '' }}

@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video Issues (the music Issues standard, video-scoped).
+ * Commissary — Video Issues (the music Issues standard, video-scoped).
  *
  * Page: status/category filters + stat cards + issue cards; clicking a card
  * opens the detail modal (snapshot hero, info bar, description, admin response,

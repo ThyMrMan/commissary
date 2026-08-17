@@ -42,7 +42,7 @@ def pick_history_row(candidates: Sequence[Tuple], *, current_paths: Iterable[str
     ("01 - Intro.flac") from healing a different song's row. Among matches a REAL download
     row is preferred over a synthetic ``acoustid_scan`` row, so the scanner heals the
     genuine record and the caller can delete the synthetic duplicate. None when nothing
-    matches safely (caller then inserts a fresh row — the "file SoulSync never downloaded"
+    matches safely (caller then inserts a fresh row — the "file Commissary never downloaded"
     intent)."""
     paths = {p for p in current_paths if p}
     want = _norm_title(title)

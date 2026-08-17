@@ -2090,7 +2090,7 @@ class RepairWorker:
         }
         # Use the RESOLVED file's directory — NOT details['album_folder'], which
         # is the raw DB path (e.g. Jellyfin's /data/music) and frequently does
-        # NOT exist inside the SoulSync container (only the resolved /app/...
+        # NOT exist inside the Commissary container (only the resolved /app/...
         # path does). Passing the raw folder made os.path.isdir() fail in
         # apply_art_to_album_files, silently skipping the cover.jpg write while
         # embedding (which uses the resolved paths) still worked — Sokhi's
@@ -2638,7 +2638,7 @@ class RepairWorker:
             logger.warning(f"Tag write failed during unknown artist fix: {e}")
 
         # Step 2: Move file if expected path differs — but ONLY when the file lives
-        # under the SoulSync transfer folder. For a media-server / non-transfer
+        # under the Commissary transfer folder. For a media-server / non-transfer
         # library the resolved file is elsewhere, and building the destination from
         # transfer_folder would YANK it into the transfer folder, away from its real
         # library (same class as #978). There we just re-tag + fix the DB metadata and

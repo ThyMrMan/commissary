@@ -1,6 +1,6 @@
 """Series types + multi-episode files (arr-parity P8).
 
-Sonarr knows three kinds of series and SoulSync treated them all as standard:
+Sonarr knows three kinds of series and Commissary treated them all as standard:
 daily shows release by AIR DATE, anime by ABSOLUTE number — an SxxExx query
 simply never finds those. And a multi-episode file (S01E01E02) used to be
 rejected as "wrong episode". Covers: parsing spans + absolute tokens, the

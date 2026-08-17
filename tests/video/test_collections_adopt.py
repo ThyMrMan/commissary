@@ -1,5 +1,5 @@
 """Adopt-from-server: a foreign (Kometa/hand-made) server collection becomes a
-SoulSync-managed definition — membership snapshot, ledger binding, append mode,
+Commissary-managed definition — membership snapshot, ledger binding, append mode,
 server art kept. The migration path that beats delete-and-rebuild."""
 
 from __future__ import annotations

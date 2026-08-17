@@ -1,5 +1,5 @@
 /*
- * SoulSync — Live Server Activity (app-wide, music + video).
+ * Commissary — Live Server Activity (app-wide, music + video).
  *
  * A Tautulli-style live view of every active Plex stream: who's playing what,
  * direct play vs transcode (with the codec line), bandwidth, and progress.
@@ -93,7 +93,7 @@
         var lc = s.link ? ' sact-card--link' : '';
         var la = s.link ? ' data-link-kind="' + esc(s.link.kind) + '" data-link-id="' + esc(s.link.id) +
             '" data-link-source="' + esc(s.link.source) + '"' : '';
-        var openIc = s.link ? '<span class="sact-open" title="Open in SoulSync"></span>' : '';
+        var openIc = s.link ? '<span class="sact-open" title="Open in Commissary"></span>' : '';
         return '<div class="sact-card sact-st-' + esc(s.state) + lc + '" data-key="' + esc(actKey(s)) + '"' + la + '>' +
             (artUrl ? '<div class="sact-art" style="background-image:url(\'' + artUrl + '\')"></div>' : '') +
             '<div class="sact-scrim"></div>' + stop +
@@ -398,7 +398,7 @@
             if (tb) { setTab(tb.getAttribute('data-sact-tab')); return; }
             var sb = e.target.closest('[data-sact-stop]');
             if (sb) { openStop(sb.getAttribute('data-sact-stop'), sb.getAttribute('data-sact-title')); return; }
-            // Click a card → jump to that movie/show's page inside SoulSync.
+            // Click a card → jump to that movie/show's page inside Commissary.
             var lk = e.target.closest('.sact-card--link');
             if (lk) {
                 var id = lk.getAttribute('data-link-id');

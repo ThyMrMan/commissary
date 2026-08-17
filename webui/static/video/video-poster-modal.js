@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video Poster Manager (full-screen modal).
+ * Commissary — Video Poster Manager (full-screen modal).
  *
  * Two entry points, one engine:
  *   VideoPoster.open({kind, tmdbId, libraryId, title, year})  — focused version,

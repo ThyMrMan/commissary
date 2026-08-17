@@ -1,5 +1,5 @@
 /*
- * SoulSync — shared VIDEO scan controller (isolated).
+ * Commissary — shared VIDEO scan controller (isolated).
  *
  * One place triggers + polls library scans for every surface (Library page,
  * Tools page, Dashboard card), so nothing duplicates the fetch/poll logic. It

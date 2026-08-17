@@ -164,7 +164,7 @@ def quarantine_group_key(
     group together — and once the user accepts one, the rest are
     redundant failed attempts at a song they now own.
 
-    The key identifies the *intended* target — what SoulSync was trying to
+    The key identifies the *intended* target — what Commissary was trying to
     fetch — NOT the downloaded file's own tags. That matters: the file's
     metadata is frequently *wrong* (that's why it failed acoustid /
     integrity), whereas the target is fixed and identical across every

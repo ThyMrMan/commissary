@@ -1,4 +1,4 @@
-"""Choosing which RELEASE of an album to grab, instead of letting SoulSync guess.
+"""Choosing which RELEASE of an album to grab, instead of letting Commissary guess.
 
 The track picker can't serve albums. Its candidates are individual files, so
 picking one for an album would import a single track named after the album.

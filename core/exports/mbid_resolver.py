@@ -1,7 +1,7 @@
 """Resolve a playlist track's MusicBrainz *recording* MBID, cheapest source first.
 
 A ListenBrainz playlist export needs each track's recording MBID (``jspf_export``). A
-SoulSync track can supply it from several places, in increasing cost:
+Commissary track can supply it from several places, in increasing cost:
 
 1. **resolution cache** — a prior (artist,title)->mbid result (persistent; reused across
    playlists and runs, so the same song never costs twice).

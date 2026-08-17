@@ -1,4 +1,4 @@
-"""Import ytdl-sub / Kometa subscription files → SoulSync YouTube follows.
+"""Import ytdl-sub / Kometa subscription files → Commissary YouTube follows.
 
 Parser is a tolerant line scanner (no PyYAML dep): pulls url / tv_show_name /
 active presets per block, skips what it can't read, never raises on a messy

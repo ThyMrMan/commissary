@@ -1,12 +1,12 @@
-# SoulSync REST API
+# Commissary REST API
 
-SoulSync includes a full REST API at `/api/v1/` that lets you control everything from external apps, scripts, Discord bots, Home Assistant, or anything that can make HTTP requests.
+Commissary includes a full REST API at `/api/v1/` that lets you control everything from external apps, scripts, Discord bots, Home Assistant, or anything that can make HTTP requests.
 
 ## Quick Start
 
 ### 1. Generate an API Key
 
-Go to **Settings** in the SoulSync web UI and find the **SoulSync API** section. Click **Generate API Key**, give it a label, and copy the key immediately — it's only shown once.
+Go to **Settings** in the Commissary web UI and find the **Commissary API** section. Click **Generate API Key**, give it a label, and copy the key immediately — it's only shown once.
 
 Alternatively, if no keys exist yet, use the bootstrap endpoint:
 
@@ -115,7 +115,7 @@ These optional parameters work on all endpoints that return entity data:
 
 ## Multi-Profile Support
 
-SoulSync supports multiple user profiles. Profile-scoped endpoints (watchlist, wishlist, discovery) accept a profile identifier:
+Commissary supports multiple user profiles. Profile-scoped endpoints (watchlist, wishlist, discovery) accept a profile identifier:
 
 | Method | Details |
 |--------|---------|
@@ -1654,7 +1654,7 @@ Get retag queue statistics.
 
 ### ListenBrainz
 
-Browse cached ListenBrainz playlists and their tracks. Playlists are cached locally when SoulSync pulls recommendations from ListenBrainz.
+Browse cached ListenBrainz playlists and their tracks. Playlists are cached locally when Commissary pulls recommendations from ListenBrainz.
 
 #### `GET /api/v1/listenbrainz/playlists`
 
@@ -1716,7 +1716,7 @@ List cached ListenBrainz playlists with optional type filtering and pagination.
 | `track_count` | int | Number of tracks in the playlist |
 | `annotation_data` | object? | Parsed JSON annotation metadata from ListenBrainz |
 | `last_updated` | string | ISO 8601 timestamp of last update from ListenBrainz |
-| `cached_date` | string | ISO 8601 timestamp when SoulSync cached this playlist |
+| `cached_date` | string | ISO 8601 timestamp when Commissary cached this playlist |
 
 #### `GET /api/v1/listenbrainz/playlists/<playlist_id>`
 
@@ -1939,7 +1939,7 @@ Get MusicBrainz cache statistics — total entries, matched vs unmatched, and br
 
 #### `GET /api/v1/cache/discovery-matches`
 
-List cached discovery provider matches. When SoulSync discovers tracks from external sources (Tidal playlists, YouTube Music, ListenBrainz recommendations, Beatport), it resolves them against Spotify or iTunes to get downloadable metadata. These resolved matches are cached here to avoid redundant API calls. Results ordered by `last_used_at` descending.
+List cached discovery provider matches. When Commissary discovers tracks from external sources (Tidal playlists, YouTube Music, ListenBrainz recommendations, Beatport), it resolves them against Spotify or iTunes to get downloadable metadata. These resolved matches are cached here to avoid redundant API calls. Results ordered by `last_used_at` descending.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|

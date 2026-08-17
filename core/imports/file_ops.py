@@ -751,7 +751,7 @@ def create_lossy_copy(final_path, settings=None):
 # Sidecars that belong to ONE audio file (same filename stem) and should travel
 # with it. Only synced lyrics for now: .nfo/.txt/.json alongside downloads are
 # usually release junk the import correctly leaves behind, but a .lrc IS part
-# of the track (SoulSync even generates them) — imports used to move the audio
+# of the track (Commissary even generates them) — imports used to move the audio
 # and strand the lyrics in the source folder (lilbob5769's report).
 _COMPANION_SIDECAR_EXTS = ('.lrc',)
 

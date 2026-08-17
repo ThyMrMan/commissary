@@ -1,4 +1,4 @@
-"""SoulSync — VIDEO side database (database/video_library.db).
+"""Commissary — VIDEO side database (database/video_library.db).
 
 ISOLATION CONTRACT: this module owns a SEPARATE SQLite file from the music
 library and imports NOTHING from the music database layer. Music code never
@@ -416,7 +416,7 @@ _COLUMN_MIGRATIONS = [
     # the release-title gate accepts a release named by any of these. Exists because
     # TMDB's alias coverage is patchy for anime — a show whose fansub releases use a
     # translation of the original title has no automatic bridge to its TMDB name.
-    # Never pushed to Plex/Jellyfin; this is SoulSync-local.
+    # Never pushed to Plex/Jellyfin; this is Commissary-local.
     ("shows", "aka_titles", "TEXT"),
     ("movies", "aka_titles", "TEXT"),
     ("video_watchlist", "approved", "INTEGER NOT NULL DEFAULT 1"),
@@ -4419,7 +4419,7 @@ class VideoDatabase:
             conn.close()
 
     def set_item_poster_url(self, kind: str, item_id: int, poster_url: str) -> bool:
-        """Best-effort: point a movie/show at a new poster path/URL so SoulSync shows it
+        """Best-effort: point a movie/show at a new poster path/URL so Commissary shows it
         immediately (the next scan reconciles it with the server's own copy)."""
         table = {"movie": "movies", "show": "shows"}.get(str(kind).lower())
         if not table:
@@ -4549,7 +4549,7 @@ class VideoDatabase:
             (src.get("name") or "Untitled") + " (copy)", src.get("definition") or {})
 
     # ── Collections (Kometa parity) ───────────────────────────────────────────
-    # SoulSync-managed movie/show collections. A definition (`definition` JSON =
+    # Commissary-managed movie/show collections. A definition (`definition` JSON =
     # smart rules OR a list source) resolves to a set of owned items and is synced
     # to the active video server. Same CRUD shape as overlay templates.
     _COLLECTION_BOOL_COLS = ("pinned", "wishlist_missing", "enabled")
@@ -5008,7 +5008,7 @@ class VideoDatabase:
 
     def list_collection_syncs(self) -> list:
         """Every ledger row (+ its definition's name) — maps server collections
-        back to the SoulSync definition that manages them, so the server-cleanup
+        back to the Commissary definition that manages them, so the server-cleanup
         view can tell ours from foreign (e.g. old Kometa) collections."""
         conn = self._get_connection()
         try:

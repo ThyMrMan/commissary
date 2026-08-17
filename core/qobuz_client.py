@@ -538,7 +538,7 @@ class QobuzClient(DownloadSourcePlugin):
     def reload_credentials(self) -> None:
         """Pull session state from config without making a network probe.
 
-        SoulSync runs two ``QobuzClient`` instances side by side — one wired
+        Commissary runs two ``QobuzClient`` instances side by side — one wired
         through ``download_orchestrator.client('qobuz')`` for the auth-flow endpoints, and a
         second owned by the enrichment worker for thread safety. When the user
         logs in via ``/api/qobuz/auth/login`` or ``/api/qobuz/auth/token`` only

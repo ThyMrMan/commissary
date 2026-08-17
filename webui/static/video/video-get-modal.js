@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video "get" button + detail/download modal (shared).
+ * Commissary — Video "get" button + detail/download modal (shared).
  *
  * The terminal-content counterpart to the watchlist eye: movies and ENDED shows
  * can't be "watched for new episodes," so instead of an eye they get a download

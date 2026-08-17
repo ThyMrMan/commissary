@@ -1,6 +1,6 @@
 """#1047 P2 — stale Plex ratingKeys must not silently unmatch owned tracks.
 
-Plex re-keys tracks on a metadata refresh/optimize, and SoulSync's db track
+Plex re-keys tracks on a metadata refresh/optimize, and Commissary's db track
 id IS that old ratingKey. The sync's fetchItem then 404s and the track —
 which exists, matched at full confidence — silently became "missing":
 wishlisted and dropped from the playlist. The manual-match path already had

@@ -1867,11 +1867,11 @@ class AutoImportWorker:
                 # → `record_soulsync_library_entry`) reads `source` to pick
                 # the right source-id columns on artists/albums/tracks,
                 # and reads `_download_username` to label the row in
-                # library history + provenance. Without these the SoulSync
+                # library history + provenance. Without these the Commissary
                 # standalone library lands the file but leaves
                 # `spotify_track_id` / `deezer_id` / etc. NULL and tags the
                 # provenance row as "Soulseek" (the default fallback).
-                # SoulSync standalone is a full server replacement, so the
+                # Commissary standalone is a full server replacement, so the
                 # row must carry the same field richness as a Plex/Jellyfin/
                 # Navidrome scan would write.
                 context_key = f"auto_import_{candidate.folder_hash}_{track_number}"

@@ -6,7 +6,7 @@ Album Completeness Auto-Fill button surfaced a flat "Could not
 determine album folder from existing tracks" error with no diagnostic.
 Reporter is on Navidrome, which (unlike Plex) has no API that exposes
 filesystem library paths — so the resolver returns None whenever the
-DB-recorded path doesn't already exist as-is in SoulSync's container
+DB-recorded path doesn't already exist as-is in Commissary's container
 view AND the user hasn't manually configured Settings → Library →
 Music Paths.
 

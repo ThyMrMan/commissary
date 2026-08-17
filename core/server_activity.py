@@ -39,7 +39,7 @@ def _first(seq: Any) -> Any:
 
 
 def _plex_config(db=None) -> Dict[str, str]:
-    """Any working Plex connection config — the music config first (SoulSync's
+    """Any working Plex connection config — the music config first (Commissary's
     origin), then the video side's effective creds. Both usually point at the
     same server, and sessions() returns everything, so either works."""
     try:
@@ -176,7 +176,7 @@ def normalize_session(item: Any) -> Dict[str, Any]:
     state = str(_g(player, "state", "") or "playing").lower()
     thumb = _g(item, "grandparentThumb") or _g(item, "parentThumb") or _g(item, "thumb")
     art = _g(item, "art") or _g(item, "grandparentArt")
-    # what identifies the SoulSync library row to jump to: a movie is its own
+    # what identifies the Commissary library row to jump to: a movie is its own
     # ratingKey; an episode links to its SHOW. Title+year are a fallback when the
     # server id doesn't line up (re-scan, different server_source, etc.).
     if mtype == "movie":
@@ -344,7 +344,7 @@ def _summarize(sessions: List[Dict[str, Any]], server_name: str, version: str) -
 
 def _resolve_library_links(sessions: List[Dict[str, Any]], db=None) -> None:
     """Attach a ``link`` = {kind, id, source:'library'} to each session whose
-    media is in the SoulSync video library, so a click opens THAT movie/show
+    media is in the Commissary video library, so a click opens THAT movie/show
     page. One DB query maps native server ids (Plex ratingKey / Jellyfin id)
     back to our rows. Best-effort — a miss just leaves the card non-clickable."""
     db_obj = None

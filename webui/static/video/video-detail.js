@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video detail page (isolated, NETFLIX-style — deliberately NOT the
+ * Commissary — Video detail page (isolated, NETFLIX-style — deliberately NOT the
  * music/Spotify layout).
  *
  * A cinematic billboard (full-bleed backdrop, content bottom-left) with a

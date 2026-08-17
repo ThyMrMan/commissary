@@ -1,5 +1,5 @@
 """
-Centralized serializers for the SoulSync API v1.
+Centralized serializers for the Commissary API v1.
 
 All serializers accept a sqlite3.Row, a dict, or a dataclass instance
 and normalize the output to a plain dict. This allows the same serializer

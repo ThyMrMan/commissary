@@ -197,7 +197,7 @@ class SoundcloudClient(DownloadSourcePlugin):
         """Search SoundCloud for the given query.
 
         Returns (tracks, albums). SoundCloud has no album concept (only
-        playlists, which don't map to the album model the rest of SoulSync
+        playlists, which don't map to the album model the rest of Commissary
         expects), so the album list is always empty.
         """
         if not self.is_available():

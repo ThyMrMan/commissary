@@ -1,7 +1,7 @@
 """Client-mode seed enforcement: push_seed_goal writes qBit share limits.
 
 The "who enforces the seed goal" toggle's client mode hands the ratio / seed-time
-goal to the torrent client (qBittorrent setShareLimits) instead of SoulSync's
+goal to the torrent client (qBittorrent setShareLimits) instead of Commissary's
 sweep. Goals are in ratio + HOURS; qBit wants MINUTES and -1 for "no limit".
 """
 

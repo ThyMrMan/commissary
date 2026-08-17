@@ -16,7 +16,7 @@ Each server client (Plex / Jellyfin / Navidrome) gets a new
 `sync_service.sync_playlist` accepts `sync_mode` and dispatches to
 `append_to_playlist` when set to 'append'. Falls back to
 `update_playlist` (replace semantics) when the client doesn't
-implement append (e.g. SoulSync standalone has no playlist methods
+implement append (e.g. Commissary standalone has no playlist methods
 at all).
 
 These tests pin:
@@ -352,7 +352,7 @@ def test_append_to_playlist_listed_in_contract():
 def test_each_client_implements_append_to_playlist():
     """Pin: Plex / Jellyfin / Navidrome all have the method (at the
     class level — instance state isn't required for this check).
-    SoulSync standalone is intentionally excluded — it has no
+    Commissary standalone is intentionally excluded — it has no
     playlist methods at all per the contract notes."""
     assert hasattr(PlexClient, 'append_to_playlist')
     assert hasattr(JellyfinClient, 'append_to_playlist')

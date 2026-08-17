@@ -215,7 +215,7 @@ def _normalize_context_artists(artists: Any) -> List[Dict[str, Any]]:
 
 def _build_album_info(album_data: Any, album_id: str, album_name: str = '',
                       artist_name: str = '', source: str = '') -> Dict[str, Any]:
-    """Build the canonical SoulSync internal album-info dict.
+    """Build the canonical Commissary internal album-info dict.
 
     When ``source`` is provided AND maps to a known typed converter,
     routes through the canonical ``Album.from_<source>_dict()`` path —

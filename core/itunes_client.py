@@ -259,7 +259,7 @@ class iTunesClient:
         self._fixed_country = country.upper() if country else None
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'SoulSync/1.0',
+            'User-Agent': 'Commissary/1.0',
             'Accept': 'application/json'
         })
         logger.info(f"iTunes client initialized for country: {self.country}")

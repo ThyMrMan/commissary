@@ -1,6 +1,6 @@
 """Pick the canonical album release by best-fit to the user's actual files.
 
-Issue #765 / #767-Bug2: SoulSync never pins ONE canonical album version per
+Issue #765 / #767-Bug2: Commissary never pins ONE canonical album version per
 album, so the Library Reorganizer, Track Number Repair, and tagging each
 re-resolve independently and can land on different releases (standard vs
 deluxe; Spotify vs MusicBrainz track numbering) and contradict each other.

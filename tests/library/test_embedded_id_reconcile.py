@@ -1,7 +1,7 @@
 """Tests for core/library/embedded_id_reconcile.py.
 
 The reconcile job reads provider IDs already embedded in a file's tags
-(by SoulSync or MusicBrainz Picard) and gap-fills them into the library
+(by Commissary or MusicBrainz Picard) and gap-fills them into the library
 DB so enrichment workers skip the API call. These pin the guarantees that
 make it safe to run across a whole library while workers run concurrently:
 

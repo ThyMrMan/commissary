@@ -1,6 +1,6 @@
 """Navidrome stream-URL building (#809): play a library track via the server's
 Subsonic /rest/stream API so playback works without mounting the music into
-the SoulSync container.
+the Commissary container.
 
 Mirrors the cover-art URL tests — token/salt are random per call, so we assert
 structure + required params, not an exact string.

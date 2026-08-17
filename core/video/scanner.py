@@ -1,4 +1,4 @@
-"""SoulSync — video library scanner.
+"""Commissary — video library scanner.
 
 The media SERVER (Plex/Jellyfin) is the source of truth, exactly like the music
 side: we ask the server what it has and mirror it into video.db. This module is

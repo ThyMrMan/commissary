@@ -149,7 +149,7 @@ def test_upgrade_sheds_an_existing_chat_table(tmp_path):
     path = str(tmp_path / 'legacy.db')
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE chat_room_messages (id INTEGER PRIMARY KEY, room TEXT)")
-    conn.execute("INSERT INTO chat_room_messages (room) VALUES ('SoulSync')")
+    conn.execute("INSERT INTO chat_room_messages (room) VALUES ('Commissary')")
     conn.commit()
     conn.close()
 
@@ -174,17 +174,19 @@ def test_support_button_and_modal_are_gone():
 
 
 def test_no_donate_links_anywhere():
-    for rel in ('README.md', 'Support/UNRAID.md', 'templates/soulsync.xml'):
+    for rel in ('README.md', 'Support/UNRAID.md', 'templates/commissary.xml'):
         text = _read(rel)
         assert 'ko-fi' not in text.lower(), rel
         assert 'DonateLink' not in text, rel
 
 
-def test_docker_image_names_were_not_collateral_damage():
-    """The upstream author's Docker Hub image is not a donation link — editing
-    it would break every documented pull command."""
-    assert 'boulderbadgedad/soulsync' in _read('README.md')
-    assert 'boulderbadgedad/soulsync' in _read('templates/soulsync.xml')
+def test_docs_name_a_pullable_image():
+    """An image name is not a donation link. This guard was written when a
+    donate-link sweep threatened to strip the upstream Docker Hub name; the
+    fork now publishes its own image to GHCR, so the name changed but the
+    concern did not — the docs must still name something users can pull."""
+    assert 'ghcr.io/thymrman/commissary' in _read('README.md')
+    assert 'ghcr.io/thymrman/commissary' in _read('templates/commissary.xml')
 
 
 # ── the two distinctions that caused the false positives ────────────────────

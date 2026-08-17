@@ -371,7 +371,7 @@ class AcoustIDScannerJob(RepairJob):
         ``db_path`` is the unresolved DB-side path — history rows may store
         either form, so both are matched.
 
-        Files SoulSync never downloaded have no history row at all — for an
+        Files Commissary never downloaded have no history row at all — for an
         'unverified' outcome one is inserted (download_source 'acoustid_scan')
         so EVERY scan-flagged file lands in the review queue, not just past
         downloads. Re-scans then match this row via file_path (no duplicates).

@@ -1,16 +1,16 @@
-"""Push a SoulSync seed goal into the torrent client's own share limits.
+"""Push a Commissary seed goal into the torrent client's own share limits.
 
 The "who enforces the seed goal" toggle has two modes:
 
-  * ``soulsync`` — SoulSync's seeding sweep polls the client and removes the
+  * ``soulsync`` — Commissary's seeding sweep polls the client and removes the
     torrent when the goal is met (nothing written to the client).
-  * ``client``  — SoulSync writes the ratio / seeding-time limit straight into
+  * ``client``  — Commissary writes the ratio / seeding-time limit straight into
     the torrent client (qBittorrent's ``setShareLimits``) so the CLIENT enforces
     it, exactly like Radarr/Sonarr. It shows up in the client's share-limit
-    dialog and keeps working even if SoulSync is off.
+    dialog and keeps working even if Commissary is off.
 
 This module is the client-mode writer, shared by the music and video sides.
-Goals are configured in SoulSync's own units (share ratio + seed-time in HOURS);
+Goals are configured in Commissary's own units (share ratio + seed-time in HOURS);
 qBittorrent wants MINUTES, and uses -1 to mean "no limit", so this converts.
 """
 
@@ -49,7 +49,7 @@ def push_seed_goal(adapter: Any, torrent_hash: str,
     Returns True if the client accepted the limits (it now enforces the goal
     itself). Returns False if there's nothing to push, the client doesn't
     support share limits, or the call failed — in which case the caller should
-    fall back to recording the grab for SoulSync's own sweep so the goal still
+    fall back to recording the grab for Commissary's own sweep so the goal still
     gets enforced.
     """
     if not adapter or not torrent_hash:

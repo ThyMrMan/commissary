@@ -9,9 +9,9 @@ The torrent and usenet download plugins need a uniform way to:
 This module is intentionally narrow — no matching, no tagging, no
 import. The download plugin layer composes this with the existing
 post-processing / matching pipeline. Lidarr does NOT use this module:
-Lidarr extracts archives in its own import step before SoulSync sees
+Lidarr extracts archives in its own import step before Commissary sees
 the files at all. Usenet downloaders (SABnzbd, NZBGet) also auto-
-extract by default. Torrents are the main case where SoulSync may
+extract by default. Torrents are the main case where Commissary may
 need to do the extract step itself — most music torrents ship loose,
 but some bundle the album in a ``.rar`` archive.
 

@@ -54,7 +54,7 @@ class LastFMClient:
         self.session_key = session_key
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'SoulSync/1.0',
+            'User-Agent': 'Commissary/1.0',
             'Accept': 'application/json'
         })
         logger.info("Last.fm client initialized")
@@ -69,7 +69,7 @@ class LastFMClient:
     def get_auth_url(self, callback_url: str) -> Optional[str]:
         """Generate the Last.fm authorization URL for scrobbling.
 
-        User visits this URL, authorizes SoulSync, gets redirected back with a token.
+        User visits this URL, authorizes Commissary, gets redirected back with a token.
         """
         if not self.api_key:
             return None

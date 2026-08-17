@@ -629,7 +629,7 @@ class _RealFS:
     @staticmethod
     def save_url(url, dst):
         import urllib.request
-        req = urllib.request.Request(url, headers={"User-Agent": "SoulSync"})
+        req = urllib.request.Request(url, headers={"User-Agent": "Commissary"})
         with urllib.request.urlopen(req, timeout=20) as resp, open(dst, "wb") as f:
             shutil.copyfileobj(resp, f)
 

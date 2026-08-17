@@ -1366,12 +1366,12 @@ async function openDownloadMissingModalForTidal(virtualPlaylistId, playlistName,
                     virtualPlaylistId.startsWith('spotify_public_') ? 'Spotify' :
                         virtualPlaylistId.startsWith('itunes_link_') ? 'iTunes' :
                             virtualPlaylistId.startsWith('spotify:') ? 'Spotify' :
-                                virtualPlaylistId.startsWith('discover_') ? 'SoulSync' :
-                                    virtualPlaylistId.startsWith('seasonal_') ? 'SoulSync' :
-                                        virtualPlaylistId.startsWith('spotify_library_') ? 'SoulSync' :
-                                            virtualPlaylistId.startsWith('build_playlist_') ? 'SoulSync' :
-                                                virtualPlaylistId.startsWith('decade_') ? 'SoulSync' :
-                                                    virtualPlaylistId === 'build_playlist_custom' ? 'SoulSync' :
+                                virtualPlaylistId.startsWith('discover_') ? 'Commissary' :
+                                    virtualPlaylistId.startsWith('seasonal_') ? 'Commissary' :
+                                        virtualPlaylistId.startsWith('spotify_library_') ? 'Commissary' :
+                                            virtualPlaylistId.startsWith('build_playlist_') ? 'Commissary' :
+                                                virtualPlaylistId.startsWith('decade_') ? 'Commissary' :
+                                                    virtualPlaylistId === 'build_playlist_custom' ? 'Commissary' :
                                                         'YouTube';
 
     const heroContext = {
@@ -3795,7 +3795,7 @@ function initializeSyncPage() {
                 }
             }
 
-            // SoulSync Discovery Sync tab — personalized_playlists pre-
+            // Commissary Discovery Sync tab — personalized_playlists pre-
             // matched, no discovery hop needed; click → refresh kind →
             // mirror under synthetic id.
             if (tabId === 'soulsync-discovery-sync') {

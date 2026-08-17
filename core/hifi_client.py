@@ -270,7 +270,7 @@ class HiFiClient(DownloadSourcePlugin):
 
         self.session = http_requests.Session()
         self.session.headers.update({
-            'User-Agent': 'SoulSync/1.0',
+            'User-Agent': 'Commissary/1.0',
             'Accept': 'application/json',
         })
 
@@ -587,7 +587,7 @@ class HiFiClient(DownloadSourcePlugin):
         return fallback
 
     def check_instance_capabilities(self, url: str, timeout: int = 5) -> Dict[str, Any]:
-        """Probe one public HiFi instance using the endpoints SoulSync needs."""
+        """Probe one public HiFi instance using the endpoints Commissary needs."""
         entry = {
             'url': url,
             'status': 'unknown',

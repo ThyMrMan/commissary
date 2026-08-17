@@ -2,9 +2,9 @@
 
 ## Goal
 
-Same playbook as the download engine refactor, applied to media servers. Replace 33 `if active_server == 'plex' / 'jellyfin' / 'navidrome' / 'soulsync'` dispatch sites in web_server.py with a central `MediaServerEngine` that owns server selection + cross-server query dispatch. Each per-server client stays as-is for its protocol-specific work (Plex API SDK, Jellyfin REST, Navidrome OpenSubsonic, SoulSync filesystem walk).
+Same playbook as the download engine refactor, applied to media servers. Replace 33 `if active_server == 'plex' / 'jellyfin' / 'navidrome' / 'soulsync'` dispatch sites in web_server.py with a central `MediaServerEngine` that owns server selection + cross-server query dispatch. Each per-server client stays as-is for its protocol-specific work (Plex API SDK, Jellyfin REST, Navidrome OpenSubsonic, Commissary filesystem walk).
 
-**The smell:** Adding a 5th server (recent SoulSync standalone showed how) requires hunting through 33 web_server.py dispatch sites + DatabaseUpdateWorker branching + UI sync-button visibility hacks. Plex assumptions had leaked into nominally generic code paths.
+**The smell:** Adding a 5th server (recent Commissary standalone showed how) requires hunting through 33 web_server.py dispatch sites + DatabaseUpdateWorker branching + UI sync-button visibility hacks. Plex assumptions had leaked into nominally generic code paths.
 
 ## Architecture target
 
@@ -13,7 +13,7 @@ Same playbook as the download engine refactor, applied to media servers. Replace
 │  feature  │ ─search/scan/sync─▶ ┌──│ MediaServerEngine │ ─▶ Plex (PlexAPI SDK)
 │           │ ◀── results ──────  │  │ ◆ active selection│ ─▶ Jellyfin (REST)
 └───────────┘                     │  │ ◆ dispatch        │ ─▶ Navidrome (Subsonic)
-                                  │  │ ◆ shared shape   │ ─▶ SoulSync (filesystem)
+                                  │  │ ◆ shared shape   │ ─▶ Commissary (filesystem)
                                   │  └──────────────────┘
                                   │  (no need for per-server thread pool — server APIs
                                   │   are sync-call shaped, not stream-shaped like downloads)
@@ -21,11 +21,11 @@ Same playbook as the download engine refactor, applied to media servers. Replace
 
 ## What clients keep (per-server, legitimately)
 
-- **Auth** — Plex token, Jellyfin API key + user ID + library ID, Navidrome user/pass + salt, SoulSync filesystem path
+- **Auth** — Plex token, Jellyfin API key + user ID + library ID, Navidrome user/pass + salt, Commissary filesystem path
 - **Wire protocol** — PlexAPI SDK objects vs Jellyfin REST `/Items` vs Navidrome XML/JSON Subsonic vs filesystem walk
-- **ID schemes** — Plex ratingKey (int), Jellyfin GUID (hex), Navidrome string, SoulSync MD5
+- **ID schemes** — Plex ratingKey (int), Jellyfin GUID (hex), Navidrome string, Commissary MD5
 - **Connection state** — each client owns its session / token / connection object
-- **Cache strategy** — Jellyfin's aggressive pre-cache, Navidrome's folder filter, SoulSync's 5-min TTL
+- **Cache strategy** — Jellyfin's aggressive pre-cache, Navidrome's folder filter, Commissary's 5-min TTL
 - **Wrapper objects** — `JellyfinTrack`, `NavidromeTrack`, etc. stay in client modules
 
 ## What moves into the engine
@@ -60,7 +60,7 @@ class MediaServerClient(ABC):
     @abstractmethod
     def get_recently_added_albums(self, max_results=400): ...
 
-    # Library writes (required for the scan endpoints — may no-op for SoulSync)
+    # Library writes (required for the scan endpoints — may no-op for Commissary)
     @abstractmethod
     def trigger_library_scan(self) -> bool: ...
     @abstractmethod
@@ -93,7 +93,7 @@ class MediaServerClient(ABC):
 - **A1** Pin Plex client surface (status check, search, scan trigger, metadata writeback shape)
 - **A2** Pin Jellyfin client surface
 - **A3** Pin Navidrome client surface
-- **A4** Pin SoulSync standalone client surface
+- **A4** Pin Commissary standalone client surface
 
 ### Phase B — Engine skeleton
 - **B1** `MediaServerEngine` skeleton — holds clients, exposes `active_server` selection
@@ -139,7 +139,7 @@ Each commit migrates a logical cluster (status, scan, playlist, metadata, histor
 
 ## What's NOT in this PR
 
-- Unifying track ID schemes (Plex int vs Jellyfin GUID vs Navidrome string vs SoulSync MD5) — separate data model refactor
+- Unifying track ID schemes (Plex int vs Jellyfin GUID vs Navidrome string vs Commissary MD5) — separate data model refactor
 - Merging Plex/Jellyfin/Navidrome wrapper objects (each tied to its API)
 - Extracting common metadata writeback logic — too server-specific
 - Adding new server types (Subsonic, MusicBrainz local) — out of scope; this PR makes them easier later
@@ -154,6 +154,6 @@ Each commit migrates a logical cluster (status, scan, playlist, metadata, histor
 
 - All existing config keys preserved
 - All existing API endpoints preserved
-- Plex/Jellyfin/Navidrome/SoulSync clients keep their public methods (engine wraps, doesn't replace)
+- Plex/Jellyfin/Navidrome/Commissary clients keep their public methods (engine wraps, doesn't replace)
 - Active-server config (`server.active`) unchanged
 - `DatabaseUpdateWorker.server_type` available for external readers (deprecated but not removed)

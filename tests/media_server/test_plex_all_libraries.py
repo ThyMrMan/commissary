@@ -409,7 +409,7 @@ def test_dedupe_artists_keeps_canonical_with_higher_track_count():
     """Pin: same-name artists across sections collapse to one — the
     one with the higher leafCount wins. Plex Home users with overlapping
     music tastes (both have Drake) shouldn't see "Drake" twice in
-    SoulSync's library."""
+    Commissary's library."""
     server = MagicMock()
     client = _make_client(server=server, all_libraries_mode=True, music_library=None)
 

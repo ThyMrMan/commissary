@@ -1,7 +1,7 @@
 """Artist photo picker seams: per-source candidate gathering + the DB pin.
 
 The scenario this exists for (Discord report): an artist got mis-matched to
-the wrong Deezer artist, SoulSync wrote the wrong photo to artist.jpg on
+the wrong Deezer artist, Commissary wrote the wrong photo to artist.jpg on
 disk, and Navidrome kept showing it forever — re-matching fixed the metadata
 but nothing ever offered a way to fix the PHOTO everywhere. The picker pulls
 one candidate per CONNECTED metadata source and applying writes DB + server

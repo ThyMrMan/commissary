@@ -1,6 +1,6 @@
 """Per-title quality profiles + follow-time monitor policies (arr-parity P2).
 
-Radarr/Sonarr assign a profile PER title; SoulSync had one global blob. Named
+Radarr/Sonarr assign a profile PER title; Commissary had one global blob. Named
 profiles now live beside it ('quality_profiles', Default stays id 0 at the
 classic key so every old reader keeps working), titles carry an assignment
 (movies/shows/video_wishlist.quality_profile_id), the drain/RSS/manual seams

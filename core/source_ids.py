@@ -1,6 +1,6 @@
 """Canonical registry of external/source ID column names.
 
-SoulSync stores each metadata provider's ID for an artist/album/track under a
+Commissary stores each metadata provider's ID for an artist/album/track under a
 column whose NAME is inconsistent across tables — e.g. Deezer's artist id is
 ``deezer_id`` on the ``artists`` table but ``deezer_artist_id`` on
 ``watchlist_artists`` and ``album_deezer_id`` / ``similar_artist_deezer_id`` on

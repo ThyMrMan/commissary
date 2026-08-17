@@ -2,7 +2,7 @@
 
 Goal: stand in as a READ-ONLY Spotify metadata source when the user has no
 Spotify auth (or is rate-limited), mapping SpotipyFree's outputs onto the same
-Spotify-compatible shapes the rest of SoulSync already consumes
+Spotify-compatible shapes the rest of Commissary already consumes
 (see core/spotify_client.py + core/search/sources.py).
 
 Unofficial / web-player scraping — best-effort, fragile, and NOT a substitute
@@ -81,7 +81,7 @@ def should_use_free_fallback(authenticated: bool, rate_limited: bool,
 
 
 def should_offer_spotify_metadata(authenticated: bool, free_available: bool) -> bool:
-    """The availability gate: SoulSync can serve *some* Spotify metadata when
+    """The availability gate: Commissary can serve *some* Spotify metadata when
     either real auth is present, or the no-creds fallback is available. The
     upstream gates (search resolve, enrichment worker, watchlist) use this so
     the fallback is actually reachable — without changing what
@@ -111,10 +111,10 @@ def should_block_rate_limited_resume(rate_limited: bool, metadata_available: boo
 def normalize_artist(raw: dict) -> dict:
     """Map a raw SpotipyFree/spotapi artist object (from ``artist()`` or an
     ``artist_search`` item's ``data``) onto the Spotify-compatible artist dict
-    SoulSync expects: ``{id, name, images, genres, followers, external_urls}``.
+    Commissary expects: ``{id, name, images, genres, followers, external_urls}``.
 
     Artist-search items carry no usable image (only color swatches), so
-    ``images`` may be empty there — SoulSync lazy-loads artist art separately.
+    ``images`` may be empty there — Commissary lazy-loads artist art separately.
     Genres aren't provided by the web player at all.
     """
     raw = raw or {}
@@ -153,7 +153,7 @@ def normalize_artist(raw: dict) -> dict:
 # --------------------------------------------------------------------------
 
 class SpotifyFreeMetadataClient:
-    """Read-only Spotify metadata via SpotipyFree, normalized to SoulSync's
+    """Read-only Spotify metadata via SpotipyFree, normalized to Commissary's
     Spotify-compatible shapes. Methods mirror the metadata-source interface."""
 
     def __init__(self):

@@ -1,5 +1,5 @@
 """
-SoulSync Public REST API  (v1)
+Commissary Public REST API  (v1)
 
 Blueprint factory + rate-limiter initialisation.
 """

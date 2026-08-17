@@ -1,7 +1,7 @@
 """Phase A pinning tests for SoulSyncClient (standalone library mode).
 
 Pin the OBSERVABLE BEHAVIOR the engine will dispatch through.
-SoulSync standalone is the structurally-different one — no auth /
+Commissary standalone is the structurally-different one — no auth /
 no API / no library scan. is_connected just checks `transfer_path`
 is a directory. Filesystem walk happens via _get_cached_scan().
 """

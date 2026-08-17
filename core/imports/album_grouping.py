@@ -1,6 +1,6 @@
-"""Canonical album grouping for the SoulSync standalone import.
+"""Canonical album grouping for the Commissary standalone import.
 
-SoulSync grouped imported tracks into albums by the album NAME string
+Commissary grouped imported tracks into albums by the album NAME string
 (``_stable_soulsync_id("artist::album_name")``). That splits one release into
 several album rows whenever the name string drifts between imports (case,
 punctuation, ``(Deluxe Edition)`` suffixes, source-A-vs-B spelling), and every

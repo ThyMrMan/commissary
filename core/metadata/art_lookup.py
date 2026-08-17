@@ -360,7 +360,7 @@ def _fetch_caa_release(mbid: str) -> Optional[dict]:
     import urllib.request
     req = urllib.request.Request(
         f"{_COVER_ART_ARCHIVE}/release/{mbid}",
-        headers={"User-Agent": "SoulSync/1.0 (cover-art picker)"},
+        headers={"User-Agent": "Commissary/1.0 (cover-art picker)"},
     )
     with urllib.request.urlopen(req, timeout=10) as resp:   # noqa: S310 (trusted host)
         return json.loads(resp.read().decode("utf-8"))

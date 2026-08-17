@@ -1,6 +1,6 @@
 """Standalone T2Tunes/TripleTriple API probe.
 
-This is intentionally not wired into SoulSync's download source registry.
+This is intentionally not wired into Commissary's download source registry.
 It validates the API surface Tubifarry targets:
 
     /api/status
@@ -232,7 +232,7 @@ class T2TunesClient:
         headers = {
             "Accept": "application/json",
             "Referer": self.base_url,
-            "User-Agent": "SoulSync-T2Tunes-Probe/0.1",
+            "User-Agent": "Commissary-T2Tunes-Probe/0.1",
         }
         try:
             response = self.session.get(url, params=params, headers=headers, timeout=self.timeout)

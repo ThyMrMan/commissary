@@ -553,7 +553,7 @@ def release_to_spotify_shape(
 ) -> Dict[str, Any]:
     """Reshape a get_release_metadata()/search_album() result into the
     'Spotify-shaped' dict (name/artists/images/tracks with
-    name/duration_ms/track_number) the rest of SoulSync's album/track
+    name/duration_ms/track_number) the rest of Commissary's album/track
     pipeline expects via its duck-typed field extraction
     (core.metadata.album_tracks._extract_lookup_value chains like
     'name', 'track_name', 'trackName' — Bandcamp's own field names

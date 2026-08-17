@@ -41,7 +41,7 @@ class WebMetadataUpdateWorker:
         self.successful_count = 0
         self.failed_count = 0
         self.max_workers = 1
-        # DB-first: reuse existing metadata from SoulSync database
+        # DB-first: reuse existing metadata from Commissary database
         try:
             from database.music_database import MusicDatabase
             self._db = MusicDatabase()
@@ -178,7 +178,7 @@ class WebMetadataUpdateWorker:
             return True  # Process if we can't determine status
     
     def _check_db_artist(self, artist_name):
-        """Check SoulSync DB for existing artist metadata (genres, spotify_artist_id).
+        """Check Commissary DB for existing artist metadata (genres, spotify_artist_id).
 
         NOTE: DB thumb_url is a Plex/Jellyfin internal path, NOT a downloadable URL.
         Photos must be checked via the media server object, not the DB.
@@ -216,7 +216,7 @@ class WebMetadataUpdateWorker:
             return None, False, None
 
     def update_artist_metadata(self, artist):
-        """Update a single artist's metadata. Checks SoulSync DB first to avoid unnecessary API calls.
+        """Update a single artist's metadata. Checks Commissary DB first to avoid unnecessary API calls.
 
         DB-first strategy:
         - Genres: DB stores real genre strings → can apply directly, skip Spotify

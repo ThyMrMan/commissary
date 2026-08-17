@@ -8,11 +8,11 @@ chase those ourselves (we tried; Spotify 429s the bare token), we lean on
 SpotipyFree — the maintained no-creds ``spotipy`` drop-in that spotDL uses,
 which tracks those rotating bits for us.
 
-Licensing: SpotipyFree is GPL-3.0, so it is NOT bundled or required by SoulSync
+Licensing: SpotipyFree is GPL-3.0, so it is NOT bundled or required by Commissary
 (MIT). It's an OPTIONAL install — if the user has run ``pip install spotipyFree``
 this lights up; otherwise the import fails, this raises, and the caller
 (``spotify_public_scraper.fetch_spotify_public``) falls back to the embed
-scraper (today's ≤100). So SoulSync ships zero GPL code and stays cleanly MIT.
+scraper (today's ≤100). So Commissary ships zero GPL code and stays cleanly MIT.
 
 ``client_factory`` is injectable so the orchestration is unit-testable without
 the library or the network.

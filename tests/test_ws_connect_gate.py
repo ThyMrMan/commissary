@@ -84,7 +84,7 @@ def test_socket_allowed_when_pin_verified(monkeypatch):
     assert sio.is_connected() is True
 
 
-# ── login mode (the "Sign in to SoulSync" path — #852 report was this one) ──
+# ── login mode (the "Sign in to Commissary" path — #852 report was this one) ──
 def _login_on(monkeypatch):
     real = web_server.config_manager.get
     monkeypatch.setattr(web_server.config_manager, 'get',

@@ -11,7 +11,7 @@ client is busy, or the torrent list is big enough that /torrents/info is slow.
 
 The consequence is worse than the wrong message: with no hash the grab is
 recorded as FAILED, so nothing ever polls the download, and the completed file is
-never imported. It arrives and SoulSync does not know it exists.
+never imported. It arrives and Commissary does not know it exists.
 
 The hash is knowable before the add in both real cases — a magnet carries it, a
 .torrent is the SHA-1 of its bencoded ``info`` value — so it only has to be

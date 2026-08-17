@@ -3,7 +3,7 @@
 Settings → YouTube offers two ways to authenticate yt-dlp:
 
 * a **browser dropdown** (Chrome/Firefox/…) → yt-dlp ``cookiesfrombrowser``, which
-  reads a logged-in browser's cookie store *on the same machine as SoulSync*. Great
+  reads a logged-in browser's cookie store *on the same machine as Commissary*. Great
   for local installs, useless on a headless server / Docker box (no browser there).
 * a **"Paste cookies.txt"** mode → yt-dlp ``cookiefile``, a Netscape-format cookie
   file the user exports (e.g. with a "Get cookies.txt LOCALLY" extension) and pastes

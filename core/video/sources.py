@@ -1,4 +1,4 @@
-"""SoulSync — video media-server adapters (Plex / Jellyfin).
+"""Commissary — video media-server adapters (Plex / Jellyfin).
 
 Turn the live, already-connected media clients (owned by the shared
 MediaServerEngine) into normalized dicts the scanner understands. We REUSE the
@@ -684,7 +684,7 @@ class PlexVideoSource:
             return {"ok": False, "error": str(e)}
 
     # ── User metadata edits (Manage sidebar) ──────────────────────────────────
-    # SoulSync editable field -> Plex edit field. Every pushed field is also
+    # Commissary editable field -> Plex edit field. Every pushed field is also
     # LOCKED on Plex ('field.locked': 1) so Plex's own agents don't undo the
     # user's edit on their next refresh — the lock travels with the value.
     _EDIT_FIELDS = {
@@ -697,7 +697,7 @@ class PlexVideoSource:
                            unlock_fields=None) -> dict:
         """Push user metadata edits to a Plex item (by ratingKey), locking each
         pushed field server-side. ``unlock_fields`` releases Plex's field lock
-        (used when the user releases a SoulSync lock). Fields Plex can't edit
+        (used when the user releases a Commissary lock). Fields Plex can't edit
         (e.g. a show's network) are reported back in ``skipped``."""
         try:
             item = self._server.fetchItem(int(server_id))
@@ -747,7 +747,7 @@ class PlexVideoSource:
             logger.exception("Plex: set_watched failed for %s", server_id)
             return {"ok": False, "error": str(e)}
 
-    # ── Collections (SoulSync-managed) ────────────────────────────────────────
+    # ── Collections (Commissary-managed) ────────────────────────────────────────
     def _collection_section(self, kind: str):
         """The library section collections of a kind live in — the mapped one,
         else the first section of that kind."""
@@ -925,7 +925,7 @@ class PlexVideoSource:
                         "section": getattr(sec, "title", None),
                         # Provenance fingerprints: Kometa labels everything it
                         # manages ('Kometa'/'PMM'); smart = filter-based, which
-                        # SoulSync never creates.
+                        # Commissary never creates.
                         "labels": labels,
                         "smart": bool(getattr(c, "smart", False)),
                     })
@@ -1355,7 +1355,7 @@ class JellyfinVideoSource:
             logger.exception("Jellyfin: set_watched failed for %s", server_id)
             return {"ok": False, "error": str(e)}
 
-    # ── Collections (BoxSets; SoulSync-managed) ───────────────────────────────
+    # ── Collections (BoxSets; Commissary-managed) ───────────────────────────────
     def _jf(self):
         base = (self._c.base_url or "").rstrip("/")
         return base, {"X-Emby-Token": self._c.api_key or ""}

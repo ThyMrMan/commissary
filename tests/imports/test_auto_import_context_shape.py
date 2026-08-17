@@ -4,7 +4,7 @@
 Background
 ----------
 
-Auto-import doesn't write to the SoulSync standalone DB itself —
+Auto-import doesn't write to the Commissary standalone DB itself —
 it routes every matched track through the same
 ``_post_process_matched_download`` callback the regular download
 flow uses. The pipeline downstream (``record_soulsync_library_entry``,
@@ -22,7 +22,7 @@ reads:
 
 If the worker drops any of these, the soulsync library row gets
 written but with NULL on every source-id column, and library history
-mislabels every imported file as a Soulseek download. SoulSync
+mislabels every imported file as a Soulseek download. Commissary
 standalone is meant to be a full server replacement so it must reach
 parity with what a Plex / Jellyfin / Navidrome scan would write. These
 tests pin that contract at the worker boundary.

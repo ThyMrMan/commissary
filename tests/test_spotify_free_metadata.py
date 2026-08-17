@@ -123,7 +123,7 @@ _RAW_ARTIST = {
 }
 
 # Trimmed from a real `artist_search` item's `data` (no usable image — only
-# color swatches under visualIdentity; SoulSync lazy-loads art separately).
+# color swatches under visualIdentity; Commissary lazy-loads art separately).
 _RAW_SEARCH_ARTIST = {
     '__typename': 'Artist',
     'uri': 'spotify:artist:1dfeR4HaWDbWqFHLkxsg1d',

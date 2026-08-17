@@ -44,7 +44,7 @@ def read_file_tags(file_path: str) -> Dict[str, Any]:
         'replaygain_track_peak': None,
         'replaygain_album_gain': None,
         'replaygain_album_peak': None,
-        # SoulSync verification status ('verified'/'unverified'/'force_imported')
+        # Commissary verification status ('verified'/'unverified'/'force_imported')
         'verification_status': None,
     }
 
@@ -170,7 +170,7 @@ def is_placeholder_meta(value: Any) -> bool:
 
 
 def write_verification_status(file_path: str, status: str) -> bool:
-    """Embed the SoulSync verification status into the file's tags.
+    """Embed the Commissary verification status into the file's tags.
 
     Vorbis comment ``SOULSYNC_VERIFICATION`` (FLAC/OGG/Opus), ID3
     ``TXXX:SOULSYNC_VERIFICATION`` (MP3), MP4 freeform

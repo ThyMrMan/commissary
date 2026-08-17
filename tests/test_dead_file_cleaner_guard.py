@@ -1,6 +1,6 @@
 """Dead File Cleaner — mass-false-positive guard (#828).
 
-macstainless: a Plex-on-macOS user running SoulSync in Docker had all 5,250
+macstainless: a Plex-on-macOS user running Commissary in Docker had all 5,250
 tracks flagged "dead" because their stored /Volumes/... paths don't exist inside
 the container. The resolver returning None means "couldn't find it at any known
 base dir" — for a mis-mounted library that's EVERY track, not a real deletion.

@@ -225,7 +225,7 @@ def get_debug_info():
     )
     # Always-available public metadata sources (no auth, no per-user
     # connection state). Listed so the debug dump reflects the full
-    # metadata surface SoulSync queries from, not just the auth-gated ones.
+    # metadata surface Commissary queries from, not just the auth-gated ones.
     info['services']['always_available_metadata_sources'] = [
         'deezer', 'itunes', 'musicbrainz',
     ]

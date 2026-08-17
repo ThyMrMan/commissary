@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video Discover page (isolated, in-app).
+ * Commissary — Video Discover page (isolated, in-app).
  *
  * A browse-everything page for TMDB titles you don't own yet: a cross-fading
  * trending hero, personalized "because you like…" rails, then a deep stack of

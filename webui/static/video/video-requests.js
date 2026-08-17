@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video Requests page (arr-parity P4): the in-app Overseerr.
+ * Commissary — Video Requests page (arr-parity P4): the in-app Overseerr.
  *
  * Members file requests from preview detail pages; this page is where they
  * live. Admins see everyone's with Approve / Deny (deny takes an optional

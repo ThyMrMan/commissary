@@ -182,7 +182,7 @@ def run_service_test(service, test_config):
                                 break
                     if found_enough:
                         break
-                return True, f"SoulSync standalone ready! Output folder: {transfer_path}" + (f" ({count}+ audio files)" if count > 0 else " (empty)")
+                return True, f"Commissary standalone ready! Output folder: {transfer_path}" + (f" ({count}+ audio files)" if count > 0 else " (empty)")
             else:
                 return False, f"Output folder not found: {transfer_path}"
         elif service == "soulseek":
@@ -453,7 +453,7 @@ def run_service_test(service, test_config):
                 resp = requests.get(
                     'https://api.discogs.com/database/search',
                     params={'q': 'beatles', 'per_page': 1},
-                    headers={'Authorization': f'Discogs token={token}', 'User-Agent': 'SoulSync/1.0'},
+                    headers={'Authorization': f'Discogs token={token}', 'User-Agent': 'Commissary/1.0'},
                     timeout=10,
                 )
                 if resp.ok:

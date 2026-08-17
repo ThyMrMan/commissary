@@ -2242,7 +2242,7 @@ class WatchlistScanner:
                         # fall through to the fuzzy path (same album gate), which wishlists it
                     else:
                         # Second-tier fallback: provenance table. Catches the
-                        # window between "SoulSync downloaded the file" and
+                        # window between "Commissary downloaded the file" and
                         # "media-server scan + sync populated the tracks row
                         # with IDs". File still has to exist on disk —
                         # otherwise a user who deleted a file would never get

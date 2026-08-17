@@ -6,7 +6,7 @@
 NTFY_URL="${NTFY_URL:-https://ntfy.sh}"
 NTFY_TOPIC="${NTFY_TOPIC:-soulsync}"
 
-curl -s -d "SoulSync automation '${SOULSYNC_AUTOMATION}' completed" \
+curl -s -d "Commissary automation '${SOULSYNC_AUTOMATION}' completed" \
     "${NTFY_URL}/${NTFY_TOPIC}" > /dev/null 2>&1
 
 echo "Notification sent to ${NTFY_URL}/${NTFY_TOPIC}"

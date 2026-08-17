@@ -6,7 +6,7 @@ Artist-discography fallback needs a stricter three-state contract:
 
 * results: the provider completed and returned releases;
 * empty: the provider completed successfully but returned no releases;
-* error: SoulSync could not complete communication with the provider.
+* error: Commissary could not complete communication with the provider.
 
 The guard works on request-local shallow copies. Shared registry clients and all
 non-discography callers retain their existing behaviour.

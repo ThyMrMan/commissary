@@ -24,7 +24,7 @@ release in ``/api/artists/{id}/albums`` is labelled ``type: album`` even when
 it is a one-track single. Many standalone singles only appear under
 ``/api/artists/{id}/songs`` (individual tracks), not in the albums feed.
 
-SoulSync does not synthesize a singles section from the songs feed. Artist
+Commissary does not synthesize a singles section from the songs feed. Artist
 discography for JioSaavn therefore surfaces **albums only** — the Singles tab
 on artist detail will be empty. Individual songs are still searchable via
 ``/api/search/songs`` and openable as tracks; this limitation applies only to
@@ -264,7 +264,7 @@ class JioSaavnClient:
         if isinstance(self.session, requests.Session):
             self.session.headers.update({
                 "Accept": "application/json",
-                "User-Agent": "SoulSync/1.0",
+                "User-Agent": "Commissary/1.0",
             })
 
     def reload_config(self) -> None:

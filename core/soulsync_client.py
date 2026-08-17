@@ -1,4 +1,4 @@
-"""SoulSync Standalone Library Client — filesystem-based media server replacement.
+"""Commissary Standalone Library Client — filesystem-based media server replacement.
 
 Implements the same interface as Plex/Jellyfin/Navidrome clients so the
 DatabaseUpdateWorker can scan the Transfer folder directly without an
@@ -99,7 +99,7 @@ class SoulSyncTrack:
         self.bitRate = tags['bitrate']
         self.suffix = os.path.splitext(file_path)[1].lstrip('.').lower()
         # File size in bytes (powers Library Disk Usage card on Stats).
-        # SoulSync standalone is the only "server" where we can read
+        # Commissary standalone is the only "server" where we can read
         # size from disk directly — Plex/Jellyfin/Navidrome get theirs
         # from the API response.
         try:
@@ -194,7 +194,7 @@ from core.media_server.contract import MediaServerClient
 
 
 class SoulSyncClient(MediaServerClient):
-    """Filesystem-based media server client for standalone SoulSync operation.
+    """Filesystem-based media server client for standalone Commissary operation.
 
     Scans the Transfer folder recursively, reads audio file tags, and
     returns artist/album/track objects in the same format as the
@@ -265,7 +265,7 @@ class SoulSyncClient(MediaServerClient):
             return []
 
         self._emit_progress(f"Scanning {self._transfer_path}...")
-        logger.info(f"[SoulSync] Scanning Transfer folder: {self._transfer_path}")
+        logger.info(f"[Commissary] Scanning Transfer folder: {self._transfer_path}")
 
         # Walk filesystem and collect all audio files with tags
         file_entries = []  # (file_path, tags)
@@ -294,7 +294,7 @@ class SoulSyncClient(MediaServerClient):
                 if scanned % 100 == 0:
                     self._emit_progress(f"Reading tags: {scanned} files...")
 
-        logger.info(f"[SoulSync] Found {len(file_entries)} audio files")
+        logger.info(f"[Commissary] Found {len(file_entries)} audio files")
         self._emit_progress(f"Found {len(file_entries)} audio files, building library...")
 
         # Group by artist → album
@@ -378,7 +378,7 @@ class SoulSyncClient(MediaServerClient):
 
             artists.append(artist_obj)
 
-        logger.info(f"[SoulSync] Built library: {len(artists)} artists, "
+        logger.info(f"[Commissary] Built library: {len(artists)} artists, "
                      f"{sum(len(a.albums()) for a in artists)} albums, "
                      f"{sum(sum(len(al.tracks()) for al in a.albums()) for a in artists)} tracks")
 

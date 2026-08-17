@@ -1,5 +1,5 @@
 """
-Shared response helpers for the SoulSync public API.
+Shared response helpers for the Commissary public API.
 """
 
 from typing import Optional, Set

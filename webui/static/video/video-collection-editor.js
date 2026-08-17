@@ -1,7 +1,7 @@
 /*
- * SoulSync — Collection Studio.
+ * Commissary — Collection Studio.
  *
- * A full-bleed studio page (Overlay Studio chrome) for SoulSync-managed
+ * A full-bleed studio page (Overlay Studio chrome) for Commissary-managed
  * movie/show collections:
  *   · Gallery — every managed collection with live sync state + quick actions.
  *   · Easy setup — Kometa-style preset packs (Genres/Decades/Franchises/…)
@@ -59,7 +59,7 @@
     function memberPosterURL(mediaType, id) {
         return '/api/video/poster/' + (mediaType === 'show' ? 'show' : 'movie') + '/' + id + '?w=140';
     }
-    // SoulSync's standard yes/no modal (core.js), promise-based; window.confirm
+    // Commissary's standard yes/no modal (core.js), promise-based; window.confirm
     // only as a fallback if the shell didn't provide it.
     function ask(opts) {
         if (typeof showConfirmDialog === 'function') return showConfirmDialog(opts);
@@ -371,7 +371,7 @@
             var ids = Object.keys(gal.selected);
             if (!ids.length) return;
             ask({ title: 'Delete ' + ids.length + ' collection' + (ids.length === 1 ? '' : 's') + '?',
-                  message: 'Removes the SoulSync definitions. Collections already on your server are left ' +
+                  message: 'Removes the Commissary definitions. Collections already on your server are left ' +
                            'in place — remove those from the On server view if you want them gone there too.',
                   confirmText: 'Delete', cancelText: 'Cancel', destructive: true }).then(function (ok) {
                 if (!ok) return;
@@ -932,9 +932,9 @@
         page.appendChild(h('div', 'vce-preshead', '<h2>Collections on your server</h2>'));
         page.appendChild(h('p', 'vce-servnote',
             'Everything that currently exists on the media server — including collections made by other tools ' +
-            '(old Kometa runs, hand-made ones). ADOPT the ones you want to keep: SoulSync takes over managing ' +
+            '(old Kometa runs, hand-made ones). ADOPT the ones you want to keep: Commissary takes over managing ' +
             'them with their members and artwork intact. Deleting removes the collection from the server only; ' +
-            'titles are never touched (a SoulSync-managed one just recreates on the next sync unless you also ' +
+            'titles are never touched (a Commissary-managed one just recreates on the next sync unless you also ' +
             'pause or delete its definition).'));
 
         var hostEl = h('div');
@@ -956,7 +956,7 @@
             var picked = {};
 
             var quick = h('div', 'vce-quick');
-            var selects = [['Not SoulSync’s', function (c) { return !c.managed; }]];
+            var selects = [['Not Commissary’s', function (c) { return !c.managed; }]];
             if (cols.some(function (c) { return c.kometa; })) {
                 selects.push(['Kometa’s', function (c) { return c.kometa; }]);
             }
@@ -982,15 +982,15 @@
             foot.appendChild(h('div', 'vce-foot-spacer'));
             var adoptBtn = h('button', 'vce-btn', I.brand + 'Adopt selected');
             adoptBtn.type = 'button';
-            adoptBtn.title = 'Bring these collections under SoulSync management (keeps their members and artwork)';
+            adoptBtn.title = 'Bring these collections under Commissary management (keeps their members and artwork)';
             adoptBtn.addEventListener('click', function () {
                 var ids = Object.keys(picked);
                 if (!ids.length) return;
                 var items = cols.filter(function (c) { return picked[c.server_id] && !c.managed; })
                                 .map(function (c) { return { server_id: c.server_id, name: c.name }; });
-                if (!items.length) { toast('Those are already managed by SoulSync'); return; }
+                if (!items.length) { toast('Those are already managed by Commissary'); return; }
                 ask({ title: 'Adopt ' + items.length + ' collection' + (items.length === 1 ? '' : 's') + '?',
-                      message: 'SoulSync takes over managing them — members and artwork are kept exactly ' +
+                      message: 'Commissary takes over managing them — members and artwork are kept exactly ' +
                                'as they are, and they join the daily sync. You can edit or delete them from ' +
                                'the gallery afterwards.',
                       confirmText: 'Adopt', cancelText: 'Cancel' }).then(function (ok) {
@@ -1002,7 +1002,7 @@
                             var bits = [n + ' adopted'];
                             if (r.skipped && r.skipped.length) bits.push(r.skipped.length + ' skipped');
                             toast(bits.join(' · '));
-                            showServer();                 // fresh read — they now show as SoulSync's
+                            showServer();                 // fresh read — they now show as Commissary's
                         } else {
                             toast((r && r.error) || 'Adopt failed', true);
                             adoptBtn.disabled = false;
@@ -1017,7 +1017,7 @@
                 var ids = Object.keys(picked);
                 if (!ids.length) return;
                 var managedN = cols.filter(function (c) { return picked[c.server_id] && c.managed; }).length;
-                var msg = (managedN ? (managedN + ' of these are SoulSync-managed and will be recreated on the next sync. ') : '') +
+                var msg = (managedN ? (managedN + ' of these are Commissary-managed and will be recreated on the next sync. ') : '') +
                     'Titles themselves are never touched.';
                 ask({ title: 'Delete ' + ids.length + ' collection' + (ids.length === 1 ? '' : 's') + ' from the server?',
                       message: msg, confirmText: 'Delete', cancelText: 'Cancel',
@@ -1056,9 +1056,9 @@
                         '<span class="vce-cb">' + I.check + '</span>' +
                         '<span class="vce-entry-name">' + esc(c.name || '(unnamed)') + '</span>' +
                         (c.media_type ? '<span class="vce-tag">' + esc(mediaWord(c.media_type, true)) + '</span>' : '') +
-                        (c.smart ? '<span class="vce-tag" title="Filter-based smart collection — not created by SoulSync">Smart</span>' : '') +
+                        (c.smart ? '<span class="vce-tag" title="Filter-based smart collection — not created by Commissary">Smart</span>' : '') +
                         (c.kometa ? '<span class="vce-tag vce-tag--warn" title="Carries a Kometa/PMM label">Kometa</span>' : '') +
-                        (c.managed ? '<span class="vce-tag vce-tag--ok" title="Managed by the definition “' + esc(c.definition_name || '') + '”">SoulSync</span>' : '') +
+                        (c.managed ? '<span class="vce-tag vce-tag--ok" title="Managed by the definition “' + esc(c.definition_name || '') + '”">Commissary</span>' : '') +
                         '<span class="vce-entry-count">' + (c.count || 0) + '</span>');
                     row.addEventListener('click', function () {
                         if (picked[c.server_id]) delete picked[c.server_id]; else picked[c.server_id] = true;
@@ -1984,7 +1984,7 @@
     }
     function delCollection(id, name, backToGallery) {
         ask({ title: 'Delete "' + (name || 'this collection') + '"?',
-              message: 'Removes the SoulSync definition. The collection already on your server is left in place — remove it from the On server view if you want it gone there too.',
+              message: 'Removes the Commissary definition. The collection already on your server is left in place — remove it from the On server view if you want it gone there too.',
               confirmText: 'Delete', cancelText: 'Cancel',
               destructive: true }).then(function (ok) {
             if (!ok) return;

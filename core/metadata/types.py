@@ -646,7 +646,7 @@ class Album:
     # ------------------------------------------------------------------
 
     def to_context_dict(self) -> Dict[str, Any]:
-        """Return the canonical dict shape SoulSync's import / download
+        """Return the canonical dict shape Commissary's import / download
         pipelines expect. This is the bridge between typed metadata and
         the existing dict-passing internal API. Future PRs migrate
         consumers off this dict shape and onto the typed Album directly,

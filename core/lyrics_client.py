@@ -19,7 +19,7 @@ class LyricsClient:
         """Initialize LRClib API with graceful fallback"""
         try:
             from lrclib import LrcLibAPI
-            self.api = LrcLibAPI(user_agent="SoulSync/1.0 (WebUI)")
+            self.api = LrcLibAPI(user_agent="Commissary/1.0 (WebUI)")
             logger.debug("LRClib API client initialized")
         except ImportError:
             logger.warning("LRClib API not available - lyrics functionality disabled")

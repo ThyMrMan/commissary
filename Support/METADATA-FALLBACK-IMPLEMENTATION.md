@@ -20,7 +20,7 @@ This document details two alternative approaches for fetching music metadata wit
 
 ### The Problem
 
-Currently, SoulSync requires users to:
+Currently, Commissary requires users to:
 1. Register at Spotify Developer Dashboard
 2. Create an application to get `client_id` and `client_secret`
 3. Enter credentials in settings
@@ -1176,7 +1176,7 @@ class SpotifyClient:
 
 ## Recommended Approach
 
-### For SoulSync
+### For Commissary
 
 1. **Primary:** Keep Spotify OAuth for users who want full features (playlist sync)
 2. **Secondary:** Add Spotify Client Credentials fallback for search/metadata when OAuth not completed

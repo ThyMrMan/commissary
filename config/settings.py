@@ -571,7 +571,7 @@ class ConfigManager:
                 # path from inside ITS OWN container — often a category folder
                 # like /data/downloads/music — which may be mounted at a
                 # different point here. Set these to the in-container path(s)
-                # where SoulSync sees those finished downloads; the resolver
+                # where Commissary sees those finished downloads; the resolver
                 # then finds the release by name under them. Empty = fall back
                 # to the soulseek download/transfer dirs (the shared-volume
                 # default). See core.download_plugins.album_bundle.resolve_reported_save_path.
@@ -1246,7 +1246,7 @@ class ConfigManager:
             navidrome = self.get_navidrome_config()
             media_server_configured = bool(navidrome.get('base_url')) and bool(navidrome.get('username')) and bool(navidrome.get('password'))
         elif active_server == 'soulsync':
-            media_server_configured = True  # SoulSync standalone is always configured
+            media_server_configured = True  # Commissary standalone is always configured
 
         return (
             bool(spotify.get('client_id')) and

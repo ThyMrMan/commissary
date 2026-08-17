@@ -128,7 +128,7 @@ def _image_from_musicbrainz_relations(mbid: str) -> Optional[str]:
     url = None
     try:
         from core.musicbrainz_client import MusicBrainzClient
-        artist = MusicBrainzClient("SoulSync", "2").get_artist(mbid, includes=['url-rels'])
+        artist = MusicBrainzClient("Commissary", "2").get_artist(mbid, includes=['url-rels'])
         for rel in ((artist or {}).get('relations') or []):
             resource = str(((rel or {}).get('url') or {}).get('resource') or '')
             if not resource:

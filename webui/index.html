@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
-    <title>SoulSync - Music Sync & Manager</title>
+    <title>Commissary - Music Sync & Manager</title>
     <link rel="icon" type="image/png" href="{{ url_for('static', filename='favicon.png', v=static_v) }}">
     <link rel="manifest" href="{{ url_for('static', filename='manifest.json', v=static_v) }}">
     <meta name="theme-color" content="{{ initial_accent_color }}">
@@ -58,7 +58,7 @@
             <!-- PIN Entry (default view) -->
             <div id="launch-pin-entry">
                 <div class="launch-pin-icon">🔒</div>
-                <h2 class="launch-pin-title">SoulSync is Locked</h2>
+                <h2 class="launch-pin-title">Commissary is Locked</h2>
                 <p class="launch-pin-subtitle">Enter your PIN to continue</p>
                 <input type="password" id="launch-pin-input" class="launch-pin-input" maxlength="20" placeholder="PIN" autocomplete="off">
                 <button id="launch-pin-submit" class="launch-pin-submit">Unlock</button>
@@ -69,7 +69,7 @@
             <div id="launch-pin-recovery" style="display: none;">
                 <div class="launch-pin-icon">🔑</div>
                 <h2 class="launch-pin-title">Verify Your Identity</h2>
-                <p class="launch-pin-subtitle">Enter any API key, token, or secret you configured in SoulSync settings</p>
+                <p class="launch-pin-subtitle">Enter any API key, token, or secret you configured in Commissary settings</p>
                 <input type="password" id="launch-recovery-input" class="launch-pin-input" maxlength="200" placeholder="Paste any API credential..." autocomplete="off" style="letter-spacing: 1px;">
                 <button id="launch-recovery-submit" class="launch-pin-submit" onclick="submitRecoveryCredential()">Verify & Reset PIN</button>
                 <p id="launch-recovery-error" class="launch-pin-error" style="display: none;"></p>
@@ -84,7 +84,7 @@
             <!-- Sign-in view -->
             <div id="login-entry">
                 <div class="launch-pin-icon">🔐</div>
-                <h2 class="launch-pin-title">Sign in to SoulSync</h2>
+                <h2 class="launch-pin-title">Sign in to Commissary</h2>
                 <p class="launch-pin-subtitle">Enter your account name and password</p>
                 <input type="text" id="login-username" class="launch-pin-input" placeholder="Username" autocomplete="username" maxlength="40" style="margin-bottom: 8px; letter-spacing: normal;">
                 <input type="password" id="login-password" class="launch-pin-input" placeholder="Password" autocomplete="current-password" maxlength="200" style="letter-spacing: normal;" onkeydown="if(event.key==='Enter') submitLogin()">
@@ -271,9 +271,9 @@
             <!-- Header Section -->
             <div class="sidebar-header">
                 <div class="sidebar-brand">
-                    <img src="/static/trans2.png" alt="SoulSync" class="sidebar-logo">
+                    <img src="/static/trans2.png" alt="Commissary" class="sidebar-logo">
                     <div class="sidebar-brand-text">
-                        <h1 class="app-name">SoulSync</h1>
+                        <h1 class="app-name">Commissary</h1>
                         <p class="app-subtitle">Music Sync & Manager</p>
                     </div>
                 </div>
@@ -787,7 +787,7 @@
                                      pixel-identical; wired by data-attribute (no inline
                                      handler) via video-enrichment.js, never music's. -->
                                 <button class="em-manage-btn" type="button" data-video-manage-workers title="Manage video enrichment workers">
-                                    <span class="em-manage-btn-icon"><img loading="lazy" src="/static/trans2.png" alt="SoulSync" class="em-manage-btn-logo"></span>
+                                    <span class="em-manage-btn-icon"><img loading="lazy" src="/static/trans2.png" alt="Commissary" class="em-manage-btn-logo"></span>
                                     <span class="em-manage-btn-label">Manage Workers</span>
                                 </button>
                             </div>
@@ -1178,7 +1178,7 @@
                             <div class="vsr-results" data-video-search-results></div>
                             <div class="vsr-state" data-video-search-hint>
                                 <div class="vsr-state-ic">&#127902;</div>
-                                <div class="vsr-state-title">Search SoulSync</div>
+                                <div class="vsr-state-title">Search Commissary</div>
                                 <div class="vsr-state-sub">Find any movie, show or person. Owned titles open your library detail; the rest open a live preview &mdash; no external links.</div>
                             </div>
                             <div class="vsr-state hidden" data-video-search-empty>
@@ -2074,13 +2074,13 @@
                                 </div>
                                 <!-- Server Scan: tells the media server to rescan its OWN folders so
                                      newly-downloaded files get indexed (distinct from the Library Scan
-                                     above, where SoulSync READS the server into its DB). -->
+                                     above, where Commissary READS the server into its DB). -->
                                 <div class="tool-card">
                                     <div class="tool-card-header">
                                         <h4 class="tool-card-title" data-video-srvscan-title>Server Scan</h4>
                                         <button class="tool-help-button" data-tool="video-server-scan" title="Learn more about this tool">?</button>
                                     </div>
-                                    <p class="tool-card-info">Tell the media server to scan its folders for newly-downloaded movies &amp; episodes — then a Library Scan pulls them into SoulSync.</p>
+                                    <p class="tool-card-info">Tell the media server to scan its folders for newly-downloaded movies &amp; episodes — then a Library Scan pulls them into Commissary.</p>
                                     <div class="tool-card-controls">
                                         <select data-video-srvscan-target aria-label="Which library the server should scan" title="Movies and TV are separate server libraries — scan one or both">
                                             <option value="all">All Libraries</option>
@@ -2102,7 +2102,7 @@
                     </div>
                 </section>
                 <!-- Person detail (drill-in from a cast/crew member; not a nav page).
-                     Bio + filmography, every credit links back into SoulSync. Built
+                     Bio + filmography, every credit links back into Commissary. Built
                      by video/video-person.js, styled by .vp-* in video-side.css. -->
 
                 <!-- Issues — user-reported problems on library items (the music Issues
@@ -2622,7 +2622,7 @@
                             <button class="em-manage-btn" id="manage-enrichment-btn"
                                     title="Manage enrichment workers — stats, unmatched items, manual matching"
                                     onclick="openEnrichmentManager()">
-                                <span class="em-manage-btn-icon"><img loading="lazy" src="/static/trans2.png" alt="SoulSync" class="em-manage-btn-logo"></span>
+                                <span class="em-manage-btn-icon"><img loading="lazy" src="/static/trans2.png" alt="Commissary" class="em-manage-btn-logo"></span>
                                 <span class="em-manage-btn-label">Manage Workers</span>
                             </button>
                         </div>
@@ -2664,7 +2664,7 @@
                         <article class="dash-card" data-card="services">
                             <header class="dash-card__head">
                                 <h3 class="dash-card__title">Service Status</h3>
-                                <p class="dash-card__sub">Connection health for every service SoulSync uses.</p>
+                                <p class="dash-card__sub">Connection health for every service Commissary uses.</p>
                             </header>
                             <div class="dash-card__body">
                                 <div class="service-status-grid">
@@ -2852,7 +2852,7 @@
                         <article class="dash-card dash-card--quick-actions" data-card="tools">
                             <header class="dash-card__head">
                                 <h3 class="dash-card__title">Quick Actions</h3>
-                                <p class="dash-card__sub">Three control rooms inside SoulSync.</p>
+                                <p class="dash-card__sub">Three control rooms inside Commissary.</p>
                             </header>
                             <div class="dash-card__body qa-bento">
                                 <button class="qa-tile qa-tile--hero qa-tile--sync" onclick="openAutoSyncScheduleModal()" aria-label="Open Auto-Sync">
@@ -3044,8 +3044,8 @@
                             <button class="sync-tab-button" data-tab="lastfm-sync" title="Last.fm">
                                 <span class="tab-icon lastfm-icon"></span><span class="sync-tab-label">Last.fm</span>
                             </button>
-                            <button class="sync-tab-button" data-tab="soulsync-discovery-sync" title="SoulSync Discovery">
-                                <span class="tab-icon soulsync-discovery-icon"></span><span class="sync-tab-label">SoulSync Discovery</span>
+                            <button class="sync-tab-button" data-tab="soulsync-discovery-sync" title="Commissary Discovery">
+                                <span class="tab-icon soulsync-discovery-icon"></span><span class="sync-tab-label">Commissary Discovery</span>
                             </button>
                             <button class="sync-tab-button" data-tab="import-file" title="Import">
                                 <span class="tab-icon import-file-icon"></span><span class="sync-tab-label">Import</span>
@@ -3936,14 +3936,14 @@
                             </div>
                         </div>
 
-                        <!-- SoulSync Discovery Sync Tab Content -->
+                        <!-- Commissary Discovery Sync Tab Content -->
                         <div class="sync-tab-content" id="soulsync-discovery-sync-tab-content">
                             <div class="playlist-header">
-                                <h3>SoulSync Discovery Playlists</h3>
+                                <h3>Commissary Discovery Playlists</h3>
                                 <button class="refresh-button soulsync-discovery" id="soulsync-discovery-sync-refresh-btn">🔄 Refresh</button>
                             </div>
                             <div class="playlist-scroll-container" id="soulsync-discovery-sync-playlist-container">
-                                <div class="playlist-placeholder">Click 'Refresh' to load your personalized SoulSync Discovery playlists.</div>
+                                <div class="playlist-placeholder">Click 'Refresh' to load your personalized Commissary Discovery playlists.</div>
                             </div>
                         </div>
 
@@ -6768,7 +6768,7 @@
 
                                 <div class="form-group">
                                     <small class="settings-hint"><strong>About <code>{Token}</code> names:</strong> a schema copied from the <a href="https://trash-guides.info/Sonarr/Sonarr-recommended-naming-scheme/" target="_blank" rel="noopener noreferrer">TRaSH guides</a> works as-is. Wrapping a token in braces makes it optional: <code>{[Quality Full]}</code> renders <code>[WEBDL-1080p]</code>, or vanishes entirely &mdash; brackets included &mdash; when there is nothing to show, which is what keeps empty <code>[]</code> and trailing dashes out of filenames. <code>{season:00}</code> zero-pads; <code>{Episode CleanTitle:90}</code> caps the length. The <code>$</code> variables above keep working, and the two can be mixed.</small>
-                                    <small class="settings-hint">Audio channels, bit depth, languages and dynamic range are read from the file itself by ffprobe, so they need <strong>Verify with ffprobe</strong> (below) left on. <code>{Preferred Words}</code> is not supported &mdash; SoulSync has no equivalent setting.</small>
+                                    <small class="settings-hint">Audio channels, bit depth, languages and dynamic range are read from the file itself by ffprobe, so they need <strong>Verify with ffprobe</strong> (below) left on. <code>{Preferred Words}</code> is not supported &mdash; Commissary has no equivalent setting.</small>
                                 </div>
 
                                 <div class="form-group">
@@ -6966,7 +6966,7 @@
                                     </button>
                                     <button class="server-toggle-btn" id="soulsync-toggle"
                                         onclick="toggleServer('soulsync')">
-                                        <img loading="lazy" src="/static/trans2.png" alt="SoulSync"
+                                        <img loading="lazy" src="/static/trans2.png" alt="Commissary"
                                             class="server-logo">
                                         Standalone
                                     </button>
@@ -7074,7 +7074,7 @@
                                 <!-- Navidrome Settings -->
                                 <div class="server-config-container hidden" id="navidrome-container">
                                     <div class="setting-help-text">
-                                        Navidrome users should enable <strong>Real Path</strong> in the Navidrome player/settings so SoulSync can resolve imported and synced files correctly.
+                                        Navidrome users should enable <strong>Real Path</strong> in the Navidrome player/settings so Commissary can resolve imported and synced files correctly.
                                     </div>
                                     <div class="form-group">
                                         <label>Navidrome Server URL:</label>
@@ -7105,10 +7105,10 @@
 
                                 <div class="server-config-container hidden" id="soulsync-container">
                                     <div class="soulsync-standalone-info">
-                                        <img loading="lazy" src="/static/trans2.png" alt="SoulSync" class="soulsync-standalone-logo">
+                                        <img loading="lazy" src="/static/trans2.png" alt="Commissary" class="soulsync-standalone-logo">
                                         <div class="soulsync-standalone-text">
                                             <h4>Standalone Mode</h4>
-                                            <p>SoulSync manages your library directly without an external media server. Import your existing music first: move files into the import folder, then use a separate music/output folder for the processed library SoulSync creates.</p>
+                                            <p>Commissary manages your library directly without an external media server. Import your existing music first: move files into the import folder, then use a separate music/output folder for the processed library Commissary creates.</p>
                                         </div>
                                     </div>
                                     <div class="form-actions">
@@ -7700,7 +7700,7 @@
                                             Free lossless downloads via community-run hifi-api instances. No authentication or subscription needed.
                                         </div>
                                         <div class="hifi-preview-warning" style="margin-top: 8px; padding: 9px 11px; border-radius: 8px; background: rgba(241, 196, 15, 0.08); border: 1px solid rgba(241, 196, 15, 0.28); color: #f1c40f; font-size: 12px; line-height: 1.5;">
-                                            <strong>Heads up:</strong> some HiFi instances only have 30-second Tidal previews for certain tracks, with headers faked to look like the full song. SoulSync decodes every HiFi download to catch these and never lets a shorter clip replace a good library file, but if a track just won't come through at full length here, grab it from another source.
+                                            <strong>Heads up:</strong> some HiFi instances only have 30-second Tidal previews for certain tracks, with headers faked to look like the full song. Commissary decodes every HiFi download to catch these and never lets a shorter clip replace a good library file, but if a track just won't come through at full length here, grab it from another source.
                                         </div>
                                     </div>
                                     <div class="form-group">
@@ -7838,7 +7838,7 @@
                                             YouTube serves Opus at roughly 130&ndash;160kbps. Converting that to MP3 320
                                             is a lossy-to-lossy transcode: a bigger file that sounds slightly worse.
                                             <strong>Original</strong> keeps the stream as-is (.m4a or .opus) &mdash; smaller and
-                                            better, and every part of SoulSync reads those formats. Note that a quality
+                                            better, and every part of Commissary reads those formats. Note that a quality
                                             profile targeting MP3 will stop matching YouTube, because the file genuinely
                                             will not be an MP3. Neither option ever downloads the music video.
                                         </div>
@@ -8273,8 +8273,8 @@
                                     </select>
                                     <div class="setting-help-text">
                                         If YouTube shows "Sign in to confirm you're not a bot", select your browser here.
-                                        SoulSync will use your browser's YouTube cookies to authenticate. Reading a browser
-                                        only works when that browser is on the same machine as SoulSync &mdash; on a
+                                        Commissary will use your browser's YouTube cookies to authenticate. Reading a browser
+                                        only works when that browser is on the same machine as Commissary &mdash; on a
                                         server/Docker box, choose <strong>Paste cookies.txt</strong> instead.
                                     </div>
                                 </div>
@@ -8296,11 +8296,11 @@
                             <div class="ind-hero-warning" style="margin-bottom:12px;">
                                 <div class="ind-hero-warning-title" style="cursor:pointer;user-select:none;" onclick="const b=this.nextElementSibling; b.style.display=(b.style.display==='none'?'':'none'); const c=this.querySelector('.ind-hero-warning-caret'); if(c)c.textContent=(b.style.display==='none'?'▾':'▴');">💡 Filesystem access — easiest setup <span class="ind-hero-warning-caret" style="opacity:.6;">▾</span></div>
                                 <div class="ind-hero-warning-body" style="display:none;">
-                                    Torrent and usenet clients write files to <strong>their own download folders</strong>, not Soulseek's. SoulSync needs read access to those folders to import the files. <strong>Simplest fix:</strong> point all your downloaders (Soulseek, qBittorrent, SABnzbd / NZBGet) at the <em>same</em> download folder. One folder, one path to worry about, everything just works.
+                                    Torrent and usenet clients write files to <strong>their own download folders</strong>, not Soulseek's. Commissary needs read access to those folders to import the files. <strong>Simplest fix:</strong> point all your downloaders (Soulseek, qBittorrent, SABnzbd / NZBGet) at the <em>same</em> download folder. One folder, one path to worry about, everything just works.
                                     <ul>
                                         <li><strong>Bare-metal:</strong> just set every client's download path to the same folder (e.g. your existing slskd folder). Done.</li>
                                         <li><strong>Docker:</strong> easiest is to reuse the <code>./downloads</code> mount you already have for slskd — point qBit and SAB at <code>/downloads</code> inside their containers too. Or use the commented placeholders in <code>docker-compose.yml</code> if you want separate folders.</li>
-                                        <li><strong>Remote client (NAS / different host):</strong> mount the remote folder locally (SMB / NFS / rclone) before SoulSync can see it.</li>
+                                        <li><strong>Remote client (NAS / different host):</strong> mount the remote folder locally (SMB / NFS / rclone) before Commissary can see it.</li>
                                     </ul>
                                 </div>
                             </div>
@@ -8321,9 +8321,9 @@
                                                 onclick="toggleSettingHelp(this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSettingHelp(this);}">i</span>
                                         </div>
                                         <div class="setting-help-text setting-help-body" style="margin-bottom: 14px;" hidden>
-                                            Prowlarr manages your Usenet and torrent indexers and exposes them through one API. SoulSync uses Prowlarr to search across every indexer at once for the Torrent and Usenet download sources.
+                                            Prowlarr manages your Usenet and torrent indexers and exposes them through one API. Commissary uses Prowlarr to search across every indexer at once for the Torrent and Usenet download sources.
                                             <br><br>
-                                            Don't have it? Grab Prowlarr from <code>prowlarr.com</code> (or your *arr stack). You point Prowlarr at your indexers, then point SoulSync at Prowlarr.
+                                            Don't have it? Grab Prowlarr from <code>prowlarr.com</code> (or your *arr stack). You point Prowlarr at your indexers, then point Commissary at Prowlarr.
                                         </div>
                                         <div class="form-group">
                                             <label>Prowlarr URL:</label>
@@ -8364,7 +8364,7 @@
                                                 Tick the indexers you want searched. Ticking any of them means <strong>only</strong> those are searched — leave them all unticked to search every enabled indexer.
                                             </div>
                                             <div id="prowlarr-indexer-list" class="ind-indexer-list">
-                                                Connect to Prowlarr and click <strong>Refresh Indexer List</strong> to see the indexers SoulSync can search.
+                                                Connect to Prowlarr and click <strong>Refresh Indexer List</strong> to see the indexers Commissary can search.
                                             </div>
                                         </div>
                                     </div>
@@ -8388,7 +8388,7 @@
                                                 onclick="toggleSettingHelp(this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSettingHelp(this);}">i</span>
                                         </div>
                                         <div class="setting-help-text setting-help-body" style="margin-bottom: 14px;" hidden>
-                                            Where SoulSync sends torrents once Prowlarr finds them. Pick the client you already use — only one can be active at a time. Add the URL of the client's WebUI, log in if it asks for credentials, and hit Test Connection.
+                                            Where Commissary sends torrents once Prowlarr finds them. Pick the client you already use — only one can be active at a time. Add the URL of the client's WebUI, log in if it asks for credentials, and hit Test Connection.
                                         </div>
                                         <div class="form-group">
                                             <label>Client Type:</label>
@@ -8421,20 +8421,20 @@
                                             <label>Category / Label:</label>
                                             <input type="text" id="torrent-client-category" placeholder="soulsync" value="soulsync">
                                             <div class="setting-help-text">
-                                                SoulSync tags every torrent it adds with this label so it's easy to spot in your client. Deluge needs the Label plugin installed for this to stick. This is the DEFAULT — on the video side, each Movies/TV Library on Settings → Connections can set its own category (e.g. "movies" vs "anime") that overrides this for grabs landing there.
+                                                Commissary tags every torrent it adds with this label so it's easy to spot in your client. Deluge needs the Label plugin installed for this to stick. This is the DEFAULT — on the video side, each Movies/TV Library on Settings → Connections can set its own category (e.g. "movies" vs "anime") that overrides this for grabs landing there.
                                             </div>
                                         </div>
                                         <div class="form-group">
                                             <label>Save Path (optional):</label>
                                             <input type="text" id="torrent-client-save-path" placeholder="leave blank to use the client's default">
                                             <div class="setting-help-text">
-                                                Override where the torrent client writes downloads. This path is on the <strong>torrent client's</strong> machine, not SoulSync's.
+                                                Override where the torrent client writes downloads. This path is on the <strong>torrent client's</strong> machine, not Commissary's.
                                             </div>
                                         </div>
                                         <div class="form-group">
-                                            <label>Completed Downloads Paths — in SoulSync (optional):</label>
+                                            <label>Completed Downloads Paths — in Commissary (optional):</label>
                                             <div class="setting-help-text" style="margin-bottom: 8px;">
-                                                Where <strong>SoulSync</strong> can read finished torrents — its own in-container paths. Set these when your client saves somewhere that's mounted here at a different path. Add one row per location: most clients sort completed downloads into <em>category</em> folders (<code>/downloads/complete/Movies</code>, <code>…/TV-Shows</code>, <code>…/Anime</code>). You can also just name the parent (<code>/downloads/complete</code>) — SoulSync looks one level inside it too, so a category you add later still works. Blank = use the Soulseek download/transfer folders.
+                                                Where <strong>Commissary</strong> can read finished torrents — its own in-container paths. Set these when your client saves somewhere that's mounted here at a different path. Add one row per location: most clients sort completed downloads into <em>category</em> folders (<code>/downloads/complete/Movies</code>, <code>…/TV-Shows</code>, <code>…/Anime</code>). You can also just name the parent (<code>/downloads/complete</code>) — Commissary looks one level inside it too, so a category you add later still works. Blank = use the Soulseek download/transfer folders.
                                             </div>
                                             <div id="torrent-download-paths-list"></div>
                                             <div class="form-actions" style="margin-top: 8px;">
@@ -8480,11 +8480,11 @@
                                             <div style="display:flex; gap:8px; align-items:center; margin-top:8px;">
                                                 <span class="settings-hint">Enforced by</span>
                                                 <select id="shared-seed-mode" class="form-select" style="max-width:260px;">
-                                                    <option value="soulsync">SoulSync (watches the client + removes)</option>
+                                                    <option value="soulsync">Commissary (watches the client + removes)</option>
                                                     <option value="client">Torrent client (writes its own seed limit)</option>
                                                 </select>
                                             </div>
-                                            <small class="settings-hint">Both at 0 = never remove (the old behavior). <strong>SoulSync</strong>: SS polls the client and removes when a goal is hit (your imported library copy is separate and never touched). <strong>Torrent client</strong>: SS writes the ratio/time limit into the client (arr-style) and lets it enforce — it shows up in the client's share-limit dialog and works even when SS is off.</small>
+                                            <small class="settings-hint">Both at 0 = never remove (the old behavior). <strong>Commissary</strong>: SS polls the client and removes when a goal is hit (your imported library copy is separate and never touched). <strong>Torrent client</strong>: SS writes the ratio/time limit into the client (arr-style) and lets it enforce — it shows up in the client's share-limit dialog and works even when SS is off.</small>
                                         </div>
                                         <div class="form-group">
                                             <label>Status:</label>
@@ -8518,7 +8518,7 @@
                                                 onclick="toggleSettingHelp(this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSettingHelp(this);}">i</span>
                                         </div>
                                         <div class="setting-help-text setting-help-body" style="margin-bottom: 14px;" hidden>
-                                            Where SoulSync sends NZBs once Prowlarr finds them. Pick one usenet downloader. SABnzbd uses an API key for auth; NZBGet uses a username + password.
+                                            Where Commissary sends NZBs once Prowlarr finds them. Pick one usenet downloader. SABnzbd uses an API key for auth; NZBGet uses a username + password.
                                         </div>
                                         <div class="form-group">
                                             <label>Client Type:</label>
@@ -8553,13 +8553,13 @@
                                             <label>Category / Label:</label>
                                             <input type="text" id="usenet-client-category" placeholder="soulsync" value="soulsync">
                                             <div class="setting-help-text">
-                                                SoulSync tags every NZB with this category so it ends up in a predictable post-processing folder.
+                                                Commissary tags every NZB with this category so it ends up in a predictable post-processing folder.
                                             </div>
                                         </div>
                                         <div class="form-group">
-                                            <label>Completed Downloads Paths — in SoulSync (optional):</label>
+                                            <label>Completed Downloads Paths — in Commissary (optional):</label>
                                             <div class="setting-help-text" style="margin-bottom: 8px;">
-                                                Where <strong>SoulSync</strong> can read finished NZB downloads — its own in-container paths. Set these when SABnzbd/NZBGet writes to a folder mounted here at a different path. Add one row per location: both sort completed downloads into <em>category</em> folders (<code>/downloads/complete/Movies</code>, <code>…/TV-Shows</code>). You can also just name the parent (<code>/downloads/complete</code>) — SoulSync looks one level inside it too. Blank = use the Soulseek download/transfer folders.
+                                                Where <strong>Commissary</strong> can read finished NZB downloads — its own in-container paths. Set these when SABnzbd/NZBGet writes to a folder mounted here at a different path. Add one row per location: both sort completed downloads into <em>category</em> folders (<code>/downloads/complete/Movies</code>, <code>…/TV-Shows</code>). You can also just name the parent (<code>/downloads/complete</code>) — Commissary looks one level inside it too. Blank = use the Soulseek download/transfer folders.
                                             </div>
                                             <div id="usenet-download-paths-list"></div>
                                             <div class="form-actions" style="margin-top: 8px;">
@@ -8598,7 +8598,7 @@
                                         <span class="info-icon" role="button" tabindex="0" title="What's this?"
                                             onclick="toggleSettingHelp(this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSettingHelp(this);}">i</span>
                                     </div>
-                                    <div class="setting-help-body" hidden>Controls what happens when a downloaded file is rejected (AcoustID mismatch, wrong version, or duration/integrity failure) — independent of post-processing. When on, SoulSync automatically tries the next-best candidate instead of failing the track. <strong>Off</strong> = quarantine and fail immediately.</div>
+                                    <div class="setting-help-body" hidden>Controls what happens when a downloaded file is rejected (AcoustID mismatch, wrong version, or duration/integrity failure) — independent of post-processing. When on, Commissary automatically tries the next-best candidate instead of failing the track. <strong>Off</strong> = quarantine and fail immediately.</div>
                                 </div>
                                 <div class="form-group">
                                     <div class="setting-row">
@@ -8694,7 +8694,7 @@
                                 <div class="setting-help-text hidden" style="margin-bottom: 4px; color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 10px; padding: 10px 12px; background: rgba(239, 68, 68, 0.08);"
                                      data-paths-default-warning>
                                     ⚠️ <strong>Your Music Library Folder is still the install-folder default.</strong> Every finished
-                                    download is landing on the disk SoulSync is installed on — on a Proxmox LXC that's typically an
+                                    download is landing on the disk Commissary is installed on — on a Proxmox LXC that's typically an
                                     8&nbsp;GB root that fills until the container hangs. Unlock the field and point it at your real
                                     music folder.
                                 </div>
@@ -8898,7 +8898,7 @@
                                     <label for="wishlist-ignore-ttl">Removed-track re-try window (days)</label>
                                     <input type="number" id="wishlist-ignore-ttl" min="1" max="365" step="1" value="30">
                                     <span class="info-icon" role="button" tabindex="0" title="What's this?" onclick="toggleSettingHelp(this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSettingHelp(this);}">i</span>
-                                    <small class="settings-hint setting-help-body" hidden>When you remove or cancel a wishlist track, SoulSync remembers not to re-add it automatically for this many days. Lower it (e.g. 7) to give removed tracks another chance sooner.</small>
+                                    <small class="settings-hint setting-help-body" hidden>When you remove or cancel a wishlist track, Commissary remembers not to re-add it automatically for this many days. Lower it (e.g. 7) to give removed tracks another chance sooner.</small>
                                 </div>
 
                                 <div class="form-group">
@@ -8953,10 +8953,10 @@
 
                                 <div class="help-text" style="margin-bottom: 12px;">
                                     Your Music Libraries above are already covered — <strong>you don't need to repeat them here.</strong>
-                                    These are folders SoulSync should <em>read</em> but never file downloads into: an old collection you
+                                    These are folders Commissary should <em>read</em> but never file downloads into: an old collection you
                                     aren't adding to, or the same files at a different path than your media server reports.
                                     Used for tag writing, streaming, and file detection.
-                                    <strong>Docker users:</strong> mount the extra folder(s) into the SoulSync container with read-write access,
+                                    <strong>Docker users:</strong> mount the extra folder(s) into the Commissary container with read-write access,
                                     then add the <em>container-side</em> path here (e.g. <code>/music2</code>).
                                 </div>
 
@@ -9340,7 +9340,7 @@
                             <div class="settings-section-body collapsed" data-stg="advanced" data-shared>
                             <div class="settings-group security-wrapper" data-stg="advanced" data-shared>
                                 <div class="setting-help-text" style="margin-bottom: 18px;">
-                                    By default, anyone who can reach SoulSync on your network can use it. Protect access below with a simple shared <strong>PIN</strong>, or full <strong>user accounts</strong> with passwords — you only need one. The last group is just for exposing SoulSync over the internet.
+                                    By default, anyone who can reach Commissary on your network can use it. Protect access below with a simple shared <strong>PIN</strong>, or full <strong>user accounts</strong> with passwords — you only need one. The last group is just for exposing Commissary over the internet.
                                 </div>
 
                                 <!-- ── Method A: PIN ── -->
@@ -9361,7 +9361,7 @@
                                     <div class="form-group">
                                         <label class="toggle-label">
                                             <input type="checkbox" id="security-require-pin" onchange="handleSecurityPinToggle(this)">
-                                            <span>Require PIN to access SoulSync</span>
+                                            <span>Require PIN to access Commissary</span>
                                         </label>
                                         <div class="setting-help-text">
                                             A lock screen appears on every page load, verified against the admin PIN. Closing the tab requires re-entry.
@@ -9425,7 +9425,7 @@
                                 <div class="security-subgroup">
                                     <h4 class="security-subhead">🌐 Reverse proxy &amp; remote access</h4>
                                     <div class="setting-help-text" style="margin-bottom: 12px;">
-                                        Only needed if you expose SoulSync to the internet behind nginx / Caddy / Traefik. See <code>Support/REVERSE-PROXY.md</code>.
+                                        Only needed if you expose Commissary to the internet behind nginx / Caddy / Traefik. See <code>Support/REVERSE-PROXY.md</code>.
                                     </div>
 
                                     <div class="form-group">
@@ -9442,7 +9442,7 @@
                                         <label for="security-auth-proxy-header">↳ Auth proxy user header <span style="opacity:0.6">(optional)</span>:</label>
                                         <input type="text" id="security-auth-proxy-header" placeholder="Remote-User" autocomplete="off" style="width: 100%; font-family: monospace; font-size: 12px;">
                                         <div class="setting-help-text">
-                                            If an auth proxy (Authelia / Authentik / oauth2-proxy) logs users in in front of SoulSync, enter the header it sets and SoulSync trusts it. <strong>Only set this behind a proxy that strips any client-supplied copy of the header.</strong> Blank = off.
+                                            If an auth proxy (Authelia / Authentik / oauth2-proxy) logs users in in front of Commissary, enter the header it sets and Commissary trusts it. <strong>Only set this behind a proxy that strips any client-supplied copy of the header.</strong> Blank = off.
                                         </div>
                                     </div>
 
@@ -9919,11 +9919,11 @@
                             </div>
                             </div><!-- end Logging body -->
 
-                            <!-- SoulSync API Keys -->
-                                                        <!-- SoulSync API (collapsible tile) -->
+                            <!-- Commissary API Keys -->
+                                                        <!-- Commissary API (collapsible tile) -->
                             <div class="settings-section-header collapsed" data-stg="advanced" onclick="this.classList.toggle('collapsed'); const b=this.nextElementSibling; b.classList.toggle('collapsed'); b.style.display=b.classList.contains('collapsed')?'none':''">
                                 <span class="settings-section-arrow">&#9660;</span>
-                                <h3>SoulSync API</h3>
+                                <h3>Commissary API</h3>
                                 <span class="settings-section-hint">REST keys &amp; inbound endpoint</span>
                             </div>
                             <div class="settings-section-body collapsed" data-stg="advanced">
@@ -9932,7 +9932,7 @@
                                 <div class="api-service-frame">
                                     <h4 class="service-title" style="color: #64ffda;">REST API Keys</h4>
                                     <div class="setting-help-text" style="margin-bottom: 12px; color: #888; font-size: 12px;">
-                                        Generate API keys to access SoulSync remotely via the <code>/api/v1/</code> endpoints.
+                                        Generate API keys to access Commissary remotely via the <code>/api/v1/</code> endpoints.
                                         Keys are shown once at creation — store them securely.
                                     </div>
 
@@ -9981,7 +9981,7 @@
                                     </div>
                                 </div>
                             </div>
-                            </div><!-- end SoulSync API body -->
+                            </div><!-- end Commissary API body -->
 
                             <!-- Developer Mode -->
                                                         <!-- Developer Mode (collapsible tile) -->
@@ -11277,7 +11277,7 @@
         <div class="version-modal" onclick="event.stopPropagation()">
             <!-- Header -->
             <div class="version-modal-header">
-                <h2 class="version-modal-title">What's New in SoulSync</h2>
+                <h2 class="version-modal-title">What's New in Commissary</h2>
                 <div class="version-modal-subtitle">Version {{ soulsync_base_version }} — Latest Changes</div>
             </div>
 
@@ -12085,7 +12085,7 @@
     <script src="{{ url_for('static', filename='purchased.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='beatport-ui.js', v=static_v) }}"></script>
     <!-- Artist Web graph stack (sigma.js): graphology = data model, sigma = WebGL renderer,
-         graphology-library = utils incl. forceAtlas2 layout. CDN/UMD (SoulSync is vanilla). -->
+         graphology-library = utils incl. forceAtlas2 layout. CDN/UMD (Commissary is vanilla). -->
     <script defer src="https://cdn.jsdelivr.net/npm/graphology@0.25.4/dist/graphology.umd.min.js"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/graphology-library/dist/graphology-library.min.js"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/sigma@2.4.0/build/sigma.min.js"></script>
@@ -12266,7 +12266,7 @@
     <script src="{{ url_for('static', filename='video/video-requests.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='video/video-import.js', v=static_v) }}"></script>
     <!-- Video worker orbs (isolated copy of the music orbs; idles into the
-         floating-orb animation around the SoulSync logo on the video dashboard) -->
+         floating-orb animation around the Commissary logo on the video dashboard) -->
     <script src="{{ url_for('static', filename='video/video-worker-orbs.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='config-migration.js', v=static_v) }}"></script>
     <script src="{{ url_for('static', filename='search-clear.js', v=static_v) }}"></script>

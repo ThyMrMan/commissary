@@ -1,4 +1,4 @@
-"""SoulSync — VIDEO side API package (isolated).
+"""Commissary — VIDEO side API package (isolated).
 
 A SEPARATE Flask blueprint from the music API (api_v1). It reads only
 database/video_library.db via VideoDatabase and imports nothing from the music

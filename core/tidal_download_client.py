@@ -500,8 +500,8 @@ class TidalDownloadClient(DownloadSourcePlugin):
                 return {
                     'status': 'error',
                     'message': (
-                        "Tidal returned an invalid auth response while SoulSync was finishing login. "
-                        "Try again after disabling VPN/proxy/network filtering, then restart SoulSync if it repeats."
+                        "Tidal returned an invalid auth response while Commissary was finishing login. "
+                        "Try again after disabling VPN/proxy/network filtering, then restart Commissary if it repeats."
                     ),
                 }
             logger.error(f"Tidal device auth check error: {e}")

@@ -186,7 +186,7 @@ def test_up_stops_at_the_root_rather_than_leading_somewhere_unusable(roots, clie
 
 
 def test_shortcuts_only_offer_folders_that_exist(roots, client, monkeypatch):
-    """A shortcut to an unmounted path reads as a SoulSync bug rather than a
+    """A shortcut to an unmounted path reads as a Commissary bug rather than a
     missing mount."""
     from config.settings import config_manager
     inner = config_manager.get

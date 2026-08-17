@@ -3,10 +3,14 @@
 #   OLD: - soulsync_database:/app/database
 #   NEW: - soulsync_database:/app/data
 # Your data will be preserved - it's the same volume, just mounted at a different path.
+#
+# The service, volume and network below keep their original `soulsync` names on
+# purpose. Commissary is a rename of the app, not of your deployment: renaming
+# the named volume here would point a running install at an EMPTY database.
 
 services:
   soulsync:
-    image: boulderbadgedad/soulsync:latest
+    image: ghcr.io/thymrman/commissary:latest
     container_name: soulsync-webui
     environment:
       # User/Group ID configuration
@@ -21,7 +25,7 @@ services:
       - TZ=America/New_York
       # OAuth callback ports. If 8888/8889 conflict with another container (e.g. Gluetun),
       # change the port numbers below AND update the matching port mappings in the ports section.
-      # Then update the redirect URI in SoulSync → Settings → Connections AND in your Spotify/Tidal developer dashboard to match.
+      # Then update the redirect URI in Commissary → Settings → Connections AND in your Spotify/Tidal developer dashboard to match.
       - SOULSYNC_SPOTIFY_CALLBACK_PORT=8888
       - SOULSYNC_TIDAL_CALLBACK_PORT=8889
     ports:
@@ -74,14 +78,14 @@ services:
       # - /path/to/your/music:/music:ro
       #
       # ─── Torrent / Usenet download sources (Prowlarr integration) ────────
-      # If you use the Torrent Only or Usenet Only download sources, SoulSync
+      # If you use the Torrent Only or Usenet Only download sources, Commissary
       # needs to read the files your torrent / usenet client downloads.
       #
       # EASIEST SETUP: point qBittorrent, SABnzbd / NZBGet, AND slskd at the
       # SAME download folder. The ./downloads mount above is reused; nothing
       # new to add here. Just configure each client's download path to
       # /downloads (inside its own container) — files land in the same place
-      # SoulSync already reads from.
+      # Commissary already reads from.
       #
       # SEPARATE FOLDERS (if you prefer): uncomment + edit these to point at
       # the client's download folder. The in-container path must MATCH the
@@ -113,9 +117,9 @@ services:
           memory: 512M
 
   ## ─── Optional: slskd (Soulseek client) ───────────────────────────────
-  ## Uncomment below to run slskd alongside SoulSync.
-  ## Downloads land in ./downloads which SoulSync already reads from.
-  ## After starting, set your SoulSync slskd URL to http://slskd:5030
+  ## Uncomment below to run slskd alongside Commissary.
+  ## Downloads land in ./downloads which Commissary already reads from.
+  ## After starting, set your Commissary slskd URL to http://slskd:5030
   ## and the API key to whatever you set in SLSKD_API_KEY below.
   #
   # slskd:

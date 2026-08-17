@@ -17,6 +17,15 @@ from core.media_server.types import TrackInfo, PlaylistInfo
 
 logger = get_logger("navidrome_client")
 
+# The Subsonic `c` (client name) parameter. Navidrome creates one Player row
+# per (client, user) and hangs per-player settings off it — including "Report
+# Real Path", which #809's playback path resolution depends on the user having
+# enabled. Renaming this to "Commissary" would silently register a SECOND,
+# unconfigured player and break stream-path resolution on every existing
+# install until each user re-enabled the setting. It stays as the app was
+# first known, deliberately, and is NOT branding.
+SUBSONIC_CLIENT_NAME = "SoulSync"
+
 
 class NavidromeArtist:
     """Wrapper class to mimic Plex artist object interface"""
@@ -366,7 +375,7 @@ class NavidromeClient(MediaServerClient):
             't': token,
             's': salt,
             'v': '1.16.1',  # API version
-            'c': 'SoulSync',  # Client name
+            'c': SUBSONIC_CLIENT_NAME,  # Client name
             'f': 'json'  # Response format
         }
 
@@ -398,7 +407,7 @@ class NavidromeClient(MediaServerClient):
             't': token,
             's': salt,
             'v': '1.16.1',
-            'c': 'SoulSync',
+            'c': SUBSONIC_CLIENT_NAME,
             'f': 'json',  # harmless for getCoverArt — it returns image binary
             'id': str(cover_id),
         }
@@ -409,9 +418,9 @@ class NavidromeClient(MediaServerClient):
     def build_stream_url(self, track_id, max_bitrate=0) -> Optional[str]:
         """Absolute, Subsonic-authenticated ``/rest/stream`` URL for a song.
 
-        Lets SoulSync play a Navidrome library track by proxying the server's
+        Lets Commissary play a Navidrome library track by proxying the server's
         own stream API — so playback works WITHOUT mounting the music into the
-        SoulSync container (#809: SoulSync otherwise reads library files off
+        Commissary container (#809: Commissary otherwise reads library files off
         disk, which fails when the user hasn't mirror-mounted the library).
         ``max_bitrate`` 0 = no transcode (original file). Returns None when not
         connected / no id."""
@@ -423,7 +432,7 @@ class NavidromeClient(MediaServerClient):
         token = hashlib.md5((self.password + salt).encode()).hexdigest()
         params = {
             'u': self.username, 't': token, 's': salt,
-            'v': '1.16.1', 'c': 'SoulSync',
+            'v': '1.16.1', 'c': SUBSONIC_CLIENT_NAME,
             'id': str(track_id),
         }
         if max_bitrate and int(max_bitrate) > 0:

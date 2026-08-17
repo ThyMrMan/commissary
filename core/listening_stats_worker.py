@@ -150,7 +150,7 @@ class ListeningStatsWorker:
         self.current_item = f"Polling {active_server}..."
 
         client = self._engine.client(active_server) if self._engine else None
-        # SoulSync standalone has no listening data; only the three
+        # Commissary standalone has no listening data; only the three
         # streaming servers contribute. Mirror the legacy guard here.
         if active_server not in ('plex', 'jellyfin', 'navidrome'):
             client = None

@@ -64,7 +64,7 @@ Each converter is the SINGLE place that knows that provider's wire
 shape. Adding a new provider = adding one classmethod here and
 nothing else needs to change.
 
-`Album.to_context_dict()` returns the canonical dict shape SoulSync's
+`Album.to_context_dict()` returns the canonical dict shape Commissary's
 existing import / download pipelines expect — the bridge between
 typed data and the current dict-passing internal API.
 

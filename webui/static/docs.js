@@ -45,8 +45,8 @@ const DOCS_SECTIONS = [
         content: () => `
             <div class="docs-subsection" id="gs-overview">
                 <h3 class="docs-subsection-title">Overview</h3>
-                <p class="docs-text">SoulSync is a self-hosted music download, sync, and library management platform. It connects to <strong>Spotify</strong>, <strong>Apple Music/iTunes</strong>, <strong>Deezer</strong>, <strong>Discogs</strong>, <strong>Tidal</strong>, <strong>Qobuz</strong>, <strong>YouTube</strong>, and <strong>Beatport</strong> for metadata, and downloads from <strong>Soulseek</strong>, <strong>YouTube</strong>, <strong>Tidal</strong>, <strong>Qobuz</strong>, <strong>HiFi</strong>, and <strong>Deezer</strong>. Your library is served through <strong>Plex</strong>, <strong>Jellyfin/Emby</strong>, or <strong>Navidrome</strong>.</p>
-                ${docsImg('gs-overview.jpg', 'SoulSync dashboard overview')}
+                <p class="docs-text">Commissary is a self-hosted music download, sync, and library management platform. It connects to <strong>Spotify</strong>, <strong>Apple Music/iTunes</strong>, <strong>Deezer</strong>, <strong>Discogs</strong>, <strong>Tidal</strong>, <strong>Qobuz</strong>, <strong>YouTube</strong>, and <strong>Beatport</strong> for metadata, and downloads from <strong>Soulseek</strong>, <strong>YouTube</strong>, <strong>Tidal</strong>, <strong>Qobuz</strong>, <strong>HiFi</strong>, and <strong>Deezer</strong>. Your library is served through <strong>Plex</strong>, <strong>Jellyfin/Emby</strong>, or <strong>Navidrome</strong>.</p>
+                ${docsImg('gs-overview.jpg', 'Commissary dashboard overview')}
                 <div class="docs-features">
                     <div class="docs-feature-card"><h4>&#x1F3B5; Download Music</h4><p>Search and download tracks in FLAC, MP3, and more from 6 sources (Soulseek, YouTube, Tidal, Qobuz, HiFi, Deezer), with automatic metadata tagging and file organization.</p></div>
                     <div class="docs-feature-card"><h4>&#x1F504; Playlist Sync</h4><p>Mirror playlists from Spotify, YouTube, Tidal, and Beatport. Discover official metadata and sync to your media server.</p></div>
@@ -58,19 +58,19 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="gs-first-setup">
                 <h3 class="docs-subsection-title">First-Time Setup</h3>
-                <p class="docs-text">After launching SoulSync, head to the <strong>Settings</strong> page to configure your services. At minimum you need:</p>
+                <p class="docs-text">After launching Commissary, head to the <strong>Settings</strong> page to configure your services. At minimum you need:</p>
                 <ol class="docs-steps">
                     <li><strong>Download Source</strong> &mdash; Connect at least one download source: Soulseek (slskd), YouTube, Tidal, Qobuz, HiFi, or Deezer. Soulseek offers the best quality selection; the others work as alternatives or fallbacks in Hybrid mode.</li>
-                    <li><strong>Media Server</strong> &mdash; Connect Plex, Jellyfin, or Navidrome so SoulSync knows where your library lives and can trigger scans.</li>
+                    <li><strong>Media Server</strong> &mdash; Connect Plex, Jellyfin, or Navidrome so Commissary knows where your library lives and can trigger scans.</li>
                     <li><strong>Spotify (Recommended)</strong> &mdash; Connect Spotify for the richest metadata. Create an app at <strong>developer.spotify.com</strong>, enter your Client ID and Secret, then click Authenticate.</li>
                     <li><strong>Input Path</strong> &mdash; Set your input and output paths in the Download Settings section. The output path should point to your media server's monitored folder.</li>
                 </ol>
                 ${docsImg('gs-first-setup.jpg', 'Settings page first-time setup')}
-                <div class="docs-callout tip"><span class="docs-callout-icon">&#x1F4A1;</span><div>You can start using SoulSync with just one download source. Spotify and other services add metadata enrichment but aren't strictly required &mdash; iTunes/Apple Music and Deezer are always available as free fallbacks.</div></div>
+                <div class="docs-callout tip"><span class="docs-callout-icon">&#x1F4A1;</span><div>You can start using Commissary with just one download source. Spotify and other services add metadata enrichment but aren't strictly required &mdash; iTunes/Apple Music and Deezer are always available as free fallbacks.</div></div>
             </div>
             <div class="docs-subsection" id="gs-connecting">
                 <h3 class="docs-subsection-title">Connecting Services</h3>
-                <p class="docs-text">SoulSync integrates with many external services. Here's a quick reference for each:</p>
+                <p class="docs-text">Commissary integrates with many external services. Here's a quick reference for each:</p>
                 <table class="docs-table">
                     <thead><tr><th>Service</th><th>Purpose</th><th>Auth Required</th></tr></thead>
                     <tbody>
@@ -96,7 +96,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="gs-interface">
                 <h3 class="docs-subsection-title">Understanding the Interface</h3>
-                <p class="docs-text">SoulSync uses a <strong>sidebar navigation</strong> layout. The left sidebar contains links to every page, a media player at the bottom, and service status indicators. The main content area changes based on the selected page.</p>
+                <p class="docs-text">Commissary uses a <strong>sidebar navigation</strong> layout. The left sidebar contains links to every page, a media player at the bottom, and service status indicators. The main content area changes based on the selected page.</p>
                 <ul class="docs-list">
                     <li><strong>Dashboard</strong> &mdash; System overview, tool cards, enrichment worker status, activity feed</li>
                     <li><strong>Sync</strong> &mdash; Import and manage playlists from Spotify, YouTube, Tidal, Beatport, ListenBrainz</li>
@@ -108,17 +108,17 @@ const DOCS_SECTIONS = [
                     <li><strong>Import</strong> &mdash; Import music files from an import folder with album/track matching</li>
                     <li><strong>Settings</strong> &mdash; Configure services, download preferences, quality profiles, and more</li>
                 </ul>
-                ${docsImg('gs-interface.jpg', 'SoulSync interface layout')}
-                <p class="docs-text"><strong>Version & Updates</strong>: Click the version number in the sidebar footer to open the <strong>What's New</strong> modal, which shows detailed release notes for every feature and fix. SoulSync automatically checks for updates by comparing your running version against the latest GitHub commit. If an update is available, a banner appears in the modal. Docker users are notified when a new image has been pushed to the repo.</p>
+                ${docsImg('gs-interface.jpg', 'Commissary interface layout')}
+                <p class="docs-text"><strong>Version & Updates</strong>: Click the version number in the sidebar footer to open the <strong>What's New</strong> modal, which shows detailed release notes for every feature and fix. Commissary automatically checks for updates by comparing your running version against the latest GitHub commit. If an update is available, a banner appears in the modal. Docker users are notified when a new image has been pushed to the repo.</p>
             </div>
             <div class="docs-subsection" id="gs-folders">
                 <h3 class="docs-subsection-title">Folder Setup (Downloads & Transfer)</h3>
-                <p class="docs-text">SoulSync uses <strong>three folders</strong> to manage your music files. <strong>Most setup issues come from incorrect folder configuration</strong> &mdash; especially in Docker. Read this section carefully.</p>
+                <p class="docs-text">Commissary uses <strong>three folders</strong> to manage your music files. <strong>Most setup issues come from incorrect folder configuration</strong> &mdash; especially in Docker. Read this section carefully.</p>
 
                 <div class="docs-callout warning"><span class="docs-callout-icon">&#x26A0;&#xFE0F;</span><div>
                     <strong>Docker users &mdash; there are TWO steps, not one!</strong><br><br>
                     <strong>Step 1:</strong> Map your volumes in <code>docker-compose.yml</code> &mdash; this makes folders <em>accessible</em> to the container.<br>
-                    <strong>Step 2:</strong> Configure the paths in <strong>SoulSync Settings &rarr; Download Settings</strong> &mdash; this tells the app <em>where to look</em>.<br><br>
+                    <strong>Step 2:</strong> Configure the paths in <strong>Commissary Settings &rarr; Download Settings</strong> &mdash; this tells the app <em>where to look</em>.<br><br>
                     Setting up docker-compose volumes alone is <strong>not enough</strong>. You must also configure the app settings. If you skip Step 2, downloads will complete but nothing will transfer, post-processing will fail silently, and tracks will re-download repeatedly.
                 </div></div>
 
@@ -136,19 +136,19 @@ const DOCS_SECTIONS = [
                 <h4>How Files Flow</h4>
                 <div class="docs-callout info"><span class="docs-callout-icon">&#x2139;&#xFE0F;</span><div>
                     <strong>The complete download-to-library pipeline:</strong><br><br>
-                    <strong>1.</strong> You search for music in SoulSync and click download<br>
-                    <strong>2.</strong> SoulSync tells slskd to download the file &rarr; slskd saves it to its input folder<br>
-                    <strong>3.</strong> SoulSync detects the completed download in the <strong>Input Path</strong><br>
+                    <strong>1.</strong> You search for music in Commissary and click download<br>
+                    <strong>2.</strong> Commissary tells slskd to download the file &rarr; slskd saves it to its input folder<br>
+                    <strong>3.</strong> Commissary detects the completed download in the <strong>Input Path</strong><br>
                     <strong>4.</strong> Post-processing runs: AcoustID verification &rarr; metadata tagging &rarr; cover art embedding &rarr; lyrics fetch<br>
                     <strong>5.</strong> File is renamed and organized (e.g., <code>Artist/Album/01 - Title.flac</code>)<br>
                     <strong>6.</strong> File is moved from Input Path &rarr; <strong>Output Path</strong><br>
                     <strong>7.</strong> Media server scan is triggered &rarr; file appears in your library<br><br>
-                    <strong>If any step fails, the pipeline stops.</strong> The most common failure point is Step 3 &mdash; SoulSync can't find the file because the Input Path doesn't match where slskd actually saved it.
+                    <strong>If any step fails, the pipeline stops.</strong> The most common failure point is Step 3 &mdash; Commissary can't find the file because the Input Path doesn't match where slskd actually saved it.
                 </div></div>
 
                 <h4>Docker Setup: The Full Picture</h4>
                 ${docsImg('gs-folder-docker.jpg', 'Docker folder mapping')}
-                <p class="docs-text">In Docker, every app runs in its own isolated container with its own filesystem. <strong>Volume mounts</strong> in docker-compose create "bridges" between your host folders and the container. But SoulSync doesn't automatically know where those bridges go &mdash; you have to tell it via the Settings page.</p>
+                <p class="docs-text">In Docker, every app runs in its own isolated container with its own filesystem. <strong>Volume mounts</strong> in docker-compose create "bridges" between your host folders and the container. But Commissary doesn't automatically know where those bridges go &mdash; you have to tell it via the Settings page.</p>
 
                 <p class="docs-text">Here's what happens with a properly configured setup:</p>
 
@@ -159,40 +159,40 @@ const DOCS_SECTIONS = [
                     <strong>docker-compose.yml (the bridges)</strong><br>
                     <code style="color: var(--accent-primary);">/mnt/data/slskd-downloads</code>:<code>/app/downloads</code><br>
                     <code style="color: #50e050;">/mnt/media/music</code>:<code>/app/Transfer</code><br><br>
-                    <strong>CONTAINER (what SoulSync sees)</strong><br>
+                    <strong>CONTAINER (what Commissary sees)</strong><br>
                     <code>/app/downloads/</code> &larr; same files as <code style="color: var(--accent-primary);">/mnt/data/slskd-downloads/</code><br>
                     <code>/app/Transfer/</code> &larr; same files as <code style="color: #50e050;">/mnt/media/music/</code><br><br>
-                    <strong>SoulSync Settings (what you enter in the app)</strong><br>
+                    <strong>Commissary Settings (what you enter in the app)</strong><br>
                     Input Path: <code>/app/downloads</code><br>
                     Output Path: <code>/app/Transfer</code>
                 </div></div>
 
                 <h4>The #1 Mistake: Not Configuring App Settings</h4>
-                <p class="docs-text">Many users set up their docker-compose volumes correctly but <strong>never open SoulSync Settings to configure the paths</strong>. The app defaults may not match your volume mounts. You must go to <strong>Settings &rarr; Download Settings</strong> and verify that:</p>
+                <p class="docs-text">Many users set up their docker-compose volumes correctly but <strong>never open Commissary Settings to configure the paths</strong>. The app defaults may not match your volume mounts. You must go to <strong>Settings &rarr; Download Settings</strong> and verify that:</p>
                 <ul class="docs-list">
                     <li><strong>Input Path</strong> matches where slskd puts completed files <em>inside the container</em> (usually <code>/app/downloads</code>)</li>
                     <li><strong>Output Path</strong> matches where you mounted your media library <em>inside the container</em> (usually <code>/app/Transfer</code>)</li>
                 </ul>
                 <div class="docs-callout warning"><span class="docs-callout-icon">&#x26A0;&#xFE0F;</span><div>
-                    <strong>"I set up my docker-compose but nothing transfers"</strong> &mdash; this almost always means the app settings weren't configured. Docker-compose makes the folders accessible. The app settings tell SoulSync where to look. <strong>Both are required.</strong>
+                    <strong>"I set up my docker-compose but nothing transfers"</strong> &mdash; this almost always means the app settings weren't configured. Docker-compose makes the folders accessible. The app settings tell Commissary where to look. <strong>Both are required.</strong>
                 </div></div>
 
                 <h4>The #2 Mistake: Input Path Doesn't Match slskd</h4>
-                <p class="docs-text">The <strong>Input Path</strong> in SoulSync must point to the <strong>exact same physical folder</strong> where slskd saves its completed downloads. If they don't match, SoulSync can't find the files and post-processing fails silently.</p>
+                <p class="docs-text">The <strong>Input Path</strong> in Commissary must point to the <strong>exact same physical folder</strong> where slskd saves its completed downloads. If they don't match, Commissary can't find the files and post-processing fails silently.</p>
 
                 <div class="docs-callout info"><span class="docs-callout-icon">&#x2139;&#xFE0F;</span><div>
-                    <strong>Both SoulSync and slskd must see the same input folder.</strong><br><br>
+                    <strong>Both Commissary and slskd must see the same input folder.</strong><br><br>
                     <strong>slskd container:</strong><br>
                     &bull; slskd downloads to <code>/downloads/complete</code> inside its own container<br>
                     &bull; slskd docker-compose: <code>- /mnt/data/slskd-downloads:/downloads/complete</code><br><br>
-                    <strong>SoulSync container:</strong><br>
-                    &bull; SoulSync docker-compose: <code>- /mnt/data/slskd-downloads:/app/downloads</code> (same host folder!)<br>
-                    &bull; SoulSync Setting: Input Path = <code>/app/downloads</code><br><br>
+                    <strong>Commissary container:</strong><br>
+                    &bull; Commissary docker-compose: <code>- /mnt/data/slskd-downloads:/app/downloads</code> (same host folder!)<br>
+                    &bull; Commissary Setting: Input Path = <code>/app/downloads</code><br><br>
                     <strong>The key:</strong> both containers mount the <strong>same host folder</strong> (<code>/mnt/data/slskd-downloads</code>). The container-internal paths can be different &mdash; that's fine. What matters is they point to the same physical directory on your server.
                 </div></div>
 
                 <h4>The #3 Mistake: Using Host Paths in Settings</h4>
-                <p class="docs-text">If you're running in Docker, the paths you enter in SoulSync's Settings page must be <strong>container-side paths</strong> (the right side of the <code>:</code> in your volume mount), <strong>not</strong> host paths (the left side). SoulSync runs inside the container and can only see its own filesystem.</p>
+                <p class="docs-text">If you're running in Docker, the paths you enter in Commissary's Settings page must be <strong>container-side paths</strong> (the right side of the <code>:</code> in your volume mount), <strong>not</strong> host paths (the left side). Commissary runs inside the container and can only see its own filesystem.</p>
 
                 <table class="docs-table">
                     <thead><tr><th></th><th>Setting Value</th><th>Result</th></tr></thead>
@@ -210,13 +210,13 @@ const DOCS_SECTIONS = [
                 <div class="docs-callout tip"><span class="docs-callout-icon">&#x1F4A1;</span><div>
                     <strong>Example with Plex:</strong><br><br>
                     &bull; Plex monitors <code>/mnt/media/music</code> on the host<br>
-                    &bull; SoulSync docker-compose: <code>- /mnt/media/music:/app/Transfer:rw</code><br>
-                    &bull; SoulSync Settings: Output Path = <code>/app/Transfer</code><br><br>
-                    <strong>Result:</strong> SoulSync writes to <code>/app/Transfer</code> inside the container &rarr; appears at <code>/mnt/media/music</code> on the host &rarr; Plex sees it and adds it to your library.
+                    &bull; Commissary docker-compose: <code>- /mnt/media/music:/app/Transfer:rw</code><br>
+                    &bull; Commissary Settings: Output Path = <code>/app/Transfer</code><br><br>
+                    <strong>Result:</strong> Commissary writes to <code>/app/Transfer</code> inside the container &rarr; appears at <code>/mnt/media/music</code> on the host &rarr; Plex sees it and adds it to your library.
                 </div></div>
 
-                <h4>Complete Docker Compose Example (slskd + SoulSync)</h4>
-                <p class="docs-text">Here's a working example showing both slskd and SoulSync configured to share the same input folder:</p>
+                <h4>Complete Docker Compose Example (slskd + Commissary)</h4>
+                <p class="docs-text">Here's a working example showing both slskd and Commissary configured to share the same input folder:</p>
                 <div class="docs-callout info"><span class="docs-callout-icon">&#x1F4CB;</span><div>
                     <code><strong># docker-compose.yml</strong></code><br>
                     <code>services:</code><br>
@@ -227,7 +227,7 @@ const DOCS_SECTIONS = [
                     <code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- /mnt/data/slskd-downloads:/downloads</code><br>
                     <code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- /docker/slskd/config:/app</code><br><br>
                     <code>&nbsp;&nbsp;soulsync:</code><br>
-                    <code>&nbsp;&nbsp;&nbsp;&nbsp;image: boulderbadgedad/soulsync:latest</code><br>
+                    <code>&nbsp;&nbsp;&nbsp;&nbsp;image: ghcr.io/thymrman/commissary:latest</code><br>
                     <code>&nbsp;&nbsp;&nbsp;&nbsp;volumes:</code><br>
                     <code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span style="color: var(--accent-primary);"># SAME host folder as slskd &mdash; this is the key!</span></code><br>
                     <code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- /mnt/data/slskd-downloads:/app/downloads</code><br><br>
@@ -238,7 +238,7 @@ const DOCS_SECTIONS = [
                     <code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- /docker/soulsync/logs:/app/logs</code><br>
                     <code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- /docker/soulsync/staging:/app/Staging</code><br>
                     <code>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- soulsync_database:/app/data</code><br><br>
-                    <code><strong># Then in SoulSync Settings:</strong></code><br>
+                    <code><strong># Then in Commissary Settings:</strong></code><br>
                     <code># Input Path: /app/downloads</code><br>
                     <code># Output Path: /app/Transfer</code>
                 </div></div>
@@ -247,20 +247,20 @@ const DOCS_SECTIONS = [
                 <h4>Setup Checklist</h4>
                 <p class="docs-text">Go through every item. If you miss any single one, the pipeline will break:</p>
                 <ol class="docs-steps">
-                    <li><strong>slskd input folder is mounted in SoulSync's container</strong> &mdash; Both containers must mount the <strong>same host directory</strong>. The host paths (left side of <code>:</code>) must be identical.</li>
+                    <li><strong>slskd input folder is mounted in Commissary's container</strong> &mdash; Both containers must mount the <strong>same host directory</strong>. The host paths (left side of <code>:</code>) must be identical.</li>
                     <li><strong>Media server's music folder is mounted as Output</strong> &mdash; Mount the folder your Plex/Jellyfin/Navidrome monitors as <code>/app/Transfer</code> with <code>:rw</code> permissions.</li>
-                    <li><strong>SoulSync Settings are configured</strong> &mdash; Open <strong>Settings &rarr; Download Settings</strong>. Set Input Path to <code>/app/downloads</code> and Output Path to <code>/app/Transfer</code> (or whatever container paths you used on the right side of <code>:</code>).</li>
+                    <li><strong>Commissary Settings are configured</strong> &mdash; Open <strong>Settings &rarr; Download Settings</strong>. Set Input Path to <code>/app/downloads</code> and Output Path to <code>/app/Transfer</code> (or whatever container paths you used on the right side of <code>:</code>).</li>
                     <li><strong>slskd URL and API key are set</strong> &mdash; In <strong>Settings &rarr; Soulseek</strong>, enter your slskd URL (e.g., <code>http://slskd:5030</code> or <code>http://host.docker.internal:5030</code>) and API key.</li>
-                    <li><strong>PUID/PGID match your host user</strong> &mdash; Run <code>id</code> on your host. Set those values in docker-compose environment variables. Both slskd and SoulSync should use the same PUID/PGID.</li>
+                    <li><strong>PUID/PGID match your host user</strong> &mdash; Run <code>id</code> on your host. Set those values in docker-compose environment variables. Both slskd and Commissary should use the same PUID/PGID.</li>
                     <li><strong>Test with one track</strong> &mdash; Download a single track. Watch the logs. If it downloads but doesn't transfer, the paths are wrong.</li>
                 </ol>
 
                 <h4>Permissions</h4>
-                <p class="docs-text">If paths are correct but files still won't transfer, it's usually a permissions issue. SoulSync needs <strong>read + write</strong> access to all three folders.</p>
+                <p class="docs-text">If paths are correct but files still won't transfer, it's usually a permissions issue. Commissary needs <strong>read + write</strong> access to all three folders.</p>
                 <ul class="docs-list">
                     <li>Set <code>PUID</code> and <code>PGID</code> in your docker-compose to match the user that owns your music folders (run <code>id</code> on your host to find your UID/GID &mdash; usually 1000/1000)</li>
                     <li>Ensure the output folder is writable: <code>chmod -R 755 /mnt/media/music</code> (use your actual host path)</li>
-                    <li>If using multiple containers (slskd + SoulSync), both must use the <strong>same PUID/PGID</strong> so file permissions are compatible</li>
+                    <li>If using multiple containers (slskd + Commissary), both must use the <strong>same PUID/PGID</strong> so file permissions are compatible</li>
                     <li>NFS/CIFS/network mounts may need additional permissions &mdash; test with a local folder first to isolate the issue</li>
                 </ul>
 
@@ -270,7 +270,7 @@ const DOCS_SECTIONS = [
                     <li><strong>Verify downloads are visible:</strong> <code>docker exec soulsync-webui ls -la /app/downloads</code> &mdash; you should see slskd's downloaded files here. If empty or "No such file or directory", your volume mount is wrong.</li>
                     <li><strong>Verify Transfer is writable:</strong> <code>docker exec soulsync-webui touch /app/Transfer/test.txt && echo "OK"</code> &mdash; then check that <code>test.txt</code> appears in your media server's music folder on the host. Clean up after: <code>rm /mnt/media/music/test.txt</code></li>
                     <li><strong>Verify permissions:</strong> <code>docker exec soulsync-webui id</code> &mdash; the uid and gid should match your PUID/PGID values.</li>
-                    <li><strong>Verify app settings:</strong> Open SoulSync Settings &rarr; Download Settings. Confirm the Input Path and Output Path show container paths (like <code>/app/downloads</code>), not host paths.</li>
+                    <li><strong>Verify app settings:</strong> Open Commissary Settings &rarr; Download Settings. Confirm the Input Path and Output Path show container paths (like <code>/app/downloads</code>), not host paths.</li>
                     <li><strong>Test a single download:</strong> Search for a track, download it, and watch the logs. Enable DEBUG logging in Settings for full detail. Check <code>logs/app.log</code> for any path errors.</li>
                 </ol>
 
@@ -278,20 +278,20 @@ const DOCS_SECTIONS = [
                 <table class="docs-table">
                     <thead><tr><th>Symptom</th><th>Likely Cause</th><th>Fix</th></tr></thead>
                     <tbody>
-                        <tr><td>Files download but never transfer</td><td>App settings not configured &mdash; docker-compose volumes are set but SoulSync Settings still have defaults or wrong paths</td><td>Open <strong>Settings &rarr; Download Settings</strong> and set Input Path + Output Path to your <strong>container-side</strong> mount paths.</td></tr>
-                        <tr><td>Post-processing log is empty</td><td>SoulSync can't find the downloaded file at the expected path &mdash; the Input Path in Settings doesn't match where slskd actually saves files inside the container</td><td>Run <code>docker exec soulsync-webui ls /app/downloads</code> to see what's actually there. The Input Path in Settings must match this path exactly.</td></tr>
-                        <tr><td>Same tracks downloading multiple times</td><td>Post-processing fails so SoulSync thinks the track was never downloaded successfully. On resume, it tries again.</td><td>Fix the folder paths first. Once post-processing works, files move to the output folder and SoulSync knows they exist.</td></tr>
+                        <tr><td>Files download but never transfer</td><td>App settings not configured &mdash; docker-compose volumes are set but Commissary Settings still have defaults or wrong paths</td><td>Open <strong>Settings &rarr; Download Settings</strong> and set Input Path + Output Path to your <strong>container-side</strong> mount paths.</td></tr>
+                        <tr><td>Post-processing log is empty</td><td>Commissary can't find the downloaded file at the expected path &mdash; the Input Path in Settings doesn't match where slskd actually saves files inside the container</td><td>Run <code>docker exec soulsync-webui ls /app/downloads</code> to see what's actually there. The Input Path in Settings must match this path exactly.</td></tr>
+                        <tr><td>Same tracks downloading multiple times</td><td>Post-processing fails so Commissary thinks the track was never downloaded successfully. On resume, it tries again.</td><td>Fix the folder paths first. Once post-processing works, files move to the output folder and Commissary knows they exist.</td></tr>
                         <tr><td>Files not renamed properly</td><td>Post-processing isn't running (path mismatch) or file organization is disabled in Settings</td><td>Verify File Organization is enabled in <strong>Settings &rarr; Processing & Organization</strong>. Fix Input Path first.</td></tr>
                         <tr><td>Permission denied in logs</td><td>Container user can't write to the output folder on the host</td><td>Set PUID/PGID to match the host user that owns the music folder. Run <code>chmod -R 755</code> on the output host folder.</td></tr>
-                        <tr><td>Media server doesn't see new files</td><td>Output Path doesn't map to the folder your media server monitors</td><td>Ensure the <strong>host path</strong> in your SoulSync volume mount (<code>/mnt/media/music:/app/Transfer</code>) is the same folder Plex/Jellyfin/Navidrome watches.</td></tr>
-                        <tr><td>slskd downloads work fine on their own but not through SoulSync</td><td>slskd's download folder and SoulSync's Input Path point to different physical locations</td><td>Both containers must mount the <strong>same host directory</strong>. Check the left side of <code>:</code> in both docker-compose volume entries &mdash; they must match.</td></tr>
+                        <tr><td>Media server doesn't see new files</td><td>Output Path doesn't map to the folder your media server monitors</td><td>Ensure the <strong>host path</strong> in your Commissary volume mount (<code>/mnt/media/music:/app/Transfer</code>) is the same folder Plex/Jellyfin/Navidrome watches.</td></tr>
+                        <tr><td>slskd downloads work fine on their own but not through Commissary</td><td>slskd's download folder and Commissary's Input Path point to different physical locations</td><td>Both containers must mount the <strong>same host directory</strong>. Check the left side of <code>:</code> in both docker-compose volume entries &mdash; they must match.</td></tr>
                     </tbody>
                 </table>
-                <div class="docs-callout tip"><span class="docs-callout-icon">&#x1F4A1;</span><div><strong>Still stuck?</strong> Enable DEBUG logging in Settings, download a single track, and check <code>logs/app.log</code>. The post-processing log will show exactly where the file pipeline breaks &mdash; whether it's a path not found, permission denied, or verification failure. If the post-processing log is empty, the issue is almost certainly a path mismatch (SoulSync never found the file to process).</div></div>
+                <div class="docs-callout tip"><span class="docs-callout-icon">&#x1F4A1;</span><div><strong>Still stuck?</strong> Enable DEBUG logging in Settings, download a single track, and check <code>logs/app.log</code>. The post-processing log will show exactly where the file pipeline breaks &mdash; whether it's a path not found, permission denied, or verification failure. If the post-processing log is empty, the issue is almost certainly a path mismatch (Commissary never found the file to process).</div></div>
             </div>
             <div class="docs-subsection" id="gs-docker">
                 <h3 class="docs-subsection-title">Docker & Deployment</h3>
-                <p class="docs-text">SoulSync runs in Docker with the following environment variables:</p>
+                <p class="docs-text">Commissary runs in Docker with the following environment variables:</p>
                 <table class="docs-table">
                     <thead><tr><th>Variable</th><th>Default</th><th>Description</th></tr></thead>
                     <tbody>
@@ -301,7 +301,7 @@ const DOCS_SECTIONS = [
                     </tbody>
                 </table>
                 <h4>Key Volume Mounts</h4>
-                <p class="docs-text">Your docker-compose <code>volumes</code> section must include these mappings. The left side is your host path, the right side is where SoulSync sees it inside the container:</p>
+                <p class="docs-text">Your docker-compose <code>volumes</code> section must include these mappings. The left side is your host path, the right side is where Commissary sees it inside the container:</p>
                 <table class="docs-table">
                     <thead><tr><th>Mount</th><th>Container Path</th><th>What Goes Here</th></tr></thead>
                     <tbody>
@@ -313,10 +313,10 @@ const DOCS_SECTIONS = [
                         <tr><td>Database</td><td><code>/app/data</code></td><td><strong>Must use a named volume</strong> (not a host path). Host path mounts can cause database corruption.</td></tr>
                     </tbody>
                 </table>
-                <div class="docs-callout warning"><span class="docs-callout-icon">&#x26A0;&#xFE0F;</span><div><strong>slskd + SoulSync shared downloads:</strong> If slskd runs in a separate container, both containers must mount the <strong>same host directory</strong> for downloads. A common issue is slskd writing to a path that SoulSync can't read because the volume mounts don't align. Both containers must see the same files. See the <strong>Folder Setup</strong> section above for detailed examples.</div></div>
+                <div class="docs-callout warning"><span class="docs-callout-icon">&#x26A0;&#xFE0F;</span><div><strong>slskd + Commissary shared downloads:</strong> If slskd runs in a separate container, both containers must mount the <strong>same host directory</strong> for downloads. A common issue is slskd writing to a path that Commissary can't read because the volume mounts don't align. Both containers must see the same files. See the <strong>Folder Setup</strong> section above for detailed examples.</div></div>
                 <div class="docs-callout warning"><span class="docs-callout-icon">&#x26A0;&#xFE0F;</span><div><strong>Database volume:</strong> Always use a named volume for the database (<code>soulsync_database:/app/data</code>), never a host path mount. Host path mounts can cause SQLite corruption, especially on networked file systems or when permissions don't align.</div></div>
-                <p class="docs-text"><strong>Podman / Rootless Docker</strong>: SoulSync supports Podman rootless (keep-id) and rootless Docker setups. The entrypoint handles permission alignment automatically.</p>
-                <p class="docs-text"><strong>Config migration</strong>: When upgrading from older versions, SoulSync automatically migrates settings from <code>config.json</code> to the database on first startup. No manual migration is needed.</p>
+                <p class="docs-text"><strong>Podman / Rootless Docker</strong>: Commissary supports Podman rootless (keep-id) and rootless Docker setups. The entrypoint handles permission alignment automatically.</p>
+                <p class="docs-text"><strong>Config migration</strong>: When upgrading from older versions, Commissary automatically migrates settings from <code>config.json</code> to the database on first startup. No manual migration is needed.</p>
             </div>
         `
     },
@@ -335,7 +335,7 @@ const DOCS_SECTIONS = [
         content: () => `
             <div class="docs-subsection" id="wf-first">
                 <h3 class="docs-subsection-title">What Should I Do First?</h3>
-                <p class="docs-text">SoulSync can do a lot, but you don't need to learn everything at once. Here are the <strong>6 essential workflows</strong> that cover 90% of what most users need. Start with whichever one matches your goal, and explore the rest later.</p>
+                <p class="docs-text">Commissary can do a lot, but you don't need to learn everything at once. Here are the <strong>6 essential workflows</strong> that cover 90% of what most users need. Start with whichever one matches your goal, and explore the rest later.</p>
                 <div class="docs-workflow-cards">
                     <div class="docs-workflow-card" onclick="document.getElementById('wf-download').scrollIntoView({behavior:'smooth'})">
                         <div class="docs-workflow-card-icon">&#x1F3B5;</div>
@@ -362,7 +362,7 @@ const DOCS_SECTIONS = [
                         <div class="docs-workflow-card-icon">&#x1F4E5;</div>
                         <div class="docs-workflow-card-title">Import Existing Music</div>
                         <span class="docs-workflow-card-badge">5 steps</span>
-                        <p>Bring your existing music files into SoulSync with proper tags and organization.</p>
+                        <p>Bring your existing music files into Commissary with proper tags and organization.</p>
                         <a class="docs-workflow-card-link" onclick="event.stopPropagation(); document.getElementById('wf-import').scrollIntoView({behavior:'smooth'})">View Guide &rarr;</a>
                     </div>
                     <div class="docs-workflow-card" onclick="document.getElementById('wf-media').scrollIntoView({behavior:'smooth'})">
@@ -376,7 +376,7 @@ const DOCS_SECTIONS = [
                         <div class="docs-workflow-card-icon">&#x1F3C1;</div>
                         <div class="docs-workflow-card-title">First Things After Setup</div>
                         <span class="docs-workflow-card-badge">5 steps</span>
-                        <p>Once connected, do these 5 things to get the most out of SoulSync right away.</p>
+                        <p>Once connected, do these 5 things to get the most out of Commissary right away.</p>
                         <a class="docs-workflow-card-link">See below &darr;</a>
                     </div>
                 </div>
@@ -398,7 +398,7 @@ const DOCS_SECTIONS = [
                     <li><strong>Type the album name</strong> &mdash; Results appear in a categorized dropdown: Artists, Albums, Singles & EPs, Tracks</li>
                     <li><strong>Click the album result</strong> &mdash; The download modal opens showing cover art, tracklist, and album details</li>
                     <li><strong>Select tracks</strong> &mdash; All tracks are selected by default. Uncheck any you don't want</li>
-                    <li><strong>Click Download</strong> &mdash; SoulSync searches for each track, downloads, tags, and organizes the files automatically</li>
+                    <li><strong>Click Download</strong> &mdash; Commissary searches for each track, downloads, tags, and organizes the files automatically</li>
                 </ol>
                 ${docsImg('wf-download-album.gif', 'Downloading an album')}
                 <p class="docs-text"><strong>Result:</strong> Tracks appear in your output folder as <code>Artist/Album/01 - Title.flac</code> and your media server is notified to scan.</p>
@@ -430,10 +430,10 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="wf-import">
                 <h3 class="docs-subsection-title">How to: Import Existing Music</h3>
-                <p class="docs-text"><strong>Goal:</strong> Bring music files you already have into SoulSync with proper metadata and organization.</p>
+                <p class="docs-text"><strong>Goal:</strong> Bring music files you already have into Commissary with proper metadata and organization.</p>
                 <ol class="docs-steps">
                     <li><strong>Place files in your import folder</strong> &mdash; Put album folders (e.g., <code>Artist - Album/</code>) in the Import Path configured in Settings</li>
-                    <li><strong>Go to the Import page</strong> &mdash; SoulSync detects the files and suggests album matches</li>
+                    <li><strong>Go to the Import page</strong> &mdash; Commissary detects the files and suggests album matches</li>
                     <li><strong>Search for the correct album</strong> &mdash; If the auto-suggestion is wrong, search Spotify/iTunes for the right album</li>
                     <li><strong>Match tracks</strong> &mdash; Drag-and-drop files onto the correct track slots, or click Auto-Match</li>
                     <li><strong>Click Confirm</strong> &mdash; Files are tagged with official metadata, organized, and moved to your library</li>
@@ -550,7 +550,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="dash-backup">
                 <h3 class="docs-subsection-title">Backup Manager</h3>
-                <p class="docs-text">The Backup Manager protects your SoulSync database (all library data, watchlists, playlists, automations, and settings).</p>
+                <p class="docs-text">The Backup Manager protects your Commissary database (all library data, watchlists, playlists, automations, and settings).</p>
                 <ul class="docs-list">
                     <li><strong>Create Backup</strong> &mdash; Creates a timestamped copy of the database file</li>
                     <li><strong>Download</strong> &mdash; Download any backup to your local machine</li>
@@ -626,7 +626,7 @@ const DOCS_SECTIONS = [
         content: () => `
             <div class="docs-subsection" id="sync-overview">
                 <h3 class="docs-subsection-title">Overview</h3>
-                <p class="docs-text">The Sync page lets you import playlists from <strong>Spotify</strong>, <strong>YouTube</strong>, <strong>Tidal</strong>, and <strong>Beatport</strong>. Once imported, playlists are <strong>mirrored</strong> &mdash; they persist in your SoulSync instance and can be refreshed, discovered, and synced to your wishlist for downloading.</p>
+                <p class="docs-text">The Sync page lets you import playlists from <strong>Spotify</strong>, <strong>YouTube</strong>, <strong>Tidal</strong>, and <strong>Beatport</strong>. Once imported, playlists are <strong>mirrored</strong> &mdash; they persist in your Commissary instance and can be refreshed, discovered, and synced to your wishlist for downloading.</p>
                 ${docsImg('sync-overview.jpg', 'Playlist sync page')}
             </div>
             <div class="docs-subsection" id="sync-spotify">
@@ -643,7 +643,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="sync-youtube">
                 <h3 class="docs-subsection-title">YouTube Playlists</h3>
-                <p class="docs-text">Paste a YouTube playlist URL into the input field and click <strong>Parse Playlist</strong>. SoulSync extracts the track list and attempts to match each track to official Spotify/iTunes metadata.</p>
+                <p class="docs-text">Paste a YouTube playlist URL into the input field and click <strong>Parse Playlist</strong>. Commissary extracts the track list and attempts to match each track to official Spotify/iTunes metadata.</p>
                 ${docsImg('sync-youtube.jpg', 'YouTube playlist import')}
                 <div class="docs-callout warning"><span class="docs-callout-icon">&#x26A0;&#xFE0F;</span><div>YouTube tracks often have non-standard titles (e.g., "Artist - Song (Official Video)"). The discovery pipeline handles this, but some manual fixes may be needed for edge cases.</div></div>
             </div>
@@ -680,7 +680,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="sync-spotify-public">
                 <h3 class="docs-subsection-title">Spotify Public Links</h3>
-                <p class="docs-text">Sync Spotify playlists and albums <strong>without OAuth credentials</strong>. Paste any public Spotify playlist or album URL and SoulSync will load the tracks for download. Useful when you don't want to connect a Spotify account or want to sync from someone else's public playlist.</p>
+                <p class="docs-text">Sync Spotify playlists and albums <strong>without OAuth credentials</strong>. Paste any public Spotify playlist or album URL and Commissary will load the tracks for download. Useful when you don't want to connect a Spotify account or want to sync from someone else's public playlist.</p>
                 <ul class="docs-list">
                     <li>Paste any <code>open.spotify.com/playlist/...</code> or <code>open.spotify.com/album/...</code> URL</li>
                     <li>Works without Spotify API credentials</li>
@@ -704,7 +704,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="sync-deezer-link">
                 <h3 class="docs-subsection-title">Deezer Link</h3>
-                <p class="docs-text">Import any public Deezer playlist by URL without needing an ARL token. Paste a Deezer playlist URL, click <strong>Load Playlist</strong>, and SoulSync parses the tracks for discovery and download.</p>
+                <p class="docs-text">Import any public Deezer playlist by URL without needing an ARL token. Paste a Deezer playlist URL, click <strong>Load Playlist</strong>, and Commissary parses the tracks for discovery and download.</p>
                 <ul class="docs-list">
                     <li>Paste any <code>deezer.com/playlist/...</code> URL or raw playlist ID</li>
                     <li>Track matching uses the same fuzzy discovery pipeline as YouTube and Tidal</li>
@@ -714,10 +714,10 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="sync-import-file">
                 <h3 class="docs-subsection-title">Import from File</h3>
-                <p class="docs-text">Import track lists from <strong>CSV, TSV, M3U/M3U8, or plain text files</strong>. Drag and drop a file or click to browse. SoulSync parses the file, lets you preview and map columns, then creates a mirrored playlist for discovery and download.</p>
+                <p class="docs-text">Import track lists from <strong>CSV, TSV, M3U/M3U8, or plain text files</strong>. Drag and drop a file or click to browse. Commissary parses the file, lets you preview and map columns, then creates a mirrored playlist for discovery and download.</p>
                 <ul class="docs-list">
                     <li><strong>CSV/TSV</strong>: Auto-detects columns; map Artist, Title, and Album from dropdowns</li>
-                    <li><strong>M3U/M3U8</strong>: Read automatically — artist, title and duration come from <code>#EXTINF</code> lines (or the file name for simple playlists). Round-trips with SoulSync's own M3U export</li>
+                    <li><strong>M3U/M3U8</strong>: Read automatically — artist, title and duration come from <code>#EXTINF</code> lines (or the file name for simple playlists). Round-trips with Commissary's own M3U export</li>
                     <li><strong>Text files</strong>: One track per line; choose Artist-Title or Title-Artist order and separator (dash, tab, pipe, etc.)</li>
                     <li>Preview parsed tracks before importing</li>
                     <li>Name your playlist and it becomes a mirrored playlist for sync</li>
@@ -755,7 +755,7 @@ const DOCS_SECTIONS = [
                 <ol class="docs-steps">
                     <li>Import a playlist (YouTube or Tidal)</li>
                     <li>Click <strong>Discover</strong> on the playlist card (or automate with the "Discover Playlist" action)</li>
-                    <li>SoulSync matches each track to official metadata &mdash; results are cached globally</li>
+                    <li>Commissary matches each track to official metadata &mdash; results are cached globally</li>
                     <li><strong>Sync</strong> the playlist &mdash; only discovered tracks are included; unmatched tracks are skipped</li>
                 </ol>
                 <div class="docs-callout tip"><span class="docs-callout-icon">&#x1F4A1;</span><div>Chain automations for hands-free operation: Refresh Playlist &rarr; Playlist Changed &rarr; Discover &rarr; Discovery Complete &rarr; Sync</div></div>
@@ -800,7 +800,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="search-sources">
                 <h3 class="docs-subsection-title">Download Sources</h3>
-                <p class="docs-text">SoulSync supports multiple download sources, configurable in <strong>Settings &rarr; Download Settings</strong>:</p>
+                <p class="docs-text">Commissary supports multiple download sources, configurable in <strong>Settings &rarr; Download Settings</strong>:</p>
                 <table class="docs-table">
                     <thead><tr><th>Source</th><th>Description</th><th>Best For</th></tr></thead>
                     <tbody>
@@ -891,7 +891,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="disc-playlists">
                 <h3 class="docs-subsection-title">Discovery & Personalized Playlists</h3>
-                <p class="docs-text">SoulSync generates playlists from two sources: your <strong>discovery pool</strong> (50 similar artists refreshed during watchlist scans) and your <strong>library listening data</strong>:</p>
+                <p class="docs-text">Commissary generates playlists from two sources: your <strong>discovery pool</strong> (50 similar artists refreshed during watchlist scans) and your <strong>library listening data</strong>:</p>
                 <table class="docs-table">
                     <thead><tr><th>Playlist</th><th>Source</th><th>Description</th></tr></thead>
                     <tbody>
@@ -987,7 +987,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="art-watchlist">
                 <h3 class="docs-subsection-title">Watchlist</h3>
-                <p class="docs-text">The watchlist tracks artists you want to follow for new releases. When SoulSync scans your watchlist, it checks each artist's discography and adds any new tracks to your <strong>wishlist</strong> for downloading.</p>
+                <p class="docs-text">The watchlist tracks artists you want to follow for new releases. When Commissary scans your watchlist, it checks each artist's discography and adds any new tracks to your <strong>wishlist</strong> for downloading.</p>
                 <ul class="docs-list">
                     <li>Add artists from search results, the Discover page hero, or library artist cards</li>
                     <li>Remove artists individually or in bulk</li>
@@ -1068,7 +1068,7 @@ const DOCS_SECTIONS = [
                         <tr><td><strong>Schedule</strong></td><td>Run on a timer interval (minutes/hours/days)</td></tr>
                         <tr><td><strong>Daily Time</strong></td><td>Run every day at a specific time</td></tr>
                         <tr><td><strong>Weekly Time</strong></td><td>Run on specific weekdays at a set time</td></tr>
-                        <tr><td><strong>App Started</strong></td><td>Fires when SoulSync starts up</td></tr>
+                        <tr><td><strong>App Started</strong></td><td>Fires when Commissary starts up</td></tr>
                         <tr><td><strong>Track Downloaded</strong></td><td>When a track finishes downloading</td></tr>
                         <tr><td><strong>Download Failed</strong></td><td>When a track permanently fails to download</td></tr>
                         <tr><td><strong>Download Quarantined</strong></td><td>When AcoustID verification rejects a download</td></tr>
@@ -1141,7 +1141,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="auto-system">
                 <h3 class="docs-subsection-title">System Automations</h3>
-                <p class="docs-text">SoulSync ships with 10 built-in automations that handle routine maintenance. You can enable/disable them and modify their configs, but you can't delete them or rename them.</p>
+                <p class="docs-text">Commissary ships with 10 built-in automations that handle routine maintenance. You can enable/disable them and modify their configs, but you can't delete them or rename them.</p>
                 <table class="docs-table">
                     <thead><tr><th>Automation</th><th>Schedule</th></tr></thead>
                     <tbody>
@@ -1233,7 +1233,7 @@ const DOCS_SECTIONS = [
                 <h3 class="docs-subsection-title">Smart Delete</h3>
                 <p class="docs-text">Right-click or use the delete action on any track to open the Smart Delete dialog. Three options are available:</p>
                 <ul class="docs-list">
-                    <li><strong>Remove from Library</strong> &mdash; Removes the track from SoulSync's database only. The audio file on disk is not touched. Use this if you want to clean up the database without losing files.</li>
+                    <li><strong>Remove from Library</strong> &mdash; Removes the track from Commissary's database only. The audio file on disk is not touched. Use this if you want to clean up the database without losing files.</li>
                     <li><strong>Delete File Too</strong> &mdash; Removes the database entry AND deletes the audio file from disk. Irreversible.</li>
                     <li><strong>Delete &amp; Blacklist</strong> &mdash; Removes and deletes the file, then adds it to the <strong>download blacklist</strong> so it won't be re-downloaded by the wishlist or automation system.</li>
                 </ul>
@@ -1276,7 +1276,7 @@ const DOCS_SECTIONS = [
         content: () => `
             <div class="docs-subsection" id="imp-setup">
                 <h3 class="docs-subsection-title">Staging Setup</h3>
-                <p class="docs-text">Set your <strong>import folder path</strong> in Settings &rarr; Download Settings. Place audio files you want to import into this folder. SoulSync scans the folder and detects albums from the file structure.</p>
+                <p class="docs-text">Set your <strong>import folder path</strong> in Settings &rarr; Download Settings. Place audio files you want to import into this folder. Commissary scans the folder and detects albums from the file structure.</p>
                 <p class="docs-text">Place albums in subfolders (e.g., <code>Artist - Album/</code>) and loose singles at the root level.</p>
                 <p class="docs-text">The import page header shows the total files in staging and their combined size.</p>
                 ${docsImg('imp-staging.jpg', 'Import staging page')}
@@ -1286,7 +1286,7 @@ const DOCS_SECTIONS = [
                 <h3 class="docs-subsection-title">Import Workflow</h3>
                 <ol class="docs-steps">
                     <li>Place audio files in your import folder</li>
-                    <li>Navigate to the <strong>Import</strong> page &mdash; SoulSync detects and suggests album matches</li>
+                    <li>Navigate to the <strong>Import</strong> page &mdash; Commissary detects and suggests album matches</li>
                     <li>Search for the correct album on Spotify/iTunes if the suggestion is wrong</li>
                     <li><strong>Match tracks</strong> &mdash; Drag-and-drop staged files onto album track slots, or let auto-match attempt it</li>
                     <li>Review the match and click <strong>Confirm</strong> to import &mdash; files are tagged, organized, and added to your library</li>
@@ -1314,7 +1314,7 @@ const DOCS_SECTIONS = [
                     <li>Click <strong>Import from File</strong> and select your text file</li>
                     <li>Choose the <strong>separator</strong> (comma, tab, or pipe)</li>
                     <li>Map columns to the correct fields (Artist, Album, Track)</li>
-                    <li>SoulSync searches for each track on Spotify/iTunes and adds matches to your wishlist for downloading</li>
+                    <li>Commissary searches for each track on Spotify/iTunes and adds matches to your wishlist for downloading</li>
                 </ol>
                 ${docsImg('imp-textfile.jpg', 'Text file import')}
             </div>
@@ -1369,7 +1369,7 @@ const DOCS_SECTIONS = [
                         <tr><td><span class="docs-kbd">Escape</span></td><td>Close Now Playing modal</td></tr>
                     </tbody>
                 </table>
-                <p class="docs-text"><strong>Media Session API</strong> &mdash; SoulSync integrates with your OS media controls (lock screen, system tray) for play/pause, next/previous, and seek.</p>
+                <p class="docs-text"><strong>Media Session API</strong> &mdash; Commissary integrates with your OS media controls (lock screen, system tray) for play/pause, next/previous, and seek.</p>
             </div>
         `
     },
@@ -1406,13 +1406,13 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="set-media">
                 <h3 class="docs-subsection-title">Media Server Setup</h3>
-                <p class="docs-text">Connect your media server so SoulSync can scan your library, trigger updates, stream audio, and sync metadata:</p>
+                <p class="docs-text">Connect your media server so Commissary can scan your library, trigger updates, stream audio, and sync metadata:</p>
                 <table class="docs-table">
                     <thead><tr><th>Server</th><th>Credentials</th><th>Setup Details</th></tr></thead>
                     <tbody>
-                        <tr><td><strong>Plex</strong></td><td>URL + Token</td><td>After connecting, select which <strong>Music Library</strong> to use from the dropdown. SoulSync scans this library for your collection and triggers scans after downloads.</td></tr>
-                        <tr><td><strong>Jellyfin</strong></td><td>URL + API Key</td><td>Select the <strong>User</strong> and <strong>Music Library</strong> to target. SoulSync uses the Jellyfin API for library scans and can stream audio directly.</td></tr>
-                        <tr><td><strong>Navidrome</strong></td><td>URL + Username + Password</td><td>Select the <strong>Music Folder</strong> to monitor. Navidrome auto-detects new files, so SoulSync doesn't need to trigger scans &mdash; just place files in the right folder.</td></tr>
+                        <tr><td><strong>Plex</strong></td><td>URL + Token</td><td>After connecting, select which <strong>Music Library</strong> to use from the dropdown. Commissary scans this library for your collection and triggers scans after downloads.</td></tr>
+                        <tr><td><strong>Jellyfin</strong></td><td>URL + API Key</td><td>Select the <strong>User</strong> and <strong>Music Library</strong> to target. Commissary uses the Jellyfin API for library scans and can stream audio directly.</td></tr>
+                        <tr><td><strong>Navidrome</strong></td><td>URL + Username + Password</td><td>Select the <strong>Music Folder</strong> to monitor. Navidrome auto-detects new files, so Commissary doesn't need to trigger scans &mdash; just place files in the right folder.</td></tr>
                     </tbody>
                 </table>
                 ${docsImg('settings-media-server.jpg', 'Media server setup')}
@@ -1423,7 +1423,7 @@ const DOCS_SECTIONS = [
                 <h3 class="docs-subsection-title">Download Settings</h3>
                 <ul class="docs-list">
                     <li><strong>Download Source Mode</strong> &mdash; Soulseek, YouTube, Tidal, Qobuz, HiFi, Deezer, or Hybrid. Hybrid tries your primary source first, then falls back to alternates with configurable priority via drag-and-drop. Each streaming source has its own quality dropdown and an <strong>Allow quality fallback</strong> toggle. See <em>Download Sources</em> and <em>Quality Profiles</em> in the Music Downloads section for details.</li>
-                    <li><strong>Input Path</strong> &mdash; The folder where files are initially downloaded. This <strong>must match</strong> the folder your download source (slskd) writes to. In Docker, this is the container-side mount point (e.g., <code>/app/downloads</code>), not the host path. SoulSync monitors this folder for completed downloads to begin post-processing.</li>
+                    <li><strong>Input Path</strong> &mdash; The folder where files are initially downloaded. This <strong>must match</strong> the folder your download source (slskd) writes to. In Docker, this is the container-side mount point (e.g., <code>/app/downloads</code>), not the host path. Commissary monitors this folder for completed downloads to begin post-processing.</li>
                     <li><strong>Output Path</strong> &mdash; The final destination for processed music files. After tagging, renaming, and organizing, files are moved here. This <strong>must</strong> point to your media server's monitored music folder (the folder Plex/Jellyfin/Navidrome watches for new content). In Docker, use the container-side path (e.g., <code>/app/Transfer</code>).</li>
                     <li><strong>Import Path</strong> &mdash; Folder for the Import feature (files placed here appear on the Import page). Separate from the input/output pipeline.</li>
                     <li><strong>iTunes Country</strong> &mdash; Storefront region for iTunes/Apple Music lookups (US, GB, FR, JP, etc.). Changes apply immediately to all searches without restarting. ID-based lookups automatically try up to 10 regional storefronts as fallback when the primary country returns no results.</li>
@@ -1462,7 +1462,7 @@ const DOCS_SECTIONS = [
                     <li><strong>Log Level</strong> &mdash; Set log verbosity (DEBUG, INFO, WARNING, ERROR) in <strong>Settings &rarr; Advanced &rarr; Logging</strong>. Changes take effect immediately. See <em>Troubleshooting &rarr; Understanding Logs</em> for details.</li>
                     <li><strong>WebSocket</strong> &mdash; Real-time status updates are delivered via WebSocket. All downloads, enrichment progress, scan status, and system events push to the UI without polling.</li>
                     <li><strong>Music Libraries</strong> &mdash; In Settings &gt; Paths &amp; Organization, the folders finished music can be filed into. The first is the default destination; downloads and imports can pick a different one. Each can override the naming template and quality profile (blank inherits the global setting). Docker users: these are container-side paths &mdash; mount the real folder first.</li>
-                    <li><strong>Additional Read-Only Paths</strong> &mdash; Same page, further down. Folders SoulSync should READ but never file downloads into: an old collection you aren't adding to, or the same files at a path your media server reports differently. Used for tag writing, streaming, and file detection. Docker users: mount the folder(s) with read-write access, then add the container-side path.</li>
+                    <li><strong>Additional Read-Only Paths</strong> &mdash; Same page, further down. Folders Commissary should READ but never file downloads into: an old collection you aren't adding to, or the same files at a path your media server reports differently. Used for tag writing, streaming, and file detection. Docker users: mount the folder(s) with read-write access, then add the container-side path.</li>
                     <li><strong>Replace Lower Quality on Import</strong> &mdash; Opt-in toggle in Settings &gt; Library. When importing from Staging, if a track already exists at lower quality (e.g. MP3), it gets replaced with the higher quality version (e.g. FLAC). Disabled by default.</li>
                     <li><strong>HiFi Instance Health</strong> &mdash; In Settings &gt; Downloads &gt; HiFi, click "Check All Instances" to see which community API instances are online, searchable, or able to download.</li>
                     <li><strong>Dead File Fix Options</strong> &mdash; Dead file findings in Library Maintenance now prompt with two choices: "Re-download" (adds to wishlist) or "Remove from DB" (just deletes the stale record). Works for single and bulk fix.</li>
@@ -1492,7 +1492,7 @@ const DOCS_SECTIONS = [
         content: () => `
             <div class="docs-subsection" id="prof-overview">
                 <h3 class="docs-subsection-title">How Profiles Work</h3>
-                <p class="docs-text">SoulSync supports <strong>Netflix-style multiple profiles</strong> for shared households. Each profile gets its own:</p>
+                <p class="docs-text">Commissary supports <strong>Netflix-style multiple profiles</strong> for shared households. Each profile gets its own:</p>
                 <ul class="docs-list">
                     <li>Watchlist (followed artists)</li>
                     <li>Wishlist (tracks to download)</li>
@@ -1556,7 +1556,7 @@ const DOCS_SECTIONS = [
         content: () => `
             <div class="docs-subsection" id="ts-logs">
                 <h3 class="docs-subsection-title">Understanding Logs</h3>
-                <p class="docs-text">SoulSync writes several log files that are critical for diagnosing issues. All logs are in the <code>logs/</code> directory (Docker: <code>/app/logs/</code>).</p>
+                <p class="docs-text">Commissary writes several log files that are critical for diagnosing issues. All logs are in the <code>logs/</code> directory (Docker: <code>/app/logs/</code>).</p>
                 <table class="docs-table">
                     <thead><tr><th>File</th><th>What It Contains</th><th>When to Check</th></tr></thead>
                     <tbody>
@@ -1578,7 +1578,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="ts-debug">
                 <h3 class="docs-subsection-title">Copy Debug Info</h3>
-                <p class="docs-text">The <strong>Copy Debug Info</strong> button in the sidebar collects a complete snapshot of your SoulSync instance in one click:</p>
+                <p class="docs-text">The <strong>Copy Debug Info</strong> button in the sidebar collects a complete snapshot of your Commissary instance in one click:</p>
                 <ul class="docs-list">
                     <li>System info (version, OS, Python, uptime, memory, CPU)</li>
                     <li>Service connection status (Spotify, Soulseek, Tidal, Qobuz, Discogs, media server)</li>
@@ -1609,7 +1609,7 @@ const DOCS_SECTIONS = [
                 <h4>Spotify shows "Rate Limited"</h4>
                 <ul class="docs-list">
                     <li>This is temporary &mdash; Spotify throttles API calls when limits are hit</li>
-                    <li>SoulSync automatically falls back to other metadata sources during a ban</li>
+                    <li>Commissary automatically falls back to other metadata sources during a ban</li>
                     <li>The rate limit modal shows a countdown. Enrichment workers auto-pause and resume when the ban lifts</li>
                 </ul>
                 <h4>Docker: paths not found / permission denied</h4>
@@ -1627,7 +1627,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="ts-reporting">
                 <h3 class="docs-subsection-title">Reporting Issues</h3>
-                <p class="docs-text">When reporting a bug on <a href="https://github.com/Nezreka/SoulSync/issues" target="_blank">GitHub Issues</a> or in the <a href="https://discord.gg/wGvKqVQwmy" target="_blank">Discord</a>, include:</p>
+                <p class="docs-text">Report Commissary bugs on <a href="https://github.com/ThyMrMan/soul-sync-thymrman-customized/issues" target="_blank">this fork's GitHub Issues</a> &mdash; not upstream, which cannot reproduce changes made here. Include:</p>
                 <ol class="docs-list">
                     <li><strong>Debug info snapshot</strong> &mdash; Click <strong>Copy Debug Info</strong> in the Help sidebar and paste the output</li>
                     <li><strong>Steps to reproduce</strong> &mdash; What you did, what you expected, what happened instead</li>
@@ -1651,7 +1651,7 @@ const DOCS_SECTIONS = [
         content: () => `
             <div class="docs-subsection" id="vid-what">
                 <h3 class="docs-subsection-title">What the Video Side Is</h3>
-                <p class="docs-text">SoulSync's <strong>Video</strong> side is a self-hosted movies &amp; TV manager that lives inside the same app as the music side but runs as an <strong>isolated application</strong> &mdash; its own database, its own pages, its own API blueprint. Think of it as a Sonarr + Radarr + overlay/collection manager built into SoulSync. It connects to <strong>Plex</strong> or <strong>Jellyfin/Emby</strong> to read your movie and TV libraries, enriches every title from <strong>TMDB</strong>, <strong>TVDB</strong>, <strong>OMDb</strong>, <strong>fanart.tv</strong>, <strong>OpenSubtitles</strong> and more, and can search, grab, organize, and upgrade downloads to fill the gaps.</p>
+                <p class="docs-text">Commissary's <strong>Video</strong> side is a self-hosted movies &amp; TV manager that lives inside the same app as the music side but runs as an <strong>isolated application</strong> &mdash; its own database, its own pages, its own API blueprint. Think of it as a Sonarr + Radarr + overlay/collection manager built into Commissary. It connects to <strong>Plex</strong> or <strong>Jellyfin/Emby</strong> to read your movie and TV libraries, enriches every title from <strong>TMDB</strong>, <strong>TVDB</strong>, <strong>OMDb</strong>, <strong>fanart.tv</strong>, <strong>OpenSubtitles</strong> and more, and can search, grab, organize, and upgrade downloads to fill the gaps.</p>
                 <div class="docs-features">
                     <div class="docs-feature-card"><h4>&#x1F3AC; Movies &amp; TV</h4><p>Browse your Plex/Jellyfin library, enriched with posters, backdrops, cast, ratings, awards, and format badges (HDR / Atmos / channels).</p></div>
                     <div class="docs-feature-card"><h4>&#x2B07;&#xFE0F; Arr-Class Downloading</h4><p>Quality profiles, custom formats, import lists, blocklist, upgrade-until-cutoff, RSS-speed grabbing, and a live download queue.</p></div>
@@ -1669,9 +1669,9 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="vid-server">
                 <h3 class="docs-subsection-title">Connecting a Media Server</h3>
-                <p class="docs-text">The video side reads your libraries from <strong>Plex</strong> or <strong>Jellyfin/Emby</strong>. Configure the connection under <strong>Video &rarr; Settings</strong>, pick which libraries to include, then run a scan to import them. SoulSync stores a lightweight copy of every movie/show/episode row and enriches it in the background &mdash; it never modifies your server's files during a scan.</p>
+                <p class="docs-text">The video side reads your libraries from <strong>Plex</strong> or <strong>Jellyfin/Emby</strong>. Configure the connection under <strong>Video &rarr; Settings</strong>, pick which libraries to include, then run a scan to import them. Commissary stores a lightweight copy of every movie/show/episode row and enriches it in the background &mdash; it never modifies your server's files during a scan.</p>
                 <table class="docs-table">
-                    <thead><tr><th>Server</th><th>What SoulSync reads</th><th>Auth</th></tr></thead>
+                    <thead><tr><th>Server</th><th>What Commissary reads</th><th>Auth</th></tr></thead>
                     <tbody>
                         <tr><td><strong>Plex</strong></td><td>Movie &amp; TV libraries, watch state, collections, incremental delta via <code>updatedAt</code></td><td>URL + Token</td></tr>
                         <tr><td><strong>Jellyfin / Emby</strong></td><td>Movie &amp; TV libraries, watch state, BoxSets, incremental delta via <code>MinDateLastSaved</code></td><td>URL + API Key (+ user for watch state)</td></tr>
@@ -1707,7 +1707,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="vdash-continue">
                 <h3 class="docs-subsection-title">Continue Watching</h3>
-                <p class="docs-text">A <strong>Continue Watching</strong> rail surfaces partially-watched movies and the next unwatched episode of shows in progress, drawn from the watch state SoulSync ingests from your server. Each card jumps straight to the title's detail page with a <strong>Next Up</strong> call-to-action.</p>
+                <p class="docs-text">A <strong>Continue Watching</strong> rail surfaces partially-watched movies and the next unwatched episode of shows in progress, drawn from the watch state Commissary ingests from your server. Each card jumps straight to the title's detail page with a <strong>Next Up</strong> call-to-action.</p>
             </div>
             <div class="docs-subsection" id="vdash-activity">
                 <h3 class="docs-subsection-title">Recent &amp; Activity</h3>
@@ -1759,7 +1759,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="vdisc-foryou">
                 <h3 class="docs-subsection-title">For You &amp; Taste</h3>
-                <p class="docs-text"><strong>For You</strong> rows are personalized from your library's <strong>taste</strong> profile &mdash; the genres, people, and studios you already own most. The more SoulSync knows about your library, the sharper these get.</p>
+                <p class="docs-text"><strong>For You</strong> rows are personalized from your library's <strong>taste</strong> profile &mdash; the genres, people, and studios you already own most. The more Commissary knows about your library, the sharper these get.</p>
             </div>
             <div class="docs-subsection" id="vdisc-more">
                 <h3 class="docs-subsection-title">More Like This &amp; Gaps</h3>
@@ -1820,7 +1820,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="vdet-watch">
                 <h3 class="docs-subsection-title">Watch State &amp; History</h3>
-                <p class="docs-text">SoulSync ingests per-episode and per-movie <strong>watch state</strong> from your server, drives the <strong>Continue Watching</strong> rail and a <strong>Next Up</strong> CTA, and lets you toggle watched/unwatched right on the page. A per-title <strong>History</strong> tab shows grabs, imports, and upgrades over time.</p>
+                <p class="docs-text">Commissary ingests per-episode and per-movie <strong>watch state</strong> from your server, drives the <strong>Continue Watching</strong> rail and a <strong>Next Up</strong> CTA, and lets you toggle watched/unwatched right on the page. A per-title <strong>History</strong> tab shows grabs, imports, and upgrades over time.</p>
             </div>
             <div class="docs-subsection" id="vdet-meta">
                 <h3 class="docs-subsection-title">Metadata Edit &amp; Lock</h3>
@@ -1849,7 +1849,7 @@ const DOCS_SECTIONS = [
         content: () => `
             <div class="docs-subsection" id="vwatch-follow">
                 <h3 class="docs-subsection-title">Following People &amp; Studios</h3>
-                <p class="docs-text">The video <strong>Watchlist</strong> is how you tell SoulSync "keep an eye on this." Follow an <strong>actor</strong>, <strong>director</strong>, or <strong>studio</strong> and their upcoming and newly-released titles are automatically added to your <strong>Wishlist</strong> so the download pipeline can go find them.</p>
+                <p class="docs-text">The video <strong>Watchlist</strong> is how you tell Commissary "keep an eye on this." Follow an <strong>actor</strong>, <strong>director</strong>, or <strong>studio</strong> and their upcoming and newly-released titles are automatically added to your <strong>Wishlist</strong> so the download pipeline can go find them.</p>
                 ${docsImg('video-watchlist.jpg', 'Video watchlist tabs')}
             </div>
             <div class="docs-subsection" id="vwatch-settings">
@@ -1912,11 +1912,11 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="vdl-lists">
                 <h3 class="docs-subsection-title">Import Lists</h3>
-                <p class="docs-text"><strong>Import lists</strong> sync an external list &mdash; Trakt, IMDb, a Plex Watchlist &mdash; into your wishlist on a schedule, so a list you curate elsewhere becomes titles SoulSync goes and gets.</p>
+                <p class="docs-text"><strong>Import lists</strong> sync an external list &mdash; Trakt, IMDb, a Plex Watchlist &mdash; into your wishlist on a schedule, so a list you curate elsewhere becomes titles Commissary goes and gets.</p>
             </div>
             <div class="docs-subsection" id="vdl-blocklist">
                 <h3 class="docs-subsection-title">Blocklist &amp; Recycle Bin</h3>
-                <p class="docs-text">When a grab turns out to be a bad file, SoulSync <strong>blocklists</strong> that specific release (by username + filename) so it's never grabbed again, and filters it out at the ranker, retry, and re-query stages. A manual grab always overrides the blocklist. Replaced files land in a <strong>recycle bin</strong> rather than being destroyed outright.</p>
+                <p class="docs-text">When a grab turns out to be a bad file, Commissary <strong>blocklists</strong> that specific release (by username + filename) so it's never grabbed again, and filters it out at the ranker, retry, and re-query stages. A manual grab always overrides the blocklist. Replaced files land in a <strong>recycle bin</strong> rather than being destroyed outright.</p>
             </div>
             <div class="docs-subsection" id="vdl-history">
                 <h3 class="docs-subsection-title">History</h3>
@@ -1965,7 +1965,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="vcal-ical">
                 <h3 class="docs-subsection-title">iCal Feed</h3>
-                <p class="docs-text">Subscribe to the calendar from any calendar app via the <strong>iCal</strong> feed (<code>/api/video/calendar.ics</code>) to see upcoming airings and releases outside SoulSync.</p>
+                <p class="docs-text">Subscribe to the calendar from any calendar app via the <strong>iCal</strong> feed (<code>/api/video/calendar.ics</code>) to see upcoming airings and releases outside Commissary.</p>
             </div>
         `
     },
@@ -2001,7 +2001,7 @@ const DOCS_SECTIONS = [
         content: () => `
             <div class="docs-subsection" id="vyt-follow">
                 <h3 class="docs-subsection-title">Following Channels</h3>
-                <p class="docs-text">Follow a <strong>YouTube channel</strong> (or a specific <strong>playlist</strong>) like a show. SoulSync uses <strong>yt-dlp</strong> to track new uploads and bridges them into the video wishlist/watchlist so they flow through the same download pipeline as everything else. It's visual-first &mdash; channels get art and a proper detail page.</p>
+                <p class="docs-text">Follow a <strong>YouTube channel</strong> (or a specific <strong>playlist</strong>) like a show. Commissary uses <strong>yt-dlp</strong> to track new uploads and bridges them into the video wishlist/watchlist so they flow through the same download pipeline as everything else. It's visual-first &mdash; channels get art and a proper detail page.</p>
                 ${docsImg('video-youtube.jpg', 'YouTube channels tab')}
             </div>
             <div class="docs-subsection" id="vyt-import">
@@ -2029,7 +2029,7 @@ const DOCS_SECTIONS = [
         content: () => `
             <div class="docs-subsection" id="vtool-overlays">
                 <h3 class="docs-subsection-title">Overlay Studio</h3>
-                <p class="docs-text">A visual, Kometa-style <strong>overlay template editor</strong>. Design badges (resolution, HDR, ratings, audio, awards, custom text, logo packs) on a live preview, assign templates to filtered sets of titles, and <strong>apply</strong> them &mdash; SoulSync renders the overlays with Pillow and writes them straight back to Plex/Jellyfin posters. A cleanup tool removes overlays again when you want the originals back.</p>
+                <p class="docs-text">A visual, Kometa-style <strong>overlay template editor</strong>. Design badges (resolution, HDR, ratings, audio, awards, custom text, logo packs) on a live preview, assign templates to filtered sets of titles, and <strong>apply</strong> them &mdash; Commissary renders the overlays with Pillow and writes them straight back to Plex/Jellyfin posters. A cleanup tool removes overlays again when you want the originals back.</p>
                 ${docsImg('video-overlay-studio.jpg', 'Overlay Studio editor')}
             </div>
             <div class="docs-subsection" id="vtool-collections">
@@ -2049,7 +2049,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="vtool-activity">
                 <h3 class="docs-subsection-title">Server Activity</h3>
-                <p class="docs-text">A Tautulli-style <strong>Server Activity</strong> drawer shows live Plex streams and recent watch history app-wide, so you can see what's playing without leaving SoulSync.</p>
+                <p class="docs-text">A Tautulli-style <strong>Server Activity</strong> drawer shows live Plex streams and recent watch history app-wide, so you can see what's playing without leaving Commissary.</p>
             </div>
             <div class="docs-subsection" id="vtool-backups">
                 <h3 class="docs-subsection-title">Backups</h3>
@@ -2828,7 +2828,7 @@ const DOCS_SECTIONS = [
             // WebSocket section
             sectionsHTML += '<div class="docs-subsection" id="api-websocket">';
             sectionsHTML += '<h3 class="docs-subsection-title">WebSocket Events</h3>';
-            sectionsHTML += '<p class="docs-text">SoulSync uses <strong>Socket.IO</strong> for real-time updates. Connect to the same host/port as the web UI. No API key required for WebSocket connections.</p>';
+            sectionsHTML += '<p class="docs-text">Commissary uses <strong>Socket.IO</strong> for real-time updates. Connect to the same host/port as the web UI. No API key required for WebSocket connections.</p>';
             sectionsHTML += '<table class="docs-table"><thead><tr><th>Event</th><th>Description</th><th>Key Fields</th></tr></thead><tbody>';
             sectionsHTML += '<tr><td><code>download_progress</code></td><td>Per-track download progress</td><td>title, percent, speed, eta</td></tr>';
             sectionsHTML += '<tr><td><code>download_complete</code></td><td>Track finished downloading</td><td>title, artist, album, file_path</td></tr>';
@@ -3080,7 +3080,7 @@ function initializeDocsPage() {
 
                 const ck = '\u2713';
                 const ex = '\u2717';
-                let text = 'SoulSync Debug Info\n';
+                let text = 'Commissary Debug Info\n';
                 text += '═══════════════════════════════════\n\n';
 
                 text += '── System ──\n';
@@ -3210,7 +3210,7 @@ function initializeDocsPage() {
                 } else {
                     text += '(no log lines)\n';
                 }
-                text += '\n---\nPaste this output into your GitHub issue at https://github.com/Nezreka/SoulSync/issues\n';
+                text += '\n---\nPaste this output into your GitHub issue at https://github.com/ThyMrMan/soul-sync-thymrman-customized/issues\n';
 
                 // Copy to clipboard — navigator.clipboard requires HTTPS/localhost,
                 // so fall back to execCommand for Docker/LAN HTTP access

@@ -370,7 +370,7 @@ def resolve_identifier(
             if is_soundcloud_url(raw):
                 return _empty_result(raw, message=(
                     'SoundCloud links resolve in the main search bar — paste it '
-                    'there and SoulSync fetches the track directly (works for '
+                    'there and Commissary fetches the track directly (works for '
                     'unlisted/private share links too).'))
         except Exception as exc:   # noqa: BLE001 - hint only, never break the resolver
             logger.debug("soundcloud hint skipped: %s", exc)

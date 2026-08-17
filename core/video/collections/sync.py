@@ -1,7 +1,7 @@
 """Sync a resolved collection to the active media server (Plex Collection /
 Jellyfin BoxSet).
 
-SoulSync resolves membership itself and pushes an explicit member list, so this
+Commissary resolves membership itself and pushes an explicit member list, so this
 is server-agnostic: it drives a duck-typed ``source`` (see the collection methods
 on ``PlexVideoSource`` / ``JellyfinVideoSource`` in ``core/video/sources.py``).
 The source is INJECTED, so the whole diff/sync-mode/ledger/adopt orchestration is

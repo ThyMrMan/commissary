@@ -684,7 +684,7 @@ class SpotifyClient:
         return self._free_installed() and self._free_wanted()
 
     def is_spotify_metadata_available(self) -> bool:
-        """Whether SoulSync can serve Spotify metadata — real auth OR the
+        """Whether Commissary can serve Spotify metadata — real auth OR the
         no-creds source. Availability gates (search resolve, enrichment worker,
         watchlist) use THIS instead of ``is_spotify_authenticated()`` so the
         free source is reachable. Does NOT change auth semantics."""
@@ -916,7 +916,7 @@ class SpotifyClient:
         # Without this guard, spotipy's auth_manager will try to start an interactive
         # OAuth flow (binding 127.0.0.1:<redirect_port>), which inside Docker either
         # steals Flask's port (crash loop) or binds loopback-only (unreachable from host).
-        # Users authenticate via the SoulSync web UI instead.
+        # Users authenticate via the Commissary web UI instead.
         try:
             cache_handler = getattr(self.sp.auth_manager, 'cache_handler', None)
             if cache_handler and cache_handler.get_cached_token() is None:

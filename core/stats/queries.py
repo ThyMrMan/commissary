@@ -178,7 +178,7 @@ def get_library_disk_usage(database) -> dict:
     Backed by `tracks.file_size` populated during the deep scan from
     media-server-reported sizes (Plex MediaPart.size, Jellyfin
     MediaSources[].Size, Navidrome <song size="...">,
-    SoulSync standalone os.path.getsize).
+    Commissary standalone os.path.getsize).
     """
     return database.get_library_disk_usage()
 

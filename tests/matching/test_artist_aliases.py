@@ -1,7 +1,7 @@
 """Pin the alias-aware artist comparison helper.
 
 Issue #442 — files tagged with one spelling of an artist's name
-(Japanese kanji `澤野弘之`) were quarantined when SoulSync expected
+(Japanese kanji `澤野弘之`) were quarantined when Commissary expected
 the romanized spelling (`Hiroyuki Sawano`). MusicBrainz aliases
 should bridge the two — this helper does the bridging.
 

@@ -2,7 +2,7 @@
 
 The automated path has fanned a pack out into per-episode imports since 1.8.0.
 Manual import could only take a single FILE, so a season pack that arrived any
-other way — moved in by hand, grabbed outside SoulSync, or left behind by a
+other way — moved in by hand, grabbed outside Commissary, or left behind by a
 failed auto-import — had to be placed twelve times, answering "which show is
 this?" on every one.
 

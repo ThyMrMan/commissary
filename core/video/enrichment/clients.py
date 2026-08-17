@@ -705,7 +705,7 @@ class TMDBClient:
     def search(self, query, pages: int | None = None):
         """Multi-search (movies / TV / people) for the in-app search page. Returns
         a flat list of {kind, tmdb_id, title, year, poster, ...} — no external IDs,
-        everything resolves back into SoulSync.
+        everything resolves back into Commissary.
 
         Reads several PAGES, not one. TMDB returns 20 results a page ordered by
         popularity, and the old single-page read meant a title sharing its name
@@ -843,7 +843,7 @@ class TMDBClient:
 
     # ── discover (browse TMDB by curated list / genre / year / decade) ────────
     def _disc_map(self, results, kind):
-        """Flatten a TMDB movie/tv list into SoulSync items. ``kind`` forces the
+        """Flatten a TMDB movie/tv list into Commissary items. ``kind`` forces the
         type for single-type endpoints; pass None to auto-detect each row's
         media_type (mixed lists like trending). Carries backdrop + overview so the
         Discover hero can render a rich slide."""
@@ -1185,7 +1185,7 @@ class TMDBClient:
 
     def person(self, tmdb_id):
         """Person detail + their filmography (cast + crew credits) for the in-app
-        person page. Everything points back to TMDB ids we resolve in SoulSync."""
+        person page. Everything points back to TMDB ids we resolve in Commissary."""
         if not self.api_key or tmdb_id is None:
             return None
         import requests
@@ -1372,7 +1372,7 @@ class TVDBClient:
         """The series' season numbers in TVDB's default (aired) order.
 
         Used to compare TVDB's season STRUCTURE against the media server's, which
-        is how SoulSync decides whose numbering to trust for episodes (see
+        is how Commissary decides whose numbering to trust for episodes (see
         core/video/episode_numbering). Best-effort — [] on any error, which
         simply leaves TVDB out of the comparison."""
         if not self.api_key or series_id is None:

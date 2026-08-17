@@ -366,7 +366,7 @@ def test_activity_merges_plex_and_jellyfin(monkeypatch):
     assert "Heat" in titles and "Dune" in titles
 
 
-# ── click-through: resolve a stream to its SoulSync library page ─────────────
+# ── click-through: resolve a stream to its Commissary library page ─────────────
 def test_normalize_captures_link_ids():
     m = normalize_session(_movie(ratingKey=100))
     assert m["_link_sid"] == "100"                    # movie links to itself
@@ -422,7 +422,7 @@ def test_normalize_captures_tmdb_from_guids():
 
 
 def test_resolve_falls_back_to_tmdb_when_not_owned(monkeypatch):
-    """Not in the SoulSync library → link to the TMDB preview page so anything on
+    """Not in the Commissary library → link to the TMDB preview page so anything on
     the server is still clickable (works even with no video library at all)."""
     import core.server_activity as sa
     monkeypatch.setattr("api.video.get_video_db", lambda: _EmptyVDB())    # nothing owned
@@ -480,7 +480,7 @@ def test_ui_is_wired():
     assert "function actKey" in js and "_actKeys" in js       # key-diffed render (no flicker)
     assert "sact-eq" in js and ".sact-eq" in css              # music equalizer
     assert ".sact-head-dot" in css and "@keyframes sactCardIn" in css
-    # click-through to the SoulSync detail page
+    # click-through to the Commissary detail page
     assert "sact-card--link" in js and "SoulSyncVideo.openDetail" in js
     assert "data-link-kind" in js and ".sact-card--link" in css
     vs = (root / "webui" / "static" / "video" / "video-side.js").read_text(encoding="utf-8")

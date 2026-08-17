@@ -3089,7 +3089,7 @@ async function restoreBackup(filename, force = false) {
             // Version mismatch — ask user to confirm
             const confirmed = await showConfirmDialog({
                 title: 'Version Mismatch',
-                message: `This backup was created on SoulSync v${data.backup_version}, but you're running v${data.current_version}.\n\nRestoring an older backup may cause issues if the database schema has changed. A safety backup will be created first.\n\nProceed anyway?`,
+                message: `This backup was created on Commissary v${data.backup_version}, but you're running v${data.current_version}.\n\nRestoring an older backup may cause issues if the database schema has changed. A safety backup will be created first.\n\nProceed anyway?`,
                 confirmText: 'Restore Anyway',
                 destructive: true
             });
@@ -3162,7 +3162,7 @@ function openLibraryHistoryModal() {
 
 // Bucket entries that are alternatives for the SAME intended target
 // (same backend group_key — derived from expected_artist/expected_track, the
-// track SoulSync was trying to fetch, not the bad file's own tags). Entries
+// track Commissary was trying to fetch, not the bad file's own tags). Entries
 // with a null group_key (legacy/orphan, ungroupable) each stand alone.
 // Preserves the newest-first order the backend already sorted by.
 function _groupQuarantineEntries(entries) {
@@ -3842,7 +3842,7 @@ function buildDownloadAuditExplanation(entry) {
     const quality = entry.quality ? ` at ${entry.quality}` : '';
     const trackPart = entry.title ? `"${entry.title}"` : 'this track';
     const artistPart = entry.artist_name ? ` by ${entry.artist_name}` : '';
-    return `SoulSync downloaded ${trackPart}${artistPart} from ${source}${quality}. Detailed source-by-source decisions, candidate scoring, and post-processing steps are not captured yet — older entries show a summary built from the recorded history fields.`;
+    return `Commissary downloaded ${trackPart}${artistPart} from ${source}${quality}. Detailed source-by-source decisions, candidate scoring, and post-processing steps are not captured yet — older entries show a summary built from the recorded history fields.`;
 }
 
 function buildDownloadAuditSteps(entry) {
@@ -4848,7 +4848,7 @@ async function loadMetadataCacheBrowse() {
                 <div class="mcache-empty">
                     <div class="mcache-empty-icon">📦</div>
                     <div class="mcache-empty-title">No cached ${_mcacheCurrentTab}s yet</div>
-                    <div class="mcache-empty-sub">As you search and browse music in SoulSync, API responses will be cached here automatically.</div>
+                    <div class="mcache-empty-sub">As you search and browse music in Commissary, API responses will be cached here automatically.</div>
                 </div>`;
             renderMetadataCachePagination(0, 0);
             return;
@@ -5188,7 +5188,7 @@ const TOOL_HELP_CONTENT = {
         title: 'Database Updater',
         content: `
             <h4>What does this tool do?</h4>
-            <p>The Database Updater syncs your media server library (Plex, Jellyfin, or Navidrome) with SoulSync's internal database.</p>
+            <p>The Database Updater syncs your media server library (Plex, Jellyfin, or Navidrome) with Commissary's internal database.</p>
 
             <h4>Update Modes</h4>
             <ul>
@@ -5291,8 +5291,8 @@ const TOOL_HELP_CONTENT = {
             <h4>What happens when you scan?</h4>
             <ol>
                 <li><strong>Plex library scan:</strong> Plex scans your music folder for new/changed files</li>
-                <li><strong>Automatic database update:</strong> After the scan completes, SoulSync automatically updates its internal database with new tracks</li>
-                <li><strong>Library refreshed:</strong> New music appears in Plex and SoulSync within moments</li>
+                <li><strong>Automatic database update:</strong> After the scan completes, Commissary automatically updates its internal database with new tracks</li>
+                <li><strong>Library refreshed:</strong> New music appears in Plex and Commissary within moments</li>
             </ol>
 
             <h4>Plex only?</h4>
@@ -5431,7 +5431,7 @@ const TOOL_HELP_CONTENT = {
             </ul>
 
             <h4>🗺️ How MusicMap Integration Works</h4>
-            <p>SoulSync uses <strong>MusicMap</strong> (music-map.com) instead of Spotify's recommendation API to find similar artists:</p>
+            <p>Commissary uses <strong>MusicMap</strong> (music-map.com) instead of Spotify's recommendation API to find similar artists:</p>
             <ul>
                 <li>During watchlist scans, each watchlist artist is looked up on MusicMap</li>
                 <li>MusicMap's artist similarity graph is scraped to find related artists</li>
@@ -5491,7 +5491,7 @@ const TOOL_HELP_CONTENT = {
             </ul>
 
             <h4>When does it first run?</h4>
-            <p>The timer starts when SoulSync boots. If the automation was previously scheduled, it resumes from where it left off.</p>
+            <p>The timer starts when Commissary boots. If the automation was previously scheduled, it resumes from where it left off.</p>
 
             <h4>Good for</h4>
             <ul>
@@ -5544,17 +5544,17 @@ const TOOL_HELP_CONTENT = {
         title: 'App Started',
         content: `
             <h4>What is this trigger?</h4>
-            <p>Fires once when SoulSync starts up. Useful for tasks you want to run on every boot.</p>
+            <p>Fires once when Commissary starts up. Useful for tasks you want to run on every boot.</p>
 
             <h4>Good for</h4>
             <ul>
                 <li>Refreshing mirrored playlists on startup</li>
                 <li>Running a quick database sync</li>
-                <li>Sending a "SoulSync is online" notification</li>
+                <li>Sending a "Commissary is online" notification</li>
             </ul>
 
             <h4>Note</h4>
-            <p>This trigger fires only once per startup — it will not fire again until SoulSync is restarted.</p>
+            <p>This trigger fires only once per startup — it will not fire again until Commissary is restarted.</p>
         `
     },
     'auto-track_downloaded': {
@@ -5704,7 +5704,7 @@ const TOOL_HELP_CONTENT = {
         title: 'Database Updated',
         content: `
             <h4>What is this trigger?</h4>
-            <p>Fires when the library database refresh finishes — either incremental or full. This means SoulSync's internal database has been synced with your media server.</p>
+            <p>Fires when the library database refresh finishes — either incremental or full. This means Commissary's internal database has been synced with your media server.</p>
 
             <h4>Available variables for notifications</h4>
             <p><code>{total_artists}</code>, <code>{total_albums}</code>, <code>{total_tracks}</code></p>
@@ -5863,7 +5863,7 @@ const TOOL_HELP_CONTENT = {
             <p>Fires when a media server library scan is considered complete. This only happens after a <strong>Scan Library</strong> action was triggered — it cannot fire on its own.</p>
 
             <h4>How does it know the scan is done?</h4>
-            <p>Your media server (Plex, Jellyfin, Navidrome) doesn't send a "scan finished" signal back to SoulSync. So after telling the server to scan, SoulSync waits <strong>approximately 5 minutes</strong> and then assumes the scan has finished. This is a generous estimate that works for most libraries.</p>
+            <p>Your media server (Plex, Jellyfin, Navidrome) doesn't send a "scan finished" signal back to Commissary. So after telling the server to scan, Commissary waits <strong>approximately 5 minutes</strong> and then assumes the scan has finished. This is a generous estimate that works for most libraries.</p>
 
             <h4>Timing</h4>
             <p>From the moment a download finishes to when this trigger fires, expect roughly <strong>6-7 minutes</strong>:</p>
@@ -5875,7 +5875,7 @@ const TOOL_HELP_CONTENT = {
             </ol>
 
             <h4>Default use</h4>
-            <p>The system automation <strong>Auto-Update Database After Scan</strong> listens for this trigger to start an incremental database update, keeping your SoulSync library in sync with your media server.</p>
+            <p>The system automation <strong>Auto-Update Database After Scan</strong> listens for this trigger to start an incremental database update, keeping your Commissary library in sync with your media server.</p>
 
             <h4>Available variables</h4>
             <p><code>{server_type}</code> — which media server was scanned (plex, jellyfin, navidrome)</p>
@@ -5929,7 +5929,7 @@ const TOOL_HELP_CONTENT = {
             <ol>
                 <li>A <strong>60 second debounce</strong> groups rapid requests — if multiple downloads finish close together, only one scan is triggered</li>
                 <li>After the debounce, your media server is told to scan</li>
-                <li>SoulSync waits <strong>~5 minutes</strong> (your media server doesn't report when it's finished, so this is an assumed completion time)</li>
+                <li>Commissary waits <strong>~5 minutes</strong> (your media server doesn't report when it's finished, so this is an assumed completion time)</li>
                 <li>The <strong>Library Scan Done</strong> event fires, which can trigger follow-up actions like a database update</li>
             </ol>
 
@@ -6027,7 +6027,7 @@ const TOOL_HELP_CONTENT = {
             <h4>Good for</h4>
             <ul>
                 <li>Getting notified about events without taking any automated action</li>
-                <li>Monitoring what's happening in SoulSync (downloads, failures, changes)</li>
+                <li>Monitoring what's happening in Commissary (downloads, failures, changes)</li>
                 <li>Pair with any event trigger + Discord/Telegram/Pushbullet notification</li>
             </ul>
         `
@@ -6036,7 +6036,7 @@ const TOOL_HELP_CONTENT = {
         title: 'Update Database',
         content: `
             <h4>What does this action do?</h4>
-            <p>Refreshes SoulSync's internal library database by syncing with your media server (Plex, Jellyfin, or Navidrome).</p>
+            <p>Refreshes Commissary's internal library database by syncing with your media server (Plex, Jellyfin, or Navidrome).</p>
 
             <h4>Configuration</h4>
             <ul>
@@ -6094,7 +6094,7 @@ const TOOL_HELP_CONTENT = {
         title: 'Backup Database',
         content: `
             <h4>What does this action do?</h4>
-            <p>Creates a timestamped backup of SoulSync's SQLite database. Uses the SQLite backup API for a safe hot-copy while the app is running.</p>
+            <p>Creates a timestamped backup of Commissary's SQLite database. Uses the SQLite backup API for a safe hot-copy while the app is running.</p>
 
             <h4>Retention</h4>
             <p>Keeps the last 5 backups automatically. Older backups are cleaned up to save disk space.</p>
@@ -6178,7 +6178,7 @@ const TOOL_HELP_CONTENT = {
         title: 'Deep Scan Library',
         content: `
             <h4>What does this action do?</h4>
-            <p>Walks your entire media server library and compares it against SoulSync's database. Adds any new tracks found and removes stale entries that no longer exist on the server.</p>
+            <p>Walks your entire media server library and compares it against Commissary's database. Adds any new tracks found and removes stale entries that no longer exist on the server.</p>
 
             <h4>How is this different from Database Update?</h4>
             <ul>
@@ -6362,7 +6362,7 @@ const TOOL_HELP_CONTENT = {
             </ul>
 
             <h4>Auto-Backups</h4>
-            <p>SoulSync automatically creates a backup every 3 days via the automation engine. Up to 5 rolling backups are kept (oldest are removed when the limit is exceeded).</p>
+            <p>Commissary automatically creates a backup every 3 days via the automation engine. Up to 5 rolling backups are kept (oldest are removed when the limit is exceeded).</p>
 
             <h4>Restore Safety</h4>
             <p>When you restore from a backup, a <strong>safety backup</strong> of your current database is created first. This means you can always undo a restore if something goes wrong.</p>
@@ -6380,10 +6380,10 @@ const TOOL_HELP_CONTENT = {
         title: 'Metadata Cache',
         content: `
             <h4>What is this?</h4>
-            <p>The Metadata Cache stores every API response from Spotify and iTunes so SoulSync can reuse them instead of making duplicate API calls. This reduces rate limit pressure and speeds up lookups.</p>
+            <p>The Metadata Cache stores every API response from Spotify and iTunes so Commissary can reuse them instead of making duplicate API calls. This reduces rate limit pressure and speeds up lookups.</p>
 
             <h4>How it works</h4>
-            <p>When SoulSync fetches artist, album, or track data from Spotify or iTunes, the response is cached locally. The next time the same data is needed, it's served from cache instantly — no API call required. Cached data is even served during Spotify rate limit bans.</p>
+            <p>When Commissary fetches artist, album, or track data from Spotify or iTunes, the response is cached locally. The next time the same data is needed, it's served from cache instantly — no API call required. Cached data is even served during Spotify rate limit bans.</p>
 
             <h4>Browsing the Cache</h4>
             <p>Click <strong>Browse Cache</strong> to explore all cached metadata. You can filter by entity type (artists, albums, tracks), search by name, filter by source (Spotify/iTunes), and sort by different fields. Click any card to see full details including the raw API response.</p>
@@ -7356,7 +7356,7 @@ function updateLibraryStatusCard(dbStats) {
         if (progressDiv) progressDiv.style.display = 'none';
         if (messageDiv) {
             messageDiv.style.display = '';
-            messageDiv.innerHTML = 'SoulSync needs a media server to manage your library. '
+            messageDiv.innerHTML = 'Commissary needs a media server to manage your library. '
                 + 'Go to <span class="link" onclick="navigateToPage(\'settings\')">Settings</span> '
                 + 'to connect Plex, Jellyfin, or Navidrome.';
         }
@@ -7395,8 +7395,8 @@ function updateLibraryStatusCard(dbStats) {
         if (progressDiv) progressDiv.style.display = 'none';
         if (messageDiv) {
             messageDiv.style.display = '';
-            messageDiv.innerHTML = 'Your server is connected but SoulSync hasn\'t imported your library yet. '
-                + 'Click <strong>Scan Now</strong> to pull your artists, albums, and tracks into SoulSync.';
+            messageDiv.innerHTML = 'Your server is connected but Commissary hasn\'t imported your library yet. '
+                + 'Click <strong>Scan Now</strong> to pull your artists, albums, and tracks into Commissary.';
         }
 
     } else {

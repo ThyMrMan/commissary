@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SoulSync development launcher.
+"""Commissary development launcher.
 
 Starts the backend and Vite dev server together, restarts the backend when
 backend source files change, and handles shutdown cleanly across platforms.
@@ -265,7 +265,7 @@ def start_backend() -> tuple[subprocess.Popen, object | None]:
         else:
             gunicorn_mode = True
 
-    print('Starting SoulSync web server...')
+    print('Starting Commissary web server...')
 
     if gunicorn_mode:
         gunicorn = resolve_command('gunicorn')
@@ -278,7 +278,7 @@ def start_backend() -> tuple[subprocess.Popen, object | None]:
         cmd = [sys.executable, str(ROOT_DIR / 'web_server.py')]
 
     proc, log_handle = start_process(
-        'SoulSync web server',
+        'Commissary web server',
         cmd,
         env=build_backend_env(direct_mode),
     )
@@ -294,8 +294,8 @@ def watch_and_run_backend() -> None:
             time.sleep(1)
 
             if backend_proc.poll() is not None:
-                print('SoulSync web server exited. Restarting...')
-                stop_process('SoulSync web server', backend_proc, backend_log)
+                print('Commissary web server exited. Restarting...')
+                stop_process('Commissary web server', backend_proc, backend_log)
                 managed_processes.pop()
                 backend_proc, backend_log = start_backend()
                 last_state = compute_backend_watch_state()
@@ -303,14 +303,14 @@ def watch_and_run_backend() -> None:
 
             current_state = compute_backend_watch_state()
             if current_state != last_state:
-                print('Detected backend file changes. Restarting SoulSync web server...')
+                print('Detected backend file changes. Restarting Commissary web server...')
                 last_state = current_state
-                stop_process('SoulSync web server', backend_proc, backend_log)
+                stop_process('Commissary web server', backend_proc, backend_log)
                 managed_processes.pop()
                 backend_proc, backend_log = start_backend()
     finally:
         if backend_proc.poll() is None:
-            stop_process('SoulSync web server', backend_proc, backend_log)
+            stop_process('Commissary web server', backend_proc, backend_log)
             if managed_processes:
                 managed_processes.pop()
 

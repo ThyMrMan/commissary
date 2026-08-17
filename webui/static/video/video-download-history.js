@@ -1,7 +1,7 @@
 /*
- * SoulSync — Video Download History modal (isolated).
+ * Commissary — Video Download History modal (isolated).
  *
- * A permanent, beautiful timeline of every grab SoulSync completed (movies +
+ * A permanent, beautiful timeline of every grab Commissary completed (movies +
  * episodes), backed by /api/video/downloads/history. Self-contained: builds its
  * own overlay DOM, no shell in index.html. Opened by [data-vdh-open]; rows expand
  * in place to reveal the full rich detail (poster, release, source, path, codecs).

@@ -479,7 +479,7 @@ class OpenSubtitlesWorker(VideoBackfillWorker):
 
     def _headers(self):
         return {"Api-Key": self._key(), "Accept": "application/json",
-                "User-Agent": "SoulSync v1.0"}
+                "User-Agent": "Commissary v1.0"}
 
     def test(self):
         if not self._key():

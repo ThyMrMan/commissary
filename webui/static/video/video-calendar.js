@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video Calendar (isolated): the Week Grid.
+ * Commissary — Video Calendar (isolated): the Week Grid.
  *
  * A real 7-column week (TODAY first). Every upcoming episode for your owned
  * shows is shown — no "+N more" — each with its air time, sorted earliest →

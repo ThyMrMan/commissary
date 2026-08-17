@@ -939,9 +939,9 @@ async function fetchAndUpdateSystemStats() {
         updateStatCard('download-speed-card', data.download_speed, 'Combined speed');
         updateStatCard('active-syncs-card', data.active_syncs, 'Playlists syncing');
         updateStatCard('uptime-card', data.uptime, 'Application runtime');
-        // system memory % headline + SoulSync's own RSS in the subtitle (#935 follow-up)
+        // system memory % headline + Commissary's own RSS in the subtitle (#935 follow-up)
         updateStatCard('memory-card', data.memory_usage,
-            data.process_memory ? `SoulSync · ${data.process_memory}` : 'Current usage');
+            data.process_memory ? `Commissary · ${data.process_memory}` : 'Current usage');
 
     } catch (error) {
         console.warn('Could not fetch system stats:', error);

@@ -308,7 +308,7 @@ class AmazonClient:
         if isinstance(self.session, requests.Session):
             self.session.headers.update({
                 "Accept": "application/json",
-                "User-Agent": "SoulSync/1.0",
+                "User-Agent": "Commissary/1.0",
                 "Referer": self.base_url,
             })
 

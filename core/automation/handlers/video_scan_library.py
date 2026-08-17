@@ -113,7 +113,7 @@ def auto_video_scan_library(
         # scan handler blocking until the scan resolves).
         deps.update_progress(
             automation_id,
-            phase=f'Reading {lib_label} library into SoulSync...',
+            phase=f'Reading {lib_label} library into Commissary...',
             progress=45,
         )
         result = run_video_scan(mode, media_type) or {}
@@ -396,7 +396,7 @@ def auto_video_update_database(
     lib_label = {'movie': 'Movie', 'show': 'TV'}.get(media_type, 'video')
     # 'deep'/'full' re-read the whole library; 'incremental' only grabs new items.
     phase = (f'Re-reading the {lib_label} library from the server…' if mode in ('deep', 'full')
-             else f'Reading new {lib_label} media into SoulSync…')
+             else f'Reading new {lib_label} media into Commissary…')
     try:
         deps.update_progress(automation_id, phase=phase, progress=40)
         result = run_video_scan(mode, media_type) or {}

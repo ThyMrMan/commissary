@@ -2,7 +2,7 @@
 
 Radarr's Custom Formats let a release's NAME move its rank: prefer trusted
 groups, penalize x265 for movies but not TV, chase freeleech tags, bury
-hardcoded-subs releases — anything a regex can see. SoulSync's version keeps
+hardcoded-subs releases — anything a regex can see. Commissary's version keeps
 the sharp edge and drops the ceremony:
 
   format = {id, name, include: [term, ...], exclude: [term, ...], score}

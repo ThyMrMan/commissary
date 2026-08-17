@@ -1,5 +1,5 @@
 /*
- * SoulSync — clear button for the library-style search fields.
+ * Commissary — clear button for the library-style search fields.
  *
  * One implementation for every `.library-search-container`: the video Library,
  * the music Library and Purchased all use the same markup, and three copies of

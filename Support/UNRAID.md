@@ -1,8 +1,8 @@
-# 🏠 SoulSync Unraid Installation Guide
+# 🏠 Commissary Unraid Installation Guide
 
-Complete guide to running SoulSync on Unraid with proper path mapping and configuration.
+Complete guide to running Commissary on Unraid with proper path mapping and configuration.
 
-## 🎯 Why SoulSync on Unraid?
+## 🎯 Why Commissary on Unraid?
 
 - **24/7 Operation**: Perfect for background music automation
 - **Centralized Storage**: All your media in one place
@@ -24,30 +24,30 @@ docker run -d \
   -v /mnt/user/appdata/soulsync/logs:/app/logs \
   -v /mnt/user/Music:/host/music:rw \
   --restart unless-stopped \
-  boulderbadgedad/soulsync:latest
+  ghcr.io/thymrman/commissary:latest
 ```
 
 ### Method 2: Unraid Template (Recommended)
 
-Create `/boot/config/plugins/dockerMan/templates-user/soulsync.xml`:
+Create `/boot/config/plugins/dockerMan/templates-user/commissary.xml`:
 
 ```xml
 <?xml version="1.0"?>
 <Container version="2">
-  <Name>SoulSync</Name>
-  <Repository>boulderbadgedad/soulsync:latest</Repository>
-  <Registry>https://hub.docker.com/r/boulderbadgedad/soulsync</Registry>
+  <Name>Commissary</Name>
+  <Repository>ghcr.io/thymrman/commissary:latest</Repository>
+  <Registry>https://github.com/ThyMrMan/soul-sync-thymrman-customized/pkgs/container/commissary</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>bash</Shell>
   <Privileged>false</Privileged>
-  <Support>https://github.com/Nezreka/SoulSync</Support>
-  <Project>https://github.com/Nezreka/SoulSync</Project>
-  <Overview>Automated music discovery and collection manager. Sync Spotify/Tidal/YouTube playlists to Plex/Jellyfin via Soulseek.</Overview>
-  <Category>MediaApp:Music</Category>
+  <Support>https://github.com/ThyMrMan/soul-sync-thymrman-customized/issues</Support>
+  <Project>https://github.com/ThyMrMan/soul-sync-thymrman-customized</Project>
+  <Overview>Automated music and video discovery and collection manager. Sync Spotify/Tidal/YouTube playlists to Plex/Jellyfin via Soulseek, and manage Movies/TV/YouTube through Prowlarr.</Overview>
+  <Category>MediaApp:Music MediaApp:Video</Category>
   <WebUI>http://[IP]:[PORT:8008]</WebUI>
   <TemplateURL/>
-  <Icon>https://raw.githubusercontent.com/Nezreka/SoulSync/main/assets/trans.png</Icon>
+  <Icon>https://raw.githubusercontent.com/ThyMrMan/soul-sync-thymrman-customized/main/templates/commissary.png</Icon>
   <ExtraParams>--restart unless-stopped</ExtraParams>
   <PostArgs/>
   <CPUset/>
@@ -73,21 +73,21 @@ Create `/boot/config/plugins/dockerMan/templates-user/soulsync.xml`:
 └── Transfer/                  # Processing folder
 
 /mnt/user/appdata/soulsync/    # App configuration
-├── config/                    # SoulSync settings
+├── config/                    # Commissary settings
 └── logs/                      # Application logs
 ```
 
 ## ⚙️ Configuration for Unraid
 
 ### 1. Service URLs
-In SoulSync settings, use these URLs:
+In Commissary settings, use these URLs:
 
 - **slskd**: `http://192.168.1.100:5030` (replace with your Unraid IP)
 - **Plex**: `http://192.168.1.100:32400`
 - **Jellyfin**: `http://192.168.1.100:8096`
 
 ### 2. Download/Transfer Paths
-Set these paths in SoulSync settings:
+Set these paths in Commissary settings:
 
 - **Download Path**: `/host/music/Downloads`
 - **Transfer Path**: `/host/music/Library`
@@ -113,16 +113,16 @@ docker run -d \
 - Ensure Plex/Jellyfin is running (if desired)
 - Create Spotify API app at https://developer.spotify.com
 
-### 2. Install SoulSync
+### 2. Install Commissary
 ```bash
 # Option 1: Community Applications
-Search for "SoulSync" in CA and install
+Search for "Commissary" in CA and install
 
 # Option 2: Manual Docker Run
 Use the docker run command above
 
 # Option 3: Unraid Docker UI
-Add container manually with repository: boulderbadgedad/soulsync:latest
+Add container manually with repository: ghcr.io/thymrman/commissary:latest
 ```
 
 ### 3. Configure Paths
@@ -138,7 +138,7 @@ Map these volumes in Unraid Docker settings:
 
 ## 🎵 First-Time Setup
 
-1. **Access SoulSync**: Navigate to `http://your-unraid-ip:8008`
+1. **Access Commissary**: Navigate to `http://your-unraid-ip:8008`
 2. **Go to Settings**: Configure your API credentials
 3. **Set Paths**: Use `/host/music/Downloads` and `/host/music/Library`
 4. **Test Connections**: Verify all services connect properly
@@ -157,7 +157,7 @@ Map these volumes in Unraid Docker settings:
 
 ### Monitoring
 - **Unraid Dashboard**: Monitor container status
-- **CA Auto Update**: Keep SoulSync updated automatically
+- **CA Auto Update**: Keep Commissary updated automatically
 - **Resource Monitoring**: Track CPU/RAM usage
 
 ## 📊 Recommended Share Setup
@@ -252,11 +252,11 @@ In Unraid Docker settings:
 
 ### Auto-Update
 Install "CA Auto Update Applications" plugin:
-- Automatically updates SoulSync container
+- Automatically updates Commissary container
 - Sends notifications on updates
 - Maintains configuration
 
-## 📱 Accessing SoulSync
+## 📱 Accessing Commissary
 
 - **Local**: `http://tower.local:8008` (if using .local domains)
 - **IP Address**: `http://192.168.1.100:8008`
@@ -266,7 +266,7 @@ Install "CA Auto Update Applications" plugin:
 
 ```
 Container Stack:
-├── SoulSync (Music automation)
+├── Commissary (Music automation)
 ├── slskd (Soulseek client)  
 ├── Plex/Jellyfin (Media server)
 ├── *arr Apps (Optional: Lidarr integration)
@@ -277,8 +277,8 @@ This creates a complete, automated music ecosystem on Unraid!
 
 ## 📝 Support
 
-- SoulSync logs: `/mnt/user/appdata/soulsync/logs/`
+- Commissary logs: `/mnt/user/appdata/soulsync/logs/`
 - Unraid diagnostics: Tools → Diagnostics
-- Container logs: Docker tab → SoulSync → Logs
+- Container logs: Docker tab → Commissary → Logs
 
 Your music automation server is ready! 🎵

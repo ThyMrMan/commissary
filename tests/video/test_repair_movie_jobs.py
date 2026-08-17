@@ -204,7 +204,7 @@ def test_complete_scan_retires_findings_for_fixed_problems(db, worker):
     _add_file(db, ok, path="/w.mkv", runtime_seconds=30 * 60)
     worker._run_job("broken_files", forced=True)
     old = _pending(db)[0]
-    # The file gets replaced outside SoulSync (rescan updates the probe).
+    # The file gets replaced outside Commissary (rescan updates the probe).
     conn = db._get_connection()
     conn.execute("UPDATE media_files SET runtime_seconds=? WHERE relative_path='/w.mkv'",
                  (118 * 60,))

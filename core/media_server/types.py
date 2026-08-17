@@ -36,7 +36,7 @@ class TrackInfo:
     """Canonical track-shape returned by media server clients.
 
     Plex, Jellyfin, and Navidrome each defined their own near-identical
-    ``XTrackInfo`` dataclass (SoulSync standalone uses richer per-track
+    ``XTrackInfo`` dataclass (Commissary standalone uses richer per-track
     wrappers and doesn't surface this exact shape). Lifted to one
     canonical type here so consumers (matching engine, sync service,
     library scanners) get a single import.

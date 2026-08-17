@@ -1,4 +1,4 @@
-// SoulSync shell bridge glue
+// Commissary shell bridge glue
 // Keep this file loaded after init.js so the legacy shell runtime state is ready.
 
 function getWebRouter() {

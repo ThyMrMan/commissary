@@ -1,7 +1,7 @@
 """Usenet client adapters.
 
 Each adapter wraps one Usenet downloader (SABnzbd, NZBGet) behind
-the ``UsenetClientAdapter`` Protocol so the rest of SoulSync can
+the ``UsenetClientAdapter`` Protocol so the rest of Commissary can
 talk to whichever client the user picked through one uniform
 surface.
 

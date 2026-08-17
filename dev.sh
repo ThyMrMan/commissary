@@ -12,5 +12,5 @@ if command -v python >/dev/null 2>&1; then
   exec python "$SCRIPT_DIR/dev.py" "$@"
 fi
 
-echo "Python is required to run the SoulSync dev launcher."
+echo "Python is required to run the Commissary dev launcher."
 exit 1

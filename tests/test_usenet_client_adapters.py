@@ -91,6 +91,8 @@ def test_sab_category_exists_uses_authenticated_category_list() -> None:
     with patch(
         'core.usenet_clients.sabnzbd.http_requests.get',
         return_value=_mock_response(200, {
+            # Fixture DATA, not branding: the default download-client category
+            # is still `soulsync`, and this proves the match is case-insensitive.
             'categories': ['*', 'Music', 'SoulSync'],
         }),
     ) as mock_get:
@@ -149,7 +151,7 @@ def test_sab_state_mapping_propagating_routes_to_queued() -> None:
 
 def test_sab_state_mapping_deleted_routes_to_failed() -> None:
     """User removed the job mid-flight — terminal failure from
-    SoulSync's perspective. Without this, the poll would keep
+    Commissary's perspective. Without this, the poll would keep
     spinning waiting for a job that's never coming back."""
     assert sab_map('Deleted') == 'failed'
 
@@ -456,7 +458,7 @@ def test_sab_get_status_uses_direct_nzo_ids_lookup_against_queue() -> None:
 
 def test_sab_get_status_falls_through_to_history_when_queue_empty() -> None:
     """Job already moved out of queue → check history with the same
-    nzo_ids filter. Direct lookup means SoulSync doesn't lose the
+    nzo_ids filter. Direct lookup means Commissary doesn't lose the
     job on a busy SAB where it's rolled past the bulk history limit."""
     adapter = _sab_with_config()
     empty_queue = _mock_response(200, {'queue': {'slots': []}})
@@ -574,7 +576,7 @@ def test_sab_poll_waits_through_history_post_processing_then_completes() -> None
     poll saw "completed but no save_path" the instant download finished,
     burned its budget mid-PP, and bailed — freezing the UI on the last
     'downloading' emit (99%). SAB then finished fine, which is why the
-    job shows Completed in History but SoulSync never staged it.
+    job shows Completed in History but Commissary never staged it.
 
     Post-fix the in-PP History slots map to NON-terminal states, so the
     poll just keeps waiting (as 'downloading') until SAB flips the slot

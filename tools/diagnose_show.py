@@ -11,7 +11,7 @@ It answers the questions that decide what the fix is:
     to the same TMDB show would merge their episodes under one numbering),
   * per season, how many episodes and what date range they span,
   * for a suspicious season, every episode with where it came from — a
-    ``server_id`` means your media server reported it, blank means SoulSync
+    ``server_id`` means your media server reported it, blank means Commissary
     wrote it from TMDB/TVDB metadata,
   * which rows have a file on disk.
 
@@ -49,7 +49,7 @@ def connect(path):
     if not os.path.exists(path):
         sys.exit(
             "No database at %s\n\nTried:\n  %s\n\n"
-            "SoulSync in Docker keeps this in the named volume 'soulsync_database',\n"
+            "Commissary in Docker keeps this in the named volume 'soulsync_database',\n"
             "which has no host path you can browse — so run the script INSIDE the\n"
             "container:\n\n"
             "  docker cp tools/diagnose_show.py soulsync:/tmp/\n"

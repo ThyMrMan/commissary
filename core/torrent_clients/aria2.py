@@ -5,7 +5,7 @@ passed as the FIRST positional param of every call as the string
 ``token:<secret>``. The RPC endpoint is ``<host>:6800/jsonrpc``.
 
 A few aria2 quirks the adapter smooths over:
-- the secret maps onto SoulSync's ``password`` field (aria2 has no username),
+- the secret maps onto Commissary's ``password`` field (aria2 has no username),
 - ``addUri`` returns a GID — that's our torrent id,
 - aria2 does NOT delete files on remove; for ``delete_files`` we read the file
   paths first and unlink them ourselves,

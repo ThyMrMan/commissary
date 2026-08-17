@@ -1,4 +1,4 @@
-"""Build a JSPF playlist (ListenBrainz-compatible) from resolved SoulSync tracks.
+"""Build a JSPF playlist (ListenBrainz-compatible) from resolved Commissary tracks.
 
 ListenBrainz's ``POST /1/playlist/create`` requires JSPF where **every track carries a
 ``identifier`` of ``https://musicbrainz.org/recording/<recording-mbid>``** — text-only
@@ -71,7 +71,7 @@ def build_jspf(
             jspf_tracks.append(entry)
 
     playlist: Dict[str, Any] = {
-        "title": (title or "SoulSync Export").strip() or "SoulSync Export",
+        "title": (title or "Commissary Export").strip() or "Commissary Export",
         "track": jspf_tracks,
     }
     if creator:

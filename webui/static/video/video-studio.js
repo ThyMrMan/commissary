@@ -1,10 +1,10 @@
 /*
- * SoulSync — Video Studio page (isolated, in-app).
+ * Commissary — Video Studio page (isolated, in-app).
  *
  * Drill-in for a production company / studio (from a search result or a title's
  * studio chip). A studio isn't a movie or a show — it's a *collection of films* —
  * so it gets its own layout: a logo/about header + a paged film grid (newest
- * first) where owned copies are marked and every card links back into SoulSync
+ * first) where owned copies are marked and every card links back into Commissary
  * (the owned library detail when we have it, else the TMDB-backed preview). No
  * external links.
  *

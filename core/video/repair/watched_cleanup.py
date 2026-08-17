@@ -48,7 +48,7 @@ class WatchedCleanupJob(VideoRepairJob):
     job_id = "watched_cleanup"
     display_name = "Watched Cleanup"
     description = "Flags watched (and optionally long-unwatched) movies to reclaim disk."
-    help_text = ("The Maintainerr rule, SoulSync-style: movies you've watched and left "
+    help_text = ("The Maintainerr rule, Commissary-style: movies you've watched and left "
                  "sitting are flagged once the last watch is old enough; approving moves "
                  "the file into the recycle bin (Settings → Library Organization) — never "
                  "a hard delete — and the weekly deep scan tidies the server view. "

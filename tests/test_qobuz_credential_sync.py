@@ -5,7 +5,7 @@ Settings showed "Connected: <username> (Active)" but underneath an error
 "Qobuz not authenticated...", and the dashboard indicator stayed
 yellow even after a successful login.
 
-Root cause: SoulSync runs two QobuzClient instances side by side — one
+Root cause: Commissary runs two QobuzClient instances side by side — one
 through ``download_orchestrator.client('qobuz')`` for the auth-flow endpoints, and a
 second owned by the enrichment worker thread for thread safety. Login
 only updated the first instance's in-memory state. The dashboard's

@@ -15,7 +15,7 @@ version: '3.8'
 
 services:
   soulsync:
-    image: boulderbadgedad/soulsync:latest
+    image: ghcr.io/thymrman/commissary:latest
     container_name: soulsync-webui
     ports:
       - "8008:8008"
@@ -50,9 +50,9 @@ volumes:
 - Use a named volume `soulsync_database:/app/database`
 - Host path mounts cause database corruption
 
-### 2. SoulSync Settings Configuration
+### 2. Commissary Settings Configuration
 
-In SoulSync Web UI → Settings:
+In Commissary Web UI → Settings:
 
 1. **Download Path**: `/app/downloads`
 2. **Transfer Path**: `/app/Transfer`
@@ -71,7 +71,7 @@ In SoulSync Web UI → Settings:
 
 ### 4. HTTP 429 (Too Many Requests) Fix
 
-This happens when too many concurrent downloads hit slskd. SoulSync has rate limiting, but slskd may need adjustment.
+This happens when too many concurrent downloads hit slskd. Commissary has rate limiting, but slskd may need adjustment.
 
 **Option 1: Increase slskd limits** (recommended)
 Edit your slskd config (`appsettings.yml`):
@@ -81,8 +81,8 @@ limits:
     maximum_concurrent_downloads: 10  # Increase from default
 ```
 
-**Option 2: Reduce SoulSync workers**
-In SoulSync settings → `config.json`:
+**Option 2: Reduce Commissary workers**
+In Commissary settings → `config.json`:
 ```json
 {
   "database": {
@@ -98,9 +98,9 @@ In SoulSync settings → `config.json`:
 1. slskd downloads → /mnt/data/slskd/downloads (host)
                   → /app/downloads (container)
 
-2. SoulSync processes files
+2. Commissary processes files
 
-3. SoulSync moves to → /app/Transfer (container)
+3. Commissary moves to → /app/Transfer (container)
                     → /mnt/data/media/music (host)
                     → Your Plex library sees the files!
 ```
@@ -161,7 +161,7 @@ version: '3.8'
 
 services:
   soulsync:
-    image: boulderbadgedad/soulsync:latest
+    image: ghcr.io/thymrman/commissary:latest
     container_name: soulsync-webui
     environment:
       - PUID=1000
@@ -186,7 +186,7 @@ volumes:
     driver: local
 ```
 
-**SoulSync Settings**:
+**Commissary Settings**:
 - slskd URL: `http://host.docker.internal:5030`
 - Download Path: `/app/downloads`
 - Transfer Path: `/app/Transfer`

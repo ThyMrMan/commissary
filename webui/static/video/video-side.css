@@ -1,5 +1,5 @@
 /*
- * SoulSync — Video side shell styling.
+ * Commissary — Video side shell styling.
  *
  * Loaded AFTER style.css so these rules win where specificity ties. Everything
  * keys off body[data-side="music|video"] (set by video-side.js). The music side
@@ -1995,7 +1995,7 @@ a.vd-guest:hover .vd-guest-name { color: rgb(var(--vd-accent-rgb)); }
 }
 .video-noserver.hidden { display: none; }
 
-/* Navidrome + SoulSync Standalone are music-only — don't offer them as server
+/* Navidrome + Commissary Standalone are music-only — don't offer them as server
    options on the VIDEO side (scoped to body[data-side="video"], so the music side
    is untouched). The "Video Source" panel governs which video server is used. */
 body[data-side="video"] #navidrome-toggle,

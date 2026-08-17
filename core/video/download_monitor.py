@@ -386,7 +386,7 @@ def _owned_library_dir(db, dl):
     download's target, or None for brand-new items. The DB stores the SERVER's
     view of the file path (Plex part.file / Jellyfin Path — a different Docker
     mount, drive letter, or NAS export from here); the video path resolver
-    re-roots it against the folders SoulSync knows. This is what makes an
+    re-roots it against the folders Commissary knows. This is what makes an
     upgrade replace the copy WHERE IT LIVES instead of forking a second copy
     into the template location. Best-effort — None falls back to the template."""
     try:

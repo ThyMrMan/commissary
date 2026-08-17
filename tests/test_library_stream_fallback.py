@@ -1,4 +1,4 @@
-"""#809: when a library file isn't on SoulSync's disk, play it by proxying the
+"""#809: when a library file isn't on Commissary's disk, play it by proxying the
 media server's stream API instead of 404-ing.
 
 Tests the routing helper _build_library_stream_url: Navidrome-only, uses the

@@ -1,7 +1,7 @@
 """Naming Conformance job — retroactively apply the naming templates.
 
 The organization templates only ever applied to NEW imports; a template change
-(or a library that predates SoulSync) leaves existing files on old names
+(or a library that predates Commissary) leaves existing files on old names
 forever — the Sonarr/Radarr "preview rename" gap. This job renders the
 CURRENT template for every owned movie/episode file and flags the ones whose
 real on-disk path differs. The findings list IS the preview (current → new);

@@ -414,7 +414,7 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
             self._mark_error(download_id, "Usenet job completed but no save_path reported")
             return
         # Translate the client-reported path to one THIS process can read
-        # (SAB reports its own container path; SoulSync may see the same
+        # (SAB reports its own container path; Commissary may see the same
         # files at a different mount). See ``resolve_reported_save_path``.
         local_path = resolve_reported_save_path(save_path)
         if local_path != save_path:
@@ -616,7 +616,7 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
             return result
 
         _emit('staging', release=release_title)
-        # SAB reports its own container path; SoulSync may mount the same
+        # SAB reports its own container path; Commissary may mount the same
         # files elsewhere. Resolve to a locally-readable path before walking.
         local_path = resolve_reported_save_path(save_path)
         if local_path != save_path:
