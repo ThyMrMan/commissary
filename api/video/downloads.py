@@ -205,18 +205,24 @@ def _episode_hints(db, body, season=None, episode=None):
         return None, None
     s = body.get("season") if season is None else season
     e = body.get("episode") if episode is None else episode
-    tmdb_id = _tmdb_id_from(db, body)
-    if not tmdb_id or s is None or e is None:
+    if s is None or e is None:
         return None, None
+    # The tmdb id is what the DB lookups below need — it is NOT a precondition for
+    # the season-1 derivation, which needs only the season and episode numbers.
+    # Bailing out here on a missing id (a payload that carries none, or a library
+    # row id for a show that isn't in the library) skipped a fallback that would
+    # have answered perfectly well without it.
+    tmdb_id = _tmdb_id_from(db, body)
     want_date = want_absolute = None
-    try:
-        want_date = db.episode_air_date(tmdb_id, s, e)
-    except Exception:   # noqa: BLE001 - a matching assist must never break a search
-        logger.debug("air-date hint failed for %s S%sE%s", tmdb_id, s, e, exc_info=True)
-    try:
-        want_absolute = db.episode_absolute_number(tmdb_id, s, e)
-    except Exception:   # noqa: BLE001
-        logger.debug("absolute hint failed for %s S%sE%s", tmdb_id, s, e, exc_info=True)
+    if tmdb_id:
+        try:
+            want_date = db.episode_air_date(tmdb_id, s, e)
+        except Exception:   # noqa: BLE001 - a matching assist must never break a search
+            logger.debug("air-date hint failed for %s S%sE%s", tmdb_id, s, e, exc_info=True)
+        try:
+            want_absolute = db.episode_absolute_number(tmdb_id, s, e)
+        except Exception:   # noqa: BLE001
+            logger.debug("absolute hint failed for %s S%sE%s", tmdb_id, s, e, exc_info=True)
     if want_absolute is None:
         # episode_absolute_number counts the show's own episode rows, so it can
         # only answer for a show already IN the library — searching for one you

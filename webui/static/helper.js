@@ -3491,6 +3491,14 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.0.1': [
+        { date: 'August 2026 · 2.0.1' },
+        { title: 'Fixed: anime searches found nothing, because the tracker numbers episodes instead of using S01E07', desc: 'reported against <code>[SubsPlease] Oh Boy, Was I Wrong About Her - 07</code>, which came back <strong>✗ NO EPISODE NUMBER IN THE RELEASE NAME</strong> on both the automatic and the manual search. Fansub groups number episodes straight through — <code>- 07</code>, not <code>S01E07</code> — and Commissary already knew how to read that. What it needed was to be told <em>which</em> number to look for, and three separate things stopped that reaching it. The release was one step from being accepted the entire time, which is exactly why it looked like the name was unreadable.' },
+        { title: 'A brand-new show could never be told', desc: 'the worst of the three, because it hit the grab that matters most. The wanted episode number was only worked out for shows already tagged as anime, and only by counting episodes already in your library. A show you have just started following has neither — no library row to tag, nothing to count — so the <strong>first</strong> episode of every new anime, the download that decides which Library the show lives in forever, was the one download that could never match. For a first season the answer needs no library at all: episode 7 is absolute number 7, for every show ever made.' },
+        { title: 'And the Soulseek search threw the answer away', desc: 'the search request carried everything needed; the follow-up requests that actually collect the results did not. Soulseek results arrive over about a minute, in batches — so a search that <em>started</em> knowing what it was looking for judged every result it received without that knowledge. Torrent searches return in one shot and were unaffected, which is a good part of why this looked inconsistent.' },
+        { title: 'Deliberately still cautious', desc: 'the episode number is only ever used to <em>accept</em> a release, never to reject one, so a wrong guess is worse than none. It is worked out for the first season of any show, and beyond that only for shows you have actually marked as anime — for an ordinary show, <code>Show - 04</code> is far more likely to be season one\'s episode 4 than the episode you asked for. Daily shows are untouched; they match on air date.' },
+        { title: 'You can also read the release name now', desc: 'reported alongside the above: the name was cut off in Manual Search with no way to see the rest. Hovering did not help either — for results from a tracker the tooltip had been spent on "open this on the indexer", which the link already made obvious. Release names now get two lines instead of one, and the tooltip carries the full name. An anime release keeps its episode number in the middle of a long name, so this was hiding the one field you open a manual search to check.' },
+    ],
     '2.0.0': [
         { date: 'August 2026 · 2.0.0' },
         { title: 'SoulSync is now Commissary', desc: 'the app has a name of its own. This fork branched from <strong>SoulSync 3.1.5</strong> and has been diverging for 130-odd releases — multi-user profiles with request approval, multiple libraries per content kind, the Purchased page, a security pass, and a video side that has gone its own way — while still answering to someone else\'s name and pointing at someone else\'s bug tracker. Nothing about how it works changed in this release. It is a rename, and a major version because the published image moved with it.' },
@@ -3818,6 +3826,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.0.1: anime searches stop coming up empty",
+        description: "reported against '[SubsPlease] Oh Boy, Was I Wrong About Her - 07', rejected as having no episode number on both the automatic and the manual search. Fansub groups number episodes straight through instead of using S01E07, and Commissary could already read that — it just had to be told which number to look for, and three separate things stopped that reaching it.",
+        features: [
+            "a brand-new show could never be told: the number was worked out only for shows already tagged as anime, and only by counting episodes already in your library — a show you just started following has neither, so the FIRST episode of every new anime was the one download that could never match",
+            "for a first season the answer needs no library at all — episode 7 is absolute number 7, for every show ever made",
+            "Soulseek searches threw the answer away: the results arrive in batches over about a minute, and those follow-up requests were judging every release without it (torrent searches return in one shot and were unaffected)",
+            "still cautious on purpose — the number can only ever accept a release, never reject one, so beyond season one it is used only for shows you have actually marked as anime",
+            "and the release name is readable: two lines instead of one, with the full name on hover (tracker results had spent that tooltip on 'open this on the indexer')",
+        ],
+        usage_note: "Nothing to configure, and nothing to re-tag. If a show has been sitting on your wishlist failing to find anything, the next hourly run should pick it up; a manual search will find it now too. Marking a show as anime (Manage → Series type, or the per-Library default from 1.9.23) still helps for later seasons, where the absolute number genuinely cannot be derived without it.",
+    },
     {
         title: "2.0.0: SoulSync is now Commissary",
         description: "a rename, and nothing else. This fork branched from SoulSync 3.1.5 and has diverged steadily since — it was overdue a name of its own, and a bug tracker of its own. No behaviour changed in this release.",

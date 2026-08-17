@@ -183,8 +183,16 @@ def test_hints_degrade_quietly(app_db):
     _, db = app_db
     # movie scope → not an episode search
     assert _episode_hints(db, {"scope": "movie", "media_id": 1, "media_source": "tmdb"}) == (None, None)
-    # nothing to resolve from
-    assert _episode_hints(db, {"scope": "episode"}, 1, 3) == (None, None)
+    # No id at all, but season 1 — the absolute number IS the episode number,
+    # and deriving it needs nothing from the database. This used to return
+    # (None, None) because the whole function bailed out on a missing tmdb id,
+    # including the one branch that never uses it. That bail-out is why the
+    # Soulseek POLL endpoint rejected every fansub release: its query string
+    # carries no media_id, so the search that STARTED with hints polled without
+    # them. The air date still needs the id and stays None.
+    assert _episode_hints(db, {"scope": "episode"}, 1, 3) == (None, 3)
+    # ...and with no season/episode either, there is still nothing to claim.
+    assert _episode_hints(db, {"scope": "episode"}) == (None, None)
     # unknown show, season > 1 — nothing is derivable, so nothing is claimed
     # (season 1 IS derivable without the library; see the season-one test)
     assert _episode_hints(db, {"scope": "episode", "media_id": 999999,

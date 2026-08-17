@@ -293,6 +293,51 @@ def _acceptable_titles(primary: Any, kind: str, tmdb_id: Any) -> List[str]:
     return out
 
 
+def _absolute_hint(item: Dict[str, Any], stype: str):
+    """The wanted ABSOLUTE episode number, or None — scene anime is numbered
+    'Show - 1071' with no season, and that number is the only episode identity
+    such a release carries. Consumed accept-only downstream, which is what makes
+    a wrong answer here dangerous and a missing one merely unhelpful.
+
+    Two sources, and which are allowed depends on how confident we are:
+
+    · ANIME — both. The library's own episode list is authoritative and is the
+      only thing that can answer for a later season (S02E01 of a show with 3
+      episodes in season 1 is absolute 4). Falls back to the season-1 identity
+      when the show isn't in the library, which is precisely the state of a show
+      whose FIRST episode is being grabbed.
+
+    · UNTYPED — the season-1 identity ONLY. A brand-new anime has no shows row,
+      so nothing has typed it yet; refusing it a hint is what made the first
+      episode of a new show the one grab that could never match. But 'untyped'
+      is not 'anime', so it does not get the library lookup: for season 1 the
+      absolute number IS the episode number, which is true of every show
+      regardless of type, and that makes this derivation safe by construction
+      rather than by assumption.
+
+    · STANDARD / DAILY — neither. Wanting S02E01 with absolute 4, a release
+      named 'Show - 04' is far more likely season ONE's episode 4. Dailies match
+      on air date instead.
+
+    Season 1 only, in every case: specials sit in season 0 and are excluded, so
+    the identity holds exactly."""
+    if stype in ("standard", "daily"):
+        return None
+    s, e = item.get("season_number"), item.get("episode_number")
+    if stype == "anime":
+        try:
+            from api.video import get_video_db
+            n = get_video_db().episode_absolute_number(item.get("show_tmdb_id"), s, e)
+            if n is not None:
+                return n
+        except Exception:   # noqa: BLE001 - a numbering assist must never break a grab
+            pass
+    try:
+        return int(e) if int(s) == 1 and int(e) >= 1 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def search_context(item: Dict[str, Any], media_type: str) -> Dict[str, Any]:
     """The ``search_ctx`` the download row carries (drives the monitor's requery).
     Carries ``titles`` — the primary title plus TMDB aliases — so both the initial pick
@@ -330,14 +375,13 @@ def search_context(item: Dict[str, Any], media_type: str) -> Dict[str, Any]:
         stype = str(item.get("series_type") or "").strip().lower()
         if stype in ("daily", "anime"):
             ctx["series_type"] = stype
-        if stype == "anime":
-            try:
-                from api.video import get_video_db
-                ctx["absolute"] = get_video_db().episode_absolute_number(
-                    item.get("show_tmdb_id"), item.get("season_number"),
-                    item.get("episode_number"))
-            except Exception:   # noqa: BLE001 - a numbering assist must never break a grab
-                ctx["absolute"] = None
+        # ``series_type`` still decides how we QUERY. It no longer decides
+        # whether the absolute number is carried at all — see _absolute_hint for
+        # what each type is trusted with, and why an untyped show has to be
+        # served (a brand-new anime has no shows row for a type to live on).
+        n = _absolute_hint(item, stype)
+        if n is not None:
+            ctx["absolute"] = n
         tmdb_id, kind = item.get("show_tmdb_id"), "show"
     titles = _acceptable_titles(ctx["title"], kind, tmdb_id)
     if len(titles) > 1:

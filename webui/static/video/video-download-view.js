@@ -541,10 +541,19 @@
         var MAX_MS = Math.min(80000, pollMs || 60000);
         function tick() {
             if (!resultsEl.isConnected) { _setScanning(triggerRows, false); return; }
+            // media_id/media_source ride along for the same reason searchInto()
+            // puts them on the start payload: the backend needs them for the alias
+            // set and the episode hints. Without them every result that streams in
+            // here is judged with no air-date and no absolute number, so a fansub
+            // release carrying no SxxExx is rejected as having no episode number —
+            // the START of a Soulseek search was fixed for this, the POLL that
+            // actually delivers its results was not.
             var qs = '?id=' + encodeURIComponent(id) + '&scope=' + encodeURIComponent(params.scope || 'movie') +
                 '&title=' + encodeURIComponent(params.title || '') +
                 (params.season != null ? '&season=' + params.season : '') +
-                (params.episode != null ? '&episode=' + params.episode : '');
+                (params.episode != null ? '&episode=' + params.episode : '') +
+                (params.media_id != null ? '&media_id=' + encodeURIComponent(params.media_id) : '') +
+                (params.media_source ? '&media_source=' + encodeURIComponent(params.media_source) : '');
             getJSON('/api/video/downloads/search/poll' + qs).then(function (d) {
                 if (!resultsEl.isConnected) { _setScanning(triggerRows, false); return; }
                 var rows = (d && d.results) || [];
@@ -746,10 +755,17 @@
             '<div class="vdl-res-main">' +
                 '<div class="vdl-r-l1">' +
                     '<span class="vdl-r-q vdl-r-q--' + resKind(r.resolution) + '">' + esc(RES_LABEL[r.resolution] || r.resolution || '?') + '</span>' +
+                    // The release NAME is the thing being judged, so it has to be
+                    // readable. The link variant used to spend its tooltip on
+                    // "Open this release on <indexer>" — which the underline and
+                    // the cursor already say — leaving a name that is ellipsised
+                    // on screen AND unavailable on hover. Anime names are long
+                    // and the episode number sits in the middle of them, so this
+                    // hid the one detail you open a manual search to check.
                     (r.info_url
                         ? '<a class="vdl-r-title vdl-r-title--link" href="' + esc(r.info_url) + '" ' +
                           'target="_blank" rel="noopener noreferrer" ' +
-                          'title="Open this release on ' + esc(r.username || 'the indexer') + '">' +
+                          'title="' + esc(r.title) + '\n\nOpen on ' + esc(r.username || 'the indexer') + '">' +
                           esc(r.title) + '</a>'
                         : '<span class="vdl-r-title" title="' + esc(r.title) + '">' + esc(r.title) + '</span>') +
                 '</div>' +

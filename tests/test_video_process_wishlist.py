@@ -89,9 +89,15 @@ def test_build_record_episode_shape():
     best = _cand("BrBa.S01E03.mkv")
     rec = build_download_record(item, best, [best], media_type="episode", target_dir="/tv", query="q")
     assert rec["kind"] == "episode" and rec["media_id"] == "9" and rec["year"] == "2008"
+    # 'absolute': 3 rides along even though nothing has typed this show. For
+    # SEASON 1 the absolute number IS the episode number, for every show — so it
+    # costs nothing here and it is the only reason a brand-new anime (which has
+    # no shows row, so no series type) can match a '[SubsPlease] Show - 03'
+    # release on its very first grab. A later season gets nothing without an
+    # explicit anime tag; see tests/test_video_anime_absolute_search.py.
     assert json.loads(rec["search_ctx"]) == {"scope": "episode", "title": "Breaking Bad",
                                              "season": 1, "episode": 3, "year": "2008",
-                                             "air_date": "2008-02-10"}
+                                             "air_date": "2008-02-10", "absolute": 3}
 
 
 # ── multi-library #1105: per-item resolution helpers (pure, DB mocked) ────────
