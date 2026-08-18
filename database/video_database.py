@@ -370,6 +370,16 @@ _COLUMN_MIGRATIONS = [
     # A locked field is owned by the user: scan upserts and enrichment skip it.
     ("movies", "locked_fields", "TEXT"),
     ("shows", "locked_fields", "TEXT"),
+    # Import lock ("Lock automatic edits"). Distinct from locked_fields above:
+    # that protects METADATA from enrichment, this protects FILES from the
+    # automatic importer. A locked show/movie/season refuses every unattended
+    # placement — including a brand-new episode — so a release whose name or
+    # season was mis-parsed cannot replace, delete or pollute content you have
+    # already curated. It fails as import_failed with the reason, and a MANUAL
+    # placement still goes through: that is the "pending manual checking" step.
+    ("movies", "import_locked", "INTEGER NOT NULL DEFAULT 0"),
+    ("shows", "import_locked", "INTEGER NOT NULL DEFAULT 0"),
+    ("seasons", "import_locked", "INTEGER NOT NULL DEFAULT 0"),
     # 'Cleared' download-history rows: hidden from the History modal but KEPT —
     # YouTube completed rows are the ownership ledger (scan dedup, retention,
     # Channels tab); a user clear must never delete the facts.
@@ -5393,7 +5403,7 @@ class VideoDatabase:
             genres = self._genres_for(conn, "show_genres", "show_id", show_id)
             credits = self._credits_for(conn, "show_id", show_id)
             seasons = conn.execute(
-                "SELECT id, season_number, title, overview, "
+                "SELECT id, season_number, title, overview, import_locked, "
                 "(poster_url IS NOT NULL AND poster_url<>'') AS has_poster "
                 "FROM seasons WHERE show_id=? ORDER BY season_number", (show_id,)).fetchall()
             eps = conn.execute(
@@ -5445,6 +5455,8 @@ class VideoDatabase:
                     "Specials" if num == 0 else "Season %d" % num),
                 "overview": meta["overview"] if meta else None,
                 "has_poster": bool(meta["has_poster"]) if meta else False,
+                # "Lock automatic edits" for THIS season only — see set_import_lock.
+                "import_locked": bool(meta["import_locked"]) if meta else False,
                 "episode_total": len(ep_list),
                 "episode_owned": owned,
                 "episodes": ep_list,
@@ -5461,6 +5473,9 @@ class VideoDatabase:
             # core/video/episode_numbering.
             "episode_source": show["episode_source"] or "auto",
             "locked_fields": sorted(self._parse_locked(show["locked_fields"])),
+            # Automatic-import lock (whole series). Not the same thing as
+            # locked_fields above, which protects metadata from enrichment.
+            "import_locked": bool(show["import_locked"] or 0),
             "watched": (show["watched_episodes"] or 0) >= total > 0,
             "watched_episodes": show["watched_episodes"] or 0,   # raw count for "N of M watched"
             # Enriched-but-never-surfaced facts (detail BIC P3)
@@ -7927,6 +7942,137 @@ class VideoDatabase:
         finally:
             conn.close()
 
+    # ── import lock ("Lock automatic edits") ──────────────────────────────────
+    # Distinct from ``locked_fields``, which protects METADATA from enrichment.
+    # This protects FILES from the automatic importer: a locked item refuses every
+    # unattended placement, so a release whose name or season was mis-parsed
+    # cannot replace, delete or pollute content you have already curated. A manual
+    # placement is unaffected — that IS the "pending manual checking" step.
+
+    def library_row_id_for_tmdb(self, kind: str, tmdb_id):
+        """The movies/shows ROW id behind a TMDB id, or None when the title is
+        not in the library. The inverse of ``tmdb_id_for_library_row`` — a
+        download only carries a TMDB id, while the per-title rename scopes by
+        row id."""
+        table = {"movie": "movies", "show": "shows"}.get(str(kind or "").lower())
+        if not table or tmdb_id is None:
+            return None
+        try:
+            tmdb_id = int(tmdb_id)
+        except (TypeError, ValueError):
+            return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT id FROM %s WHERE tmdb_id=? ORDER BY id LIMIT 1" % table,
+                (tmdb_id,)).fetchone()
+            return row["id"] if row else None
+        except sqlite3.Error:
+            logger.exception("library_row_id_for_tmdb failed (%s %s)", kind, tmdb_id)
+            return None
+        finally:
+            conn.close()
+
+    def set_import_lock(self, kind: str, item_id, locked: bool) -> bool:
+        """Lock/unlock automatic imports for a movie, show or season row id."""
+        table = {"movie": "movies", "show": "shows", "season": "seasons"}.get(
+            str(kind or "").lower())
+        if not table:
+            return False
+        conn = self._get_connection()
+        try:
+            cur = conn.execute(
+                "UPDATE %s SET import_locked=? WHERE id=?" % table,
+                (1 if locked else 0, int(item_id)))
+            conn.commit()
+            return cur.rowcount > 0
+        except (sqlite3.Error, TypeError, ValueError):
+            logger.exception("set_import_lock failed (%s %s)", kind, item_id)
+            return False
+        finally:
+            conn.close()
+
+    def set_season_import_lock(self, show_library_id, season_number, locked: bool) -> bool:
+        """Lock/unlock one season, addressed the way the UI has it: the show's
+        library id plus the season NUMBER (the season row id is an internal
+        detail the detail page never carries)."""
+        conn = self._get_connection()
+        try:
+            cur = conn.execute(
+                "UPDATE seasons SET import_locked=? WHERE show_id=? AND season_number=?",
+                (1 if locked else 0, int(show_library_id), int(season_number)))
+            conn.commit()
+            return cur.rowcount > 0
+        except (sqlite3.Error, TypeError, ValueError):
+            logger.exception("set_season_import_lock failed (%s S%s)",
+                             show_library_id, season_number)
+            return False
+        finally:
+            conn.close()
+
+    def locked_seasons(self, show_library_id) -> list:
+        """Season NUMBERS of this show that are locked — what the detail page
+        paints its per-season toggles from."""
+        conn = self._get_connection()
+        try:
+            return [r["season_number"] for r in conn.execute(
+                "SELECT season_number FROM seasons WHERE show_id=? AND import_locked=1 "
+                "ORDER BY season_number", (int(show_library_id),))]
+        except (sqlite3.Error, TypeError, ValueError):
+            return []
+        finally:
+            conn.close()
+
+    def import_lock_reason(self, kind: str, tmdb_id, season_number=None):
+        """Why an UNATTENDED import into this target is refused, or None to allow.
+
+        Answers for a TMDB id rather than a library row id because that is the
+        only identity a download carries before it is placed. A title that isn't
+        in the library yet cannot be locked — there is nothing there to protect,
+        and refusing it would block every first-time download.
+
+        A SHOW lock covers the whole series; a SEASON lock covers only its own
+        season, so the show's other seasons keep downloading. Returns the reason
+        string so the failure names which lock stopped it."""
+        if tmdb_id is None:
+            return None
+        try:
+            tmdb_id = int(tmdb_id)
+        except (TypeError, ValueError):
+            return None
+        conn = self._get_connection()
+        try:
+            if str(kind or "").lower() == "movie":
+                row = conn.execute(
+                    "SELECT title FROM movies WHERE tmdb_id=? AND import_locked=1 LIMIT 1",
+                    (tmdb_id,)).fetchone()
+                return ("%s is locked — automatic imports are turned off for it"
+                        % (row["title"] or "This movie")) if row else None
+            show = conn.execute(
+                "SELECT id, title, import_locked FROM shows WHERE tmdb_id=? "
+                "ORDER BY id LIMIT 1", (tmdb_id,)).fetchone()
+            if not show:
+                return None
+            if show["import_locked"]:
+                return ("%s is locked — automatic imports are turned off for it"
+                        % (show["title"] or "This show"))
+            if season_number is None:
+                return None
+            try:
+                sn = int(season_number)
+            except (TypeError, ValueError):
+                return None
+            season = conn.execute(
+                "SELECT 1 FROM seasons WHERE show_id=? AND season_number=? AND import_locked=1",
+                (show["id"], sn)).fetchone()
+            return ("%s season %d is locked — automatic imports are turned off for it"
+                    % (show["title"] or "This show", sn)) if season else None
+        except (sqlite3.Error, TypeError, ValueError):
+            logger.exception("import_lock_reason failed (%s %s)", kind, tmdb_id)
+            return None
+        finally:
+            conn.close()
+
     def episode_air_date(self, show_tmdb_id, season_number, episode_number):
         """One episode's air date (ISO), or None when it isn't in the library.
 
@@ -9211,6 +9357,9 @@ class VideoDatabase:
             "sort_title": m["sort_title"],
             "quality_profile_id": m["quality_profile_id"] or 0,
             "locked_fields": sorted(self._parse_locked(m["locked_fields"])),
+            # Automatic-import lock (see set_import_lock) — protects the FILE,
+            # where locked_fields above protects the metadata.
+            "import_locked": bool(m["import_locked"] or 0),
             "watched": (m["play_count"] or 0) > 0,
             # Continue Watching raw state (v45): last watched + resume position
             "play_count": m["play_count"] or 0,

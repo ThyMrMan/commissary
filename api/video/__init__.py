@@ -135,6 +135,12 @@ def create_video_blueprint() -> Blueprint:
             admin = admin or _p("/api/video/bulk", "/api/video/monitor",
                                  "/api/video/poster/set", "/api/video/downloads/blocklist") \
                 or path.endswith(("/metadata", "/lock", "/refresh-art", "/aka", "/library",
+                                  # "Lock automatic edits" — decides whether the
+                                  # unattended importer may write into a title at
+                                  # all. Same class as the other library-management
+                                  # writes; note it does NOT end with "/lock", so
+                                  # it needs naming here in its own right.
+                                  "/import-lock",
                                   "/rescan-episodes", "/episode-source",
                                   # per-title acquisition settings (P2/P8) — management,
                                   # same as the metadata edits above

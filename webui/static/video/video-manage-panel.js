@@ -96,6 +96,8 @@
                 'background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);color:#eef1f7;transition:all .13s;white-space:nowrap;}' +
             '.vmg-btn-ghost:hover{background:rgba(255,255,255,.13);}' +
             '.vmg-toggles{display:grid;grid-template-columns:1fr 1fr;gap:12px;}' +
+            '.vmg-toggles--one{grid-template-columns:1fr;margin-top:12px;}' +
+            '.vmg-hint--lock{margin-top:6px;}' +
             '.vmg-toggle{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 13px;' +
                 'border-radius:12px;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.07);cursor:pointer;' +
                 'font-size:13px;font-weight:700;color:#eef1f7;transition:border .13s;}' +
@@ -264,6 +266,22 @@
                 '<div class="vmg-toggle' + (d.monitored ? ' vmg-toggle--on' : '') + '" data-vmg-monitored role="switch" ' +
                     'aria-checked="' + (d.monitored ? 'true' : 'false') + '" tabindex="0"><span>Monitored</span><span class="vmg-sw"></span></div>' +
             '</div>' +
+            // Lock automatic edits. Unattended imports into this title are refused
+            // outright — an upgrade, a replacement and a brand-new episode alike —
+            // so a release whose name or season was mis-parsed cannot damage
+            // content you have already curated. It fails as import_failed naming
+            // the lock; placing it by hand still works, and is the check the lock
+            // exists to demand.
+            '<div class="vmg-toggles vmg-toggles--one">' +
+                '<div class="vmg-toggle' + (d.import_locked ? ' vmg-toggle--on' : '') + '" data-vmg-import-lock role="switch" ' +
+                    'aria-checked="' + (d.import_locked ? 'true' : 'false') + '" tabindex="0">' +
+                    '<span>Lock automatic edits</span><span class="vmg-sw"></span></div>' +
+            '</div>' +
+            '<div class="vmg-hint vmg-hint--lock">Refuses every automatic import for this ' +
+                (isShow ? 'show' : 'movie') + ' — new episodes included. A download that targets ' +
+                'it stops at placement and says so, instead of replacing what you already have. ' +
+                'Manual import still works.' +
+                (isShow ? ' Seasons can be locked on their own from the season list.' : '') + '</div>' +
             // Per-title quality profile (arr-parity P2): which ladder/cutoff this
             // title is grabbed + upgraded under. Options fill in async.
             '<div class="vmg-field"><label>Quality profile</label>' +
@@ -967,6 +985,34 @@
             .catch(function () { toast('Couldn’t update the quality profile', 'error'); });
     }
 
+    // "Lock automatic edits" — its own endpoint rather than a case in toggle()
+    // above, because it is neither watch state nor the monitored flag: it decides
+    // whether the unattended importer may write into this title at all.
+    function toggleImportLock(el) {
+        var on = !el.classList.contains('vmg-toggle--on');
+        el.classList.toggle('vmg-toggle--on', on);
+        el.setAttribute('aria-checked', on ? 'true' : 'false');
+        fetch('/api/video/detail/' + state.kind + '/' + state.id + '/import-lock', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ locked: on }),
+        })
+            .then(function (r) {
+                if (!r.ok) throw new Error();
+                if (state.data) state.data.import_locked = on;
+                toast(on ? 'Locked — automatic imports for this title will be refused'
+                         : 'Unlocked — automatic imports can write to this title again',
+                      'success');
+                document.dispatchEvent(new CustomEvent('soulsync:video-meta-changed', {
+                    detail: { kind: state.kind, id: state.id, quiet: true },
+                }));
+            })
+            .catch(function () {
+                el.classList.toggle('vmg-toggle--on', !on);
+                el.setAttribute('aria-checked', !on ? 'true' : 'false');
+                toast('Couldn’t change the lock', 'error');
+            });
+    }
+
     function toggle(which, el) {
         var url = which === 'watched'
             ? '/api/video/detail/' + state.kind + '/' + state.id + '/watched'
@@ -1095,6 +1141,8 @@
         ov.addEventListener('change', function (e) {
             var qp = e.target.closest('[data-vmg-quality-profile]');
             if (qp) setQualityProfile(qp);
+            var lk = e.target.closest('[data-vmg-import-lock]');
+            if (lk) { toggleImportLock(lk); return; }
             var st = e.target.closest('[data-vmg-series-type]');
             if (st) setSeriesType(st);
             var lib = e.target.closest('[data-vmg-library]');

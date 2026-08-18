@@ -258,6 +258,42 @@ def register_routes(bp):
             return jsonify({"error": res.get("error", "not found")}), 404
         return jsonify(res)
 
+    @bp.route("/detail/<kind>/<int:item_id>/import-lock", methods=["POST"])
+    def video_import_lock(kind, item_id):
+        """"Lock automatic edits" for a movie or a whole show. Body: {locked}.
+
+        A locked item refuses every UNATTENDED import — a replacement, an
+        upgrade, and a brand-new episode alike — so a release whose name or
+        season was mis-parsed cannot touch content you have already curated. The
+        download still happens and still reports what it found; it just stops at
+        placement, as import_failed, naming the lock. Manual import is the way
+        past it, which is the review the lock exists to demand.
+
+        Nothing about metadata: that is the /lock route above, which is a
+        per-FIELD enrichment lock and unrelated."""
+        from . import get_video_db
+        if kind not in ("movie", "show"):
+            return jsonify({"error": "bad kind"}), 400
+        locked = bool((request.get_json(silent=True) or {}).get("locked"))
+        if not get_video_db().set_import_lock(kind, item_id, locked):
+            return jsonify({"error": "unknown item"}), 404
+        return jsonify({"ok": True, "import_locked": locked})
+
+    @bp.route("/detail/show/<int:show_id>/season/<int:season_number>/import-lock",
+              methods=["POST"])
+    def video_season_import_lock(show_id, season_number):
+        """The narrower lock: this SEASON only. Body: {locked}.
+
+        A show-level lock covers everything; this covers one season, so a
+        finished season can be sealed while the show keeps acquiring the one
+        currently airing. A season pack spanning both imports the unlocked half
+        and refuses the rest."""
+        from . import get_video_db
+        locked = bool((request.get_json(silent=True) or {}).get("locked"))
+        if not get_video_db().set_season_import_lock(show_id, season_number, locked):
+            return jsonify({"error": "unknown season"}), 404
+        return jsonify({"ok": True, "season": season_number, "import_locked": locked})
+
     @bp.route("/detail/<kind>/<int:item_id>/watched", methods=["POST"])
     def video_set_watched(kind, item_id):
         """Played/unplayed toggle — local watch state + server markPlayed."""

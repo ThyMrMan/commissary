@@ -3491,6 +3491,16 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.0.2': [
+        { date: 'August 2026 · 2.0.2' },
+        { title: 'New: lock a show, a season or a movie so automatic downloads cannot touch it', desc: 'a <strong>Lock automatic edits</strong> switch, on the Manage panel for a show or movie and on each season of a show. While it is on, nothing unattended may write to that title — not a replacement, not an upgrade, not a brand-new episode. A download that targets it still runs and still tells you what it found; it simply stops at the last step and reports why, instead of changing anything.' },
+        { title: 'What it protects you from', desc: 'when a finished download is placed, Commissary works out where it belongs from the request that started it, and it can only argue with a release whose name actually spells out S01E07. A release that names no episode at all — fansub numbering, a bare title, a mis-titled scene release — is filed wherever the request claimed. If that claim was wrong, and the release happens to score better than what you already have, the existing file is <strong>deleted and replaced</strong> with the wrong episode. That is the sequence this stops.' },
+        { title: 'Season locks are narrower than show locks', desc: 'lock a whole show and every season is sealed. Lock a single season and only that one is — so a finished season can be closed off for good while the season currently airing keeps downloading normally. A season pack spanning both imports the half it is allowed to and refuses the rest.' },
+        { title: 'Manual import is the way through', desc: 'the lock is aimed squarely at unattended work. Placing a file by hand still does exactly what you tell it, because that IS the check the lock is asking for: it stops the automation from deciding, not you. A refused download is left where it is with its reason attached, so you can look at it and place it yourself if it was right after all.' },
+        { title: 'New: existing files are renamed to match before a new episode is imported', desc: 'naming templates only ever applied at import time, so changing one quietly split a show in two: the next episode arrived named the new way, in a folder named the new way, while every earlier season kept the name it was first imported under — and Plex or Jellyfin then sees two shows. The manual Rename tool could always fix it, but only if you remembered to run it before the next episode landed, and for an airing show that is a weekly race you will eventually lose. The rename now runs on the way in.' },
+        { title: 'Scoped, quiet, and on by default', desc: 'only the title being imported into is touched — an import is not the moment to start a library-wide job. A library that already matches its template renames nothing, which is why this is safe to leave on: for most people it will never do anything at all. There is a switch in <strong>Settings → Library</strong> if you would rather it did not. If a rename cannot be done — a name already taken, a file offline — it is logged and the import goes ahead regardless, because a tidy-up should never cost you a download.' },
+        { title: 'And a refused release is not blacklisted', desc: 'being pointed at locked content says nothing about the release itself — it may be perfectly good and simply aimed at the wrong title. It is left eligible, so it can still be picked for whatever it actually belongs to. Locking is admin-only, and nothing is locked by default: this changes nothing until you switch it on.' },
+    ],
     '2.0.1': [
         { date: 'August 2026 · 2.0.1' },
         { title: 'Fixed: anime searches found nothing, because the tracker numbers episodes instead of using S01E07', desc: 'reported against <code>[SubsPlease] Oh Boy, Was I Wrong About Her - 07</code>, which came back <strong>✗ NO EPISODE NUMBER IN THE RELEASE NAME</strong> on both the automatic and the manual search. Fansub groups number episodes straight through — <code>- 07</code>, not <code>S01E07</code> — and Commissary already knew how to read that. What it needed was to be told <em>which</em> number to look for, and three separate things stopped that reaching it. The release was one step from being accepted the entire time, which is exactly why it looked like the name was unreadable.' },
@@ -3826,6 +3836,20 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.0.2: lock a title so automatic downloads cannot touch it",
+        description: "a new 'Lock automatic edits' switch on shows, movies and individual seasons. While it is on, nothing unattended may write to that title - it stops at placement and says why, instead of changing what you already have.",
+        features: [
+            "protects against the real sequence: a release that names no episode is filed wherever the request claimed, and if the request was wrong and the release scores better, your existing file is deleted and replaced with the wrong episode",
+            "blunt on purpose - a replacement, an upgrade and a brand-new episode are all refused, because a release that mis-identified itself cannot be trusted about being new either",
+            "season locks are narrower than show locks: seal a finished season while the airing one keeps downloading, and a pack spanning both imports only the half it is allowed to",
+            "manual import still works - that is the check the lock exists to demand, not something it should block",
+            "a refused release is not blacklisted: being aimed at locked content says nothing about the release, so it stays eligible for the title it actually belongs to",
+            "ALSO: a title's existing files are now renamed to the current naming template before a new episode is imported into it, so changing a template no longer splits a show across two folders (Settings → Library, on by default, scoped to that one title)",
+            "a rename that cannot be done is logged and the import proceeds anyway - a tidy-up should never cost you a download",
+        ],
+        usage_note: "Shows and movies: Manage → Lock automatic edits. Seasons: the switch above the episode list on the season you are viewing. Admin-only, and off everywhere until you turn it on - nothing changes for an existing library. A refused download waits on the Downloads page with its reason, and can be placed by hand from there.",
+    },
     {
         title: "2.0.1: anime searches stop coming up empty",
         description: "reported against '[SubsPlease] Oh Boy, Was I Wrong About Her - 07', rejected as having no episode number on both the automatic and the manual search. Fansub groups number episodes straight through instead of using S01E07, and Commissary could already read that — it just had to be told which number to look for, and three separate things stopped that reaching it.",

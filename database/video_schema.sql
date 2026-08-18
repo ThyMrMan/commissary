@@ -109,7 +109,11 @@ CREATE TABLE IF NOT EXISTS movies (
     play_count       INTEGER,                         -- server watch state (viewCount)
     last_viewed_at   TEXT,                             -- server last-watched stamp (Plex lastViewedAt / JF LastPlayedDate)
     view_offset_ms   INTEGER,                         -- resume position (Continue Watching)
-    locked_fields    TEXT                             -- JSON list of user-edited (scan/enrichment-immune) fields
+    locked_fields    TEXT,                            -- JSON list of user-edited (scan/enrichment-immune) fields
+    -- "Lock automatic edits" — see the shows table. A locked movie refuses every
+    -- unattended import, so an upgrade that mis-identified itself cannot replace
+    -- the copy you already have.
+    import_locked    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_movies_tmdb       ON movies(tmdb_id);
 CREATE INDEX IF NOT EXISTS idx_movies_monitored  ON movies(monitored, has_file);
@@ -161,7 +165,11 @@ CREATE TABLE IF NOT EXISTS shows (
     added_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at         TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     watched_episodes INTEGER,                         -- server watch state (viewed leaf count)
-    locked_fields    TEXT                             -- JSON list of user-edited (scan/enrichment-immune) fields
+    locked_fields    TEXT,                            -- JSON list of user-edited (scan/enrichment-immune) fields
+    -- "Lock automatic edits": refuse every UNATTENDED import into this show, a
+    -- new episode included, so a mis-parsed release cannot touch curated content.
+    -- Manual placement still works — that is the intended review step.
+    import_locked    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_shows_tvdb      ON shows(tvdb_id);
 CREATE INDEX IF NOT EXISTS idx_shows_monitored ON shows(monitored);
@@ -176,6 +184,9 @@ CREATE TABLE IF NOT EXISTS seasons (
     overview      TEXT,
     poster_url    TEXT,
     monitored     INTEGER NOT NULL DEFAULT 1,
+    -- Narrower than the show-level lock: blocks unattended imports into THIS
+    -- season only, leaving the show's other seasons downloading normally.
+    import_locked INTEGER NOT NULL DEFAULT 0,
     UNIQUE (show_id, season_number)
 );
 CREATE INDEX IF NOT EXISTS idx_seasons_show ON seasons(show_id);

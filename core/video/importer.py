@@ -147,7 +147,8 @@ def _existing_match(scope: str, dest_dir: str, ctx: dict, list_dir: Callable) ->
 
 def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | None = None,
                 settings: dict | None = None, force: bool = False,
-                override: dict | None = None, library_dir: str | None = None) -> dict:
+                override: dict | None = None, library_dir: str | None = None,
+                lock_reason: str | None = None) -> dict:
     """Decide what to do with a finished download. Returns one of:
 
       {"action": "import",  "dest": {...}, "quality_label": str}
@@ -164,7 +165,13 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
     episode, episode_title, target_dir, media_id}) trusts the user's chosen identity —
     it skips the auto sanity-gates (sample / wrong-episode / pack / not-an-upgrade) and
     files the file exactly where they said, replacing any worse copy. ffprobe is still
-    used for the true resolution, but never to reject."""
+    used for the true resolution, but never to reject.
+
+    ``lock_reason`` is the "Lock automatic edits" verdict, resolved by the CALLER
+    (this function stays pure and has no DB). A non-empty string refuses the
+    placement outright — before any destination is computed, so a mis-identified
+    release cannot so much as name a file inside locked content. ``force`` bypasses
+    it deliberately: a manual placement IS the review the lock exists to demand."""
     dl = dl or {}
     settings = organization.normalize(settings)
     override = override or {}
@@ -180,6 +187,11 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
 
     if not is_video(src_path):   # can't place a non-video, even on a forced import
         return _reject("Not a video file (%s)" % (ext or "no extension"), bad_release=True)
+    # The import lock, checked BEFORE anything else decides where this would go.
+    # Not tagged bad_release: the release may be perfectly good and simply
+    # mis-identified — blocklisting it would punish the file for the lock.
+    if lock_reason and not force:
+        return _reject("%s. Place it by hand once you have checked it." % lock_reason)
     if not force:
         if is_sample(name, dl.get("size_bytes")):
             return _reject("Looks like a sample, not the feature", bad_release=True)
@@ -347,7 +359,7 @@ def plan_subs(src_path: str, dest_path: str, list_dir: Callable) -> list:
 def run_import(dl: dict, src_path: str, *, fs: Any, prober: Callable | None = None,
                settings: dict | None = None, force: bool = False,
                override: dict | None = None, library_dir: str | None = None,
-               recycle: Callable | None = None) -> dict:
+               recycle: Callable | None = None, lock_reason: str | None = None) -> dict:
     """Execute the import and return a DB patch dict for the download row.
 
     ``fs`` is an injected facade with: ``list_dir(dir)->iterable[name]``,
@@ -369,7 +381,7 @@ def run_import(dl: dict, src_path: str, *, fs: Any, prober: Callable | None = No
             probe_info = None
     plan = plan_import(dl, src_path, list_dir=fs.list_dir, probe=probe_info,
                        settings=settings, force=force, override=override,
-                       library_dir=library_dir)
+                       library_dir=library_dir, lock_reason=lock_reason)
     if plan["action"] == "reject":
         # Leave the file where it is; remember WHERE so manual import can find it.
         # _bad_release is transient (stripped by update_video_download): it tells
@@ -478,7 +490,8 @@ def run_season_import(dl: dict, src_dir: str, *, fs: Any, lister: Callable,
                       prober: Callable | None = None, settings: dict | None = None,
                       library_dir: str | None = None, recycle: Callable | None = None,
                       size_of: Callable | None = None, force: bool = False,
-                      override: dict | None = None) -> dict:
+                      override: dict | None = None,
+                      lock_check: Callable | None = None) -> dict:
     """Import every episode in a season/series pack. Returns a DB patch dict.
 
     Partial success is SUCCESS: a pack advertised as S01 that ships 8 of 12
@@ -513,9 +526,14 @@ def run_season_import(dl: dict, src_dir: str, *, fs: Any, lister: Callable,
             # than none (it names the file).
             member_override.pop("episode_title", None)
         try:
+            # Per MEMBER, not once for the pack: a season lock protects its own
+            # season, so a pack spanning a locked and an unlocked season imports
+            # the unlocked half and refuses the rest.
+            member_lock = lock_check(m.get("season")) if lock_check else None
             patch = run_import(_member_download(dl, m), m["path"], fs=fs, prober=prober,
                                settings=settings, library_dir=library_dir, recycle=recycle,
-                               force=force, override=member_override)
+                               force=force, override=member_override,
+                               lock_reason=member_lock)
         except Exception as e:      # noqa: BLE001 - one bad member must not abort the pack
             failed.append("S%02dE%02d: %s" % (m["season"], m["episode"], e))
             continue

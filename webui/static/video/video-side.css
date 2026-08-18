@@ -5331,6 +5331,22 @@ body[data-side="video"] #gsearch-aura {
     background: linear-gradient(135deg, rgba(74,222,128,0.16), rgba(74,222,128,0.05)) !important;
 }
 
+/* Per-season "Lock automatic edits" (see seasonLockHTML in video-detail.js).
+   Sits above the season action bar because that bar only renders while episodes
+   are still missing, and a COMPLETE season is the one most worth sealing. */
+.vd-season-lock { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 8px 4px 0; }
+.vd-season-lock-btn { display: inline-flex; align-items: center; gap: 7px;
+    padding: 5px 11px; border-radius: 999px; cursor: pointer; font-size: 11.5px;
+    font-weight: 700; letter-spacing: 0.01em;
+    border: 1px solid rgba(255, 255, 255, 0.14); background: rgba(255, 255, 255, 0.03);
+    color: rgba(255, 255, 255, 0.62); transition: background 0.15s ease, color 0.15s ease,
+    border-color 0.15s ease; }
+.vd-season-lock-btn:hover { border-color: rgba(255, 255, 255, 0.3); color: #fff; }
+.vd-season-lock-btn:disabled { opacity: 0.5; cursor: default; }
+.vd-season-lock--on .vd-season-lock-btn { border-color: rgba(240, 168, 48, 0.65);
+    background: rgba(240, 168, 48, 0.16); color: #f0a830; }
+.vd-season-lock-note { font-size: 11.5px; color: rgba(255, 255, 255, 0.45); }
 .vd-season-actions {
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
     padding: 10px 4px 14px; margin-bottom: 4px;

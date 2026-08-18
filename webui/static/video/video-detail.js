@@ -56,6 +56,44 @@
     function root() { return document.querySelector('[data-video-detail="' + currentKind + '"]'); }
     function q(sel) { var r = root(); return r ? r.querySelector(sel) : null; }
     function toast(msg, type) { if (typeof showToast === 'function') showToast(msg, type); }
+
+    function isAdminUser() {
+        return (typeof currentProfile === 'undefined') || !currentProfile ||
+            !!currentProfile.is_admin || currentProfile.id === 1;
+    }
+
+    var VD_LOCK_SHUT = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><rect x="4" y="10.5" width="16" height="11" rx="2"/><path d="M8 10.5V7a4 4 0 0 1 8 0v3.5"/></svg>';
+    var VD_LOCK_OPEN = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><rect x="4" y="10.5" width="16" height="11" rx="2"/><path d="M8 10.5V7a4 4 0 0 1 7.5-1.3"/></svg>';
+
+    // "Lock automatic edits" for ONE season - the narrow half of the show-level
+    // lock that lives in the Manage panel. A finished season can be sealed while
+    // the show keeps acquiring the one currently airing.
+    //
+    // Its own row rather than a button in the season action bar: that bar only
+    // renders while the season still has missing episodes, and a COMPLETE season
+    // is exactly the one you most want to seal.
+    function seasonLockHTML(season) {
+        // Library shows only (a TMDB preview has no season row to lock), never
+        // YouTube (no seasons), and admins only - the endpoint refuses everyone
+        // else, and a button that always 403s is worse than no button.
+        if (!data || data.kind !== 'show' || data.source === 'tmdb' || data.source === 'youtube') return '';
+        if (!isAdminUser() || !season || season.season_number == null) return '';
+        var on = !!season.import_locked;
+        var label = season.season_number === 0 ? 'Specials' : 'Season ' + season.season_number;
+        return '<div class="vd-season-lock' + (on ? ' vd-season-lock--on' : '') + '">' +
+            '<button class="vd-season-lock-btn" type="button" data-vd-season-lock="' + season.season_number + '" ' +
+                'role="switch" aria-checked="' + (on ? 'true' : 'false') + '" ' +
+                'title="' + (on
+                    ? 'Automatic imports into ' + esc(label) + ' are refused. Click to unlock.'
+                    : 'Refuse automatic imports into ' + esc(label) + ' &mdash; a mis-named or ' +
+                      'wrong-season release cannot then touch it. Manual import still works.') + '">' +
+                (on ? VD_LOCK_SHUT : VD_LOCK_OPEN) +
+                '<span>' + (on ? 'Locked' : 'Lock automatic edits') + '</span>' +
+            '</button>' +
+            (on ? '<span class="vd-season-lock-note">automatic imports here are refused &mdash; ' +
+                  'they stop at placement and say so</span>' : '') +
+        '</div>';
+    }
     // Set a discog-style button's label without clobbering its icon/shimmer spans.
     function _btnLabel(btn, text) { var t = btn.querySelector('.discog-btn-text'); if (t) t.textContent = text; else btn.textContent = text; }
     function setText(sel, t) { var n = q(sel); if (n) n.textContent = t || ''; }
@@ -1724,10 +1762,33 @@
                     '<span class="discog-btn-shimmer"></span></button>' +
               '</div>'
             : '';
-        host.innerHTML = seasonBar +
+        host.innerHTML = seasonLockHTML(season) + seasonBar +
             (eps.length ? eps.map(episodeRow).join('') : '<div class="vd-ep-empty">' + emptyMsg + '</div>');
         host.classList.remove('vd-ep-anim'); void host.offsetWidth; host.classList.add('vd-ep-anim');
         applyDlStates();   // repaint any in-flight/finished grabs on the fresh rows
+    }
+
+    function toggleSeasonLock(btn) {
+        var sn = parseInt(btn.getAttribute('data-vd-season-lock'), 10);
+        var season = seasonByNum(sn);
+        if (!season) return;
+        var on = !season.import_locked;
+        btn.disabled = true;
+        fetch('/api/video/detail/show/' + data.id + '/season/' + sn + '/import-lock', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ locked: on }),
+        })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (res) {
+                btn.disabled = false;
+                if (!res || !res.ok) { toast('Could not change the lock', 'error'); return; }
+                season.import_locked = on;
+                renderEpisodes();
+                toast(on ? 'Season locked - automatic imports into it will be refused'
+                         : 'Season unlocked - automatic imports can write to it again',
+                      'success');
+            })
+            .catch(function () { btn.disabled = false; toast('Could not change the lock', 'error'); });
     }
 
     function selectSeason(n) {
@@ -2626,6 +2687,12 @@
         if (epSearch && r.contains(epSearch)) { e.preventDefault(); e.stopPropagation(); manualSearchEpisode(epSearch); return; }
         var epWish = e.target.closest('[data-vd-ep-wish]');
         if (epWish && r.contains(epWish)) { e.preventDefault(); e.stopPropagation(); wishEpisodeInline(epWish); return; }
+        var seasonLock = e.target.closest('[data-vd-season-lock]');
+        if (seasonLock && r.contains(seasonLock)) {
+            e.preventDefault(); e.stopPropagation();
+            toggleSeasonLock(seasonLock);
+            return;
+        }
         var seasonGrab = e.target.closest('[data-vd-season-grab]');
         if (seasonGrab && r.contains(seasonGrab)) {
             e.preventDefault();

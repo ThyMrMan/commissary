@@ -1585,6 +1585,7 @@
         set('vo-transfer-mode', _videoOrg.transfer_mode || 'copy');
         chk('vo-verify', _videoOrg.verify_with_ffprobe);
         chk('vo-replace', _videoOrg.replace_existing);
+        chk('vo-rename-first', _videoOrg.rename_before_import);
         chk('vo-subs', _videoOrg.carry_subtitles);
         chk('vo-artwork', _videoOrg.save_artwork);
         chk('vo-nfo', _videoOrg.write_nfo);
@@ -1627,6 +1628,7 @@
             transfer_mode: val('vo-transfer-mode'),
             verify_with_ffprobe: on('vo-verify'),
             replace_existing: on('vo-replace'),
+            rename_before_import: on('vo-rename-first'),
             carry_subtitles: on('vo-subs'),
             save_artwork: on('vo-artwork'),
             write_nfo: on('vo-nfo'),

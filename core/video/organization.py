@@ -75,6 +75,14 @@ DEFAULTS = {
     # so they stay consistent (Settings → Library). 0 = follow with no backfill (only
     # new uploads after you follow).
     "youtube_follow_count": 5,
+    # Bring a title's EXISTING files up to the current naming template before a
+    # new episode is imported into it. Templates used to apply only at import
+    # time, so changing one forked a show across two naming eras: the new
+    # episode lands in a folder named the new way while every earlier season
+    # sits in the old one, and the media server sees two shows. On by default —
+    # it is a no-op for a library that already matches its template, and the
+    # split it prevents is tedious to unpick by hand.
+    "rename_before_import": True,
 }
 
 _TRANSFER_MODES = ("copy", "move")
@@ -103,7 +111,7 @@ def normalize(raw: Any) -> dict:
         d["youtube_sponsorblock"] = sb
     for key in ("verify_with_ffprobe", "replace_existing", "carry_subtitles",
                 "save_artwork", "write_nfo", "download_subtitles", "recycle_deletes",
-                "youtube_embed_subs"):
+                "youtube_embed_subs", "rename_before_import"):
         if key in raw:
             d[key] = bool(raw.get(key))
     if "recycle_keep_days" in raw:

@@ -162,6 +162,10 @@ def _make_organizer(db):
         except Exception:   # noqa: BLE001, S110 - a status blip must never wedge the import
             pass
         dl = {**dl, "_custom_formats": _custom_formats_for(db, dl)}
+        # Before placing the new file: bring the title's existing files up to the
+        # current naming template, so the import cannot fork the show across two
+        # naming eras. No-op when nothing needs renaming, or when switched off.
+        _rename_before_import(db, dl, settings)
         from core.video.recycle import discarder
         # A season/series grab hands us the pack FOLDER; fan it out into one
         # per-episode import each (core.video.importer.run_season_import), which
@@ -172,11 +176,13 @@ def _make_organizer(db):
             from core.video.importer import run_season_import
             patch = run_season_import(dl, src, fs=fs, lister=_walk_files, prober=prober,
                                       settings=settings, library_dir=_owned_library_dir(db, dl),
-                                      recycle=discarder(db, settings), size_of=_size_of)
+                                      recycle=discarder(db, settings), size_of=_size_of,
+                                      lock_check=lambda sn: _import_lock(db, dl, season=sn))
         else:
             patch = run_import(dl, src, fs=fs, prober=prober, settings=settings,
                                library_dir=_owned_library_dir(db, dl),
-                               recycle=discarder(db, settings))
+                               recycle=discarder(db, settings),
+                               lock_reason=_import_lock(db, dl))
         if patch.get("status") == "completed" and patch.get("dest_path"):
             if settings.get("save_artwork") or settings.get("write_nfo"):
                 write_sidecars(db, dl, patch["dest_path"], settings, fs)
@@ -379,6 +385,76 @@ def _wishlist_ids(db, dl):
         return "movie", (_as_int(media_id) if is_tmdb else db.movie_tmdb_id(media_id)), None, None, ctx
     return ("show", (_as_int(media_id) if is_tmdb else db.show_tmdb_id(media_id)),
             ctx.get("season"), ctx.get("episode"), ctx)
+
+
+def _rename_before_import(db, dl, settings) -> None:
+    """Bring this title's EXISTING files up to the current naming template,
+    before the new file is placed beside them.
+
+    Templates used to apply only at import time, so changing one forked a show
+    across two naming eras: the incoming episode is rendered with today's
+    template and lands in a folder named today's way, while every earlier season
+    keeps the name it was imported under. The media server then sees two shows,
+    and unpicking it by hand afterwards is the tedious part.
+
+    Scoped to the ONE title being imported into, never the whole library — an
+    import is not the moment to start a library-wide job. A title that is not in
+    the library yet has nothing to rename, and a library already matching its
+    template renames nothing, so the common case costs one scoped preview.
+
+    Failures are deliberately ignored. ``mass_rename.apply`` is collision-safe
+    and reports what it skipped; a rename that could not happen leaves exactly
+    the split this tries to avoid, which is no worse than not trying, whereas
+    refusing the import over it would strand a perfectly good download.
+    """
+    if not (settings or {}).get("rename_before_import", True):
+        return
+    try:
+        from core.video import mass_rename
+        kind, tmdb_id, _sn, _en, _ctx = _wishlist_ids(db, dl)
+        if not tmdb_id:
+            return
+        scope_kind = "movie" if kind == "movie" else "show"
+        row_id = db.library_row_id_for_tmdb(scope_kind, tmdb_id)
+        if not row_id:
+            return   # nothing on disk yet — this IS the first file
+        res = mass_rename.apply(scope=(scope_kind, row_id)) or {}
+        if res.get("status") == "skipped":
+            # a manual mass-rename holds the lock; its pass covers this title too
+            logger.debug("rename-before-import skipped (%s), importing as-is",
+                         res.get("reason"))
+            return
+        if res.get("renamed"):
+            logger.info("Renamed %d existing file(s) for %s to the current template "
+                        "before importing", res["renamed"], dl.get("title") or tmdb_id)
+        if res.get("failures"):
+            logger.warning("rename-before-import could not rename %d file(s) for %s: %s "
+                           "- importing anyway",
+                           len(res["failures"]), dl.get("title") or tmdb_id,
+                           res["failures"][:3])
+    except Exception:   # noqa: BLE001 - a tidy-up must never cost the import
+        logger.debug("rename-before-import failed, importing as-is", exc_info=True)
+
+
+def _import_lock(db, dl, season=None):
+    """Why this UNATTENDED import is refused by "Lock automatic edits", or None.
+
+    Everything reaching the monitor is unattended by definition — a manual
+    placement goes through api/video/manual_import.py, which is exactly the
+    review a locked item is asking for. Best-effort: a lookup that fails must
+    never wedge an import, so it returns None and the import proceeds as it
+    always did. Failing OPEN is deliberate — a lock that silently swallowed
+    downloads because of a DB hiccup would be worse than one that missed a
+    protection it could not prove was wanted."""
+    try:
+        kind, tmdb_id, sn, _en, _ctx = _wishlist_ids(db, dl)
+        if not tmdb_id:
+            return None
+        return db.import_lock_reason(kind, tmdb_id,
+                                     sn if season is None else season)
+    except Exception:   # noqa: BLE001 - a lock lookup must never wedge the monitor
+        logger.debug("import-lock lookup failed", exc_info=True)
+        return None
 
 
 def _owned_library_dir(db, dl):
