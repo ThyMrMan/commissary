@@ -17,7 +17,7 @@ Template tokens
   Movies:   $title $titlefirst $year $quality $resolution $source $codec $edition
             $tmdbid $imdbid
   Episodes: $series $season $seasonraw $episode $episodetitle $year $quality
-            $resolution $source $codec $tvdbid $airdate
+            $resolution $source $codec $tvdbid $tmdbid $imdbid $airdate
   ($season/$episode are zero-padded to 2; $seasonraw is the bare number; a
   multi-episode file renders its span through $episode — 'S01E01-E02'; $airdate
   is the episode's YYYY-MM-DD air date, for daily-show naming.)
@@ -271,7 +271,14 @@ def _episode_values(f: dict) -> dict:
         "resolution": _str(f.get("resolution")),
         "source": source_label(f.get("source")),
         "codec": _str(f.get("codec")).upper(),
+        # All three ids, not just tvdbid. The brace vocabulary has offered
+        # {TmdbId}/{ImdbId} for episodes all along; the $token set carried only
+        # $tvdbid, so the same scheme written in $tokens silently dropped the id
+        # — and a folder named for an id that renders as nothing is one the media
+        # server has to guess at.
         "tvdbid": _str(f.get("tvdbid")),
+        "tmdbid": _str(f.get("tmdbid")),
+        "imdbid": _str(f.get("imdbid")),
     }
 
 

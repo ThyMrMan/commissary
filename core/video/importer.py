@@ -148,7 +148,7 @@ def _existing_match(scope: str, dest_dir: str, ctx: dict, list_dir: Callable) ->
 def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | None = None,
                 settings: dict | None = None, force: bool = False,
                 override: dict | None = None, library_dir: str | None = None,
-                lock_reason: str | None = None) -> dict:
+                lock_reason: str | None = None, identity: dict | None = None) -> dict:
     """Decide what to do with a finished download. Returns one of:
 
       {"action": "import",  "dest": {...}, "quality_label": str}
@@ -167,6 +167,14 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
     files the file exactly where they said, replacing any worse copy. ffprobe is still
     used for the true resolution, but never to reject.
 
+    ``identity`` is the LIBRARY's own naming facts for this title
+    (``video_naming_identity`` — title, premiere year, tmdb/tvdb/imdb ids, and the
+    episode list), resolved by the CALLER for the same reason ``lock_reason`` is:
+    this function stays pure. It exists because naming a destination from the GRAB
+    instead of from the library forked every ongoing show into two folders — see
+    that method for the full account. None (an unowned title) keeps the previous
+    behaviour, which is all that can be known before the first file lands.
+
     ``lock_reason`` is the "Lock automatic edits" verdict, resolved by the CALLER
     (this function stays pure and has no DB). A non-empty string refuses the
     placement outright — before any destination is computed, so a mis-identified
@@ -180,10 +188,30 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
     ext = ext_of(src_path)
     parsed = parse_release(dl.get("release_title") or name)
     ctx = _ctx(dl)
+    # The library's own title and year — the two naming facts the grab gets wrong,
+    # its "year" being the year this EPISODE aired rather than the year the series
+    # began. Deliberately nothing else: season, episode and air_date are what the
+    # sanity gates below judge the release against, so those keep coming from the
+    # grab and a library row cannot talk the importer into accepting a release it
+    # had already decided was the wrong episode. Applied before the force overlay,
+    # so a manual placement — itself a deliberate statement of identity — wins.
+    _ident = identity if isinstance(identity, dict) else {}
+    for _k, _v in (("title", _ident.get("title")), ("year", _ident.get("year"))):
+        if _v not in (None, ""):
+            ctx[_k] = _v
     if force:   # the user told us what it is — let their identity win
         for k in ("title", "year", "season", "episode", "episode_title"):
             if override.get(k) is not None:
                 ctx[k] = override.get(k)
+    # The episode's own title, looked up AFTER the numbering is final: a manual
+    # placement happens precisely when the detected episode was wrong, and reading
+    # the library at the pre-override number would name the corrected file after
+    # the episode it was mistaken for. Fills a gap only — the grab seldom carries
+    # a title, which is why a newly imported episode had none in its filename
+    # until some later rename pass put it back.
+    _ep = (_ident.get("episodes") or {}).get((ctx.get("season"), ctx.get("episode")))
+    if _ep and _ep.get("episode_title") and not ctx.get("episode_title"):
+        ctx["episode_title"] = _ep["episode_title"]
 
     if not is_video(src_path):   # can't place a non-video, even on a forced import
         return _reject("Not a video file (%s)" % (ext or "no extension"), bad_release=True)
@@ -253,6 +281,12 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
         return _reject("No library folder configured for this type")
 
     media_id = override.get("media_id") if force else dl.get("media_id")
+    # A FORCED placement's media_id is a TMDB id by construction — the Place
+    # dialog resolves the title against TMDB and sends that id (it is the same
+    # value the endpoint feeds to root_folder_id_for_tmdb). Without this a manual
+    # placement of a title not yet in the library would lose the one id it does
+    # know, which is the case the dialog exists to serve.
+    _tmdb_sourced = bool(force) or str(dl.get("media_source") or "").lower() == "tmdb"
     quality = quality_full(parsed)
     # A multi-episode file is NAMED by its full span (S01E01-E02, the Sonarr/Plex
     # convention) even though the download row's identity is one episode of it.
@@ -267,8 +301,16 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
         "air_date": ctx.get("air_date"),
         "quality": quality, "resolution": parsed.get("resolution"),
         "source": parsed.get("source"), "codec": parsed.get("codec"),
-        "tmdbid": media_id if scope == "movie" else None,
-        "tvdbid": media_id if scope == "episode" else None,
+        # Ids come from the LIBRARY row, falling back to ``media_id`` only when it
+        # IS a TMDB id (a tmdb-sourced grab of a title not on disk yet — the first
+        # episode of a new show, which is precisely the import that used to leave
+        # an empty '(tmdb-)' for the media server to guess at). ``media_id`` was
+        # previously written into ``tvdbid`` for every episode: it is a TMDB id or
+        # a local row id and never a TVDB one, so that asserted an id that was
+        # false rather than merely missing. Only a real tvdb_id goes there now.
+        "tmdbid": _ident.get("tmdbid") or (media_id if _tmdb_sourced else None),
+        "tvdbid": _ident.get("tvdbid"),
+        "imdbid": _ident.get("imdbid"),
         # Sonarr/Radarr {Token} inputs. Everything here is optional — a template
         # that doesn't mention them is byte-for-byte unaffected, and a token
         # whose value is missing collapses its own group.
@@ -359,7 +401,8 @@ def plan_subs(src_path: str, dest_path: str, list_dir: Callable) -> list:
 def run_import(dl: dict, src_path: str, *, fs: Any, prober: Callable | None = None,
                settings: dict | None = None, force: bool = False,
                override: dict | None = None, library_dir: str | None = None,
-               recycle: Callable | None = None, lock_reason: str | None = None) -> dict:
+               recycle: Callable | None = None, lock_reason: str | None = None,
+               identity: dict | None = None) -> dict:
     """Execute the import and return a DB patch dict for the download row.
 
     ``fs`` is an injected facade with: ``list_dir(dir)->iterable[name]``,
@@ -381,7 +424,8 @@ def run_import(dl: dict, src_path: str, *, fs: Any, prober: Callable | None = No
             probe_info = None
     plan = plan_import(dl, src_path, list_dir=fs.list_dir, probe=probe_info,
                        settings=settings, force=force, override=override,
-                       library_dir=library_dir, lock_reason=lock_reason)
+                       library_dir=library_dir, lock_reason=lock_reason,
+                       identity=identity)
     if plan["action"] == "reject":
         # Leave the file where it is; remember WHERE so manual import can find it.
         # _bad_release is transient (stripped by update_video_download): it tells
@@ -491,7 +535,8 @@ def run_season_import(dl: dict, src_dir: str, *, fs: Any, lister: Callable,
                       library_dir: str | None = None, recycle: Callable | None = None,
                       size_of: Callable | None = None, force: bool = False,
                       override: dict | None = None,
-                      lock_check: Callable | None = None) -> dict:
+                      lock_check: Callable | None = None,
+                      identity: dict | None = None) -> dict:
     """Import every episode in a season/series pack. Returns a DB patch dict.
 
     Partial success is SUCCESS: a pack advertised as S01 that ships 8 of 12
@@ -530,10 +575,12 @@ def run_season_import(dl: dict, src_dir: str, *, fs: Any, lister: Callable,
             # season, so a pack spanning a locked and an unlocked season imports
             # the unlocked half and refuses the rest.
             member_lock = lock_check(m.get("season")) if lock_check else None
+            # One identity for the whole pack — it carries every episode of the
+            # show, so each member still names itself from its OWN row.
             patch = run_import(_member_download(dl, m), m["path"], fs=fs, prober=prober,
                                settings=settings, library_dir=library_dir, recycle=recycle,
                                force=force, override=member_override,
-                               lock_reason=member_lock)
+                               lock_reason=member_lock, identity=identity)
         except Exception as e:      # noqa: BLE001 - one bad member must not abort the pack
             failed.append("S%02dE%02d: %s" % (m["season"], m["episode"], e))
             continue

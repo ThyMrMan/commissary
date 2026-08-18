@@ -7949,6 +7949,69 @@ class VideoDatabase:
     # cannot replace, delete or pollute content you have already curated. A manual
     # placement is unaffected — that IS the "pending manual checking" step.
 
+    def video_naming_identity(self, kind: str, tmdb_id) -> dict | None:
+        """The LIBRARY's own naming facts for a title, or None when it isn't owned.
+
+        An import used to name its destination folder from the GRAB — the wishlist
+        title, the episode's air year, and ``media_id``. Every one of those is a
+        different fact from the one the library holds, so the importer and the
+        renamer computed different folders for the same show and the media server
+        saw two:
+
+            import  ->  Kitchen Nightmares (US) (2026) (tmdb-)
+            rename  ->  Kitchen Nightmares (US) (2007) (tmdb-235884)
+
+        Both halves of that mattered. The YEAR a series template asks for is the
+        premiere year, not the year this particular episode aired. And ``media_id``
+        is a TMDB id (or a local row id) — never a TVDB one, so writing it into a
+        ``(tvdb-…)`` folder asserted an id that was simply false, which is worse
+        than an absent one because the server believes it.
+
+        ``episodes`` is keyed ``(season, episode)`` and covers the whole show in one
+        query, so a season PACK names every member from the library too — resolving
+        per member would be one query per file.
+        """
+        table = {"movie": "movies", "show": "shows"}.get(str(kind or "").lower())
+        if not table or tmdb_id is None:
+            return None
+        try:
+            tmdb_id = int(tmdb_id)
+        except (TypeError, ValueError):
+            return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                # The year falls back to first_air_date/release_date exactly as the
+                # rename query does — enrichment fills those even when the media
+                # server omits ProductionYear, so a NULL year heals without a deep
+                # scan, and the two paths agree on what the year IS.
+                "SELECT title, "
+                "COALESCE(year, CAST(substr(NULLIF(%s, ''), 1, 4) AS INTEGER)) AS year, "
+                "tmdb_id, imdb_id%s "
+                "FROM %s WHERE tmdb_id=? ORDER BY id LIMIT 1"
+                % ("first_air_date" if table == "shows" else "release_date",
+                   ", tvdb_id, id" if table == "shows" else "",
+                   table),
+                (tmdb_id,)).fetchone()
+            if not row:
+                return None
+            out = {"title": row["title"], "year": row["year"],
+                   "tmdbid": row["tmdb_id"], "imdbid": row["imdb_id"],
+                   "tvdbid": row["tvdb_id"] if table == "shows" else None}
+            if table == "shows":
+                out["episodes"] = {
+                    (r["season_number"], r["episode_number"]):
+                        {"episode_title": r["title"], "air_date": r["air_date"]}
+                    for r in conn.execute(
+                        "SELECT season_number, episode_number, title, air_date "
+                        "FROM episodes WHERE show_id=?", (row["id"],)).fetchall()}
+            return out
+        except sqlite3.Error:
+            logger.exception("video_naming_identity failed (%s %s)", kind, tmdb_id)
+            return None
+        finally:
+            conn.close()
+
     def library_row_id_for_tmdb(self, kind: str, tmdb_id):
         """The movies/shows ROW id behind a TMDB id, or None when the title is
         not in the library. The inverse of ``tmdb_id_for_library_row`` — a

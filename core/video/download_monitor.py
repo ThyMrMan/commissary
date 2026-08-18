@@ -166,6 +166,9 @@ def _make_organizer(db):
         # current naming template, so the import cannot fork the show across two
         # naming eras. No-op when nothing needs renaming, or when switched off.
         _rename_before_import(db, dl, settings)
+        # After the rename pass, which is what brings the existing files into
+        # agreement with the template this import is about to render against.
+        identity = _library_identity(db, dl)
         from core.video.recycle import discarder
         # A season/series grab hands us the pack FOLDER; fan it out into one
         # per-episode import each (core.video.importer.run_season_import), which
@@ -177,12 +180,13 @@ def _make_organizer(db):
             patch = run_season_import(dl, src, fs=fs, lister=_walk_files, prober=prober,
                                       settings=settings, library_dir=_owned_library_dir(db, dl),
                                       recycle=discarder(db, settings), size_of=_size_of,
-                                      lock_check=lambda sn: _import_lock(db, dl, season=sn))
+                                      lock_check=lambda sn: _import_lock(db, dl, season=sn),
+                                      identity=identity)
         else:
             patch = run_import(dl, src, fs=fs, prober=prober, settings=settings,
                                library_dir=_owned_library_dir(db, dl),
                                recycle=discarder(db, settings),
-                               lock_reason=_import_lock(db, dl))
+                               lock_reason=_import_lock(db, dl), identity=identity)
         if patch.get("status") == "completed" and patch.get("dest_path"):
             if settings.get("save_artwork") or settings.get("write_nfo"):
                 write_sidecars(db, dl, patch["dest_path"], settings, fs)
@@ -481,6 +485,30 @@ def _owned_library_dir(db, dl):
         return _os.path.dirname(resolved) if resolved else None
     except Exception:   # noqa: BLE001 - resolution is an assist, never a blocker
         logger.debug("owned-library-dir resolution failed", exc_info=True)
+        return None
+
+
+def _library_identity(db, dl):
+    """The library's own naming facts for this download's title, or None when it
+    isn't owned yet. Resolved HERE because the importer is pure, exactly like
+    ``_owned_library_dir`` beside it — and for the same underlying reason: the
+    grab knows what was asked for, only the library knows what the title IS.
+
+    ``_owned_library_dir`` answers "where does the copy of THIS EPISODE live",
+    which is None for an episode that has never been imported — i.e. every new
+    one. That left the destination to be computed from the grab, and the grab's
+    year is the episode's air year while its ``media_id`` is not a TVDB id, so a
+    template asking for either forked the show into a second folder. This answers
+    the question that is actually available for a new episode: what is the SHOW.
+    Best-effort — None simply keeps the previous naming."""
+    try:
+        kind, tmdb_id, _sn, _en, _ctx = _wishlist_ids(db, dl)
+        if not tmdb_id:
+            return None
+        return db.video_naming_identity("movie" if kind == "movie" else "show",
+                                        int(tmdb_id))
+    except Exception:   # noqa: BLE001 - a naming assist must never wedge an import
+        logger.debug("library-identity resolution failed", exc_info=True)
         return None
 
 

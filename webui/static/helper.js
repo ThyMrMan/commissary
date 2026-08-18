@@ -3491,6 +3491,16 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.0.3': [
+        { date: 'August 2026 · 2.0.3' },
+        { title: "Fixed: a new episode was filed into a second folder, and your server read it as a different show", desc: "reported as <em>Kitchen Nightmares (US) keeps downloading new episodes as Kitchen Nightmares: Road to Super Bowl LIX</em>. The download itself was right every week; what went wrong was where it was put. Commissary worked the destination folder out from the <strong>request</strong> that started the download, while everything else — the rename tool, the naming-conformance repair, the library scan — works it out from the show's own library row. For an airing show those two disagree, so the episode landed in a folder <em>beside</em> the show instead of inside it, and Plex or Jellyfin scanned that as a brand-new series whose identity it then had to guess." },
+        { title: "Three facts, all wrong, all in the same place", desc: "the <strong>year</strong> came from the episode's air date rather than the year the series began, so <code>Futurama (1999)</code> was written as <code>Futurama (2026)</code>. The <strong>TMDB id</strong> was never filled in for an episode at all, so a template asking for it wrote an empty <code>(tmdb-)</code> and left the server nothing to match on. And the <strong>TVDB id</strong> was filled with whichever id the download happened to carry — a TMDB id, or an internal row number, never a TVDB one — so the folder asserted an id that was flatly false. That is worse than a missing one, because the server believes it." },
+        { title: "It was not one show", desc: "in the library this was diagnosed against, <strong>36 of the last 37</strong> episode downloads had written to a folder the library did not use. The single exception was a show that lived in the malformed folder itself, having never been acquired any other way. The damage already on disk included a second <em>Its Always Sunny in Philadelphia</em> with no ids holding two episodes, three separate folders for one anime, and a Futurama episode filed under an unrelated series." },
+        { title: "Why the rename-before-import step added in 2.0.2 could never win", desc: "that step exists precisely so a show cannot end up split across two namings, and it was working exactly as designed. It corrected the show's existing files to the library's name — and then the import created its own differently-named folder alongside them. Every week, for every airing show. The two halves are now computed from the same facts, so they agree." },
+        { title: "A brand-new show now arrives identifiable", desc: "a show you do not own yet has no library row to read, and that is the very download which <strong>creates</strong> the folder your server will identify the show by forever. It now writes the TMDB id it already had from the request, instead of an empty <code>(tmdb-)</code> for the server to guess at. Placing a file by hand gets the same treatment: the Place dialog has no field for a TVDB or IMDb id, so it reads them from the library too." },
+        { title: "Also: $tmdbid and $imdbid now work in episode templates", desc: "they had only ever worked in the <code>{TmdbId}</code> brace form. The same scheme written with <code>$tokens</code> silently dropped them, which is a quiet way to lose the one part of a folder name your server matches on." },
+        { title: "What this does not do", desc: "folders that are <strong>already</strong> split are left where they are. This stops new ones appearing; it does not merge what has already happened, because rearranging a library you have curated is not something an upgrade should do behind your back. To bring an existing show onto one naming, use <strong>Manage → Rename</strong> on that show, then remove any phantom series your media server invented." },
+    ],
     '2.0.2': [
         { date: 'August 2026 · 2.0.2' },
         { title: 'New: lock a show, a season or a movie so automatic downloads cannot touch it', desc: 'a <strong>Lock automatic edits</strong> switch, on the Manage panel for a show or movie and on each season of a show. While it is on, nothing unattended may write to that title — not a replacement, not an upgrade, not a brand-new episode. A download that targets it still runs and still tells you what it found; it simply stops at the last step and reports why, instead of changing anything.' },
@@ -3836,6 +3846,20 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.0.3: new episodes stop being filed as a different show",
+        description: "reported as 'Kitchen Nightmares (US) keeps downloading new episodes as Kitchen Nightmares: Road to Super Bowl LIX'. The download was right every week; the folder it went into was not. Commissary named that folder from the request that started the download, while the rest of the app names it from the show's library row — and for an airing show those disagree.",
+        features: [
+            "the year came from the EPISODE's air date, not the year the series began: Futurama (1999) was written as Futurama (2026)",
+            "the TMDB id was never filled in for an episode, so a template asking for it wrote an empty (tmdb-) and gave the server nothing to match on",
+            "the TVDB id was filled with whichever id the download carried - a TMDB id or an internal row number, never a TVDB one - asserting an identity that was false rather than missing, which the server then believes",
+            "the result is a second folder beside the show, which Plex or Jellyfin scans as a brand-new series and has to guess the identity of - in the library this was diagnosed against, 36 of the last 37 episode grabs had done it",
+            "it is also why the rename-before-import step added in 2.0.2 could never win: it corrected the existing files while the import kept creating a new folder next to them",
+            "a show you do not own yet now arrives carrying the TMDB id from its request, so the folder that decides the show's identity forever is identifiable from the first episode",
+            "ALSO: $tmdbid and $imdbid now work in episode templates (they had only ever worked in the {TmdbId} brace form), and a hand-placed file is named the same way an automatic one is",
+        ],
+        usage_note: "Nothing to configure. Folders already split are deliberately left alone - this stops new ones appearing rather than rearranging a library you have curated. To bring an existing show onto one naming, use Manage → Rename on that show, then remove any phantom series your media server invented from its own library.",
+    },
     {
         title: "2.0.2: lock a title so automatic downloads cannot touch it",
         description: "a new 'Lock automatic edits' switch on shows, movies and individual seasons. While it is on, nothing unattended may write to that title - it stops at placement and says why, instead of changing what you already have.",

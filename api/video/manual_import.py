@@ -398,6 +398,12 @@ def register_routes(bp):
         }
         settings = organization.load(db)
         prober = probe if settings.get("verify_with_ffprobe", True) else None
+        # The library's ids for the chosen title. The dialog supplies the title,
+        # year and numbering and those still win; what it has no field for is the
+        # tvdb/imdb ids a naming template may ask for, so a hand-placed episode
+        # would otherwise be named differently from an automatic one — and hand
+        # placement is exactly what people fall back on when naming goes wrong.
+        identity = db.video_naming_identity(_kind, body.get("media_id"))
         from core.video.recycle import discarder
 
         def _place() -> dict:
@@ -410,11 +416,12 @@ def register_routes(bp):
                 patch = run_season_import(row, src, fs=real_fs(), lister=_walk_video_files,
                                           prober=prober, settings=settings, force=True,
                                           override=override, recycle=discarder(db, settings),
+                                          identity=identity,
                                           size_of=lambda p: (os.path.getsize(p)
                                                              if os.path.exists(p) else 0))
             else:
                 patch = run_import(row, src, fs=real_fs(), prober=prober, settings=settings,
-                                   force=True, override=override,
+                                   force=True, override=override, identity=identity,
                                    recycle=discarder(db, settings))
             return _finish(patch)
 
