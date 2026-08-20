@@ -33,11 +33,17 @@ def _usenet_category() -> str:
 
 
 def grab_torrent(url_or_magnet: str, *, category: Optional[str] = None,
-                 save_path: Optional[str] = None) -> dict:
+                 save_path: Optional[str] = None,
+                 fallback_magnet: Optional[str] = None) -> dict:
     """Add a magnet/.torrent URL to the active torrent client. ``category``
     overrides the global default (e.g. a per-Library category resolved from
     root_folders) — omitted/blank falls back to torrent_client.category.
-    Returns ``{ok, ref}`` (ref = the info-hash to poll) or ``{ok: False, error}``."""
+    Returns ``{ok, ref}`` (ref = the info-hash to poll) or ``{ok: False, error}``.
+
+    ``fallback_magnet`` is the same release's magnet, carried from the search
+    hit. Callers hand over the .torrent URL first (#1139) so it can be fetched
+    server-side and pushed as a file; without the magnet to fall back on, a URL
+    this process cannot reach would be a dead end where the magnet worked."""
     from core.torrent_clients import get_active_adapter
     adapter = get_active_adapter()
     if adapter is None or not adapter.is_configured():
@@ -45,7 +51,9 @@ def grab_torrent(url_or_magnet: str, *, category: Optional[str] = None,
     try:
         from core.torrent_clients.base import add_torrent_smart
         cat = category or _torrent_category()
-        ref = _run(add_torrent_smart(adapter, url_or_magnet, category=cat, save_path=save_path))
+        ref = _run(add_torrent_smart(adapter, url_or_magnet, category=cat,
+                                     save_path=save_path,
+                                     fallback_magnet=fallback_magnet))
     except Exception as e:   # noqa: BLE001 - surface the client error to the grab handler
         logger.warning("torrent add failed: %s", e, exc_info=True)
         return {"ok": False, "error": "Torrent client: " + str(e)}
@@ -75,10 +83,15 @@ def grab_usenet(url_or_nzb: Any, *, category: Optional[str] = None,
 
 
 def grab(source: str, url: Any, *, category: Optional[str] = None,
-        save_path: Optional[str] = None) -> dict:
-    """Dispatch a grab by source (torrent | usenet)."""
+        save_path: Optional[str] = None, fallback_magnet: Optional[str] = None) -> dict:
+    """Dispatch a grab by source (torrent | usenet).
+
+    ``fallback_magnet`` is torrent-only and ignored for usenet, which has no
+    such thing — keeping it on the shared signature means callers do not have to
+    branch on the source just to pass it."""
     if str(source).lower() == "torrent":
-        return grab_torrent(url, category=category, save_path=save_path)
+        return grab_torrent(url, category=category, save_path=save_path,
+                            fallback_magnet=fallback_magnet)
     if str(source).lower() == "usenet":
         return grab_usenet(url, category=category, save_path=save_path)
     return {"ok": False, "error": "Unsupported source %r" % source}

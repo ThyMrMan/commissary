@@ -118,7 +118,7 @@
                         quality_label: x.quality_label, title: x.title }; });
             } else {
                 // torrent / usenet — the magnet/NZB carriers the backend hands to the client
-                payload.download_url = best.download_url; payload.protocol = best.protocol;
+                payload.download_url = best.download_url; payload.magnet_uri = best.magnet_uri; payload.protocol = best.protocol;
                 payload.indexer_id = best.indexer_id; payload.guid = best.guid;
                 payload.username = best.username; payload.filename = best.filename || best.title;
                 payload.candidates = [];
@@ -193,7 +193,7 @@
                 payload.username = best.username; payload.filename = best.filename;
                 payload.candidates = [];
             } else {
-                payload.download_url = best.download_url; payload.protocol = best.protocol;
+                payload.download_url = best.download_url; payload.magnet_uri = best.magnet_uri; payload.protocol = best.protocol;
                 payload.indexer_id = best.indexer_id; payload.guid = best.guid;
                 payload.username = best.username; payload.filename = best.filename || best.title;
                 payload.candidates = [];

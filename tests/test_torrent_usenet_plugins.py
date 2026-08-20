@@ -160,11 +160,36 @@ def test_torrent_project_results_drops_releases_without_download_url() -> None:
     assert albums == []
 
 
-def test_torrent_project_results_prefers_magnet_when_available() -> None:
+def test_torrent_project_results_prefers_the_torrent_url_carrying_the_magnet() -> None:
+    """Reversed deliberately (#1139): this used to assert the MAGNET won.
+
+    A magnet hands the client an info-hash and nothing else — it has to find the
+    swarm itself, and one that cannot parks on "downloading metadata" with zero
+    size and zero peers indefinitely. Preferring the URL lets the real .torrent
+    be fetched server-side and pushed as file bytes, which needs no swarm
+    discovery at all.
+
+    The magnet is still carried, which is what makes the flip safe rather than a
+    trade of one failure for another: in a split install where Commissary cannot
+    reach the indexer but the CLIENT can, it is used the moment the URL handoff
+    is refused. So this asserts strictly more than the old test did.
+    """
     from core.download_plugins.candidate_store import get_candidate_store
     plugin = TorrentDownloadPlugin()
     magnet = 'magnet:?xt=urn:btih:abc'
     results = [_make_torrent_result(magnet_uri=magnet, download_url='https://x/y.torrent')]
+    tracks, _ = plugin._project_results(results)
+    token, _ = _decode_filename(tracks[0].filename)
+    assert get_candidate_store().resolve(token) == 'https://x/y.torrent'
+    assert get_candidate_store().resolve_magnet(token) == magnet
+
+
+def test_torrent_project_results_still_uses_a_magnet_only_release() -> None:
+    """A private tracker offering nothing else must keep working."""
+    from core.download_plugins.candidate_store import get_candidate_store
+    plugin = TorrentDownloadPlugin()
+    magnet = 'magnet:?xt=urn:btih:def'
+    results = [_make_torrent_result(magnet_uri=magnet, download_url=None)]
     tracks, _ = plugin._project_results(results)
     token, _ = _decode_filename(tracks[0].filename)
     assert get_candidate_store().resolve(token) == magnet

@@ -3491,6 +3491,17 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.0.7': [
+        { date: 'August 2026 · 2.0.7' },
+        { title: "Four fixes carried over from upstream, each verified as a real fault here first", desc: "Commissary forked from SoulSync 3.1.5 and has diverged a long way, so most of what lands upstream either does not apply or was already solved differently. These four were checked against this code before being taken." },
+        { title: "Fixed: a magnet was preferred over the real .torrent file, and could stall forever", desc: "when an indexer offers both, Commissary was taking the magnet. A magnet hands your download client an info-hash and nothing else — it has to find the swarm itself, and one that cannot parks on <em>downloading metadata</em> with zero size and zero peers indefinitely. Commissary can fetch the actual .torrent server-side and hand the client the file, which needs no swarm discovery at all, and that path could never be reached." },
+        { title: "The magnet is still carried, which is the point", desc: "simply flipping the preference would trade one failure for another: if Commissary cannot reach your indexer but your download client can, a magnet that worked would be lost. So the magnet travels alongside the URL the whole way and is used the moment the file handoff is refused. This affected music single-track grabs and both video paths — the album flow had already been fixed." },
+        { title: "Fixed: a stalled download's clock was reset by every restart", desc: "a download that stops moving is given half an hour before Commissary gives up on it — but that clock was kept in memory, so restarting wiped it and handed every stuck download a fresh half hour. The perverse result is that the longer something had been stuck, the more restarts it had survived and the <strong>less</strong> likely it was ever to be caught. Upstream saw six torrents sit at the same percentage for over three hours against a thirty-minute timeout. The clock is now stored with the download and measured in real time, so it survives restarts." },
+        { title: "And two things that clock never noticed", desc: "a download that <em>finished</em> but whose file Commissary then could not find was not tracked at all — it sat at 100% forever. That is what a path-mapping problem looks like, and it now says so rather than telling you there was no progress, which would send you hunting seeders that were never the problem. Separately, a torrent re-checking itself briefly reports a LOWER percentage; that used to count as movement and renew the grace period every time it happened." },
+        { title: "Fixed: Quality Check upgrades failed with \"No matched track in finding\"", desc: "the tool would find plenty to upgrade and then refuse every single one. Two causes. The scanner records no library-track link for a file it could not match, and the fix handler was gated on exactly that link — so for those findings it never even looked at the finding's own details, which carry the title and artist perfectly well. And a full database refresh renumbers every track, orphaning findings written beforehand; those were discarded too. Both closed." },
+        { title: "Fixed: folders differing only in capitalisation became two albums", desc: "every destination folder is built from metadata, so when the metadata's capitalisation differs from the folder already on disk you got a second one. On Linux — which is what Docker runs — that is two real directories and the album shows up twice. On Windows or macOS the file lands in the first folder but the path recorded is not how the folder is actually spelled, so later lookups miss it. Each folder now resolves to the spelling already on disk." },
+        { title: "It steers new writes; it does not merge", desc: "two folders that have already split stay split until something moves their files — running a Reorganize is what merges them, and every track will now resolve to the same surviving folder. Filenames are never case-folded: two tracks differing only in case are two different files, and folding them would overwrite one with the other." },
+    ],
     '2.0.6': [
         { date: 'August 2026 · 2.0.6' },
         { title: "Fixed: every Opus download was labelled with no quality at all", desc: "in the library this was found in, <strong>507 of 521</strong> YouTube downloads had recorded no quality and no bitrate, while the handful of M4A ones beside them were labelled perfectly. One missing attribute explains all of it: the tag library Commissary uses genuinely cannot read a bitrate out of an Opus file — the field does not exist in that format's header — and the code asked for it anyway. The error was swallowed, and what came back was an empty string, which everything downstream reads as <em>unknown file</em> rather than <em>unreadable field</em>." },
@@ -3874,6 +3885,20 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.0.7: four upstream fixes, each verified here first",
+        description: "Commissary forked from SoulSync 3.1.5 and has diverged, so most of what lands upstream either does not apply or was already solved differently. These four were confirmed as real, present faults in this code before being taken.",
+        features: [
+            "a magnet was preferred over the real .torrent when an indexer offered both - a magnet gives your client an info-hash and nothing else, and one that cannot find the swarm parks on 'downloading metadata' forever",
+            "the magnet is still carried alongside and used the moment the file handoff is refused, so this cannot lose a magnet that would have worked in a split setup",
+            "a stalled download's thirty-minute clock was kept in memory, so every restart wiped it - the longer something was stuck, the more restarts it survived and the LESS likely it was ever caught",
+            "that clock also never noticed a download that FINISHED but whose file could not be found: it sat at 100% forever, and now says it is a path problem rather than 'no progress'",
+            "a torrent re-checking itself briefly reports a lower percentage, which used to count as movement and renew the grace period",
+            "Quality Check upgrades failed with 'No matched track in finding' every time - the handler was gated on a library link the scanner deliberately leaves empty, and a database refresh orphaned findings written before it",
+            "folders differing only in capitalisation became two albums: two real directories on Linux, and on Windows/macOS a recorded path that is not how the folder is spelled",
+        ],
+        usage_note: "Nothing to configure. The folder fix steers new writes only - two folders that have already split stay split until a Reorganize moves their files together. Filenames are never case-folded, because two tracks differing only in case are two different files.",
+    },
     {
         title: "2.0.6: Opus downloads stop reporting no quality at all",
         description: "507 of 521 YouTube downloads in the reporting library had recorded no quality and no bitrate, while the M4A ones beside them labelled fine. The tag library cannot read a bitrate out of an Opus file - the field is not in that format's header - and the code asked for it anyway, swallowed the error, and returned an empty string.",

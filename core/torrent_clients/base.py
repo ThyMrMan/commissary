@@ -185,6 +185,7 @@ async def add_torrent_smart(
     url_or_magnet: str,
     category: Optional[str] = None,
     save_path: Optional[str] = None,
+    fallback_magnet: Optional[str] = None,
 ) -> Optional[str]:
     """Add a release the way Sonarr/Radarr do: magnets go straight to the
     client; HTTP download links are fetched server-side and handed over as
@@ -220,4 +221,15 @@ async def add_torrent_smart(
         "torrent client instead (the client must be able to reach that host itself)",
         _strip_query(url_or_magnet),
     )
-    return await adapter.add_torrent(url_or_magnet, category=category, save_path=save_path)
+    ref = await adapter.add_torrent(url_or_magnet, category=category, save_path=save_path)
+    if ref or not fallback_magnet:
+        return ref
+    # The same release's magnet, carried from the search hit. Callers hand over
+    # the .torrent URL FIRST, because a magnet gives the client an info-hash and
+    # nothing else — one that cannot reach the swarm parks on "downloading
+    # metadata" with zero size and zero peers indefinitely. But in a split
+    # install where Commissary cannot reach the indexer and the CLIENT can, that
+    # preference would lose a magnet that worked. This is the other half of the
+    # trade: prefer the file, keep the magnet.
+    logger.info("URL handoff was refused — retrying the same release as a magnet")
+    return await adapter.add_torrent(fallback_magnet, category=category, save_path=save_path)

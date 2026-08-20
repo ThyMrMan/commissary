@@ -21,7 +21,8 @@ def test_grab_torrent_uses_explicit_category_over_global(monkeypatch):
     monkeypatch.setattr("core.torrent_clients.get_active_adapter", lambda: _FakeAdapter())
     seen = {}
 
-    async def fake_add_torrent_smart(adapter, url, category=None, save_path=None):
+    async def fake_add_torrent_smart(adapter, url, category=None, save_path=None,
+                                     fallback_magnet=None):
         seen["category"] = category
         seen["save_path"] = save_path
         return "abc123"
@@ -38,7 +39,8 @@ def test_grab_torrent_falls_back_to_global_category_when_omitted(monkeypatch):
     monkeypatch.setattr("core.torrent_clients.get_active_adapter", lambda: _FakeAdapter())
     seen = {}
 
-    async def fake_add_torrent_smart(adapter, url, category=None, save_path=None):
+    async def fake_add_torrent_smart(adapter, url, category=None, save_path=None,
+                                     fallback_magnet=None):
         seen["category"] = category
         return "abc123"
 
@@ -72,7 +74,8 @@ def test_grab_usenet_uses_explicit_category_over_global(monkeypatch):
 
 def test_grab_dispatches_category_by_source(monkeypatch):
     calls = []
-    monkeypatch.setattr(cg, "grab_torrent", lambda url, *, category=None, save_path=None:
+    monkeypatch.setattr(cg, "grab_torrent",
+                        lambda url, *, category=None, save_path=None, fallback_magnet=None:
                         calls.append(("torrent", category)) or {"ok": True, "ref": "t"})
     monkeypatch.setattr(cg, "grab_usenet", lambda url, *, category=None, save_path=None:
                         calls.append(("usenet", category)) or {"ok": True, "ref": "u"})

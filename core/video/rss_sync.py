@@ -64,7 +64,8 @@ def fetch_recent_releases(limit: int = _FETCH_LIMIT) -> Optional[List[Dict[str, 
         return []
     hits: Dict[str, Dict[str, Any]] = {}
     for r in results:
-        url = getattr(r, "magnet_uri", None) or getattr(r, "download_url", None)
+        # .torrent URL first, magnet second — see prowlarr_search (#1139).
+        url = getattr(r, "download_url", None) or getattr(r, "magnet_uri", None)
         if not url:
             continue
         proto = str(getattr(r, "protocol", "") or "torrent")

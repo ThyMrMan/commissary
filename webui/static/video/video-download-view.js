@@ -596,6 +596,7 @@
         } else {
             // torrent / usenet — hand the magnet/NZB carriers to the backend client (no slskd requery)
             payload.download_url = r.download_url;
+            payload.magnet_uri = r.magnet_uri;
             payload.protocol = r.protocol;
             payload.indexer_id = r.indexer_id;
             payload.guid = r.guid;

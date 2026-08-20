@@ -255,6 +255,12 @@ _COLUMN_MIGRATIONS = [
     # seeding lifecycle (P5): 1 = the sweep finished with this torrent (goals
     # met + removed from the client, or the client no longer knows it)
     ("video_downloads", "seed_released", "INTEGER"),
+    # When this download's progress last MOVED — not when the row was last
+    # touched, which updated_at already does on every poll. The stall clock used
+    # to live in memory keyed off process uptime, so a restart wiped it and a
+    # torrent dead for days looked brand new; six of them sat 199 minutes against
+    # a 30-minute timeout. Stored with the row it is wall-clock, and survives.
+    ("video_downloads", "progress_at", "TEXT"),
     ("video_watchlist", "lookback_years", "INTEGER"),   # per-person back-catalog window: NULL/0=forward-only, N=years, -1=everything
     # series type (P8, Sonarr parity): standard | daily | anime — drives how the
     # drain QUERIES for episodes (SxxExx vs air date vs absolute number).

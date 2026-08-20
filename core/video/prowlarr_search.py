@@ -278,6 +278,12 @@ def _project(r: Any, url: str, want_proto: str) -> dict:
         "filename": r.title,                 # the grab uses the URL carriers below, not this
         "files": [], "file_count": 0, "folder_size_bytes": size,
         "download_url": url,
+        # The SAME release's magnet, riding along beside the URL. The URL is
+        # preferred (see the caller) so the real .torrent can be fetched
+        # server-side and pushed as a file; this is what add_torrent_smart falls
+        # back to when that fetch is refused, which is what makes preferring the
+        # URL safe rather than a trade of one failure for another.
+        "magnet_uri": getattr(r, "magnet_uri", None),
         "protocol": getattr(r, "protocol", want_proto),
         "indexer_id": getattr(r, "indexer_id", None),
         "guid": getattr(r, "guid", None),
@@ -344,7 +350,12 @@ def prowlarr_search(scope: str, title: Any, *, year: Any = None, season: Any = N
         for r in res:
             if getattr(r, "protocol", "") != want_proto:
                 continue
-            url = getattr(r, "magnet_uri", None) or getattr(r, "download_url", None)
+            # .torrent URL first, magnet second (#1139, video side): a magnet
+            # hands the client an info-hash and nothing else, and one that
+            # cannot reach the swarm parks on "downloading metadata" forever.
+            # add_torrent_smart fetches the real .torrent server-side and pushes
+            # the file — with a magnet it could never be reached at all.
+            url = getattr(r, "download_url", None) or getattr(r, "magnet_uri", None)
             if not url:
                 continue
             keyv = getattr(r, "guid", None) or url

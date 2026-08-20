@@ -1192,7 +1192,11 @@ def register_routes(bp):
             category = None
             if str(body.get("kind") or "").lower() != "youtube":
                 category = _resolve_category(db, body.get("kind"), _root_folder_id_for_grab(db, body))
-            res = grab(source, body.get("download_url"), category=category)
+            # magnet_uri rides along from the search hit: the URL is preferred
+            # (#1139) so the real .torrent is fetched server-side, and this is
+            # what the client falls back to if that handoff is refused.
+            res = grab(source, body.get("download_url"), category=category,
+                       fallback_magnet=body.get("magnet_uri"))
             if not res.get("ok"):
                 return jsonify({"ok": False, "error": res.get("error") or "The download client refused it."}), 502
             dl_id = db.add_video_download({**common, "source": source,

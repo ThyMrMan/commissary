@@ -188,13 +188,17 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
         for result in results:
             if result.protocol != 'torrent':
                 continue
-            download_url = result.magnet_uri or result.download_url
+            # .torrent URL first, magnet second (#1139). The album flow below
+            # already did this; the single-track grab did not, so one release
+            # offering both would hand the client a bare info-hash.
+            download_url = result.download_url or result.magnet_uri
+            fallback_magnet = result.magnet_uri if result.download_url else None
             if not download_url:
                 continue
             # The filename crosses to the browser in search responses and
             # comes back on grab. Indexer URLs can carry API keys / signed
             # params, so only an opaque server-side token travels (P0-03).
-            token = get_candidate_store().put(download_url)
+            token = get_candidate_store().put(download_url, magnet=fallback_magnet)
             filename = f"{token}{_FILENAME_SEP}{result.title}"
             quality = _guess_quality_from_title(result.title)
             parsed_artist, parsed_title = _parse_release_title(result.title)
@@ -269,6 +273,10 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
             logger.error("Torrent download: unknown or expired candidate for %r "
                          "— re-run the search", display_name)
             return None
+        # The same release's magnet, when the indexer offered both. Carried so
+        # the .torrent URL can be preferred without losing the magnet in an
+        # install where this process cannot reach the indexer but the client can.
+        fallback_magnet = get_candidate_store().resolve_magnet(token)
 
         download_id = str(uuid.uuid4())
         with self._lock:
@@ -290,14 +298,15 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
 
         thread = threading.Thread(
             target=self._download_thread,
-            args=(download_id, download_url, display_name),
+            args=(download_id, download_url, display_name, fallback_magnet),
             daemon=True,
             name=f'torrent-dl-{download_id[:8]}',
         )
         thread.start()
         return download_id
 
-    def _download_thread(self, download_id: str, download_url: str, display_name: str) -> None:
+    def _download_thread(self, download_id: str, download_url: str, display_name: str,
+                         fallback_magnet: Optional[str] = None) -> None:
         """Background worker: hand the URL to the active adapter,
         poll until done, then walk the resulting directory."""
         adapter = get_active_torrent_adapter()
@@ -307,7 +316,8 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
 
         try:
             from core.torrent_clients.base import add_torrent_smart
-            torrent_hash = run_async(add_torrent_smart(adapter, download_url))
+            torrent_hash = run_async(add_torrent_smart(
+                adapter, download_url, fallback_magnet=fallback_magnet))
         except Exception as e:
             self._mark_error(download_id, f"add_torrent failed: {e}")
             return

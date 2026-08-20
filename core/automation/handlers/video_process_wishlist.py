@@ -693,7 +693,11 @@ def _default_enqueue(item: Dict[str, Any], best: Dict[str, Any], candidates: Lis
         # Category comes from the SAME Library target_dir was resolved from — the item's
         # own Library when it has one, else the primary (multi-library #1105).
         from core.video.client_grab import grab
-        res = grab(source, best.get("download_url"), category=_category_for_item(item, media_type))
+        # The hit carries the magnet beside the URL (#1139) — the automation
+        # grabs unattended, so a dead-magnet stall here is one nobody sees.
+        res = grab(source, best.get("download_url"),
+                   category=_category_for_item(item, media_type),
+                   fallback_magnet=best.get("magnet_uri"))
         if not res.get("ok"):
             # Episode items alias the show name as `show_title`; reading only
             # `title` made every episode refusal log 'refused for None' — the
