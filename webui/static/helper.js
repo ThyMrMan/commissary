@@ -3491,6 +3491,14 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.0.5': [
+        { date: 'August 2026 · 2.0.5' },
+        { title: "Three fixes carried over from upstream SoulSync 3.2.1 and 3.2.2", desc: "Commissary forked from SoulSync 3.1.5 and has diverged a long way since, so most of what lands upstream either does not apply here or was already solved differently. These three were checked against this code first and found to be real, present faults." },
+        { title: "Fixed: a library scan could slowly corrupt where your files are recorded as living", desc: "for Navidrome and other Subsonic servers. When the API leaves the file path out of a response — which it does transiently, during its own library rescan or a network blip — Commissary invented a bare filename from the track title, something like <code>My Song.flac</code> with no folder in front of it. That name matches nothing on disk, and the next scan wrote it straight over the correct value. Each pass damaged another slice of the library and it accumulated. Nothing is invented now, and the update keeps what it already has when a scan says nothing — the same protection the columns beside it have always had. Plex libraries were never exposed to this." },
+        { title: "Fixed: punctuation stuck to a search word buried the track you were looking for", desc: "searching for <em>Would've, Could've, Should've</em> returned other songs called <em>Should've</em> and put the real one third. The commas were the culprit, though not where you would guess: the broad fallback search — the one that runs when the exact search finds nothing, which is precisely when your file is tagged a little differently from the source — split on spaces only, so it asked for <code>would've,</code> <em>with the comma</em>. A file tagged without them matched on the last word alone and scored the same as anything else sharing that one word. Punctuation is now trimmed from the ends of each word, and only the ends: N.W.A, P!nk and AC/DC survive intact. The same applied to artist names, which is not exotic either — Crosby, Stills & Nash." },
+        { title: "Fixed: \"replace the original file\" did nothing if you imported the file yourself", desc: "re-identify a track with that box ticked and it staged the replacement correctly, but the instruction was only ever read by the automatic importer. Import the staged file by hand from the Import page and nothing looked for it, so the old file and its library entry stayed exactly where they were. It is honoured on both paths now." },
+        { title: "And it refuses rather than guesses", desc: "the replacement only happens after the import has actually succeeded — a file that failed its checks and went to quarantine never causes the original to be deleted. If Commissary cannot work out where the new file landed, it keeps the original and says so, because a duplicate you can delete and a missing file you cannot. Re-identifying a track onto the release it was already in deletes nothing at all." },
+    ],
     '2.0.4': [
         { date: 'August 2026 · 2.0.4' },
         { title: "Fixed: a short track title made its own finished download invisible", desc: "reported against Kanaria's <em>Dec.</em>, which downloaded perfectly and then never finished — no import, no library entry, the FLAC just sitting in the download folder. Commissary matches a completed file by comparing what it asked for against what it finds on disk, and it was comparing a bare title against a filename that still had <code>.flac</code> on the end. The extension was the only difference, and it was enough: 0.839 against a 0.85 threshold, so the file sitting right there was reported missing." },
@@ -3857,6 +3865,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.0.5: three fixes carried over from upstream",
+        description: "Commissary forked from SoulSync 3.1.5 and has diverged a long way, so most of what lands upstream either does not apply or was already solved differently here. These three were checked against this code first and found to be real, present faults - taken from upstream 3.2.1 and 3.2.2.",
+        features: [
+            "a library scan could slowly corrupt where your files are recorded as living: when a Subsonic/Navidrome server left the path out of a response, Commissary invented a bare filename from the title and the next scan wrote it over the correct value - damage that accumulated with every pass (Plex libraries were never exposed)",
+            "searching for 'Would've, Could've, Should've' returned other 'Should've' songs and buried the real one, because the broad fallback search asked for the words WITH their commas attached - a file tagged without them matched on one word and scored no better than anything else sharing it",
+            "punctuation now comes off the ends of a search word only, so N.W.A, P!nk and AC/DC stay intact - and the same applied to artist names, which is not exotic either (Crosby, Stills & Nash)",
+            "'replace the original file' did nothing when you imported the staged file by hand - the instruction was only ever read by the automatic importer",
+            "it now refuses rather than guesses: a quarantined import never deletes the original, an unknown landing place keeps it, and re-identifying onto the release a track was already in deletes nothing",
+        ],
+        usage_note: "Nothing to configure. Paths already damaged by an earlier scan are not repaired by this - it stops the erosion rather than undoing it; a Navidrome library that has been drifting may want one Refresh with the server healthy so the correct paths are re-read.",
+    },
     {
         title: "2.0.4: downloads that finish, and upgrades that actually replace",
         description: "two separate faults behind the same complaint - that re-downloading a track for better quality never seems to finish, and never overwrites what is already there. One stopped short-titled downloads being found at all; the other meant a format upgrade could only ever add a second copy.",

@@ -684,11 +684,116 @@ def process_single_import_file(runtime: ImportRouteRuntime, file_info: Dict[str,
             final_artist,
             resolved.get("source") or "local",
         )
+        # A re-identified file staged with "replace the original" ticked can be
+        # imported EITHER by the auto-import worker or by hand from this page.
+        # Only the worker consumed the hint, so importing manually left the old
+        # file and its library row exactly where they were — the checkbox
+        # silently did nothing. (Upstream #1158-adjacent; reported upstream by
+        # Urethra Franklin.) Reached only after the reject check above, so a
+        # quarantined import never deletes anything.
+        finalize_manual_rematch_replace(runtime, file_path, context)
         return ("ok", final_title)
     except Exception as proc_err:
         err_msg = f"{title}: {str(proc_err)}"
         runtime.logger.error("Import single processing error: %s", err_msg)
         return ("error", err_msg)
+
+
+def finalize_manual_rematch_replace(runtime, staged_path: str, context: Dict[str, Any]) -> None:
+    """Honour a re-identify hint's "replace the original" after a MANUAL import.
+
+    The hint was consumed in exactly one place — the auto-import worker. Import
+    the staged file yourself from the Import page and nothing ever looked for
+    it, so the checkbox did nothing at all.
+
+    Only the REPLACE half is honoured here. The identification half is already
+    settled on this path: the user picked the release themselves in this UI, and
+    re-applying the hint would fight the choice they just made.
+
+    Best-effort throughout. The import has already succeeded, so a cleanup
+    problem is logged and swallowed rather than turned into a failed import, and
+    no hint at all — the overwhelmingly common case of an ordinary staging file
+    — is a silent no-op.
+    """
+    try:
+        from core.imports.rematch_hints import (
+            consume_hint,
+            delete_replaced_track,
+            find_hint_for_file,
+            quick_file_signature,
+        )
+    except Exception:                                   # pragma: no cover - defensive
+        return
+
+    try:
+        signature = quick_file_signature(staged_path)
+    except Exception:
+        signature = None
+
+    try:
+        from database.music_database import get_database
+        conn = get_database()._get_connection()
+    except Exception as exc:                            # pragma: no cover - defensive
+        runtime.logger.debug("manual re-identify cleanup skipped (no db): %s", exc)
+        return
+
+    try:
+        cursor = conn.cursor()
+        hint = find_hint_for_file(cursor, staged_path, signature)
+        if hint is None:
+            return
+        if hint.replace_track_id:
+            # Where the re-import actually landed. `_final_processed_path` is
+            # the canonical key and takes precedence — post-processing can move
+            # a file after `_final_path` was recorded, and reading only the
+            # older key leaves the same-home guard blind. That is a data-loss
+            # path: a re-identify onto a release resolving to the SAME location
+            # would delete the file the import just wrote.
+            new_paths = (context.get('_final_processed_path')
+                         or context.get('_final_path')
+                         or context.get('_reid_final_paths'))
+            if isinstance(new_paths, str):
+                new_paths = [new_paths]
+
+            if not new_paths:
+                # With no landing path known, the same-home guard cannot do its
+                # job, so refuse outright. Leaving a duplicate is recoverable;
+                # deleting the only copy is not. The hint is still consumed so
+                # it cannot fire later against a stale path.
+                runtime.logger.warning(
+                    "Manual import could not determine where track %s landed — "
+                    "keeping the original rather than risking the only copy",
+                    hint.replace_track_id)
+            else:
+                def _resolve_old(stored):
+                    # The old row's path is a STORED path — the media server's
+                    # view, through a mount this process may not have. Resolve
+                    # it to a real file, or the row is deleted and the FILE is
+                    # orphaned. The config manager widens the search to the
+                    # transfer/download/library roots, exactly as the
+                    # auto-import worker does it.
+                    try:
+                        from config.settings import config_manager
+                        from core.library.path_resolver import resolve_library_file_path
+                        return resolve_library_file_path(stored, config_manager=config_manager)
+                    except Exception:
+                        return None
+
+                removed = delete_replaced_track(cursor, hint.replace_track_id,
+                                                resolve_fn=_resolve_old, new_paths=new_paths)
+                if removed:
+                    runtime.logger.info(
+                        "Manual import honoured a re-identify replace for library "
+                        "track %s — removed %s", hint.replace_track_id, removed)
+        consume_hint(cursor, hint.id)
+        conn.commit()
+    except Exception as exc:
+        runtime.logger.warning("Manual re-identify cleanup failed (import still succeeded): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception as exc:                        # noqa: BLE001 - close is best-effort
+            runtime.logger.debug("re-identify cleanup: connection close failed: %s", exc)
 
 
 def singles_process(runtime: ImportRouteRuntime, files: list[Dict[str, Any]]) -> tuple[Dict[str, Any], int]:

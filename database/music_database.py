@@ -3,6 +3,7 @@
 import sqlite3
 import json
 import logging
+import string
 import os
 import re
 import threading
@@ -7332,8 +7333,15 @@ class MusicDatabase:
                     file_path = track_obj.path
                 if bitrate is None and hasattr(track_obj, 'bitRate') and track_obj.bitRate:
                     bitrate = track_obj.bitRate
-                if file_path is None and hasattr(track_obj, 'suffix') and track_obj.suffix:
-                    file_path = f"{track_obj.title}.{track_obj.suffix}"
+                # Do NOT fabricate a bare filename when path is missing. The
+                # Subsonic API omits 'path' transiently — during a Navidrome
+                # library rescan, or a network hiccup — and a bare
+                # "My Song.flac" has no directory structure, matches nothing on
+                # disk, and overwrites the correct value on the next UPDATE.
+                # Each scan then corrupts another slice of the library and the
+                # damage accumulates. Leave it None so the COALESCE guard in the
+                # UPDATE below can protect what is already stored.
+                # (Upstream #1158, reported by shkarlsson.)
                 # File size: Jellyfin / Navidrome / Commissary-standalone
                 # all set track_obj.file_size on their wrapper class.
                 # Plex came in via the media.parts[0].size path above —
@@ -7409,7 +7417,7 @@ class MusicDatabase:
                     cursor.execute("""
                         UPDATE tracks
                         SET album_id = ?, artist_id = ?, title = ?, track_number = ?, disc_number = ?,
-                            duration = ?, file_path = ?, bitrate = ?,
+                            duration = ?, file_path = COALESCE(?, file_path), bitrate = ?,
                             file_size = COALESCE(?, file_size),
                             server_source = ?,
                             track_artist = COALESCE(?, track_artist),
@@ -7897,17 +7905,46 @@ class MusicDatabase:
         rows = self._search_tracks_fuzzy_rows(cursor, title, artist, limit, server_source)
         return self._rows_to_tracks(rows)
 
+    @staticmethod
+    def _fuzzy_terms(text: str) -> list:
+        """Words to fuzzy-match on, with punctuation trimmed off each END.
+
+        Splitting on whitespace alone leaves punctuation glued to the token, so
+        "Would've, Could've, Should've" asked the database for ``%would've,%`` —
+        which only matches a title carrying the comma too. The LAST word is the
+        only one without trailing punctuation, so it was the only one matching
+        broadly, and a library file tagged without the commas therefore matched
+        ONE term where it should have matched three. Scoring then could not tell
+        the real track from anything else sharing that single word, and the tie
+        broke alphabetically. (Upstream #1159, reported by AfonsoG6.)
+
+        This is the FUZZY fallback, which only runs when the basic LIKE search
+        found nothing — precisely the path taken when the library's tag differs
+        from the source title, which is when it is needed most.
+
+        Ends only, so internal punctuation survives: N.W.A, P!nk, AC/DC and
+        "pepper's" are real names. Strictly broader than before — the column
+        side keeps its own punctuation, so a trimmed term matches everything the
+        untrimmed one did and more. It can raise a row's score, never lower it.
+        """
+        terms = []
+        for word in (text or '').split():
+            trimmed = word.strip().strip(string.punctuation)
+            if len(trimmed) >= 3:
+                terms.append(trimmed)
+        return terms
+
     def _search_tracks_fuzzy_rows(self, cursor, title: str, artist: str, limit: int,
                                   server_source: Optional[str] = None):
         """Broadest fuzzy search returning raw rows (shared by DatabaseTrack and dict-returning callers)."""
         # Get broader results by searching for individual words
         search_terms = []
         if title:
-            title_words = [w.strip() for w in self._normalize_for_comparison(title).split() if len(w.strip()) >= 3]
+            title_words = self._fuzzy_terms(self._normalize_for_comparison(title))
             search_terms.extend(title_words)
 
         if artist:
-            artist_words = [w.strip() for w in self._normalize_for_comparison(artist).split() if len(w.strip()) >= 3]
+            artist_words = self._fuzzy_terms(self._normalize_for_comparison(artist))
             search_terms.extend(artist_words)
 
         if not search_terms:
