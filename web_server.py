@@ -52,7 +52,7 @@ logger = setup_logging(_log_level, _log_path)
 # the published image moved (ghcr.io/thymrman/commissary) even though nothing
 # about the data changed — see tests/test_branding.py for what deliberately
 # kept its old `soulsync` name.
-_SOULSYNC_BASE_VERSION = "2.0.5"
+_SOULSYNC_BASE_VERSION = "2.0.6"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -18075,48 +18075,16 @@ def _probe_audio_quality(file_path):
 
 
 def _get_audio_quality_string(file_path):
+    """Read an audio file and return a quality descriptor string.
+
+    Delegates to the import path's labeller. This used to be a second copy of
+    that logic and the two had already drifted: both asked mutagen for an Opus
+    bitrate that does not exist — so both returned '' for every Opus file — but
+    only one of them knows about .webm leftovers, an .ogg holding Opus, or a
+    source's own itag claim. One implementation, one behaviour.
     """
-    Read audio file and return a quality descriptor string.
-
-    Returns strings like 'FLAC 16bit', 'MP3-320', 'M4A-256', 'OGG-192'.
-    Returns empty string on any error.
-    """
-    try:
-        ext = os.path.splitext(file_path)[1].lower()
-
-        if ext == '.flac':
-            audio = FLAC(file_path)
-            bits = audio.info.bits_per_sample
-            return f"FLAC {bits}bit"
-
-        elif ext == '.mp3':
-            from mutagen.mp3 import MP3, BitrateMode
-            audio = MP3(file_path)
-            bitrate_kbps = audio.info.bitrate // 1000
-            if audio.info.bitrate_mode == BitrateMode.VBR:
-                return "MP3-VBR"
-            return f"MP3-{bitrate_kbps}"
-
-        elif ext in ('.m4a', '.aac', '.mp4'):
-            audio = MP4(file_path)
-            bitrate_kbps = audio.info.bitrate // 1000
-            return f"M4A-{bitrate_kbps}"
-
-        elif ext == '.ogg':
-            audio = OggVorbis(file_path)
-            bitrate_kbps = audio.info.bitrate // 1000
-            return f"OGG-{bitrate_kbps}"
-
-        elif ext == '.opus':
-            from mutagen.oggopus import OggOpus
-            audio = OggOpus(file_path)
-            bitrate_kbps = audio.info.bitrate // 1000
-            return f"OPUS-{bitrate_kbps}"
-
-        return ''
-    except Exception as e:
-        logger.debug(f"Could not determine audio quality for {file_path}: {e}")
-        return ''
+    from core.imports.file_ops import get_audio_quality_string
+    return get_audio_quality_string(file_path)
 
 
 def _get_album_type_display(raw_type, track_count) -> str:

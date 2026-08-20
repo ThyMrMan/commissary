@@ -255,7 +255,7 @@ def _enable_lossy(monkeypatch, codec="mp3", bitrate="320"):
     cfg = {"lossy_copy.enabled": True, "lossy_copy.codec": codec,
            "lossy_copy.bitrate": bitrate, "lossy_copy.delete_original": False}
     monkeypatch.setattr(_fo.config_manager, "get", lambda k, d=None: cfg.get(k, d))
-    monkeypatch.setattr(_fo, "get_audio_quality_string", lambda _p: None)
+    monkeypatch.setattr(_fo, "get_audio_quality_string", lambda _p, **_kw: None)
 
 
 def test_create_lossy_copy_rejects_non_lossless(monkeypatch, tmp_path):

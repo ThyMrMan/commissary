@@ -3491,6 +3491,15 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.0.6': [
+        { date: 'August 2026 · 2.0.6' },
+        { title: "Fixed: every Opus download was labelled with no quality at all", desc: "in the library this was found in, <strong>507 of 521</strong> YouTube downloads had recorded no quality and no bitrate, while the handful of M4A ones beside them were labelled perfectly. One missing attribute explains all of it: the tag library Commissary uses genuinely cannot read a bitrate out of an Opus file — the field does not exist in that format's header — and the code asked for it anyway. The error was swallowed, and what came back was an empty string, which everything downstream reads as <em>unknown file</em> rather than <em>unreadable field</em>." },
+        { title: "Three answers, tried in order", desc: "the tag header when there is one; then the <strong>source's own claim</strong> from before the download — the format YouTube said it was sending — but only while the file on disk is still that format; and finally the honest arithmetic of size divided by playing time. Carried over from upstream, where it was part of the YouTube quality work." },
+        { title: "The claim is never copied onto a re-encoded file", desc: "if you have Commissary convert downloads to MP3, the original stream's bitrate says nothing about the file that was actually written. Copying it across would have replaced a blank label with a confident wrong one, which is worse." },
+        { title: "And an Opus bitrate is now shown as the average it is", desc: "Opus has no single bitrate — it varies through the track — so a figure like <em>137 kbps</em> was always an average being presented as a precise number. Library rows that stored nothing for Opus now get that average filled in, and the formats whose bitrate is inherently an average are marked as such rather than quoted like a constant." },
+        { title: "One implementation instead of two", desc: "this logic existed twice, once in the import path and once inside the web server, and the copies had already drifted apart: both were wrong about Opus in the same way, but only one of them knew about leftover download containers or an .ogg file that actually holds Opus. There is one now." },
+        { title: "What it does not do", desc: "nothing here changes what gets downloaded or its quality — it changes what Commissary knows and reports about it. Files already in your library keep their bitrate; the estimate fills in rows that had nothing rather than overwriting anything." },
+    ],
     '2.0.5': [
         { date: 'August 2026 · 2.0.5' },
         { title: "Three fixes carried over from upstream SoulSync 3.2.1 and 3.2.2", desc: "Commissary forked from SoulSync 3.1.5 and has diverged a long way since, so most of what lands upstream either does not apply here or was already solved differently. These three were checked against this code first and found to be real, present faults." },
@@ -3865,6 +3874,17 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.0.6: Opus downloads stop reporting no quality at all",
+        description: "507 of 521 YouTube downloads in the reporting library had recorded no quality and no bitrate, while the M4A ones beside them labelled fine. The tag library cannot read a bitrate out of an Opus file - the field is not in that format's header - and the code asked for it anyway, swallowed the error, and returned an empty string.",
+        features: [
+            "three answers now, in order: the tag header, then the source's own pre-download claim while the file is still that format, then size divided by playing time",
+            "the claim is never copied onto a re-encoded file - if you convert downloads to MP3, the original stream's bitrate says nothing about what was written, and a confident wrong number is worse than a blank one",
+            "an Opus bitrate is an average by nature, so it is now marked as one instead of quoted like a constant - and library rows that stored nothing for Opus get that average filled in",
+            "this logic existed twice, in the import path and inside the web server, and the copies had drifted - both wrong about Opus, only one aware of leftover download containers or an .ogg holding Opus. There is one now",
+        ],
+        usage_note: "Nothing to configure, and nothing changes about what gets downloaded or at what quality - only what Commissary knows and reports about it. Existing library rows keep their bitrate; the estimate fills in rows that had none rather than overwriting anything.",
+    },
     {
         title: "2.0.5: three fixes carried over from upstream",
         description: "Commissary forked from SoulSync 3.1.5 and has diverged a long way, so most of what lands upstream either does not apply or was already solved differently here. These three were checked against this code first and found to be real, present faults - taken from upstream 3.2.1 and 3.2.2.",
