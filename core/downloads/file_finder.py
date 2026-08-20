@@ -65,6 +65,27 @@ def _is_audio_candidate(path: str) -> bool:
     return os.path.splitext(str(path or ''))[1].lower() in AUDIO_EXTENSIONS
 
 
+def _strip_audio_ext(name: str) -> str:
+    """Drop a trailing AUDIO extension, and only that.
+
+    The fuzzy tier compared a bare title against a filename that still carried
+    its extension, so every on-disk candidate was penalised by a constant
+    ``' flac'``/``' mp3'`` token the target could not have. A streaming source
+    hands the finder ``id||Artist - Title``; there is no extension on that side
+    to cancel it out. The penalty is a fixed number of characters, so it is the
+    SHORT names that fail: ``Kanaria - Dec.`` scored 0.839 against its own file
+    sitting in the download folder and was reported missing, while a longer
+    title diluted the same five characters to nothing.
+
+    Deliberately not ``os.path.splitext``: that splits on the LAST dot wherever
+    it falls, so a title is not safe to feed it — ``The Killers - Mr. Brightside``
+    would come back as ``The Killers - Mr``, and ``Kanaria - Dec.`` would silently
+    lose the period that is part of its name. Only a real audio extension is
+    removed; anything else is left exactly as it is."""
+    stem, ext = os.path.splitext(str(name or ''))
+    return stem if ext.lower() in AUDIO_EXTENSIONS else str(name or '')
+
+
 def _normalize_for_finding(text: str) -> str:
     """Match-engine-style normalisation for fuzzy filename comparison.
 
@@ -197,7 +218,7 @@ def _search_in_directory(
             # Tier 4: fuzzy basename match. Cheaper than path-walking
             # the whole tree a second time, so always compute and
             # keep the best one as a fallback.
-            normalized_file = _normalize_for_finding(filename)
+            normalized_file = _normalize_for_finding(_strip_audio_ext(filename))
             similarity = SequenceMatcher(
                 None, normalized_target, normalized_file,
             ).ratio()
@@ -263,7 +284,10 @@ def find_completed_audio_file(
     else:
         target_basename = _extract_basename(api_filename)
         api_dirs = _api_dir_parts(api_filename)
-    normalized_target = _normalize_for_finding(target_basename)
+    # Extension stripped on the target too. Soulseek reports a real remote PATH
+    # and its basename carries an extension; strip only one side and every
+    # Soulseek transfer would acquire the penalty this just removed.
+    normalized_target = _normalize_for_finding(_strip_audio_ext(target_basename))
 
     best_dl_path, dl_sim = _search_in_directory(
         download_dir, 'downloads', target_basename, normalized_target, api_dirs,

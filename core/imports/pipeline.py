@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from types import SimpleNamespace
@@ -121,6 +122,127 @@ def _replacement_length_is_safe(existing_path: str, incoming_path: str,
     if existing_s <= 0 or incoming_s <= 0:
         return True
     return incoming_s >= existing_s * min_ratio
+
+
+def _existing_library_copy(final_path: str, track_number=None,
+                           quality_profile: dict | None = None) -> str | None:
+    """The copy the library already holds for this track when it is NOT sitting
+    at ``final_path``, or None.
+
+    Every replace/upgrade decision below used to hang off
+    ``os.path.exists(final_path)``, an exact path match — extension included.
+    An upgrade is precisely a change of CONTAINER, so that test is False for
+    every format upgrade there is: replacing a 130 kbps ``.opus`` with a FLAC
+    computes ``Track.flac``, does not find ``Track.opus``, and moves the new
+    file in ALONGSIDE the old one. Both then live in the library and the media
+    server shows the track twice. A reported library had nine such pairs,
+    including ``01 - STAY.opus`` next to ``01 - STAY.flac`` — identical stems,
+    the extension alone keeping them apart.
+
+    Scope is deliberately ONE directory: the folder the incoming file is being
+    placed into, never a search of the library. A track downloaded as a single
+    templates into its own album folder, so it cannot reach into an album's
+    folder and replace that album's copy — the two simply never meet. That is a
+    structural guarantee rather than a rule someone has to remember.
+
+    A leading track number is tolerated in the EXISTING name (a library
+    organised as ``01 - Title`` while the current template writes ``Title``),
+    but only when the number agrees with the incoming track's own — otherwise
+    importing track 5 of an album whose track 1 is called ``Intro`` could delete
+    track 1's file.
+
+    A lossy sibling that the lossy-copy feature deliberately maintains is NOT a
+    replacement candidate; it is a companion this install asked for.
+    """
+    from core.imports.paths import strip_leading_track_number
+    from core.imports.staging import AUDIO_EXTENSIONS
+    try:
+        target_dir = os.path.dirname(final_path)
+        if not target_dir or not os.path.isdir(target_dir):
+            return None
+        final_ext = os.path.splitext(final_path)[1].lower()
+        final_stem = os.path.splitext(os.path.basename(final_path))[0]
+        final_key = strip_leading_track_number(final_stem).casefold().strip()
+        if not final_key:
+            return None
+
+        # Extensions the lossy-copy feature owns: with it on, a lossy file beside
+        # the FLAC is a companion, not a stale original.
+        companion_exts = set()
+        _qp = quality_profile if isinstance(quality_profile, dict) else {}
+        if final_ext == '.flac' and _qp.get(
+                'lossy_copy_enabled', config_manager.get('lossy_copy.enabled', False)):
+            _codec = _qp.get('lossy_copy_codec',
+                             config_manager.get('lossy_copy.codec', 'mp3'))
+            companion_exts.add({'mp3': '.mp3', 'opus': '.opus',
+                                'aac': '.m4a'}.get(_codec, '.mp3'))
+
+        try:
+            incoming_num = int(track_number) if track_number is not None else None
+        except (TypeError, ValueError):
+            incoming_num = None
+
+        matches = []
+        for name in os.listdir(target_dir):
+            candidate = os.path.join(target_dir, name)
+            stem, ext = os.path.splitext(name)
+            ext = ext.lower()
+            if ext not in AUDIO_EXTENSIONS or ext in companion_exts:
+                continue
+            if os.path.normpath(candidate) == os.path.normpath(final_path):
+                continue
+            if not os.path.isfile(candidate):
+                continue
+            stripped = strip_leading_track_number(stem)
+            if stripped.casefold().strip() != final_key:
+                continue
+            if stripped != stem:
+                # The existing name carries a track number — it has to be THIS
+                # track's, or we would be deleting a different song. With no
+                # incoming number to check it against there is nothing to verify,
+                # so refuse: a duplicate is recoverable, a deletion is not.
+                m = re.match(r"\s*(\d{1,3})", stem)
+                if incoming_num is None or not m or int(m.group(1)) != incoming_num:
+                    continue
+            matches.append(candidate)
+
+        if len(matches) == 1:
+            logger.info("[Upgrade] Existing library copy for this track is '%s' — "
+                        "replacing it rather than adding '%s' beside it",
+                        os.path.basename(matches[0]), os.path.basename(final_path))
+            return matches[0]
+        if matches:
+            # Ambiguous: several files could be this track. Refuse to guess —
+            # adding a duplicate is recoverable, deleting the wrong file is not.
+            logger.warning("[Upgrade] %d existing files could be this track (%s) — "
+                           "not replacing any of them",
+                           len(matches), ", ".join(os.path.basename(m) for m in matches))
+        return None
+    except Exception:   # noqa: BLE001 - never let a tidy-up cost the import
+        logger.debug("existing-library-copy lookup failed for %s", final_path, exc_info=True)
+        return None
+
+
+def _resolve_replace_target(final_path: str, source_path: str, track_number=None,
+                            quality_profile: dict | None = None) -> str | None:
+    """The library file this import is about to replace, or None for a new track.
+
+    Three cases, in order:
+
+      · Something is already at ``final_path`` — the pre-existing behaviour, and
+        still the answer whenever it applies.
+      · The incoming file is gone. Nothing is being placed, so nothing is being
+        replaced; the pre-move recovery further down owns that situation and
+        must see it exactly as it did before.
+      · Otherwise ask ``_existing_library_copy`` whether the same track is
+        already in that folder under another container or another naming — the
+        case a bare ``os.path.exists(final_path)`` could never see.
+    """
+    if os.path.exists(final_path):
+        return final_path
+    if not os.path.exists(source_path):
+        return None
+    return _existing_library_copy(final_path, track_number, quality_profile)
 
 
 def _batch_force_replace(context: dict) -> bool:
@@ -1104,21 +1226,31 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
         force_replace = _batch_force_replace(context)
 
         logger.info(f"Moving '{os.path.basename(file_path)}' to '{final_path}'")
-        if os.path.exists(final_path):
+        # The library's existing copy of this track, which is NOT necessarily at
+        # final_path: an upgrade changes the container, so .opus -> .flac never
+        # lands on the same path and every check below used to be skipped. Only
+        # consulted while the source file is still here — with it gone, the
+        # pre-move recovery further down owns the situation, exactly as before.
+        existing_path = _resolve_replace_target(
+            final_path, file_path,
+            album_info.get('track_number') if album_info else None,
+            _resolve_context_quality_profile(context))
+        if existing_path:
             if not os.path.exists(file_path):
+                # Only reachable with existing_path == final_path; see above.
                 logger.info(f"[Protection] Destination exists and source already gone - file already transferred: {os.path.basename(final_path)}")
                 return
             # THE backstop for sella's incident: an upgrade/replace must NEVER
             # swap a good library file for a materially shorter one. Every path
-            # below can os.remove(final_path) and move the incoming file in — so
+            # below can os.remove(existing_path) and move the incoming file in — so
             # before any of them, compare the REAL decoded lengths. A 30s HiFi
             # preview replacing a 220s track is caught here even if every header
             # (and AcoustID) was faked, and even for files no other gate saw.
-            if not _replacement_length_is_safe(final_path, file_path):
+            if not _replacement_length_is_safe(existing_path, file_path):
                 logger.error(
                     "[Protection] Refusing to replace %s — the incoming file is "
                     "far shorter (likely a preview/truncated clip). Quarantining it.",
-                    os.path.basename(final_path))
+                    os.path.basename(existing_path))
                 try:
                     qpath = move_to_quarantine(
                         file_path, context,
@@ -1146,25 +1278,25 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                 return
             try:
                 from mutagen import File as MutagenFile
-                existing_file = MutagenFile(final_path)
+                existing_file = MutagenFile(existing_path)
                 has_metadata = existing_file is not None and len(existing_file.tags or {}) > 2
                 if has_metadata and not is_enhance_download and not force_replace:
                     _replace_lower = _resolve_context_quality_profile(context).get(
                         'replace_lower_quality',
                         config_manager.get('import.replace_lower_quality', False))
                     if _replace_lower:
-                        _existing_tier = get_quality_tier_from_extension(final_path)
+                        _existing_tier = get_quality_tier_from_extension(existing_path)
                         _incoming_tier = get_quality_tier_from_extension(file_path)
                         if _incoming_tier[1] < _existing_tier[1]:
-                            logger.info(f"[Quality Replace] Replacing {_existing_tier[0]} with {_incoming_tier[0]}: {os.path.basename(final_path)}")
+                            logger.info(f"[Quality Replace] Replacing {_existing_tier[0]} with {_incoming_tier[0]}: {os.path.basename(existing_path)}")
                             try:
-                                os.remove(final_path)
+                                os.remove(existing_path)
                             except Exception as e:
                                 logger.error(f"[Quality Replace] Could not remove existing file: {e}")
                         else:
                             logger.info(
                                 f"[Protection] Existing file is same or better quality ({_existing_tier[0]} vs {_incoming_tier[0]}) - skipping: "
-                                f"{os.path.basename(final_path)}"
+                                f"{os.path.basename(existing_path)}"
                             )
                             try:
                                 os.remove(file_path)
@@ -1173,8 +1305,23 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                             except Exception as e:
                                 logger.error(f"[Protection] Error removing redundant file: {e}")
                             return
+                    elif existing_path != final_path:
+                        # The existing copy is a DIFFERENT container or naming, and
+                        # this install has not asked for lower-quality replacement.
+                        # Discarding the download here would be a new way to lose a
+                        # file: before the cross-container lookup existed this case
+                        # was invisible and the incoming file was simply placed. Keep
+                        # that outcome — a duplicate, as before — rather than deleting
+                        # what may well be the better copy. Turning on "replace lower
+                        # quality" is what asks for the upgrade.
+                        logger.info(
+                            "[Protection] '%s' already exists in another format and "
+                            "replace-lower-quality is off — placing '%s' alongside it "
+                            "rather than discarding it",
+                            os.path.basename(existing_path), os.path.basename(final_path))
+                        existing_path = None
                     else:
-                        logger.info(f"[Protection] Existing file already has metadata enhancement - skipping overwrite: {os.path.basename(final_path)}")
+                        logger.info(f"[Protection] Existing file already has metadata enhancement - skipping overwrite: {os.path.basename(existing_path)}")
                         logger.info(f"[Protection] Removing redundant download file: {os.path.basename(file_path)}")
                         try:
                             os.remove(file_path)
@@ -1185,24 +1332,24 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                         return
                 elif is_enhance_download or force_replace:
                     if is_enhance_download:
-                        logger.info(f"[Enhance] Quality enhance mode — replacing existing file: {os.path.basename(final_path)}")
+                        logger.info(f"[Enhance] Quality enhance mode — replacing existing file: {os.path.basename(existing_path)}")
                     else:
-                        logger.info(f"[Force] User-forced re-download — replacing existing file: {os.path.basename(final_path)}")
+                        logger.info(f"[Force] User-forced re-download — replacing existing file: {os.path.basename(existing_path)}")
                     try:
-                        os.remove(final_path)
+                        os.remove(existing_path)
                     except Exception as e:
                         logger.error(f"[Enhance] Could not remove existing file for replacement: {e}")
                 else:
-                    logger.info(f"[Protection] Existing file lacks metadata - safe to overwrite: {os.path.basename(final_path)}")
+                    logger.info(f"[Protection] Existing file lacks metadata - safe to overwrite: {os.path.basename(existing_path)}")
                     try:
-                        os.remove(final_path)
+                        os.remove(existing_path)
                     except FileNotFoundError:
                         pass
             except Exception as check_error:
                 logger.error(f"[Protection] Error checking existing file metadata, proceeding with overwrite: {check_error}")
                 try:
-                    if os.path.exists(final_path):
-                        os.remove(final_path)
+                    if os.path.exists(existing_path):
+                        os.remove(existing_path)
                 except Exception as e:
                     logger.error(f"[Protection] Failed to remove existing file for overwrite: {e}")
 

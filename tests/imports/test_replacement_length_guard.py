@@ -67,6 +67,10 @@ def test_zero_length_header_falls_back_to_decode(tmp_path, monkeypatch):
 
 def test_the_guard_is_wired_into_the_replace_path():
     src = Path(pipeline.__file__).read_text(encoding="utf-8", errors="replace")
-    # called before any os.remove(final_path) in the destination-exists block
-    assert "_replacement_length_is_safe(final_path, file_path)" in src
+    # Called before any os.remove of the library file. The first argument is
+    # ``existing_path``, not ``final_path``: the copy being replaced is not
+    # necessarily at the computed destination (a format upgrade lands on a
+    # different path), and the guard has to measure the file that is actually
+    # about to be deleted.
+    assert "_replacement_length_is_safe(existing_path, file_path)" in src
     assert "Refusing to replace" in src

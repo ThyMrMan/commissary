@@ -75,9 +75,11 @@ def test_force_is_wired_into_the_protection_branch():
 
 def test_force_replace_still_behind_the_length_guard():
     # ordering contract: the short-file replacement guard runs BEFORE any
-    # branch that can os.remove(final_path) — a forced re-download can never
-    # replace a full track with a preview clip
+    # branch that can os.remove(existing_path) — a forced re-download can never
+    # replace a full track with a preview clip. (``existing_path``, because the
+    # copy being replaced need not sit at the computed destination — a format
+    # upgrade never does.)
     src = Path(pipeline.__file__).read_text(encoding="utf-8", errors="replace")
-    guard = src.index("_replacement_length_is_safe(final_path, file_path)")
+    guard = src.index("_replacement_length_is_safe(existing_path, file_path)")
     force_branch = src.index("elif is_enhance_download or force_replace:")
     assert guard < force_branch
