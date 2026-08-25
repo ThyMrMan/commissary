@@ -3491,6 +3491,14 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.0.9': [
+        { date: 'August 2026 · 2.0.9' },
+        { title: "Set a quality profile for a whole Library, not one title at a time", desc: "quality profiles could only be assigned per TITLE. That is fine for the occasional exception and useless for the thing people actually want to say — <em>everything in my 4K Library is judged at 4K, everything in Anime is judged at 1080p</em> — which had to be repeated once per title, forever, and again for every show or film added afterwards. Each Library now carries its own default, set once in Settings → Libraries." },
+        { title: "It fixes the moment that mattered most: the very first grab", desc: "a title your library has never seen carries no profile at all, so there was nothing to read — which meant a brand-new show was always judged by the global Default, no matter which Library you were explicitly sending it to. That first grab is the one that decides what actually lands on disk, so it was precisely the wrong moment to have no opinion. Pick a destination in the download window and it is now judged by that Library's profile before anything is fetched." },
+        { title: "Per-title profiles still win", desc: "nothing about the existing per-title picker changes — a profile set on one show or film still overrides its Library, which is what makes it an override rather than a second setting doing the same job. The order is simply: the title's own profile, then its Library's, then the global Default." },
+        { title: "And the per-title picker stopped calling inheritance 'Default'", desc: "leaving a title unassigned means it INHERITS, so a picker reading <em>Default</em> while the show was actually being judged at 4K was lying about the very setting it was showing. It now names what it will really resolve to — <em>Default — this Library uses 4K</em> — and updates the moment you move the title to a different Library." },
+        { title: "Deleting a profile releases the Libraries using it", desc: "rather than leaving them pointing at something that no longer exists. Those Libraries fall back to the global Default, exactly as titles pointing at a deleted profile already did." },
+    ],
     '2.0.8': [
         { date: 'August 2026 · 2.0.8' },
         { title: "The video side now says where it put a file, and why", desc: "this release adds no features and changes no behaviour. It closes two silences that made real problems impossible to investigate — both found while trying and failing to explain a show that had been filed as the wrong series." },
@@ -3893,6 +3901,19 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.0.9: a quality profile per Library",
+        description: "Profiles were per-title only, so \"everything in my 4K Library is judged at 4K\" had to be repeated once per title, forever - and a title the library had never seen had nowhere to say it at all.",
+        features: [
+            "each Library carries its own default quality profile, set once in Settings - Libraries, for film and TV Libraries alike",
+            "a title your library has never seen is now judged by the Library it is being sent to, instead of always falling back to the global Default",
+            "that is the first grab - the one that decides what actually lands on disk - so it was the worst possible moment to have no opinion",
+            "per-title profiles still win: the order is the title's own profile, then its Library's, then the global Default",
+            "the per-title picker now names what \"Default\" will really resolve to, and updates when you move a title to another Library",
+            "deleting a profile releases any Library using it rather than leaving it pointing at nothing",
+        ],
+        usage_note: "Nothing changes until you set one - every Library starts on \"no Library default\", which is exactly today's behaviour. Set profiles up in the Quality section first, then pick one per Library. A show or film with a profile of its own is untouched.",
+    },
     {
         title: "2.0.8: the video side stops being silent",
         description: "No features, no behaviour changes. Two silences closed, both found while trying and failing to explain a show that had been filed as the wrong series - the log simply did not contain the answer.",

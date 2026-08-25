@@ -670,19 +670,55 @@
         });
     }
 
+    // The profile this title INHERITS when it carries none of its own — the
+    // default set on its Library, by name. Empty when the title has no Library,
+    // or that Library sets no default, in which case "Default" means the global
+    // Default profile and is already saying the truth.
+    function inheritedProfileName(d, libRes, profiles) {
+        var rid = d && d.root_folder_id;
+        if (!rid || !libRes) return '';
+        var conf = libRes.configured || {};
+        var rows = (state.kind === 'show' ? conf.tv : conf.movies) || [];
+        for (var i = 0; i < rows.length; i++) {
+            if (String(rows[i].id) !== String(rid)) continue;
+            var pid = parseInt(rows[i].default_quality_profile_id, 10) || 0;
+            if (!pid) return '';
+            for (var j = 0; j < profiles.length; j++) {
+                if (profiles[j].id === pid) return profiles[j].name;
+            }
+            return '';
+        }
+        return '';
+    }
+
     // Per-title quality profile (P2): fill the picker with the real profile
     // list + the title's current assignment; change persists immediately.
+    //
+    // Leaving a title unassigned is INHERITANCE, not an absence: its Library can
+    // carry a default profile of its own. A picker reading "Default" while the
+    // title is actually being judged at 4K would be lying about the very setting
+    // it is showing, so option 0 names what it will really resolve to. Both
+    // lists are needed to say that, hence the pair.
     function loadQualityProfiles(d) {
         var sel = state.overlay && state.overlay.querySelector('[data-vmg-quality-profile]');
         if (!sel) return;
-        fetch('/api/video/downloads/quality/profiles', { headers: { 'Accept': 'application/json' } })
-            .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (res) {
+        var get = function (url) {
+            return fetch(url, { headers: { 'Accept': 'application/json' } })
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .catch(function () { return null; });
+        };
+        Promise.all([get('/api/video/downloads/quality/profiles'), get('/api/video/libraries')])
+            .then(function (both) {
+                var res = both[0];
                 if (!res || !sel.isConnected) return;
+                var profiles = res.profiles || [];
                 var cur = parseInt(d.quality_profile_id, 10) || 0;
-                sel.innerHTML = (res.profiles || []).map(function (p) {
+                var inherited = inheritedProfileName(d, both[1], profiles);
+                sel.innerHTML = profiles.map(function (p) {
+                    var name = (p.id === 0 && inherited)
+                        ? 'Default — this Library uses ' + inherited : p.name;
                     return '<option value="' + p.id + '"' + (p.id === cur ? ' selected' : '') + '>' +
-                        esc(p.name) + '</option>';
+                        esc(name) + '</option>';
                 }).join('') || '<option value="0">Default</option>';
             })
             .catch(function () { /* picker keeps its Default option */ });
@@ -721,7 +757,12 @@
             .then(function (r) {
                 return r.json().catch(function () { return {}; }).then(function (b) {
                     if (!r.ok) throw new Error(b.error || '');
-                    if (state.data) state.data.root_folder_id = b.root_folder_id;
+                    if (state.data) {
+                        state.data.root_folder_id = b.root_folder_id;
+                        // A different Library can carry a different default, so the
+                        // profile picker's "Default" option now means something else.
+                        loadQualityProfiles(state.data);
+                    }
                     toast(b.root_folder_id == null
                         ? 'Library cleared — new downloads use the default for this type'
                         : 'Library updated — new downloads and upgrades go there', 'success');

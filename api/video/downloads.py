@@ -980,19 +980,40 @@ def register_routes(bp):
 
     def _profile_for_request(db, src):
         """The quality profile a get-modal search/grab should be judged under:
-        the title's own assignment (resolved from tmdb_id when the client sends
-        it) → else the Default profile (P2, per-title profiles)."""
+        the title's own assignment → the DEFAULT on the Library this grab is
+        destined for → else the global Default profile.
+
+        The Library step is the one that matters for a title the library has
+        never seen. Nothing about such a title carries an assignment yet, so
+        before this it was always judged by the global Default — even when it
+        was explicitly being grabbed INTO a Library that says otherwise, and
+        even though that first grab is the one that decides what lands on disk.
+
+        ``media_source`` follows the convention the rest of the video side uses:
+        'tmdb' means ``media_id`` is a TMDB id, anything else a library row id.
+        Passing the wrong one as ``tmdb_id`` would resolve some other title's
+        profile, so the two are kept apart here rather than guessed at."""
         from core.video.quality_profile import profile_by_id
         pid = src.get("quality_profile_id")
         if pid in (None, "", 0, "0"):
-            tmdb = src.get("tmdb_id") or src.get("media_id")
             scope = str(src.get("scope") or src.get("kind") or "movie").lower()
             kind = "movie" if scope == "movie" else "show"
-            if tmdb and str(src.get("media_source") or "tmdb") == "tmdb":
-                try:
-                    pid = db.quality_profile_id_for(kind, tmdb_id=int(tmdb))
-                except (TypeError, ValueError):
-                    pid = None
+            media_id = src.get("media_id")
+            is_tmdb = str(src.get("media_source") or "tmdb") == "tmdb"
+            tmdb = src.get("tmdb_id") or (media_id if is_tmdb else None)
+            rfid = _root_folder_id_for_grab(db, src)
+            try:
+                rfid = int(rfid) if rfid not in (None, "", "null") else None
+            except (TypeError, ValueError):
+                rfid = None
+            try:
+                pid = db.quality_profile_id_for(
+                    kind,
+                    tmdb_id=int(tmdb) if tmdb else None,
+                    library_id=None if is_tmdb else media_id,
+                    root_folder_id=rfid)
+            except (TypeError, ValueError):
+                pid = None
         return profile_by_id(db, pid), pid
 
     @bp.route("/downloads/search", methods=["POST"])

@@ -455,6 +455,19 @@ _COLUMN_MIGRATIONS = [
     # to be set per show, by hand, on a field most users never find. A Library
     # that exists specifically to hold anime already knows the answer.
     ("root_folders", "default_series_type", "TEXT"),
+    # The quality profile every title in this Library is judged under, unless
+    # the title carries an assignment of its own. Profiles were per-title ONLY,
+    # so "everything in my 4K Library is judged at 4K" had to be said one title
+    # at a time — and a title the library has never seen had nowhere to say it
+    # at all, which is why a first grab was always judged by the global Default
+    # no matter which Library it was destined for.
+    #
+    # A plain INTEGER, not a REFERENCES: an ALTER-added column cannot carry the
+    # FK a fresh CREATE TABLE would, so declaring one here would make existing
+    # and new installs disagree about what deleting a profile does. Instead
+    # delete_named_quality_profile clears it explicitly, and a dangling id
+    # still degrades to Default via quality_profile.profile_by_id.
+    ("root_folders", "default_quality_profile_id", "INTEGER"),
 ]
 
 
@@ -465,6 +478,31 @@ def _norm_indexer_ids(raw) -> str | None:
     _indexer_ids) — non-digit tokens are just dropped, never an error."""
     ids = [p.strip() for p in str(raw or "").split(",") if p.strip().isdigit()]
     return ",".join(ids) if ids else None
+
+
+def _wishlist_profile_sql(tbl: str) -> str:
+    """The quality profile a wishlist row is judged under, as a SELECT expression.
+
+    Three levels, strictest first: the row's own assignment, the owned title's
+    assignment, then the DEFAULT set on the Library the row is destined for.
+    NULL falls through to the global Default profile — which is exactly what
+    every row resolved to before Libraries could carry one.
+
+    The Library step reuses the SAME expression the row's ``root_folder_id``
+    resolves to, deliberately: judging a grab under one Library's profile and
+    then filing it into another's would be worse than having no Library default
+    at all.
+    """
+    root = ("COALESCE(w.root_folder_id, "
+            "(SELECT root_folder_id FROM {t} WHERE id = w.library_id))").format(t=tbl)
+    return ("COALESCE(w.quality_profile_id, "
+            "(SELECT t.quality_profile_id FROM {t} t WHERE t.tmdb_id = w.tmdb_id), "
+            "(SELECT rf.default_quality_profile_id FROM root_folders rf "
+            "WHERE rf.id = {root})) AS quality_profile_id").format(t=tbl, root=root)
+
+
+_WL_PROFILE_MOVIE = _wishlist_profile_sql("movies")
+_WL_PROFILE_SHOW = _wishlist_profile_sql("shows")
 
 
 def _proxied_art(url) -> str | None:
@@ -3255,14 +3293,15 @@ class VideoDatabase:
         Settings editor + the Library page's tab bar).
         {"movies": [...], "tv": [...]} — each entry:
         {id, server_title, label, path, sort_order, category, preferred_indexer_ids,
-        default_series_type}."""
+        default_series_type, default_quality_profile_id}."""
         conn = self._get_connection()
         try:
             self._migrate_legacy_libraries(conn, server)
             out = {}
             for ui_kind, content_kind in self._LIB_KIND.items():
                 rows = conn.execute(
-                    "SELECT id, server_title, label, path, sort_order, category, preferred_indexer_ids, default_series_type "
+                    "SELECT id, server_title, label, path, sort_order, category, preferred_indexer_ids, "
+                    "default_series_type, default_quality_profile_id "
                     "FROM root_folders WHERE server=? AND content_kind=? ORDER BY sort_order, id",
                     (server, content_kind)).fetchall()
                 out[ui_kind] = [dict(r) for r in rows]
@@ -3292,7 +3331,12 @@ class VideoDatabase:
         inherits the global torrent_client.category. ``preferred_indexer_ids``
         is a comma-separated list of Prowlarr indexer ids (same format as the
         global prowlarr.indexer_ids allowlist) that rank higher for titles in
-        this library; blank/omitted means no preference."""
+        this library; blank/omitted means no preference.
+        ``default_quality_profile_id`` is the quality profile titles in this
+        library are judged under when they carry no assignment of their own;
+        blank/0/omitted means no Library default (the global Default applies).
+        Unlike ``default_series_type`` it is meaningful for EVERY content kind —
+        a Library of 4K films wants it exactly as much as one of anime."""
         entries_by_kind = {"movies": movies, "tv": tv, "youtube": youtube}
         conn = self._get_connection()
         try:
@@ -3320,22 +3364,31 @@ class VideoDatabase:
                     dst = str(e.get("default_series_type") or "").strip().lower()
                     if content_kind != "show" or dst not in ("standard", "daily", "anime"):
                         dst = None
+                    # 0 and "" both mean "no Library default" — the picker's first
+                    # option. Stored as NULL so the resolution chain simply falls
+                    # through to the global Default, rather than pointing at a
+                    # profile id 0 that has no row.
+                    try:
+                        dqp = int(e.get("default_quality_profile_id") or 0) or None
+                    except (TypeError, ValueError):
+                        dqp = None
                     eid = e.get("id")
                     if eid:
                         conn.execute(
                             "UPDATE root_folders SET server_title=?, label=?, path=?, sort_order=?, category=?, "
-                            "preferred_indexer_ids=?, default_series_type=? "
+                            "preferred_indexer_ids=?, default_series_type=?, default_quality_profile_id=? "
                             "WHERE id=? AND server=? AND content_kind=?",
-                            (title, label, path, i, category, preferred_indexer_ids, dst,
+                            (title, label, path, i, category, preferred_indexer_ids, dst, dqp,
                              int(eid), server, content_kind))
                         keep_ids.add(int(eid))
                     else:
                         cur = conn.execute(
                             "INSERT INTO root_folders (path, content_kind, server, server_title, label, "
-                            "sort_order, category, preferred_indexer_ids, default_series_type) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            "sort_order, category, preferred_indexer_ids, default_series_type, "
+                            "default_quality_profile_id) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             (path, content_kind, server, title, label, i, category,
-                             preferred_indexer_ids, dst))
+                             preferred_indexer_ids, dst, dqp))
                         keep_ids.add(cur.lastrowid)
                 existing_ids = {r[0] for r in conn.execute(
                     "SELECT id FROM root_folders WHERE server=? AND content_kind=?",
@@ -6958,8 +7011,7 @@ class VideoDatabase:
                 "(SELECT GROUP_CONCAT(f.resolution) FROM movies m "
                 "  JOIN media_files f ON f.movie_id=m.id "
                 "  WHERE m.tmdb_id=w.tmdb_id AND m.has_file=1) AS owned_resolutions, "
-                "COALESCE(w.quality_profile_id, (SELECT m.quality_profile_id FROM movies m "
-                "  WHERE m.tmdb_id=w.tmdb_id)) AS quality_profile_id "
+                + _WL_PROFILE_MOVIE + " "
                 "FROM video_wishlist w "
                 # APPROVAL GATE: a wish from a profile without download rights is
                 # invisible to every acquisition path until an admin approves it.
@@ -7048,8 +7100,7 @@ class VideoDatabase:
                 "  WHERE s.tmdb_id = w.tmdb_id AND e.season_number = w.season_number "
                 "  AND e.episode_number = w.episode_number AND e.has_file = 1) "
                 "  AS owned_resolutions, "
-                "COALESCE(w.quality_profile_id, (SELECT s.quality_profile_id FROM shows s "
-                "  WHERE s.tmdb_id = w.tmdb_id)) AS quality_profile_id, "
+                + _WL_PROFILE_SHOW + ", "
                 # series type (P8): daily/anime shows QUERY differently (air date /
                 # absolute number). NULL for shows not in the library = standard.
                 # MAX = a type set on ANY server's row wins over a NULL sibling.
@@ -7094,8 +7145,7 @@ class VideoDatabase:
                     "(SELECT GROUP_CONCAT(f.resolution) FROM movies m "
                     "  JOIN media_files f ON f.movie_id=m.id "
                     "  WHERE m.tmdb_id=w.tmdb_id AND m.has_file=1) AS owned_resolutions, "
-                    "COALESCE(w.quality_profile_id, (SELECT m.quality_profile_id FROM movies m "
-                    "  WHERE m.tmdb_id=w.tmdb_id)) AS quality_profile_id "
+                    + _WL_PROFILE_MOVIE + " "
                     "FROM video_wishlist w "
                     # APPROVAL GATE: 'Search now' is a manual acquisition path, so
                     # it must respect the queue too — otherwise a pending wish
@@ -7121,8 +7171,7 @@ class VideoDatabase:
                 "  WHERE s.tmdb_id = w.tmdb_id AND e.season_number = w.season_number "
                 "  AND e.episode_number = w.episode_number AND e.has_file = 1) "
                 "  AS owned_resolutions, "
-                "COALESCE(w.quality_profile_id, (SELECT s.quality_profile_id FROM shows s "
-                "  WHERE s.tmdb_id = w.tmdb_id)) AS quality_profile_id, "
+                + _WL_PROFILE_SHOW + ", "
                 # The library row WINS over the override. The override is a stand-in for
                 # a show that has no row yet; once one exists the full Manage panel
                 # edits the row, and leaving a stale override ahead of it would make
@@ -7866,9 +7915,16 @@ class VideoDatabase:
     def delete_named_quality_profile(self, profile_id) -> bool:
         """Delete a named profile. The schema's ON DELETE SET NULL clears
         movies/shows assignments; migrated columns (wishlist/downloads) degrade
-        via profile_by_id's dangling-id rule."""
+        via profile_by_id's dangling-id rule.
+
+        root_folders.default_quality_profile_id is cleared EXPLICITLY: it arrives
+        by ALTER TABLE on existing installs, so it cannot carry the FK that would
+        do it, and a Library left pointing at a deleted profile would keep showing
+        a selection the picker has no option for."""
         conn = self._get_connection()
         try:
+            conn.execute("UPDATE root_folders SET default_quality_profile_id=NULL "
+                         "WHERE default_quality_profile_id=?", (int(profile_id),))
             cur = conn.execute("DELETE FROM quality_profiles WHERE id=?", (int(profile_id),))
             conn.commit()
             return cur.rowcount > 0
@@ -7878,33 +7934,113 @@ class VideoDatabase:
         finally:
             conn.close()
 
-    def quality_profile_id_for(self, kind: str, *, tmdb_id=None, library_id=None):
-        """The per-title quality-profile id for a movie/show (P2), or None for
-        the Default. Library row wins; a wishlist row's assignment covers
-        titles not in the library yet."""
+    def quality_profile_id_for(self, kind: str, *, tmdb_id=None, library_id=None,
+                               root_folder_id=None):
+        """The quality-profile id a movie/show is judged under, or None for the
+        global Default.
+
+        Precedence, strictest first:
+
+          1. the title's OWN assignment (movies/shows.quality_profile_id)
+          2. a wishlist row's assignment — a title not in the library yet
+          3. the DEFAULT set on its Library (root_folders.default_quality_profile_id)
+          4. None, meaning the global Default profile
+
+        Step 3 is what makes "everything in my 4K Library is judged at 4K" one
+        setting instead of one assignment per title, and it is the only step that
+        can answer for a title the library has never seen — which is precisely
+        the first grab, the one that decides what lands on disk.
+
+        ``root_folder_id`` names the Library a grab is BOUND for when the title
+        isn't filed anywhere yet (the destination picked in the download modal).
+        It outranks the Libraries inferred from existing rows, because it is
+        where this file is actually going.
+        """
         tbl = "movies" if kind == "movie" else "shows"
         conn = self._get_connection()
         try:
+            roots = []          # Libraries to consult for a default, best first
+            if root_folder_id:
+                roots.append(root_folder_id)
             if library_id:
-                row = conn.execute(f"SELECT quality_profile_id FROM {tbl} WHERE id=?",
-                                   (int(library_id),)).fetchone()
-                if row and row[0]:
-                    return row[0]
+                row = conn.execute(
+                    f"SELECT quality_profile_id, root_folder_id FROM {tbl} WHERE id=?",
+                    (int(library_id),)).fetchone()
+                if row:
+                    if row[0]:
+                        return row[0]
+                    if row[1]:
+                        roots.append(row[1])
             if tmdb_id:
-                row = conn.execute(f"SELECT quality_profile_id FROM {tbl} WHERE tmdb_id=?",
-                                   (int(tmdb_id),)).fetchone()
-                if row and row[0]:
-                    return row[0]
+                row = conn.execute(
+                    f"SELECT quality_profile_id, root_folder_id FROM {tbl} WHERE tmdb_id=?",
+                    (int(tmdb_id),)).fetchone()
+                if row:
+                    if row[0]:
+                        return row[0]
+                    if row[1]:
+                        roots.append(row[1])
                 row = conn.execute(
                     "SELECT quality_profile_id FROM video_wishlist "
                     "WHERE tmdb_id=? AND quality_profile_id IS NOT NULL LIMIT 1",
                     (int(tmdb_id),)).fetchone()
                 if row and row[0]:
                     return row[0]
+                row = conn.execute(
+                    "SELECT root_folder_id FROM video_wishlist "
+                    "WHERE tmdb_id=? AND root_folder_id IS NOT NULL LIMIT 1",
+                    (int(tmdb_id),)).fetchone()
+                if row and row[0]:
+                    roots.append(row[0])
+            for rid in roots:
+                row = conn.execute(
+                    "SELECT default_quality_profile_id FROM root_folders WHERE id=?",
+                    (int(rid),)).fetchone()
+                if row and row[0]:
+                    return row[0]
             return None
-        except sqlite3.Error:
+        except (sqlite3.Error, TypeError, ValueError):
             logger.exception("quality_profile_id_for failed")
             return None
+        finally:
+            conn.close()
+
+    def library_quality_profile_id(self, root_folder_id):
+        """The default quality profile set on ONE Library, or None.
+
+        Its own reader because the UI needs to name what "Default" will actually
+        resolve to on a per-title picker, which is a question about the Library
+        alone — no title involved."""
+        if not root_folder_id:
+            return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT default_quality_profile_id FROM root_folders WHERE id=?",
+                (int(root_folder_id),)).fetchone()
+            return row[0] if row and row[0] else None
+        except (sqlite3.Error, TypeError, ValueError):
+            return None
+        finally:
+            conn.close()
+
+    def set_library_quality_profile(self, root_folder_id, profile_id) -> bool:
+        """Set (or clear, with None/0) one Library's default quality profile.
+
+        The Libraries settings editor saves every row at once through
+        ``save_libraries``; this is the single-Library seam for callers that hold
+        one id and nothing else. Returns False for an unknown Library."""
+        conn = self._get_connection()
+        try:
+            pid = int(profile_id) if profile_id else None
+            cur = conn.execute(
+                "UPDATE root_folders SET default_quality_profile_id=? WHERE id=?",
+                (pid, int(root_folder_id)))
+            conn.commit()
+            return cur.rowcount > 0
+        except (sqlite3.Error, TypeError, ValueError):
+            logger.exception("set_library_quality_profile failed (%s)", root_folder_id)
+            return False
         finally:
             conn.close()
 

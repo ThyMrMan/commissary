@@ -31,7 +31,8 @@ def register_routes(bp):
     # What a non-admin sees per configured Library: enough to render a tab and
     # pick a download destination, and nothing else. Filesystem paths are
     # settings-only detail, so they stay out of the member-facing payload.
-    _MEMBER_LIB_FIELDS = ("id", "server_title", "label", "sort_order", "category")
+    _MEMBER_LIB_FIELDS = ("id", "server_title", "label", "sort_order", "category",
+                          "default_quality_profile_id")
 
     @bp.route("/libraries", methods=["GET"])
     def video_libraries():

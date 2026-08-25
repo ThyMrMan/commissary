@@ -272,6 +272,27 @@
             fields.appendChild(stWrap);
         }
 
+        // Default quality profile — every kind, unlike series type (a film has
+        // no episode numbering, but it certainly has a resolution). Profiles
+        // were per-TITLE only, so "everything in my 4K Library is judged at 4K"
+        // had to be said one title at a time — and a title not in the library
+        // yet had nowhere to say it at all, so its FIRST grab, the one that
+        // decides what actually lands on disk, was always judged by the global
+        // Default no matter which Library it was headed for.
+        // A title carrying a profile of its own still outranks this.
+        var qpWrap = document.createElement('label');
+        qpWrap.className = 'library-quality-profile';
+        qpWrap.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:6px;font-size:12px;opacity:.85';
+        qpWrap.appendChild(document.createTextNode('Judge titles here by'));
+        var qpSel = document.createElement('select');
+        qpSel.setAttribute('data-lib-quality-profile', '');
+        qpSel.title = 'The quality profile titles in this Library are grabbed and upgraded '
+                    + 'under. A title with a profile of its own overrides it. Set profiles up '
+                    + 'in the Quality section below.';
+        qpWrap.appendChild(qpSel);
+        fields.appendChild(qpWrap);
+        renderProfilePicker(qpSel, configured && configured.default_quality_profile_id);
+
         // A VISIBLE label and explanation, not a tooltip on the input. The input
         // is switched to type=hidden as soon as the checkbox picker renders, and
         // a hidden input shows neither tooltip nor placeholder — so the previous
@@ -296,6 +317,45 @@
         row.appendChild(fields);
         box.addEventListener('change', function () { fields.style.display = box.checked ? '' : 'none'; });
         return row;
+    }
+
+    // The named quality profiles, fetched once per page and shared by every
+    // Library row's picker. Separate from loadQuality()'s fetch of the same
+    // endpoint: that one drives the profile EDITOR further down the page and
+    // only runs when that section opens, so a Library row cannot wait on it.
+    // null = not fetched yet, [] = unreachable.
+    var _qProfiles = null;
+    var _qProfilesPromise = null;
+
+    function loadQualityProfileList() {
+        if (_qProfiles !== null) return Promise.resolve(_qProfiles);
+        if (_qProfilesPromise) return _qProfilesPromise;
+        _qProfilesPromise = fetch(QUALITY_URL + '/profiles', { headers: { Accept: 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) { _qProfiles = (d && d.profiles) || []; return _qProfiles; })
+            .catch(function () { _qProfiles = []; return _qProfiles; });
+        return _qProfilesPromise;
+    }
+
+    function renderProfilePicker(sel, currentId) {
+        // "no Library default" is a real choice, not an absence — it means every
+        // title here falls through to the global Default profile, which is what
+        // this install did before a Library could carry one. Profile id 0 IS that
+        // global Default, so it is dropped from the list rather than offered as a
+        // second option that does the same thing under a different name.
+        var cur = parseInt(currentId, 10) || 0;
+        var head = function (on) {
+            return '<option value="0"' + (on ? ' selected' : '') + '>no Library default</option>';
+        };
+        sel.innerHTML = head(!cur);
+        loadQualityProfileList().then(function (list) {
+            if (!sel.isConnected) return;
+            sel.innerHTML = head(!cur) + list.filter(function (p) { return p.id > 0; })
+                .map(function (p) {
+                    return '<option value="' + p.id + '"' + (p.id === cur ? ' selected' : '') +
+                        '>' + esc(p.name) + '</option>';
+                }).join('');
+        });
     }
 
     // Prowlarr's indexer list, fetched once per page and shared by every Library
@@ -393,6 +453,10 @@
                 default_series_type: (function () {
                     var el = row.querySelector('[data-lib-series-type]');
                     return el ? el.value : '';
+                })(),
+                default_quality_profile_id: (function () {
+                    var el = row.querySelector('[data-lib-quality-profile]');
+                    return el ? (parseInt(el.value, 10) || 0) : 0;
                 })()
             });
         }
