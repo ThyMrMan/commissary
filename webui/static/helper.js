@@ -3491,6 +3491,15 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.0.10': [
+        { date: 'August 2026 · 2.0.10' },
+        { title: "Downloads that quietly went nowhere", desc: "three faults that all ended the same way — a title sitting on the wishlist forever while the file it wanted was already on your disk. Each was invisible in the log, which is why they took so long to find." },
+        { title: "A torrent your client already has is no longer treated as a refusal", desc: "when a release is re-grabbed, the download client is asked to add a torrent it may already hold. qBittorrent and Transmission report that honestly. <strong>Deluge and aria2 raise an error instead</strong>, which came back as nothing at all — indistinguishable from <em>the torrent client didn't accept the release</em>. So no download was recorded, nothing ever watched that torrent, and the wishlist re-grabbed it every hour, forever, while the finished file sat in the client the whole time. One title did this <strong>324 times over eight days</strong>. Both now recognise the torrent they already have and adopt it." },
+        { title: "And a failed download finally says why", desc: "when a download was given up on, <strong>nothing was written to the log at all</strong> — not the reason, not what happened next. Worse, the retry then overwrote the error on the row with its own summary, so the original cause reached neither the log nor the record. Two separate problems could only be worked out afterwards by reading timestamps out of the database. Every failure now names the title, the reason, the exact release, and whether it is retrying or giving up." },
+        { title: "A vanished torrent stops blaming Soulseek", desc: "every download that disappeared from its client reported <em>Soulseek transfer disappeared</em> — including torrent and usenet ones, which never go near Soulseek. The one line you had to go on pointed at the wrong program entirely. It now names the client that actually lost it." },
+        { title: "Releases that are just a pile of RAR archives are refused up front", desc: "some releases arrive as <em>film.part01.rar, film.part02.rar…</em> with the video only appearing once something unpacks them. Commissary does not unpack archives on the video side, so those can never be imported — but they used to download in full first, then sit at 100% for half an hour before failing with a message about checking your save paths. The download client is now asked what is inside <strong>while it is still downloading</strong>, and a rar-only release is dropped immediately and the next one tried instead." },
+        { title: "And if one slips through, the reason is the real one", desc: "a release that finishes with no video file in it now says exactly that — <em>14 rar files and nothing playable</em> — instead of sending you to check folder paths that were never wrong. Usenet is unaffected either way: your usenet client unpacks those itself before Commissary looks." },
+    ],
     '2.0.9': [
         { date: 'August 2026 · 2.0.9' },
         { title: "Set a quality profile for a whole Library, not one title at a time", desc: "quality profiles could only be assigned per TITLE. That is fine for the occasional exception and useless for the thing people actually want to say — <em>everything in my 4K Library is judged at 4K, everything in Anime is judged at 1080p</em> — which had to be repeated once per title, forever, and again for every show or film added afterwards. Each Library now carries its own default, set once in Settings → Libraries." },
@@ -3901,6 +3910,20 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.0.10: downloads that quietly went nowhere",
+        description: "Three faults with one symptom - a title stuck on the wishlist forever while the file it wanted was already downloaded. All three were invisible in the log, which is why they took so long to find.",
+        features: [
+            "Deluge and aria2 treated 'I already have this torrent' as 'I refuse this torrent', so a re-grab recorded nothing, nothing watched the finished download, and the wishlist retried hourly forever - one title did it 324 times in eight days",
+            "qBittorrent and Transmission already handled this correctly; the rule is now written into the adapter contract instead of being an accident of implementation",
+            "a failed download logged NOTHING - not the reason, not what happens next - and the retry then overwrote the error on the row, so the cause reached neither the log nor the record",
+            "every failure now names the title, the reason, the release, and whether it is retrying or giving up",
+            "a vanished torrent no longer reports 'Soulseek transfer disappeared' - it names the client that actually lost it",
+            "releases that are only RAR archives are refused while still downloading, by asking the client what is inside, and the next release is tried instead",
+            "one that slips through says 'no video file in it - 14 rar files and nothing playable' rather than blaming your save paths",
+        ],
+        usage_note: "Nothing to configure. If a title has been stuck on your wishlist while its torrent sits finished in your download client, this is the release that lets it through - it will be picked up on the next hourly pass. Usenet is unaffected by the archive checks: SABnzbd and NZBGet unpack those themselves before Commissary sees them.",
+    },
     {
         title: "2.0.9: a quality profile per Library",
         description: "Profiles were per-title only, so \"everything in my 4K Library is judged at 4K\" had to be repeated once per title, forever - and a title the library had never seen had nowhere to say it at all.",

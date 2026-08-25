@@ -25,6 +25,7 @@ from typing import List, Optional
 import requests as http_requests
 
 from config.settings import config_manager
+from core.torrent_clients import infohash
 from core.torrent_clients.base import TorrentStatus, normalize_client_url
 from utils.logging_config import get_logger
 
@@ -123,7 +124,7 @@ class Aria2Adapter:
 
     def _add_uri_sync(self, uri: str, save_path: Optional[str]) -> Optional[str]:
         result = self._rpc('aria2.addUri', [uri], self._opts(save_path))
-        return str(result) if result else None   # GID
+        return str(result) if result else self._existing_ref(uri)   # GID
 
     async def add_torrent_file(self, file_bytes: bytes, category: Optional[str] = None,
                                save_path: Optional[str] = None) -> Optional[str]:
@@ -133,7 +134,44 @@ class Aria2Adapter:
     def _add_file_sync(self, file_bytes: bytes, save_path: Optional[str]) -> Optional[str]:
         b64 = base64.b64encode(file_bytes).decode('ascii')
         result = self._rpc('aria2.addTorrent', b64, [], self._opts(save_path))
-        return str(result) if result else None
+        return str(result) if result else self._existing_ref(file_bytes)
+
+    # Just enough to match an existing download to what we tried to add. The
+    # full _STATUS_KEYS payload would be wasted here — this runs once, on a
+    # refusal, and only needs to map info-hash back to GID.
+    _REF_KEYS = ['gid', 'infoHash']
+
+    def _existing_ref(self, payload) -> Optional[str]:
+        """The GID of a torrent aria2 ALREADY holds, when the add was refused.
+
+        aria2 errors on a duplicate ("Duplicate torrent") and ``_rpc`` maps that
+        to None, which the stack above reads as "the client didn't accept the
+        release" — no download row, nothing polling the torrent already sitting
+        there, and an hourly re-grab that can never succeed.
+
+        aria2 is the one adapter whose identifier is NOT the info-hash: it hands
+        out a GID. So unlike Deluge, knowing the expected hash is not the answer
+        by itself — it has to be looked up across the three queues to recover the
+        GID that ``get_status`` will actually answer to. Stopped is included on
+        purpose: a torrent that finished and is no longer active is exactly the
+        one whose duplicate add needs adopting."""
+        expected = infohash.expected_hash(payload)
+        if not expected:
+            return None
+        for rows in (self._rpc('aria2.tellActive', self._REF_KEYS),
+                     self._rpc('aria2.tellWaiting', 0, 1000, self._REF_KEYS),
+                     self._rpc('aria2.tellStopped', 0, 1000, self._REF_KEYS)):
+            for item in (rows or []):
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get('infoHash') or '').lower() != expected:
+                    continue
+                gid = str(item.get('gid') or '')
+                if gid:
+                    logger.info("aria2 already had %s as gid %s — the add was a "
+                                "duplicate, not a refusal; adopting it", expected, gid)
+                    return gid
+        return None
 
     # ── status ──
     async def get_status(self, torrent_id: str) -> Optional[TorrentStatus]:
@@ -143,6 +181,20 @@ class Aria2Adapter:
     def _get_status_sync(self, gid: str) -> Optional[TorrentStatus]:
         result = self._rpc('aria2.tellStatus', gid, self._STATUS_KEYS)
         return self._parse_status(result) if result else None
+
+    async def list_files(self, torrent_id: str) -> Optional[List[str]]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._list_files_sync, torrent_id)
+
+    def _list_files_sync(self, gid: str) -> Optional[List[str]]:
+        """aria2 gives ABSOLUTE paths; the classifier reads basenames, so that
+        costs nothing. A torrent still fetching metadata reports one placeholder
+        file named after the .torrent itself, which classifies as unknown."""
+        result = self._rpc('aria2.tellStatus', gid, ['files'])
+        if not isinstance(result, dict):
+            return None
+        return [str(f.get('path')) for f in (result.get('files') or [])
+                if isinstance(f, dict) and f.get('path')]
 
     async def get_all(self) -> List[TorrentStatus]:
         loop = asyncio.get_event_loop()

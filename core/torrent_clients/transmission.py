@@ -202,6 +202,21 @@ class TransmissionAdapter:
             return None
         return self._parse_status(data['torrents'][0])
 
+    async def list_files(self, torrent_id: str) -> Optional[List[str]]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._list_files_sync, torrent_id)
+
+    def _list_files_sync(self, torrent_id: str) -> Optional[List[str]]:
+        """'files' is asked for on its own rather than added to _STATUS_FIELDS:
+        that field list drives the every-few-seconds poll for every torrent, and
+        this is wanted once per download."""
+        data = self._rpc('torrent-get', {'ids': [torrent_id], 'fields': ['files']})
+        rows = (data or {}).get('torrents') or []
+        if not rows:
+            return None
+        return [str(f.get('name')) for f in (rows[0].get('files') or [])
+                if isinstance(f, dict) and f.get('name')]
+
     async def get_all(self) -> List[TorrentStatus]:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._get_all_sync)

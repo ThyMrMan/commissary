@@ -20,6 +20,7 @@ from typing import Any, List, Optional
 import requests as http_requests
 
 from config.settings import config_manager
+from core.torrent_clients import infohash
 from core.torrent_clients.base import TorrentStatus, normalize_client_url
 from utils.logging_config import get_logger
 
@@ -191,7 +192,11 @@ class DelugeAdapter:
             method = 'core.add_torrent_url'
         torrent_hash = self._rpc_sync(method, [url_or_magnet, options])
         if not torrent_hash:
-            return None
+            # Deluge RAISES on a duplicate rather than handing back the hash it
+            # already has, and _rpc_sync maps every raise to None. See
+            # _existing_ref: an add refused because it was already done is a
+            # success with the answer withheld.
+            return self._existing_ref(url_or_magnet, category)
         self._apply_label(str(torrent_hash), category or self._category)
         return str(torrent_hash)
 
@@ -220,9 +225,41 @@ class DelugeAdapter:
         encoded = base64.b64encode(file_bytes).decode('ascii')
         torrent_hash = self._rpc_sync('core.add_torrent_file', ['soulsync.torrent', encoded, options])
         if not torrent_hash:
-            return None
+            return self._existing_ref(file_bytes, category)
         self._apply_label(str(torrent_hash), category or self._category)
         return str(torrent_hash)
+
+    def _existing_ref(self, payload, category=None) -> Optional[str]:
+        """The hash of a torrent Deluge ALREADY holds, when the add was refused.
+
+        A duplicate is Deluge's commonest refusal and it is silent: the RPC
+        raises, ``_rpc_sync`` logs and returns None, and the whole stack above
+        reads that as "the torrent client didn't accept the release". No
+        download row is created, so nothing polls the torrent that is sitting
+        right there — frequently already finished — the wishlist row stays
+        wanted, and it re-grabs every hour forever. Two separate incidents on
+        the library this was written for looked exactly like that, one of them
+        for eight days.
+
+        The hash needs no asking: a magnet carries it, and a .torrent is the
+        SHA-1 of its bencoded info value. If Deluge has it, the add did not fail
+        — it was already done, and the right answer is the hash.
+
+        None for an http .torrent URL, whose hash cannot be derived without
+        fetching it. That is the same limit qBittorrent's _confirm_or_poll has,
+        and it falls back to today's behaviour rather than guessing."""
+        expected = infohash.expected_hash(payload)
+        if not expected:
+            return None
+        row = self._rpc_sync('core.get_torrent_status', [expected, ['hash']])
+        if not isinstance(row, dict) or not row:
+            return None
+        logger.info("Deluge already had %s — the add was a duplicate, not a "
+                    "refusal; adopting the existing torrent", expected)
+        # It may have been added by hand, or by an older build that lost track
+        # of it. Label it now so it lands in the right category either way.
+        self._apply_label(expected, category or self._category)
+        return expected
 
     def _apply_label(self, torrent_hash: str, label: str) -> None:
         """Best-effort label assignment. The Label plugin is optional
@@ -245,6 +282,19 @@ class DelugeAdapter:
         # core.get_torrent_status doesn't echo back the hash — patch it in.
         result.setdefault('hash', torrent_id)
         return self._parse_status(result)
+
+    async def list_files(self, torrent_id: str) -> Optional[List[str]]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._list_files_sync, torrent_id)
+
+    def _list_files_sync(self, torrent_id: str) -> Optional[List[str]]:
+        """Deluge reports each file as {'path': 'Release/file.rar', 'size': N};
+        an unresolved magnet has no 'files' key at all, which reads as unknown."""
+        result = self._rpc_sync('core.get_torrent_status', [torrent_id, ['files']])
+        if not isinstance(result, dict):
+            return None
+        return [str(f.get('path')) for f in (result.get('files') or [])
+                if isinstance(f, dict) and f.get('path')]
 
     async def get_all(self) -> List[TorrentStatus]:
         loop = asyncio.get_event_loop()

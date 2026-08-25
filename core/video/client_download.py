@@ -13,6 +13,7 @@ import asyncio
 import os
 from typing import Any, Callable, Optional
 
+from core.video import packed_release
 from core.video.slskd_search import _is_video
 from utils.logging_config import get_logger
 
@@ -40,12 +41,49 @@ def _is_pack(dl: dict) -> bool:
         return False
 
 
+def _packed_patch(dl: dict, names) -> dict:
+    """The refusal patch for a release that can never yield a video file.
+
+    ``_bad_release`` is what tells the monitor to blocklist this exact release
+    before retrying — being packed is a permanent property of it, not a bad
+    night on the swarm, and without the flag the retry would pick it straight
+    back off its own candidate list."""
+    err = packed_release.reason(names, before_finishing=False)
+    logger.info("video download %s (%s): %s", dl.get("id"),
+                dl.get("release_title") or dl.get("title") or "?", err)
+    return {"status": "failed", "_bad_release": True, "error": err}
+
+
+def _packed_by_client(dl: dict, ref, list_files) -> Optional[dict]:
+    """Refuse an in-flight TORRENT whose file list is archives and nothing else.
+
+    Torrents only, and that is not a limitation to be lifted later. A usenet
+    release is ALWAYS rars — that is what usenet is — and SABnzbd/NZBGet unpack
+    them server-side before Commissary ever sees the folder. Judging a usenet job
+    by its file list would refuse every usenet download there is."""
+    if list_files is None or str(dl.get("source") or "") != "torrent":
+        return None
+    try:
+        names = list_files(str(dl.get("source") or ""), str(ref))
+    except Exception:   # noqa: BLE001 - an unanswerable client reads as unknown
+        logger.debug("file list unavailable for %s", ref, exc_info=True)
+        return None
+    if packed_release.classify(names or []) != packed_release.PACKED:
+        return None
+    err = packed_release.reason(names or [], before_finishing=True)
+    logger.info("video download %s (%s): %s", dl.get("id"),
+                dl.get("release_title") or dl.get("title") or "?", err)
+    return {"status": "failed", "_bad_release": True, "error": err}
+
+
 def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
                             resolve_path: Callable[[Any], Any],
                             find_video: Callable[[Any, Any], Any],
                             organizer: Optional[Callable] = None,
                             find_pack: Optional[Callable[[Any, Any], Any]] = None,
-                            settled: Optional[Callable[[dict, str], bool]] = None) -> dict:
+                            settled: Optional[Callable[[dict, str], bool]] = None,
+                            list_files: Optional[Callable[[str, str], Any]] = None,
+                            listing: Optional[Callable[[Any], Any]] = None) -> dict:
     """Next-state patch for a torrent/usenet download. ``get_status(source, ref)`` returns the
     client's status object (or None if it forgot the job), ``resolve_path`` maps its reported
     save_path to a locally-readable one, ``find_video(root, name)`` returns the main video file
@@ -55,7 +93,15 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
     ``settled(dl, path)`` is the guard against importing a file something is still
     writing. 100% means the BYTES are in; it does not mean the client has finished
     putting them where we are about to read them. Passing None keeps the old
-    behaviour (import as soon as a file is visible)."""
+    behaviour (import as soon as a file is visible).
+
+    ``list_files(source, ref)`` asks the download CLIENT what is inside the job,
+    and ``listing(path)`` asks the FILESYSTEM what actually arrived. Both feed the
+    same classifier for the same question — "is this a video, or a pile of RAR
+    parts nothing here can unpack?" — at the only two moments it can be answered:
+    while there is still bandwidth to save, and after the fact when there is at
+    least an honest explanation to give. Both default to None, which keeps every
+    existing caller's behaviour exactly."""
     ref = dl.get("client_ref")
     if not ref:
         return {"_missing": True}
@@ -85,6 +131,16 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
             size = int(getattr(status, "size", 0) or 0)
             done = int(getattr(status, "downloaded", 0) or 0)
             eta = int((size - done) / speed) if (speed > 0 and size > done) else None
+        # WHAT is this, before hours of bandwidth go into it? Nothing on the video
+        # side unpacks archives, so a release that is a set of RAR parts is already
+        # lost — the only question is whether that is discovered now or at 100%,
+        # thirty minutes later, by a stall clock whose message is about save paths.
+        # The client is the ONLY place to ask: Prowlarr results carry no file list
+        # at all (prowlarr_search._project hardcodes files=[]), so at grab time
+        # there is quite literally nothing to judge.
+        refusal = _packed_by_client(dl, ref, list_files)
+        if refusal is not None:
+            return refusal
         return {"status": "downloading", "progress": pct,
                 "speed_bps": speed, "eta_seconds": eta}
     # Completed → locate THIS job's finished video file, then import. Prefer the client's
@@ -100,6 +156,7 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
     # (and every existing test) that don't supply it keep today's behaviour exactly.
     locate = find_pack if (find_pack and _is_pack(dl)) else find_video
     content = getattr(status, "content_path", None)
+    name = None
     if content:
         save = resolve_path(content)
         src = locate(save, None) if save else None            # already this job's own content
@@ -111,6 +168,17 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
     if not src:
         if dl.get("dest_path"):
             return {"status": "completed", "progress": 100.0, "dest_path": dl.get("dest_path")}
+        # "Not yet" and "never" look identical from here, and the difference is
+        # thirty minutes of polling followed by a message telling you to go and
+        # check your save paths. So look at what DID arrive.
+        own = scoped_content_path(save, name)
+        names = listing(own) if (listing and own) else []
+        if packed_release.classify(names) == packed_release.PACKED:
+            # Settle FIRST. A usenet job at 100% is very often still being unrar'd
+            # by its own client, with the rars sitting right there while it works;
+            # failing on sight would kill the exact case that was about to succeed.
+            if settled is None or settled(dl, own):
+                return _packed_patch(dl, names)
         return {"progress": 100.0}   # complete but the file isn't visible yet — keep polling
     # Visible is not the same as finished. qBittorrent's 'moving' (relocating from
     # the incomplete folder to the complete one) reports progress 1.0, and the
@@ -125,6 +193,14 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
     # filesystem itself: hold until the bytes stop changing.
     if settled is not None and not settled(dl, src):
         return {"progress": 100.0}   # still being written — keep polling
+    # find_pack_dir hands back its content FOLDER whatever is in it, so a season
+    # delivered as RAR parts gets this far with src set and would fail deep in the
+    # importer, per file, with a message about the wrong thing entirely. Settled
+    # already, so there is no unrar left to wait for.
+    settled_names = listing(src) if listing else None
+    if settled_names is not None and \
+            packed_release.classify(settled_names) == packed_release.PACKED:
+        return _packed_patch(dl, settled_names)
     if organizer is not None:
         return organizer(dl, src)
     return {"status": "completed", "progress": 100.0, "dest_path": src}
@@ -149,6 +225,47 @@ def _get_status(source: str, ref: str):
     except Exception:   # noqa: BLE001 - a poll hiccup = 'unknown this tick', not a failure
         logger.debug("client status poll failed for %s %s", source, ref, exc_info=True)
         return None
+
+
+def _list_files(source: str, ref: str):
+    """The torrent client's file list for one job, memoized per client ref.
+
+    Memoized because the monitor polls every few seconds and this answer does not
+    change once the metadata is in — asking every tick would be a request per
+    torrent per tick to settle a question asked once. Only a NON-EMPTY answer is
+    cached: an empty list means the magnet has not resolved yet, and caching that
+    as final would mean never looking again at precisely the torrents that had
+    not told us anything.
+
+    Torrent adapters only — the usenet ones have no such call, and would answer
+    'rars' for every job even when SABnzbd is about to unpack them perfectly."""
+    if source != "torrent":
+        return None
+    cached = _files_cache.get(ref)
+    if cached is not None:
+        return cached
+    try:
+        from core.torrent_clients import get_active_adapter
+        adapter = get_active_adapter()
+        if adapter is None or not hasattr(adapter, "list_files"):
+            return None
+        names = _run(adapter.list_files(ref))
+    except Exception:   # noqa: BLE001 - unanswerable reads as unknown, never as bad
+        logger.debug("file list unavailable for %s", ref, exc_info=True)
+        return None
+    if names:
+        if len(_files_cache) > _FILES_CACHE_CAP:
+            for stale in list(_files_cache)[:len(_files_cache) - _FILES_CACHE_CAP]:
+                _files_cache.pop(stale, None)
+        _files_cache[ref] = list(names)
+    return names
+
+
+# client_ref -> the file list, once the client has actually given us one. Same
+# shape and the same reason as _settle_state below: the monitor calls process_*
+# once per tick with no memory in between.
+_files_cache: dict = {}
+_FILES_CACHE_CAP = 512
 
 
 def _resolve_path(reported):
@@ -218,6 +335,37 @@ def find_pack_dir(root, name=None) -> Optional[str]:
     if os.path.isdir(target):
         return str(target)
     return str(target) if _is_video(str(target)) else None
+
+
+def scoped_content_path(root, name=None) -> Optional[str]:
+    """This job's OWN content inside ``root``, or None when it isn't there.
+
+    Public because the archive check and the settle gate that guards it both
+    have to look at exactly what ``find_video_file`` looked at. A shared download
+    folder holds every concurrent grab, so a neighbour's .rar files must never be
+    what condemns this release."""
+    if not root:
+        return None
+    return _scoped_content(root, name) if name else str(root)
+
+
+def content_listing(path) -> list:
+    """Every file under ``path`` (or the file itself), as full paths.
+
+    The mirror image of ``_largest_video``: the same walk, asking what IS here
+    rather than which video is biggest. Handed to the same classifier the torrent
+    client's file list goes through, so both sources get one answer."""
+    if not path:
+        return []
+    if os.path.isfile(path):
+        return [str(path)]
+    if not os.path.isdir(path):
+        return []
+    out = []
+    for dirpath, _dirs, files in os.walk(path):
+        for f in files:
+            out.append(os.path.join(dirpath, f))
+    return out
 
 
 def find_video_file(root, name=None) -> Optional[str]:
@@ -299,8 +447,16 @@ def forget_settle_state(dl_id) -> None:
     _settle_state.pop(str(dl_id), None)
 
 
+def forget_file_list(client_ref) -> None:
+    """Drop a job's cached file list. Its own function rather than a line in
+    forget_settle_state because the two are keyed differently — settle by
+    download id, this by the CLIENT's ref, which is what the adapter answers to."""
+    _files_cache.pop(str(client_ref), None)
+
+
 def process_active_client_download(dl: dict, organizer=None) -> dict:
     """Production entry: poll the real client + resolve + find the video for one torrent/usenet row."""
     return process_client_download(dl, get_status=_get_status, resolve_path=_resolve_path,
                                    find_video=find_video_file, organizer=organizer,
-                                   find_pack=find_pack_dir, settled=content_has_settled)
+                                   find_pack=find_pack_dir, settled=content_has_settled,
+                                   list_files=_list_files, listing=content_listing)

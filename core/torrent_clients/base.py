@@ -104,7 +104,17 @@ class TorrentClientAdapter(Protocol):
         """Hand the torrent client a HTTP/HTTPS URL pointing to a
         ``.torrent`` file or a ``magnet:`` URI. Returns the torrent's
         client-side identifier (info-hash for qBit / Deluge, numeric
-        id for Transmission) or ``None`` on failure."""
+        id for Transmission, GID for aria2) or ``None`` on failure.
+
+        A DUPLICATE IS NOT A FAILURE. When the client already holds the
+        torrent it must return the existing identifier, not None — every
+        adapter has its own way of learning it (Transmission's
+        ``torrent-duplicate``, or ``infohash.expected_hash`` confirmed
+        present for the rest). Returning None there is indistinguishable
+        from a genuine refusal, and the consequence is severe: no download
+        row is created, so nothing ever polls the torrent sitting in the
+        client — often already finished — and the wishlist re-grabs it
+        every hour, forever."""
         ...
 
     async def add_torrent_file(
@@ -127,6 +137,25 @@ class TorrentClientAdapter(Protocol):
     async def get_all(self) -> List[TorrentStatus]:
         """Return live status for every torrent the client currently
         tracks. Used by the global download list."""
+        ...
+
+    async def list_files(self, torrent_id: str) -> Optional[List[str]]:
+        """The paths inside one torrent, or ``None`` when the client
+        cannot say.
+
+        Deliberately NOT folded into ``get_status``. This answers a
+        question asked ONCE per download — "is this a video, or a pile
+        of RAR parts nothing here can unpack?" — while
+        ``get_status``/``get_all`` run every few seconds for every
+        active torrent. Carrying a 40-file season pack's listing on
+        every one of those ticks would be paying the payload
+        continuously for an answer wanted once.
+
+        ``None`` means "couldn't ask". An EMPTY list means "asked, and
+        the client has no metadata yet" — a magnet that hasn't resolved.
+        Callers must read both as *unknown*, never as "no files":
+        refusing a release you cannot read is how a working one gets
+        thrown away."""
         ...
 
     async def remove(self, torrent_id: str, delete_files: bool = False) -> bool:

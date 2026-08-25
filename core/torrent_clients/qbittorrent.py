@@ -315,6 +315,23 @@ class QBittorrentAdapter:
             return None
         return self._parse_status(items[0])
 
+    async def list_files(self, torrent_id: str) -> Optional[List[str]]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._list_files_sync, torrent_id)
+
+    def _list_files_sync(self, torrent_id: str) -> Optional[List[str]]:
+        """qBittorrent returns [] for a magnet whose metadata hasn't arrived —
+        which is 'ask again', not 'this torrent is empty'. Passed straight
+        through; the caller owns that distinction."""
+        resp = self._call('GET', '/api/v2/torrents/files', params={'hash': torrent_id})
+        if not resp or not resp.ok:
+            return None
+        try:
+            return [str(f.get('name')) for f in (resp.json() or []) if f.get('name')]
+        except Exception as e:
+            logger.error("qBittorrent /torrents/files parse failed: %s", e)
+            return None
+
     async def get_all(self) -> List[TorrentStatus]:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._get_all_sync)

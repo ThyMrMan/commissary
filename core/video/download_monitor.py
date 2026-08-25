@@ -644,12 +644,55 @@ def _blocked_users(db):
         return frozenset()
 
 
+def _vanished_reason(dl) -> str:
+    """What actually went missing.
+
+    Every route into ``_fail_or_retry`` for a gone transfer said "Soulseek
+    transfer disappeared" — including torrent and usenet rows, which the Soulseek
+    path never touches. The single line a user had to go on named the wrong
+    subsystem entirely, and sent them looking at slskd for a torrent problem."""
+    src = str((dl or {}).get("source") or "").lower()
+    if src == "torrent":
+        return ("The torrent client no longer knows this torrent (removed there, "
+                "or its data cleared) and no file had been placed")
+    if src == "usenet":
+        return ("The usenet client no longer knows this job (removed there, or its "
+                "history cleared) and no file had been placed")
+    return "Soulseek transfer disappeared"
+
+
+def _plan_summary(plan) -> str:
+    """What the retry planner decided, in words."""
+    action = (plan or {}).get("action")
+    if action == "candidate":
+        cand = (plan or {}).get("candidate") or {}
+        return "trying the next stored candidate (%s)" % (
+            cand.get("release_title") or cand.get("filename") or "?")
+    if action == "requery":
+        return "searching again for %r" % ((plan or {}).get("query") or "?")
+    return "giving up — %s" % ((plan or {}).get("reason") or "no options left")
+
+
 def _fail_or_retry(db, dl, error_msg) -> None:
     """A download just failed/disappeared. Try the next candidate inline; if none,
     hand off to a requery thread; if nothing left, mark it failed for real — and
     put it back on the wishlist so it isn't silently lost."""
     from core.video.retry import plan_retry
     plan = plan_retry(dl, blocked=_blocked_pairs(db), blocked_users=_blocked_users(db))
+    # SAY IT. Every route into here was silent. A stall timeout, a client error
+    # and a vanished transfer all just... stopped, and then the requery worker
+    # overwrote `error` with its own summary — so the original reason reached
+    # neither the row nor the log. Two separate incidents on a live library could
+    # only be diagnosed afterwards by reading timestamps out of the database and
+    # inferring which branch must have run. This is the line that would have
+    # answered both in seconds.
+    try:
+        logger.warning("[Download] %r failed: %s | release=%r | %s",
+                       dl.get("title") or "?", error_msg or "no reason given",
+                       dl.get("release_title") or dl.get("filename") or "?",
+                       _plan_summary(plan))
+    except Exception:   # noqa: BLE001 - a diagnostic must never break the retry
+        pass
     if plan["action"] == "candidate" and _apply_candidate(db, dl["id"], dl, plan["candidate"], plan["rest"]):
         return
     if plan["action"] in ("candidate", "requery"):
@@ -774,6 +817,24 @@ def _requery_worker(dl_id) -> None:
         # back on the wishlist + archive it so it isn't silently lost.
         err = "No working release found after retries"
         final = db.get_video_download(dl_id) or {"id": dl_id}
+        # The end of the line, and previously its only trace was a row quietly
+        # flipping to 'failed'. Worth naming where the searching happened: this
+        # retry runs against SLSKD, for torrent rows too, so "found nothing" can
+        # simply mean Soulseek has nothing — which is a very different statement
+        # from the release being unavailable, and one you cannot make from the
+        # error text alone.
+        try:
+            _tried = json.loads(final.get("tried_queries") or "[]") or []
+        except (ValueError, TypeError):
+            _tried = []
+        try:
+            logger.warning("[Download] %r: %s — %s. Back on the wishlist.",
+                           final.get("title") or dl_id, err,
+                           ("%d quer%s tried against slskd" % (
+                               len(_tried), "y" if len(_tried) == 1 else "ies"))
+                           if _tried else "no further queries were available")
+        except Exception:   # noqa: BLE001 - a diagnostic never breaks the failure path
+            pass
         db.update_video_download(dl_id, status="failed", error=err, completed_at=_now())
         _wishlist_failed(db, final)
         _archive_history(db, final, {"status": "failed", "error": err, "completed_at": _now()})
@@ -837,10 +898,17 @@ def _tick(db) -> None:
             _misses[dl["id"]] = n
             if n >= _GIVE_UP_AFTER:
                 _misses.pop(dl["id"], None)
-                _fail_or_retry(db, dl, "Soulseek transfer disappeared")
+                _fail_or_retry(db, dl, _vanished_reason(dl))
             continue
         _misses.pop(dl["id"], None)
         if upd.get("status") == "failed":
+            # A release the CONTENTS prove bad — a pile of RAR parts nothing here
+            # can unpack — is not a transient failure, and it is a permanent
+            # property of that exact release. Blocklist it FIRST: plan_retry reads
+            # the blocklist to filter the stored candidate list, so doing it after
+            # would let the retry pick the very same release straight back off it.
+            if upd.get("_bad_release") and dl.get("username") and dl.get("filename"):
+                _blocklist_release(db, dl, upd.get("error") or "Bad release")
             _fail_or_retry(db, dl, upd.get("error"))      # auto-retry before truly failing
             continue
         # Stall/queue timeout — a transfer sitting with no % movement for too long
