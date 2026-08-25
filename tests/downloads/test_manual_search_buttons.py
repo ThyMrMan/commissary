@@ -140,13 +140,38 @@ def test_every_modal_offering_the_wishlist_also_offers_manual_search():
 
 
 def test_the_manual_search_button_sits_next_to_the_wishlist_one():
+    """Nothing UNRELATED may drift between the two footer actions.
+
+    The whole-album release picker is the one permitted neighbour, and it is
+    permitted because it is the manual search button's sibling: pick a file for
+    one ticked track, or pick a release for the whole album. Pushing it to the
+    far side of Add to Wishlist to satisfy a positional rule would separate the
+    two choices that belong together — the bug this test exists to prevent,
+    rather than the fix for it."""
     for name, src in _MODAL_SOURCES.items():
         manual_at = src.index('id="manual-search-btn-')
         wishlist_at = src.index('id="add-to-wishlist-btn-')
         between = src[min(manual_at, wishlist_at):max(manual_at, wishlist_at)]
-        assert between.count("<button") <= 1, (
-            f"{name}: something else was inserted between the two buttons"
+        strangers = between.count("<button") - between.count('id="album-release-btn-')
+        assert strangers <= 1, (
+            f"{name}: something other than the album release picker was "
+            f"inserted between the two buttons"
         )
+
+
+def test_only_the_shared_album_modal_needs_the_release_picker():
+    """Why exactly one of the four footers grew a button.
+
+    Every album surface — artist pages, discover, beatport, label detail,
+    library re-download, the search page — opens the SAME modal via
+    ``openDownloadMissingModalForArtistAlbum`` in shared-helpers.js. The other
+    three footers serve playlists and YouTube, which have no single album to
+    choose a release for. If a second footer ever starts rendering album
+    context, this is the test that should stop being true."""
+    shared = _MODAL_SOURCES["shared-helpers.js"]
+    assert 'id="album-release-btn-' in shared
+    for name in ("downloads.js", "sync-services.js", "sync-spotify.js"):
+        assert 'id="album-release-btn-' not in _MODAL_SOURCES[name], name
 
 
 def test_the_modal_action_routes_through_the_one_opener():

@@ -1676,6 +1676,14 @@ async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlis
                             style="background-color: #0ea5e9; color: white;">
                         🔎 Manual Search
                     </button>
+                    ${(typeof window.isAlbumContextPlaylistId === 'function'
+                       && window.isAlbumContextPlaylistId(virtualPlaylistId)) ? `
+                    <button class="download-control-btn" id="album-release-btn-${virtualPlaylistId}"
+                            onclick="openAlbumReleasePickerForModal('${virtualPlaylistId}')"
+                            title="Pick a release of the WHOLE album — every source that indexes complete albums is searched, and the one you choose is downloaded as a set instead of track by track."
+                            style="background-color: #14b8a6; color: white;">
+                        💿 Choose Release
+                    </button>` : ''}
                     <button class="download-control-btn" id="add-to-wishlist-btn-${virtualPlaylistId}" onclick="addModalTracksToWishlist('${virtualPlaylistId}')" style="background-color: #9333ea; color: white;">
                         Add to Wishlist
                     </button>

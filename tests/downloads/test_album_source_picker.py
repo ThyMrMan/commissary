@@ -24,9 +24,21 @@ import pathlib
 import pytest
 
 _ROOT = pathlib.Path(__file__).resolve().parents[2]
-_DOWNLOADS_JS = (_ROOT / "webui" / "static" / "downloads.js").read_text(encoding="utf-8")
-_SEARCH_JS = (_ROOT / "webui" / "static" / "search.js").read_text(encoding="utf-8")
-_CSS = (_ROOT / "webui" / "static" / "style.css").read_text(encoding="utf-8")
+
+
+def _js(*parts) -> str:
+    """A webui source with line endings normalised.
+
+    The repo stores these LF and a Windows checkout hands them back CRLF, so an
+    anchor spanning a newline passes on CI and fails only on a dev machine."""
+    return _ROOT.joinpath(*parts).read_text(encoding="utf-8").replace("\r\n", "\n")
+
+
+_DOWNLOADS_JS = _js("webui", "static", "downloads.js")
+_SEARCH_JS = _js("webui", "static", "search.js")
+_SHARED_JS = _js("webui", "static", "shared-helpers.js")
+_WISHLIST_JS = _js("webui", "static", "wishlist-tools.js")
+_CSS = _js("webui", "static", "style.css")
 
 
 # ── the pin is normalised, not trusted ───────────────────────────────────────
@@ -259,3 +271,79 @@ def test_the_picker_is_styled():
     for cls in ("album-source-row", "album-source-row-unpinnable",
                 "album-source-pick-btn", "album-sources-footer"):
         assert "." + cls in _CSS, cls
+
+
+# ── the album option in the Download Missing Tracks modal ───────────────────
+# Artist -> Album -> Download Now opens that modal, and its only manual option
+# was the per-track picker. That refusal is right for what it is — its
+# candidates are individual FILES, so "manually search these nine" means
+# nothing — but an album has its own kind of candidate. A release is a real
+# thing you can look at and choose, and there was no way to ask for one.
+
+def test_the_modal_offers_a_whole_album_release_picker():
+    assert "openAlbumReleasePickerForModal" in _SHARED_JS
+    assert "async function openAlbumReleasePickerForModal(" in _WISHLIST_JS
+    assert "window.openAlbumReleasePickerForModal = openAlbumReleasePickerForModal;" in _WISHLIST_JS
+
+
+def test_it_is_a_second_button_not_an_overloaded_first_one():
+    """The two do different things — one file versus a whole release — and the
+    per-track button is shared by four other pages that have no album at all."""
+    assert "💿 Choose Release" in _SHARED_JS
+    assert "🔎 Manual Search" in _SHARED_JS
+    body = _WISHLIST_JS.split("async function openManualSearchForModalSelection(", 1)[1]
+    body = body.split("async function openAlbumReleasePickerForModal(", 1)[0]
+    assert "openAlbumSourcePicker" not in body, "the track picker must stay per-track"
+
+
+def test_the_button_only_appears_where_a_pin_would_be_honoured():
+    """A button that opens a picker whose answer is then discarded is worse than
+    no button. Both sides now read the SAME predicate."""
+    assert "window.isAlbumContextPlaylistId(virtualPlaylistId)" in _SHARED_JS
+    assert "function isAlbumContextPlaylistId(" in _DOWNLOADS_JS
+    assert "window.isAlbumContextPlaylistId = isAlbumContextPlaylistId;" in _DOWNLOADS_JS
+    # ...and the request builder resolves album context through it too, rather
+    # than keeping its own copy of the prefix list to drift out of step.
+    assert "const _isAlbumContext = isAlbumContextPlaylistId(playlistId);" in _DOWNLOADS_JS
+
+
+def test_every_album_prefix_still_counts():
+    """The predicate was extracted from an inline expression; losing a prefix
+    would silently drop the button from that whole surface."""
+    body = _DOWNLOADS_JS.split("function isAlbumContextPlaylistId(", 1)[1].split("}", 1)[0]
+    for prefix in ("artist_album_", "enhanced_search_album_", "discover_album_",
+                   "seasonal_album_", "spotify_library_", "issue_download_",
+                   "library_redownload_", "beatport_release_"):
+        assert prefix in body, prefix
+
+
+def test_the_pick_rides_the_existing_download_path():
+    """No second download route: stash the pin against the playlist id and run
+    the ordinary flow, exactly as the search page already does."""
+    body = _WISHLIST_JS.split("async function openAlbumReleasePickerForModal(", 1)[1]
+    assert "window.setPendingAlbumPin(playlistId, pin)" in body
+    assert "startMissingTracksProcess(playlistId)" in body
+
+
+def test_a_running_album_is_not_started_twice():
+    """startMissingTracksProcess has no re-entrancy guard — it is simply what
+    Begin Analysis calls — so choosing a release after pressing that would open
+    a second batch for the same album."""
+    body = _WISHLIST_JS.split("async function openAlbumReleasePickerForModal(", 1)[1]
+    assert "process.status === 'running'" in body
+    assert body.index("process.status === 'running'") < body.index("openAlbumSourcePicker")
+
+
+def test_a_playlist_modal_without_one_album_is_refused():
+    """The button isn't rendered there, so this only fires if the predicate and
+    the render ever disagree — better to say so than to search for ''."""
+    body = _WISHLIST_JS.split("async function openAlbumReleasePickerForModal(", 1)[1]
+    assert "no single album to choose a release for" in body
+
+
+def test_the_track_picker_points_at_the_album_one():
+    """Otherwise the only way to find the second button is to notice it."""
+    body = _WISHLIST_JS.split("async function openManualSearchForModalSelection(", 1)[1]
+    body = body.split("async function openAlbumReleasePickerForModal(", 1)[0]
+    assert "isAlbumContextPlaylistId" in body
+    assert "Choose Release" in body

@@ -3491,6 +3491,13 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.0.11': [
+        { date: 'August 2026 · 2.0.11' },
+        { title: "Download a whole album by choosing the release, not track by track", desc: "Artist → Album → Download Now opens the Download Missing Tracks window, and its only manual option was the per-track picker — you had to tick exactly one song, pick a file for it, and repeat. There is now a <strong>💿 Choose Release</strong> button beside it that asks every source indexing whole albums what it has, shows the releases side by side — format, track count, size, seeders, tracker — and downloads the one you pick as a complete set." },
+        { title: "Why it is a second button and not a smarter first one", desc: "the per-track picker refuses a multi-selection on purpose: its candidates are individual <em>files</em>, so “search these nine” has no meaning and quietly searching the first would be the wrong song. That reasoning is right and stays. What was missing is that an album has a different kind of candidate — a release is a real thing you can look at and choose — so it gets its own button rather than an overloaded one, and the track picker now points at it when you have ticked more than one." },
+        { title: "Choosing is the instruction", desc: "picking a release starts the download there and then, rather than leaving you to press Begin Analysis afterwards and wonder whether the choice registered. <em>Let Commissary choose</em> is still offered and does exactly what Begin Analysis would have done. An album already downloading is refused rather than started a second time." },
+        { title: "It appears everywhere an album does", desc: "artist pages, Discover, Beatport, label pages, a library re-download and the search page all open the same window, so all of them gained it at once. Playlist and YouTube downloads do not — they have no single album to choose a release for, and the button is deliberately absent there rather than present and inert." },
+    ],
     '2.0.10': [
         { date: 'August 2026 · 2.0.10' },
         { title: "Downloads that quietly went nowhere", desc: "three faults that all ended the same way — a title sitting on the wishlist forever while the file it wanted was already on your disk. Each was invisible in the log, which is why they took so long to find." },
@@ -3910,6 +3917,20 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.0.11: choose the release for a whole album",
+        description: "Artist - Album - Download Now could only ever hand you the per-track picker: tick one song, pick a file, repeat. Albums now get a release picker of their own.",
+        features: [
+            "a new Choose Release button in the Download Missing Tracks window asks every source that indexes whole albums what it has",
+            "releases are shown side by side - format, track count, size, seeders, tracker - and the one you pick downloads as a complete set",
+            "it is a second button, not an overloaded first one: the per-track picker's candidates are individual FILES, so 'search these nine' has no meaning, and that refusal stays",
+            "the track picker now points at the album one when more than one track is ticked, so it is findable rather than something you have to notice",
+            "choosing a release starts the download immediately; 'Let Commissary choose' still does what Begin Analysis would",
+            "an album already downloading is refused rather than started twice",
+            "artist pages, Discover, Beatport, label pages, library re-downloads and search all share the same window, so all of them gained it at once",
+        ],
+        usage_note: "Nothing to configure. Open an album's Download Now window and the button sits beside Manual Search. Playlist and YouTube downloads do not show it - there is no single album there to choose a release for. Only torrent, usenet and Soulseek can be pinned to an exact release; other sources can be picked as a source but not as a specific copy.",
+    },
     {
         title: "2.0.10: downloads that quietly went nowhere",
         description: "Three faults with one symptom - a title stuck on the wishlist forever while the file it wanted was already downloaded. All three were invisible in the log, which is why they took so long to find.",

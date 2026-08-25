@@ -2798,7 +2798,7 @@ async function startMissingTracksProcess(playlistId) {
         // If this is an artist album download, use album name and include full context
         // Match 'artist_album_', 'enhanced_search_album_', 'discover_album_', and 'seasonal_album_' prefixes
         // Note: 'enhanced_search_track_' is excluded — single track search results use singles context
-        const _isAlbumContext = playlistId.startsWith('artist_album_') || playlistId.startsWith('enhanced_search_album_') || playlistId.startsWith('discover_album_') || playlistId.startsWith('seasonal_album_') || playlistId.startsWith('spotify_library_') || playlistId.startsWith('issue_download_') || playlistId.startsWith('library_redownload_') || playlistId.startsWith('beatport_release_');
+        const _isAlbumContext = isAlbumContextPlaylistId(playlistId);
         const _isSearchTrack = playlistId.startsWith('enhanced_search_track_') || playlistId.startsWith('gsearch_track_');
         if (_isAlbumContext || _isSearchTrack) {
             requestBody.playlist_name = process.album?.name || process.playlist.name;
@@ -3532,6 +3532,22 @@ window.openAlbumSourcePicker = openAlbumSourcePicker;
 // start button fires, which is a separate user action. Keyed by the virtual
 // playlist id the album flow already uses, so re-picking overwrites cleanly
 // and an abandoned pick can't attach itself to a different album.
+// Which virtual playlist ids carry ALBUM context — the ones whose download
+// request sends is_album_download and may therefore carry a pinned release.
+// A function rather than a repeated expression because two places now need the
+// same answer: startMissingTracksProcess, which honours a pin, and the modal
+// footer, which offers the button that creates one. If those two ever disagree
+// the button still opens, the user still chooses, and the choice is silently
+// discarded — the worst kind of wrong.
+function isAlbumContextPlaylistId(playlistId) {
+    const id = String(playlistId || '');
+    return id.startsWith('artist_album_') || id.startsWith('enhanced_search_album_')
+        || id.startsWith('discover_album_') || id.startsWith('seasonal_album_')
+        || id.startsWith('spotify_library_') || id.startsWith('issue_download_')
+        || id.startsWith('library_redownload_') || id.startsWith('beatport_release_');
+}
+window.isAlbumContextPlaylistId = isAlbumContextPlaylistId;
+
 const _pendingAlbumPins = {};
 function setPendingAlbumPin(virtualPlaylistId, pin) {
     if (pin) _pendingAlbumPins[virtualPlaylistId] = pin;

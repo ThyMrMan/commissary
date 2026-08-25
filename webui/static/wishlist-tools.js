@@ -1362,14 +1362,20 @@ async function openManualSearchForModalSelection(playlistId) {
     }
 
     const tracks = selectedModalTracks(playlistId, process);
+    // Where the whole-album picker exists, say so — otherwise the only way to
+    // discover it is to notice a second button you were not looking for.
+    const _albumHint = (typeof window.isAlbumContextPlaylistId === 'function'
+                        && window.isAlbumContextPlaylistId(playlistId))
+        ? ' To choose a release of the whole album instead, use 💿 Choose Release.'
+        : '';
     if (tracks.length === 0) {
-        showToast('Tick the track you want to search for', 'error');
+        showToast(`Tick the track you want to search for.${_albumHint}`, 'error');
         return;
     }
     if (tracks.length > 1) {
         showToast(
             `Manual search handles one track at a time — ${tracks.length} are ticked. ` +
-            `Leave just the one you want.`,
+            `Leave just the one you want.${_albumHint}`,
             'info',
         );
         return;
@@ -1403,6 +1409,63 @@ async function openManualSearchForModalSelection(playlistId) {
     }, document.getElementById(`manual-search-btn-${playlistId}`));
 }
 window.openManualSearchForModalSelection = openManualSearchForModalSelection;
+
+
+// The whole-album sibling of the button above.
+//
+// The per-track picker deliberately refuses a multi-selection, because "manually
+// search these nine" has no coherent meaning — its candidates are individual
+// FILES. That reasoning is sound and stays; what was missing is that an album
+// has its own kind of candidate. A release is a real thing you can look at and
+// choose: this format, this many tracks, this size, these seeders. So albums get
+// the release picker rather than an overloaded track one, and the two buttons
+// say plainly which is which.
+//
+// The pick rides the SAME path the search page already uses — stash it against
+// the playlist id, then run the normal flow — so nothing here forks a second
+// download route. startMissingTracksProcess consumes the pin exactly once.
+async function openAlbumReleasePickerForModal(playlistId) {
+    const process = activeDownloadProcesses[playlistId];
+    if (!process) {
+        showToast('No album data available', 'error');
+        return;
+    }
+    // Choosing a release starts the download, and startMissingTracksProcess has
+    // no re-entrancy guard of its own — it is simply what Begin Analysis calls.
+    // Pressing this after that button would start a second batch for the same
+    // album, so refuse rather than quietly doubling up.
+    if (process.status === 'running') {
+        showToast('This album is already downloading — close and reopen the modal '
+                  + 'to choose a different release', 'info');
+        return;
+    }
+    const albumName = (process.album && process.album.name) || '';
+    const artistName = (process.artist && process.artist.name) || '';
+    if (!albumName) {
+        // A playlist-context modal has tracks from many albums; there is no one
+        // release to choose. The button isn't rendered there, so this only fires
+        // if the two ever disagree — say so rather than searching for ''.
+        showToast('This download has no single album to choose a release for', 'error');
+        return;
+    }
+    if (typeof window.openAlbumSourcePicker !== 'function'
+            || typeof window.setPendingAlbumPin !== 'function') {
+        showToast('The release picker is unavailable on this page', 'error');
+        return;
+    }
+    await window.openAlbumSourcePicker(albumName, artistName, (pin) => {
+        window.setPendingAlbumPin(playlistId, pin);
+        // Choosing a release IS the instruction to download it — leaving the user
+        // to press Begin Analysis afterwards would make the pick look like it did
+        // nothing. "Let Commissary choose" lands here with a null pin and starts
+        // the ordinary run, which is exactly what Begin Analysis would have done.
+        showToast(pin
+            ? `Downloading that release of “${albumName}”`
+            : `Choosing a release automatically for “${albumName}”`, 'info');
+        startMissingTracksProcess(playlistId);
+    });
+}
+window.openAlbumReleasePickerForModal = openAlbumReleasePickerForModal;
 
 
 async function addModalTracksToWishlist(playlistId) {
