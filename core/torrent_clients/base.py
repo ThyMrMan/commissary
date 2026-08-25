@@ -204,7 +204,22 @@ async def add_torrent_smart(
     logger = get_logger('torrent.add')
 
     if not str(url_or_magnet or '').lower().startswith(('http://', 'https://')):
-        return await adapter.add_torrent(url_or_magnet, category=category, save_path=save_path)
+        # A magnet (or an empty URL, which is its own kind of bug). Handed
+        # straight over — there is nothing to fetch server-side.
+        ref = await adapter.add_torrent(url_or_magnet, category=category, save_path=save_path)
+        if not ref:
+            # The single most common thing a person needs to know when a grab
+            # "just doesn't work": the client was asked and said no. Across eight
+            # days of a real app.log there was not one line from this subsystem
+            # while one release was refused 324 times, so the refusal was
+            # unattributable — the reason lives in the adapter and died there.
+            logger.warning(
+                "The torrent client accepted nothing for a %s handoff (%s). "
+                "Common causes: the torrent is already in the client, the magnet "
+                "is malformed, or the client cannot reach the swarm.",
+                "magnet" if str(url_or_magnet or '').lower().startswith("magnet:")
+                else "non-HTTP", _strip_query(str(url_or_magnet or '')[:120]) or "<empty>")
+        return ref
 
     import asyncio
     loop = asyncio.get_event_loop()

@@ -58,7 +58,17 @@ def grab_torrent(url_or_magnet: str, *, category: Optional[str] = None,
         logger.warning("torrent add failed: %s", e, exc_info=True)
         return {"ok": False, "error": "Torrent client: " + str(e)}
     if not ref:
-        return {"ok": False, "error": "The torrent client didn't accept the release."}
+        # Name the handoff kind. A release the indexer only offers as a magnet
+        # behaves differently from one with a .torrent URL, and "didn't accept
+        # the release" alone cannot be acted on — it was logged 324 times for a
+        # single title over a week without ever saying what was tried.
+        kind = ("magnet" if str(url_or_magnet or '').lower().startswith("magnet:")
+                else "a .torrent URL" if str(url_or_magnet or '').lower().startswith("http")
+                else "an empty URL")
+        logger.warning("torrent client refused %s for this release (category=%s)",
+                       kind, cat)
+        return {"ok": False,
+                "error": "The torrent client didn't accept the release (handed over %s)." % kind}
     return {"ok": True, "ref": str(ref)}
 
 

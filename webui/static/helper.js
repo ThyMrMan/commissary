@@ -3491,6 +3491,14 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.0.8': [
+        { date: 'August 2026 · 2.0.8' },
+        { title: "The video side now says where it put a file, and why", desc: "this release adds no features and changes no behaviour. It closes two silences that made real problems impossible to investigate — both found while trying and failing to explain a show that had been filed as the wrong series." },
+        { title: "Every video import now logs its destination", desc: "the video import code contained <strong>no logging at all</strong> — not one line, anywhere in the file. So nothing ever recorded where a downloaded episode or film was placed, while the music side has logged its destination on every single import for years. When a show turned up filed under the wrong name, the only way to investigate was to read the database afterwards and work backwards, and that only tells you where it ENDED, never what it decided or why." },
+        { title: "And on whose authority it chose that name", desc: "the line says whether the name came from the title's own library entry (with the ids and year it used), from an existing copy already on disk, from a manual placement, or from the download request alone because the title is not in your library yet. That last case is the one that creates a folder your media server then has to guess the identity of — so it is worth being able to see it happen, rather than discovering it a week later." },
+        { title: "And when a download client refuses a release, it now says what it was handed", desc: "a refused grab said only <em>the torrent client didn't accept the release</em>. In eight days of logs one title produced that message <strong>324 times</strong> — twice an hour, every hour — while the download-client code logged nothing whatsoever, so there was no way to tell whether it had been handed a magnet link, a .torrent file, or nothing at all. Those three fail for completely different reasons and need completely different fixes." },
+        { title: "It also names the likely cause", desc: "a client that takes a magnet and returns nothing is most often telling you the torrent is <strong>already in it</strong> — a stalled or errored copy sitting there means every retry is rejected as a duplicate, forever, which is exactly what an hourly retry loop that never succeeds looks like. That, a malformed magnet, and a client that cannot reach the swarm are now spelled out in the log rather than left to guesswork." },
+    ],
     '2.0.7': [
         { date: 'August 2026 · 2.0.7' },
         { title: "Four fixes carried over from upstream, each verified as a real fault here first", desc: "Commissary forked from SoulSync 3.1.5 and has diverged a long way, so most of what lands upstream either does not apply or was already solved differently. These four were checked against this code before being taken." },
@@ -3885,6 +3893,19 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.0.8: the video side stops being silent",
+        description: "No features, no behaviour changes. Two silences closed, both found while trying and failing to explain a show that had been filed as the wrong series - the log simply did not contain the answer.",
+        features: [
+            "the video import code had NO logging at all - not one line in the file - so nothing ever recorded where a downloaded episode or film was placed, while the music side has logged its destination on every import for years",
+            "every video import now logs its destination, and whether the name came from the title's library entry (with the ids and year used), an existing copy on disk, a manual placement, or the download request alone",
+            "that last case is the one that creates a folder your media server has to guess the identity of - now visible as it happens rather than a week later",
+            "a refused grab said only 'the torrent client didn't accept the release' - logged 324 times for one title in eight days while the download-client code logged nothing at all",
+            "it now names what was handed over: a magnet, a .torrent URL, or an empty one. Those fail for different reasons and need different fixes",
+            "and names the likeliest cause - a client that takes a magnet and returns nothing is usually saying the torrent is ALREADY in it, so every retry is rejected as a duplicate forever",
+        ],
+        usage_note: "Nothing to configure and nothing changes about what gets downloaded or where. If a grab has been quietly retrying for days, the log will now tell you what it tried and what the client said - check your download client for a stalled or errored copy of the same release first.",
+    },
     {
         title: "2.0.7: four upstream fixes, each verified here first",
         description: "Commissary forked from SoulSync 3.1.5 and has diverged, so most of what lands upstream either does not apply or was already solved differently. These four were confirmed as real, present faults in this code before being taken.",

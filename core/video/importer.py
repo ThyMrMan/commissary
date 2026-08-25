@@ -26,7 +26,11 @@ import uuid
 from typing import Any, Callable
 
 from core.video import organization
+from utils.logging_config import get_logger
+
 from core.video.download_pipeline import basename_of
+
+logger = get_logger("video.importer")
 from core.video.library_paths import quality_full
 from core.video.quality_eval import resolution_rank
 from core.video.release_parse import parse_release
@@ -341,6 +345,31 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
     if library_dir and not force:
         dest = {"dir": library_dir, "filename": dest["filename"],
                 "path": os.path.join(library_dir, dest["filename"])}
+    # WHERE THIS FILE IS ABOUT TO GO, and on whose authority. The video import
+    # path logged nothing at all: across eight days of a real app.log there was
+    # not one line naming a destination, so "it got filed as the wrong show" could
+    # only be investigated by reading the database afterwards and guessing. The
+    # music side has logged `Resolved path:` on every import for years.
+    #
+    # The SOURCE matters as much as the path. A destination built from the grab
+    # rather than from the library row is exactly how a show acquires a second
+    # folder, so the line says which one it was — and names the ids it used, since
+    # an absent tmdb id is what leaves a folder the media server has to guess at.
+    try:
+        if library_dir and not force:
+            _why = "existing library copy"
+        elif force:
+            _why = "manual placement"
+        elif _ident:
+            _why = "library row (tmdb=%s tvdb=%s year=%s)" % (
+                _ident.get("tmdbid"), _ident.get("tvdbid"), _ident.get("year"))
+        else:
+            _why = "the grab alone — this title is not in the library yet"
+        logger.info("[Placement] %s %r -> %s  (naming from: %s)",
+                    scope, ctx.get("title") or "?", dest["path"], _why)
+    except Exception:   # noqa: BLE001 - a log line must never cost an import
+        pass
+
     # Where poster.jpg goes: the movie folder, or the SHOW root for an episode
     # (parent of the Season folder) — so it isn't dropped per-season.
     artwork_dir = dest["dir"] if scope == "movie" else os.path.dirname(dest["dir"])
