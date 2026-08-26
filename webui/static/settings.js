@@ -2056,10 +2056,10 @@ async function startPlexPinAuth() {
     const statusEl = document.getElementById('plex-pin-status');
     if (setupButtons) setupButtons.style.display = 'none';
     if (authFlow) authFlow.style.display = '';
-    if (statusEl) statusEl.textContent = 'Starting Plex authorization...';
+    if (statusEl) statusEl.textContent = 'Starting Plex authorization…';
 
     try {
-        showLoadingOverlay('Starting Plex authorization...');
+        showLoadingOverlay('Starting Plex authorization…');
         const response = await fetch('/api/plex/pin/start', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
@@ -2075,7 +2075,7 @@ async function startPlexPinAuth() {
         if (statusEl) {
             statusEl.textContent = result.expires_in
                 ? `Enter this code at plex.tv/link. Code expires in ${result.expires_in} seconds.`
-                : 'Enter this code at plex.tv/link. Waiting for authorization...';
+                : 'Enter this code at plex.tv/link. Waiting for authorization…';
         }
 
         startPlexPinAuthPolling();
@@ -2117,7 +2117,7 @@ async function pollPlexPinAuthStatus() {
 
         if (result.success) {
             stopPlexPinAuthPolling();
-            if (statusEl) statusEl.textContent = 'Authorization complete! Saving Plex configuration...';
+            if (statusEl) statusEl.textContent = 'Authorization complete! Saving Plex configuration…';
             document.getElementById('plex-url').value = result.found_url || '';
             document.getElementById('plex-token').value = result.token || '';
             if (typeof saveSettings === 'function') {
@@ -2141,7 +2141,7 @@ async function pollPlexPinAuthStatus() {
     } catch (error) {
         console.error('Error polling Plex PIN status:', error);
         const statusEl = document.getElementById('plex-pin-status');
-        if (statusEl) statusEl.textContent = 'Unable to contact Plex auth status. Retrying...';
+        if (statusEl) statusEl.textContent = 'Unable to contact Plex auth status. Retrying…';
     }
 }
 
@@ -4296,7 +4296,7 @@ async function _logViewerChangeSource() {
     _logViewerStop();
     _logViewerSource = document.getElementById('log-viewer-source')?.value || 'app';
     const container = document.getElementById('log-viewer-lines');
-    if (container) container.innerHTML = '<div class="log-line log-info">Loading...</div>';
+    if (container) container.innerHTML = '<div class="log-line log-info">Loading…</div>';
     await _logViewerInit();
 }
 
@@ -4319,7 +4319,7 @@ function _logViewerOnSearch(input) {
 function _logViewerReload() {
     _logViewerStop();
     const container = document.getElementById('log-viewer-lines');
-    if (container) container.innerHTML = '<div class="log-line log-info">Loading...</div>';
+    if (container) container.innerHTML = '<div class="log-line log-info">Loading…</div>';
     _logViewerInit();
 }
 
@@ -4377,8 +4377,8 @@ async function runDatabaseVacuum() {
     const status = document.getElementById('db-vacuum-status');
     if (!confirm('This will compact the database by rewriting it. The database will be locked during this operation. For large databases this may take over a minute. Continue?')) return;
     btn.disabled = true;
-    btn.textContent = 'Compacting...';
-    if (status) { status.style.display = 'block'; status.style.background = 'rgba(255,255,255,0.04)'; status.style.color = 'rgba(255,255,255,0.6)'; status.textContent = 'Running VACUUM — this may take a while...'; }
+    btn.textContent = 'Compacting…';
+    if (status) { status.style.display = 'block'; status.style.background = 'rgba(255,255,255,0.04)'; status.style.color = 'rgba(255,255,255,0.6)'; status.textContent = 'Running VACUUM — this may take a while…'; }
     try {
         const resp = await fetch('/api/database/maintenance/vacuum', { method: 'POST' });
         const data = await resp.json();
@@ -4404,8 +4404,8 @@ async function enableIncrementalVacuum() {
     const status = document.getElementById('db-vacuum-status');
     if (!confirm('This will enable incremental vacuum mode. It requires a one-time full VACUUM to activate, which locks the database and may take over a minute on large databases. Continue?')) return;
     btn.disabled = true;
-    btn.textContent = 'Enabling...';
-    if (status) { status.style.display = 'block'; status.style.background = 'rgba(255,255,255,0.04)'; status.style.color = 'rgba(255,255,255,0.6)'; status.textContent = 'Enabling incremental vacuum — this may take a while...'; }
+    btn.textContent = 'Enabling…';
+    if (status) { status.style.display = 'block'; status.style.background = 'rgba(255,255,255,0.04)'; status.style.color = 'rgba(255,255,255,0.6)'; status.textContent = 'Enabling incremental vacuum — this may take a while…'; }
     try {
         const resp = await fetch('/api/database/maintenance/enable-incremental-vacuum', { method: 'POST' });
         const data = await resp.json();
@@ -4472,7 +4472,7 @@ async function hydrabaseConnect() {
     }
     const statusEl = document.getElementById('hydra-connection-status');
     const btn = document.getElementById('hydra-connect-btn');
-    statusEl.textContent = 'Connecting...';
+    statusEl.textContent = 'Connecting…';
     statusEl.style.color = '#f0ad4e';
     try {
         const response = await fetch('/api/hydrabase/connect', {
@@ -4582,7 +4582,7 @@ async function hydrabaseSendRaw(textareaId) {
         payload.nonce = Date.now();
     }
     const responseArea = document.getElementById('hydra-response');
-    responseArea.textContent = 'Sending...';
+    responseArea.textContent = 'Sending…';
     try {
         const response = await fetch('/api/hydrabase/send', {
             method: 'POST',
@@ -5253,7 +5253,7 @@ async function saveSettings(quiet = false) {
     }
 
     try {
-        if (!quiet) showLoadingOverlay('Saving settings...');
+        if (!quiet) showLoadingOverlay('Saving settings…');
 
         // Save main settings
         const response = await fetch(API.settings, {
@@ -5337,7 +5337,7 @@ async function authorizeLastfmScrobbling() {
 
 async function testConnection(service) {
     try {
-        showLoadingOverlay(`Testing ${service} connection...`);
+        showLoadingOverlay(`Testing ${service} connection…`);
 
         const response = await fetch(API.testConnection, {
             method: 'POST',
@@ -5373,7 +5373,7 @@ async function testConnection(service) {
 async function clearQuarantine() {
     if (!await showConfirmDialog({ title: 'Clear Quarantine', message: 'Delete all files in the quarantine folder? This cannot be undone.', confirmText: 'Delete', destructive: true })) return;
     try {
-        showLoadingOverlay('Clearing quarantine folder...');
+        showLoadingOverlay('Clearing quarantine folder…');
         const response = await fetch('/api/quarantine/clear', { method: 'POST' });
         const result = await response.json();
         if (result.success) {
@@ -5422,7 +5422,7 @@ function renderApiKeys(keys) {
             <div style="flex: 1; min-width: 0;">
                 <div style="font-size: 13px; color: #e0e0e0; font-weight: 500;">${escapeHtml(k.label || 'Unnamed')}</div>
                 <div style="font-size: 11px; color: #666; margin-top: 2px;">
-                    <code>${escapeHtml(k.key_prefix || 'sk_...')}...</code>
+                    <code>${escapeHtml(k.key_prefix || 'sk_…')}…</code>
                     &middot; Created ${k.created_at ? new Date(k.created_at).toLocaleDateString() : 'unknown'}
                     ${k.last_used_at ? '&middot; Last used ' + new Date(k.last_used_at).toLocaleDateString() : ''}
                 </div>
@@ -5520,7 +5520,7 @@ async function testDashboardConnection(service) {
     // service to test is 'spotify'.
     if (service === 'spotify_free') service = 'spotify';
     try {
-        showLoadingOverlay(`Testing ${service} service...`);
+        showLoadingOverlay(`Testing ${service} service…`);
 
         const response = await fetch(API.testDashboardConnection, {
             method: 'POST',
@@ -5549,7 +5549,7 @@ async function testDashboardConnection(service) {
 // Individual Auto-detect functions - same as GUI
 async function autoDetectPlex() {
     try {
-        showLoadingOverlay('Auto-detecting Plex server...');
+        showLoadingOverlay('Auto-detecting Plex server…');
 
         const response = await fetch('/api/detect-media-server', {
             method: 'POST',
@@ -5576,7 +5576,7 @@ async function autoDetectPlex() {
 
 async function autoDetectJellyfin() {
     try {
-        showLoadingOverlay('Auto-detecting Jellyfin server...');
+        showLoadingOverlay('Auto-detecting Jellyfin server…');
 
         const response = await fetch('/api/detect-media-server', {
             method: 'POST',
@@ -5603,7 +5603,7 @@ async function autoDetectJellyfin() {
 
 async function autoDetectNavidrome() {
     try {
-        showLoadingOverlay('Auto-detecting Navidrome server...');
+        showLoadingOverlay('Auto-detecting Navidrome server…');
 
         const response = await fetch('/api/detect-media-server', {
             method: 'POST',
@@ -5630,7 +5630,7 @@ async function autoDetectNavidrome() {
 
 async function autoDetectSlskd() {
     try {
-        showLoadingOverlay('Auto-detecting Soulseek (slskd) server...');
+        showLoadingOverlay('Auto-detecting Soulseek (slskd) server…');
 
         const response = await fetch('/api/detect-soulseek', {
             method: 'POST',
@@ -5675,7 +5675,7 @@ function updateStatusDisplays() {
 
 async function authenticateSpotify() {
     try {
-        showLoadingOverlay('Saving credentials and starting Spotify authentication...');
+        showLoadingOverlay('Saving credentials and starting Spotify authentication…');
         // Save settings first to ensure client_id/client_secret are persisted
         await saveSettings();
         showToast('Spotify authentication started', 'success');
@@ -5696,7 +5696,7 @@ async function disconnectSpotify() {
         return;
     }
     try {
-        showLoadingOverlay('Disconnecting Spotify...');
+        showLoadingOverlay('Disconnecting Spotify…');
         const response = await fetch('/api/spotify/disconnect', { method: 'POST' });
         const data = await response.json();
         if (data.success) {
@@ -5796,7 +5796,7 @@ function closeRateLimitModal() {
 async function disconnectSpotifyFromRateLimit() {
     closeRateLimitModal();
     try {
-        showLoadingOverlay('Disconnecting Spotify...');
+        showLoadingOverlay('Disconnecting Spotify…');
         const response = await fetch('/api/spotify/disconnect', { method: 'POST' });
         const data = await response.json();
         if (data.success) {
@@ -5830,7 +5830,7 @@ function formatRateLimitDuration(seconds) {
 
 async function authenticateTidal() {
     try {
-        showLoadingOverlay('Saving credentials and starting Tidal authentication...');
+        showLoadingOverlay('Saving credentials and starting Tidal authentication…');
         // Save settings first to ensure credentials are persisted
         await saveSettings();
         showToast('Tidal authentication started', 'success');
@@ -5853,7 +5853,7 @@ async function disconnectTidal() {
         return;
     }
     try {
-        showLoadingOverlay('Disconnecting Tidal...');
+        showLoadingOverlay('Disconnecting Tidal…');
         const resp = await fetch('/api/tidal/disconnect', { method: 'POST' });
         const data = await resp.json();
         if (resp.ok && data.success) {
@@ -5871,7 +5871,7 @@ async function disconnectTidal() {
 
 async function authenticateDeezer() {
     try {
-        showLoadingOverlay('Saving credentials and starting Deezer authentication...');
+        showLoadingOverlay('Saving credentials and starting Deezer authentication…');
         await saveSettings();
         showToast('Deezer authentication started', 'success');
         window.open('/auth/deezer', '_blank');
@@ -5889,7 +5889,7 @@ async function testHiFiConnection() {
     const statusEl = document.getElementById('hifi-connection-status');
     const btn = document.getElementById('hifi-test-btn');
     if (!statusEl) return;
-    statusEl.textContent = 'Checking...';
+    statusEl.textContent = 'Checking…';
     statusEl.style.color = '#aaa';
     try {
         const resp = await fetch('/api/hifi/status');
@@ -5910,7 +5910,7 @@ async function testHiFiConnection() {
 async function testSoundcloudConnection() {
     const statusEl = document.getElementById('soundcloud-connection-status');
     if (!statusEl) return;
-    statusEl.textContent = 'Checking...';
+    statusEl.textContent = 'Checking…';
     statusEl.style.color = '#aaa';
     try {
         const resp = await fetch('/api/soundcloud/status');
@@ -5936,7 +5936,7 @@ async function testSoundcloudConnection() {
 async function testLidarrConnection() {
     const statusEl = document.getElementById('lidarr-connection-status');
     if (!statusEl) return;
-    statusEl.textContent = 'Checking...';
+    statusEl.textContent = 'Checking…';
     statusEl.style.color = '#aaa';
     try {
         // Save settings first so the backend has the URL/key
@@ -5979,7 +5979,7 @@ function _setIndStatusDot(dotId, state) {
 async function testProwlarrConnection() {
     const statusEl = document.getElementById('prowlarr-connection-status');
     if (!statusEl) return;
-    statusEl.textContent = 'Checking...';
+    statusEl.textContent = 'Checking…';
     statusEl.style.color = '#aaa';
     try {
         await saveSettings();
@@ -6025,7 +6025,7 @@ function updateUsenetClientUI() {
 async function testUsenetClientConnection() {
     const statusEl = document.getElementById('usenet-client-connection-status');
     if (!statusEl) return;
-    statusEl.textContent = 'Checking...';
+    statusEl.textContent = 'Checking…';
     statusEl.style.color = '#aaa';
     try {
         await saveSettings();
@@ -6054,7 +6054,7 @@ async function testUsenetClientConnection() {
 async function testTorrentClientConnection() {
     const statusEl = document.getElementById('torrent-client-connection-status');
     if (!statusEl) return;
-    statusEl.textContent = 'Checking...';
+    statusEl.textContent = 'Checking…';
     statusEl.style.color = '#aaa';
     try {
         await saveSettings();
@@ -6338,8 +6338,8 @@ async function checkHiFiInstances() {
     const btn = document.getElementById('hifi-instances-check-btn');
     if (!panel) return;
     panel.style.display = 'block';
-    panel.innerHTML = '<div style="color: rgba(255,255,255,0.4); font-size: 0.85em; padding: 8px 0;">Checking instances...</div>';
-    if (btn) { btn.disabled = true; btn.textContent = 'Checking...'; }
+    panel.innerHTML = '<div style="color: rgba(255,255,255,0.4); font-size: 0.85em; padding: 8px 0;">Checking instances…</div>';
+    if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
     try {
         const resp = await fetch('/api/hifi/instances');
         const data = await resp.json();
@@ -6375,7 +6375,7 @@ async function checkHiFiInstances() {
 async function testDeezerDownloadConnection() {
     const statusEl = document.getElementById('deezer-download-status');
     if (!statusEl) return;
-    statusEl.textContent = 'Checking...';
+    statusEl.textContent = 'Checking…';
     statusEl.style.color = '#aaa';
     try {
         let arl = document.getElementById('deezer-download-arl')?.value || '';
@@ -6405,7 +6405,7 @@ async function testDeezerDownloadConnection() {
 async function testAmazonConnection() {
     const statusEl = document.getElementById('amazon-connection-status');
     if (!statusEl) return;
-    statusEl.textContent = 'Checking...';
+    statusEl.textContent = 'Checking…';
     statusEl.style.color = '#aaa';
     try {
         const resp = await fetch('/api/amazon/test-connection');
@@ -6451,7 +6451,7 @@ async function startTidalDownloadAuth() {
     const codeEl = document.getElementById('tidal-download-auth-code');
 
     btn.disabled = true;
-    btn.textContent = 'Starting...';
+    btn.textContent = 'Starting…';
     statusEl.textContent = '';
 
     try {
@@ -6467,8 +6467,8 @@ async function startTidalDownloadAuth() {
         const code = data.user_code || '';
         codeEl.style.display = 'block';
         codeEl.innerHTML = `Go to <a href="${uri}" target="_blank" style="color:rgb(var(--accent-rgb));">${uri}</a> and enter code: <strong>${code}</strong>`;
-        btn.textContent = 'Waiting for approval...';
-        statusEl.textContent = 'Waiting...';
+        btn.textContent = 'Waiting for approval…';
+        statusEl.textContent = 'Waiting…';
         statusEl.style.color = '#ff9800';
 
         // Poll for completion
@@ -6566,7 +6566,7 @@ async function loginQobuzFromConnections() {
     }
 
     btn.disabled = true;
-    btn.textContent = 'Connecting...';
+    btn.textContent = 'Connecting…';
     statusEl.textContent = '';
 
     try {
@@ -6608,7 +6608,7 @@ async function loginQobuzWithToken() {
     }
 
     btn.disabled = true;
-    btn.textContent = 'Connecting...';
+    btn.textContent = 'Connecting…';
     if (statusEl) statusEl.textContent = '';
 
     try {
@@ -6648,7 +6648,7 @@ async function loginQobuzWithTokenFromDownloads() {
     }
 
     btn.disabled = true;
-    btn.textContent = 'Connecting...';
+    btn.textContent = 'Connecting…';
     if (statusEl) statusEl.textContent = '';
 
     try {
@@ -6689,7 +6689,7 @@ async function loginQobuz() {
     }
 
     btn.disabled = true;
-    btn.textContent = 'Connecting...';
+    btn.textContent = 'Connecting…';
     statusEl.textContent = '';
 
     try {

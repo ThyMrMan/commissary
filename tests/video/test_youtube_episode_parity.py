@@ -117,7 +117,7 @@ def test_owned_yt_rows_keep_the_download_button():
 def test_channel_season_bar_matches_tv_minus_manual_search():
     bar = _DETAIL_JS.split("Season-level acquisition bar")[1].split("host.innerHTML = seasonBar")[0]
     assert "isYt" in bar
-    assert "Grab ' + (isYt ? 'year' : 'season')" in bar
+    assert "Download ' + (isYt ? 'year' : 'season')" in bar
     assert "Wishlist ' + (isYt ? 'year' : 'season')" in bar
     assert "(isYt ? '' :" in bar                       # manual search hidden for channels
     assert "ytFilter.q" in bar                         # a filtered view isn't "the season"

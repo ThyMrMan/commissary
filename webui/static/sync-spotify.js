@@ -1407,11 +1407,11 @@ function getActionButtonText(phase) {
 function getPhaseText(phase) {
     switch (phase) {
         case 'fresh': return 'Ready to discover';
-        case 'discovering': return 'Discovering...';
+        case 'discovering': return 'Discovering…';
         case 'discovered': return 'Discovery Complete';
-        case 'syncing': return 'Syncing...';
+        case 'syncing': return 'Syncing…';
         case 'sync_complete': return 'Sync Complete';
-        case 'downloading': return 'Downloading...';
+        case 'downloading': return 'Downloading…';
         case 'download_complete': return 'Download Complete';
         default: return phase;
     }
@@ -1599,9 +1599,9 @@ async function loadSpotifyPlaylists() {
     const container = document.getElementById('spotify-playlist-container');
     const refreshBtn = document.getElementById('spotify-refresh-btn');
 
-    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading playlists...</div>`;
+    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading playlists…</div>`;
     refreshBtn.disabled = true;
-    refreshBtn.textContent = '🔄 Loading...';
+    refreshBtn.textContent = '🔄 Loading…';
 
     try {
         const response = await fetch('/api/spotify/playlists');
@@ -1689,7 +1689,7 @@ function updatePlaylistCardUI(playlistId) {
         progressBtn.classList.remove('hidden');
         progressBtn.textContent = 'View Progress';
         progressBtn.style.backgroundColor = '';  // Reset any custom styling
-        actionBtn.textContent = '📥 Downloading...';
+        actionBtn.textContent = '📥 Downloading…';
         actionBtn.disabled = true;
 
         // Remove completion styling from card
@@ -1835,7 +1835,7 @@ async function openPlaylistDetailsModal(event, playlistId) {
     const playlist = spotifyPlaylists.find(p => p.id === playlistId);
     if (!playlist) return;
 
-    showLoadingOverlay(`Loading playlist: ${playlist.name}...`);
+    showLoadingOverlay(`Loading playlist: ${playlist.name}…`);
 
     try {
         const cacheStale = typeof playlistTrackCacheIsStale === 'function'
@@ -2191,7 +2191,7 @@ function applyProgressiveTrackRendering(playlistId, totalTrackCount) {
 }
 
 async function openDownloadMissingModal(playlistId) {
-    showLoadingOverlay('Loading playlist...');
+    showLoadingOverlay('Loading playlist…');
 
     // **NEW**: Check if a process is already active for this playlist
     const playlistMeta = spotifyPlaylists.find(p => p.id === playlistId);

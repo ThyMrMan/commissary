@@ -672,7 +672,7 @@ function updateSpotifyEnrichmentStatusFromData(data) {
         } else if (data.current_item && data.current_item.name) {
             tooltipCurrent.textContent = `Now: ${data.current_item.name}`;
         } else {
-            tooltipCurrent.textContent = 'Waiting for next item...';
+            tooltipCurrent.textContent = 'Waiting for next item…';
         }
     }
 
@@ -1950,7 +1950,7 @@ let _repairCurrentTab = 'jobs';
 let _repairFindingsPage = 0;
 let _repairSelectedFindings = new Set();
 let _repairFindingsTotal = 0;
-let _repairFindingsAutoSwitched = false;  // Set after auto-switching to "All Status" so we don't loop
+let _repairFindingsAutoSwitched = false;  // Set after auto-switching to "All Statuses" so we don't loop
 // Findings per page — user-adjustable (pertti: 30 was the only option besides
 // Fix All). Persisted per browser.
 let REPAIR_FINDINGS_PAGE_SIZE = (() => {
@@ -2632,7 +2632,7 @@ async function openCacheHealthModal() {
             <div class="cache-health-body">
                 <div class="cache-health-loading">
                     <div class="watch-all-loading-spinner"></div>
-                    <div>Loading cache stats...</div>
+                    <div>Loading cache stats…</div>
                 </div>
             </div>
             <div class="cache-health-footer">
@@ -2744,12 +2744,12 @@ async function openFailedMBLookupsModal() {
             <div class="failed-mb-toolbar">
                 <div class="failed-mb-tabs" id="failed-mb-tabs"></div>
                 <div class="failed-mb-search-row">
-                    <input type="text" id="failed-mb-search" class="failed-mb-search-input" placeholder="Filter by name...">
+                    <input type="text" id="failed-mb-search" class="failed-mb-search-input" placeholder="Filter by name…">
                     <button class="failed-mb-btn failed-mb-btn-danger" onclick="_failedMBClearAll()">Clear All Failed</button>
                 </div>
             </div>
             <div class="failed-mb-body" id="failed-mb-body">
-                <div class="cache-health-loading"><div class="watch-all-loading-spinner"></div><div>Loading...</div></div>
+                <div class="cache-health-loading"><div class="watch-all-loading-spinner"></div><div>Loading…</div></div>
             </div>
             <div class="failed-mb-footer" id="failed-mb-footer"></div>
         </div>
@@ -2971,8 +2971,8 @@ async function _runMBSearch(entryId) {
     if (!query) return;
 
     goBtn.disabled = true;
-    goBtn.textContent = 'Searching...';
-    resultsEl.innerHTML = '<div class="cache-health-loading"><div class="watch-all-loading-spinner"></div><div>Searching MusicBrainz...</div></div>';
+    goBtn.textContent = 'Searching…';
+    resultsEl.innerHTML = '<div class="cache-health-loading"><div class="watch-all-loading-spinner"></div><div>Searching MusicBrainz…</div></div>';
 
     try {
         const params = new URLSearchParams({ type, q: query, limit: 10 });
@@ -3002,7 +3002,7 @@ async function _runMBSearch(entryId) {
                         ${r.disambiguation ? `<div class="mb-search-result-disambig">${escapeHtml(r.disambiguation)}</div>` : ''}
                         ${detail ? `<div class="mb-search-result-detail">${escapeHtml(detail)}</div>` : ''}
                     </div>
-                    <div class="mb-search-result-mbid" title="${r.mbid}">${r.mbid.substring(0, 8)}...</div>
+                    <div class="mb-search-result-mbid" title="${r.mbid}">${r.mbid.substring(0, 8)}…</div>
                 </div>
             `;
         }).join('');
@@ -3083,7 +3083,7 @@ async function loadRepairFindings() {
         if (items.length === 0) {
             // If the user is on the default "pending" filter and there are
             // ZERO pending rows but other statuses (dismissed/resolved) do
-            // have rows, auto-switch the filter to "All Status" so the user
+            // have rows, auto-switch the filter to "All Statuses" so the user
             // sees the carry-over findings instead of an empty pane. Common
             // case: scanner re-found same issues that were dismissed
             // previously — dedup-skip means no new pending row, so the
@@ -3105,7 +3105,7 @@ async function loadRepairFindings() {
                                 const notice = document.createElement('div');
                                 notice.className = 'repair-auto-switch-notice';
                                 notice.style.cssText = 'background:rgba(96,165,250,0.08);border:1px solid rgba(96,165,250,0.25);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#cbd5e1;';
-                                notice.innerHTML = `No <b>pending</b> findings, but ${otherTotal.toLocaleString()} carry-over (resolved/dismissed/auto-fixed). Showing <b>All Status</b> — change the filter above to switch back.`;
+                                notice.innerHTML = `No <b>pending</b> findings, but ${otherTotal.toLocaleString()} carry-over (resolved/dismissed/auto-fixed). Showing <b>All Statuses</b> — change the filter above to switch back.`;
                                 list.parentNode.insertBefore(notice, list);
                             }
                             return;
@@ -3791,7 +3791,7 @@ async function fixAllMatchingFindings() {
                 confirmText: 'Clear All',
                 destructive: false
             })) return;
-            showToast(`Clearing ${_repairFindingsTotal} findings...`, 'info');
+            showToast(`Clearing ${_repairFindingsTotal} findings…`, 'info');
             try {
                 const resp = await fetch('/api/repair/findings/clear', {
                     method: 'POST',
@@ -3867,7 +3867,7 @@ async function fixAllMatchingFindings() {
         });
         const result = await response.json();
         if (result.started) {
-            showToast(`Fixing ${result.total} findings in the background...`, 'info');
+            showToast(`Fixing ${result.total} findings in the background…`, 'info');
             _watchBulkFixRun();
         } else if (result.already_running) {
             showToast('A bulk fix is already running — showing its progress', 'info');
@@ -3933,7 +3933,7 @@ function _watchBulkFixRun() {
 
 function stopBulkFixRun() {
     fetch('/api/repair/bulk-fix/stop', { method: 'POST' }).catch(() => {});
-    showToast('Stopping after the current fix...', 'info');
+    showToast('Stopping after the current fix…', 'info');
 }
 
 async function _checkBulkFixResume() {
@@ -3965,14 +3965,14 @@ function renderRepairFindingsPagination(total, currentPage) {
 
     if (startPage > 0) {
         html += `<button class="repair-page-btn" onclick="_repairFindingsPage=0;loadRepairFindings()">1</button>`;
-        if (startPage > 1) html += '<span class="repair-page-info">...</span>';
+        if (startPage > 1) html += '<span class="repair-page-info">…</span>';
     }
     for (let i = startPage; i < endPage; i++) {
         html += `<button class="repair-page-btn ${i === currentPage ? 'active' : ''}"
                          onclick="_repairFindingsPage=${i};loadRepairFindings()">${i + 1}</button>`;
     }
     if (endPage < totalPages) {
-        if (endPage < totalPages - 1) html += '<span class="repair-page-info">...</span>';
+        if (endPage < totalPages - 1) html += '<span class="repair-page-info">…</span>';
         html += `<button class="repair-page-btn" onclick="_repairFindingsPage=${totalPages - 1};loadRepairFindings()">${totalPages}</button>`;
     }
 
@@ -4076,7 +4076,7 @@ async function fixRepairFinding(id, findingType) {
     if (fixBtn) {
         originalText = fixBtn.textContent;
         fixBtn.disabled = true;
-        fixBtn.textContent = '...';
+        fixBtn.textContent = '…';
     }
     try {
         const body = fixAction ? { fix_action: fixAction } : {};
@@ -4403,7 +4403,7 @@ async function bulkFixFindings() {
     }
 
     let fixed = 0, failed = 0, lastError = '';
-    showToast(`Fixing ${ids.length} findings...`, 'info');
+    showToast(`Fixing ${ids.length} findings…`, 'info');
 
     for (const id of ids) {
         try {

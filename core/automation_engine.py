@@ -392,7 +392,7 @@ SYSTEM_AUTOMATIONS = [
         'owned_by': 'video',
     },
     {
-        'name': 'RSS Sync (Instant Grabs)',            # indexers' newest releases vs the wishlist
+        'name': 'RSS Sync (Instant Downloads)',        # indexers' newest releases vs the wishlist
         'trigger_type': 'schedule',
         'trigger_config': {'interval': 15, 'unit': 'minutes'},
         'action_type': 'video_rss_sync',
@@ -633,6 +633,7 @@ class AutomationEngine:
         self._fix_airing_automation_schedule()
         self._fix_deep_scan_schedules()
         self._fix_wishlist_processor_rename()
+        self._fix_rss_sync_rename()
 
     def _fix_video_scan_default(self):
         """Remove the obsolete standalone 'Scan Video Library' SYSTEM automation — it's
@@ -677,6 +678,24 @@ class AutomationEngine:
                             yt.get('id'))
         except Exception:
             logger.exception("wishlist processor rename migration failed")
+
+    def _fix_rss_sync_rename(self):
+        """Rename the RSS Sync system automation's 'Grabs' -> 'Downloads' so a DB
+        seeded under the old label doesn't keep showing it forever.
+
+        The seeder only sets ``name`` when it CREATES a row, and
+        ``get_system_automation_by_action`` matches on action_type — so a rename in
+        the spec alone is invisible on every existing install, with no duplicate to
+        hint at it. Guarded on the exact old name, so a row the user renamed
+        themselves is left alone. Idempotent — no-ops once renamed."""
+        try:
+            auto = self.db.get_system_automation_by_action('video_rss_sync')
+            if auto and auto.get('name') == 'RSS Sync (Instant Grabs)':
+                self.db.update_automation(auto['id'], name='RSS Sync (Instant Downloads)')
+                logger.info("Renamed RSS Sync automation -> 'RSS Sync (Instant Downloads)' (id=%s)",
+                            auto.get('id'))
+        except Exception:
+            logger.exception("RSS sync rename migration failed")
 
     def _fix_airing_automation_schedule(self):
         """Migrate 'Auto-Wishlist Episodes Airing Today' from the old rolling 24h

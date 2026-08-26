@@ -748,7 +748,7 @@
                 '<div class="vcm-actions">' +
                     '<button class="vcm-btn vcm-btn--ghost" type="button" data-vcm-close>Close</button>' +
                     (wishable ? '<button class="vcm-btn vcm-btn--ghost vcm-btn--wish" type="button" data-vcm-wish disabled' +
-                        (upcoming ? ' title="Grabs automatically once it airs"' : '') + '>＋ Wishlist episode</button>' : '') +
+                        (upcoming ? ' title="Downloads automatically once it airs"' : '') + '>＋ Wishlist episode</button>' : '') +
                     '<button class="vcm-btn vcm-btn--primary" type="button" data-vcm-open>Open full show page →</button>' +
                 '</div>' +
             '</div>';

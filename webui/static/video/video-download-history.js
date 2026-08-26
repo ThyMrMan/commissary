@@ -320,7 +320,7 @@
             body.innerHTML = '<div class="vdh-empty">' +
                 '<div class="vdh-empty-ic">📦</div>' +
                 '<div class="vdh-empty-t">' + (state.search ? 'No matches' : 'Nothing here yet') + '</div>' +
-                '<div class="vdh-empty-s">' + (state.search ? 'Try a different search.' : 'Grabs you complete will be recorded here forever.') + '</div></div>';
+                '<div class="vdh-empty-s">' + (state.search ? 'Try a different search.' : 'Downloads you complete will be recorded here forever.') + '</div></div>';
             return;
         }
         // Group rows under day headers (timeline feel).

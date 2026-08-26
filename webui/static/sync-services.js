@@ -5,9 +5,9 @@ async function loadTidalPlaylists() {
     const container = document.getElementById('tidal-playlist-container');
     const refreshBtn = document.getElementById('tidal-refresh-btn');
 
-    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading Tidal playlists...</div>`;
+    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading Tidal playlists…</div>`;
     refreshBtn.disabled = true;
-    refreshBtn.textContent = '🔄 Loading...';
+    refreshBtn.textContent = '🔄 Loading…';
 
     try {
         const response = await fetch('/api/tidal/playlists');
@@ -379,9 +379,9 @@ function updateCompletedModalResults(playlistId, downloadData) {
             let statusText = '';
             switch (task.status) {
                 case 'pending': statusText = '⏸️ Pending'; break;
-                case 'searching': statusText = '🔍 Searching...'; break;
-                case 'downloading': statusText = `⏬ Downloading... ${Math.round(task.progress || 0)}%`; break;
-                case 'post_processing': statusText = '⌛ Processing...'; break; // NEW VERIFICATION WORKFLOW
+                case 'searching': statusText = '🔍 Searching…'; break;
+                case 'downloading': statusText = `⏬ Downloading… ${Math.round(task.progress || 0)}%`; break;
+                case 'post_processing': statusText = '⌛ Processing…'; break; // NEW VERIFICATION WORKFLOW
                 case 'completed': statusText = '✅ Completed'; completedCount++; break;
                 case 'not_found': statusText = '🔇 Not Found'; notFoundCount++; break;
                 case 'failed': statusText = '❌ Failed'; failedOrCancelledCount++; break;
@@ -1310,7 +1310,7 @@ async function startTidalDownloadMissing(urlHash) {
 }
 
 async function openDownloadMissingModalForTidal(virtualPlaylistId, playlistName, spotifyTracks, options = {}) {
-    showLoadingOverlay('Loading Tidal playlist...');
+    showLoadingOverlay('Loading Tidal playlist…');
     // Check if a process is already active for this virtual playlist
     if (activeDownloadProcesses[virtualPlaylistId]) {
         console.log(`Modal for ${virtualPlaylistId} already exists. Showing it.`);
@@ -1523,9 +1523,9 @@ async function loadQobuzPlaylists() {
     const container = document.getElementById('qobuz-playlist-container');
     const refreshBtn = document.getElementById('qobuz-refresh-btn');
 
-    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading Qobuz playlists...</div>`;
+    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading Qobuz playlists…</div>`;
     refreshBtn.disabled = true;
-    refreshBtn.textContent = '🔄 Loading...';
+    refreshBtn.textContent = '🔄 Loading…';
 
     try {
         const response = await fetch('/api/qobuz/playlists');
@@ -1654,7 +1654,7 @@ async function handleQobuzCardClick(playlistId) {
     if (state.phase === 'fresh') {
         if (!state.playlist.tracks || state.playlist.tracks.length === 0) {
             console.log(`🎵 Fetching tracks for Qobuz playlist: ${state.playlist.name}`);
-            showLoadingOverlay(`Loading ${state.playlist.name}...`);
+            showLoadingOverlay(`Loading ${state.playlist.name}…`);
             try {
                 const resp = await fetch(`/api/qobuz/playlist/${playlistId}`);
                 if (resp.ok) {
@@ -2444,9 +2444,9 @@ async function loadDeezerArlPlaylists() {
     const container = document.getElementById('deezer-arl-playlist-container');
     const refreshBtn = document.getElementById('deezer-arl-refresh-btn');
 
-    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading playlists...</div>`;
+    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading playlists…</div>`;
     refreshBtn.disabled = true;
-    refreshBtn.textContent = '🔄 Loading...';
+    refreshBtn.textContent = '🔄 Loading…';
 
     try {
         const response = await fetch('/api/deezer/arl-playlists');
@@ -2544,7 +2544,7 @@ async function openDeezerArlPlaylistDetailsModal(event, playlistId) {
     if (!playlist) return;
 
     const arlPlaylistId = `deezer_arl_${playlistId}`;
-    showLoadingOverlay(`Loading playlist: ${playlist.name}...`);
+    showLoadingOverlay(`Loading playlist: ${playlist.name}…`);
 
     try {
         const playlistMeta = { ...playlist, track_count: playlist.track_count ?? playlist.tracks?.length };
@@ -2683,7 +2683,7 @@ function updateDeezerArlPlaylistCardUI(playlistId) {
         progressBtn.classList.remove('hidden');
         progressBtn.textContent = 'View Progress';
         progressBtn.style.backgroundColor = '';
-        actionBtn.textContent = '📥 Downloading...';
+        actionBtn.textContent = '📥 Downloading…';
         actionBtn.disabled = true;
         if (card) card.classList.remove('download-complete');
     } else if (process && process.status === 'complete') {
@@ -2744,7 +2744,7 @@ async function loadDeezerPlaylist() {
     const parseBtn = document.getElementById('deezer-parse-btn');
     if (parseBtn) {
         parseBtn.disabled = true;
-        parseBtn.textContent = 'Loading...';
+        parseBtn.textContent = 'Loading…';
     }
 
     try {
@@ -4072,7 +4072,7 @@ async function handleDbUpdateButtonClick() {
             // second click reads "Starting..." and falls through to the stop
             // branch below, so there's no double-start risk.
             button.disabled = false;
-            button.textContent = 'Starting...';
+            button.textContent = 'Starting…';
             const response = await fetch('/api/database/update', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -4202,7 +4202,7 @@ async function cleanupWishlist(playlistId) {
         const cleanupBtn = document.getElementById(`cleanup-wishlist-btn-${playlistId}`);
         if (cleanupBtn) {
             cleanupBtn.disabled = true;
-            cleanupBtn.textContent = '🧹 Cleaning...';
+            cleanupBtn.textContent = '🧹 Cleaning…';
         }
 
         const response = await fetch('/api/wishlist/cleanup', {
@@ -4266,7 +4266,7 @@ async function clearWishlist(playlistId) {
         const clearBtn = document.getElementById(`clear-wishlist-btn-${playlistId}`);
         if (clearBtn) {
             clearBtn.disabled = true;
-            clearBtn.textContent = 'Clearing...';
+            clearBtn.textContent = 'Clearing…';
         }
 
         // Call the clear API endpoint
@@ -4369,7 +4369,7 @@ async function clearBeatportPlaylists() {
 
     // Show loading state
     clearBtn.disabled = true;
-    clearBtn.textContent = '🗑️ Clearing...';
+    clearBtn.textContent = '🗑️ Clearing…';
 
     try {
         // Clear all Beatport chart states
@@ -4462,7 +4462,7 @@ async function loadBeatportGenres() {
     genreGrid.innerHTML = `
         <div class="genre-loading-placeholder">
             <div class="loading-spinner"></div>
-            <p>🔍 Discovering current Beatport genres...</p>
+            <p>🔍 Discovering current Beatport genres…</p>
         </div>
     `;
 
@@ -4694,8 +4694,8 @@ async function handleHomepageChartTypeClick(chartType, chartEndpoint, chartName)
     }
 
     try {
-        showToast(`Loading ${chartConfig.name}...`, 'info');
-        showLoadingOverlay(`Loading ${chartConfig.name}...`);
+        showToast(`Loading ${chartConfig.name}…`, 'info');
+        showLoadingOverlay(`Loading ${chartConfig.name}…`);
 
         const response = await fetch(`${chartConfig.endpoint}?limit=${chartConfig.limit}`);
         if (!response.ok) {
@@ -4995,7 +4995,7 @@ async function handleRebuildChartClick(trackDataKey, chartName, chartType) {
         }
 
         console.log(`✅ Got ${trackData.length} tracks from ${chartName}, enriching one-by-one...`);
-        showLoadingOverlay(`Fetching track metadata... (0/${trackData.length})`);
+        showLoadingOverlay(`Fetching track metadata… (0/${trackData.length})`);
 
         const enrichedTracks = await _enrichTracksWithProgress(trackData, chartName);
 
@@ -5478,7 +5478,7 @@ async function startBeatportPlaylistSync(urlHash) {
         updateBeatportModalButtons(urlHash, 'syncing');
         startBeatportSyncPolling(urlHash, syncPlaylistId);
 
-        showToast('Starting Beatport playlist sync...', 'success');
+        showToast('Starting Beatport playlist sync…', 'success');
 
     } catch (error) {
         console.error('❌ Error starting Beatport sync:', error);
@@ -5807,8 +5807,8 @@ async function handleBeatportChartClick(chartType, chartId, chartName, chartEndp
     console.log(`🎵 Beatport chart clicked: ${chartType} - ${chartId} - ${chartName}`);
 
     try {
-        showToast(`Loading ${chartName}...`, 'info');
-        showLoadingOverlay(`Loading ${chartName}...`);
+        showToast(`Loading ${chartName}…`, 'info');
+        showLoadingOverlay(`Loading ${chartName}…`);
 
         const response = await fetch(`${chartEndpoint}?limit=100`);
         if (!response.ok) {
@@ -6276,8 +6276,8 @@ function setupDJChartItemHandlers() {
             console.log(`🎧 DJ Chart clicked: ${chartName}`);
 
             try {
-                showToast(`Loading ${chartName}...`, 'info');
-                showLoadingOverlay(`Scraping ${chartName}...`);
+                showToast(`Loading ${chartName}…`, 'info');
+                showLoadingOverlay(`Scraping ${chartName}…`);
 
                 const response = await fetch('/api/beatport/chart/extract', {
                     method: 'POST',
@@ -6320,8 +6320,8 @@ function setupFeaturedChartItemHandlers() {
             console.log(`⭐ Featured Chart clicked: ${chartName}`);
 
             try {
-                showToast(`Loading ${chartName}...`, 'info');
-                showLoadingOverlay(`Scraping ${chartName}...`);
+                showToast(`Loading ${chartName}…`, 'info');
+                showLoadingOverlay(`Scraping ${chartName}…`);
 
                 const response = await fetch('/api/beatport/chart/extract', {
                     method: 'POST',
@@ -6367,8 +6367,8 @@ function setupNewChartItemHandlers(genreSlug, genreId, genreName) {
             const fullChartName = `${chartName} (${genreName})`;
 
             try {
-                showToast(`Loading ${chartName}...`, 'info');
-                showLoadingOverlay(`Scraping ${chartName}...`);
+                showToast(`Loading ${chartName}…`, 'info');
+                showLoadingOverlay(`Scraping ${chartName}…`);
 
                 const response = await fetch('/api/beatport/chart/extract', {
                     method: 'POST',
@@ -6554,8 +6554,8 @@ function setupGenreChartItemHandlers(genreSlug, genreId, genreName) {
             const fullChartName = `${chartName} (${genreName})`;
 
             try {
-                showToast(`Loading ${chartName}...`, 'info');
-                showLoadingOverlay(`Scraping ${chartName}...`);
+                showToast(`Loading ${chartName}…`, 'info');
+                showLoadingOverlay(`Scraping ${chartName}…`);
 
                 const response = await fetch('/api/beatport/chart/extract', {
                     method: 'POST',
@@ -6652,8 +6652,8 @@ async function handleGenreChartTypeClick(genreSlug, genreId, genreName, chartTyp
     }
 
     try {
-        showToast(`Loading ${chartConfig.name}...`, 'info');
-        showLoadingOverlay(`Loading ${chartConfig.name}...`);
+        showToast(`Loading ${chartConfig.name}…`, 'info');
+        showLoadingOverlay(`Loading ${chartConfig.name}…`);
 
         const response = await fetch(`${chartConfig.endpoint}?limit=${chartConfig.limit}`);
         if (!response.ok) {
@@ -6709,7 +6709,7 @@ async function parseSpotifyPublicUrl() {
     const parseBtn = document.getElementById('spotify-public-parse-btn');
     if (parseBtn) {
         parseBtn.disabled = true;
-        parseBtn.textContent = 'Loading...';
+        parseBtn.textContent = 'Loading…';
     }
 
     try {
@@ -7734,7 +7734,7 @@ async function parseITunesLinkUrl() {
     const parseBtn = document.getElementById('itunes-link-parse-btn');
     if (parseBtn) {
         parseBtn.disabled = true;
-        parseBtn.textContent = 'Loading...';
+        parseBtn.textContent = 'Loading…';
     }
 
     try {
@@ -8780,7 +8780,7 @@ function renderUrlHistory(source) {
     container.style.display = 'flex';
     container.innerHTML = `<span class="url-history-bar-label">Recent</span>` +
         history.map(h => {
-            const rawName = h.name.length > 30 ? h.name.substring(0, 28) + '...' : h.name;
+            const rawName = h.name.length > 30 ? h.name.substring(0, 28) + '…' : h.name;
             const safeName = escapeHtml(rawName);
             const safeTitle = escapeHtml(h.name);
             const safeUrl = h.url.replace(/"/g, '&quot;');
@@ -8967,16 +8967,16 @@ function createYouTubeCard(url, phase = 'fresh') {
         <div class="youtube-playlist-card" id="youtube-card-${tempHash}" data-url="${url}">
             <div class="playlist-card-icon youtube-icon">▶</div>
             <div class="playlist-card-content">
-                <div class="playlist-card-name">Parsing YouTube playlist...</div>
+                <div class="playlist-card-name">Parsing YouTube playlist…</div>
                 <div class="playlist-card-info">
                     <span class="playlist-card-track-count">-- tracks</span>
-                    <span class="playlist-card-phase-text" style="color: #999;">Loading...</span>
+                    <span class="playlist-card-phase-text" style="color: #999;">Loading…</span>
                 </div>
             </div>
             <div class="playlist-card-progress hidden">
                 ♪ 0 / ✓ 0 / ✗ 0 / 0%
             </div>
-            <button class="playlist-card-action-btn" disabled>Parsing...</button>
+            <button class="playlist-card-action-btn" disabled>Parsing…</button>
         </div>
     `;
 
@@ -9064,7 +9064,7 @@ function updateYouTubeCardPhase(urlHash, phase) {
             break;
 
         case 'discovering':
-            phaseTextElement.textContent = 'Discovering...';
+            phaseTextElement.textContent = 'Discovering…';
             phaseTextElement.style.color = '#ffa500'; // Orange
             actionBtn.textContent = 'View Progress';
             actionBtn.disabled = false;
@@ -9080,7 +9080,7 @@ function updateYouTubeCardPhase(urlHash, phase) {
             break;
 
         case 'syncing':
-            phaseTextElement.textContent = 'Syncing...';
+            phaseTextElement.textContent = 'Syncing…';
             phaseTextElement.style.color = '#ffa500'; // Orange
             actionBtn.textContent = 'View Progress';
             actionBtn.disabled = false;
@@ -9096,7 +9096,7 @@ function updateYouTubeCardPhase(urlHash, phase) {
             break;
 
         case 'downloading':
-            phaseTextElement.textContent = 'Downloading...';
+            phaseTextElement.textContent = 'Downloading…';
             phaseTextElement.style.color = '#ffa500'; // Orange
             actionBtn.textContent = 'View Downloads';
             actionBtn.disabled = false;
@@ -9694,7 +9694,7 @@ function getModalActionButtons(urlHash, phase, state = null) {
                 }
             } else {
                 // Discovering phase - show progress
-                return `<div class="modal-info">🔍 Discovering ${currentMusicSourceName} matches...</div>`;
+                return `<div class="modal-info">🔍 Discovering ${currentMusicSourceName} matches…</div>`;
             }
 
         case 'discovered':
@@ -10007,30 +10007,30 @@ function getModalDescription(phase, isTidal = false, isBeatport = false, isListe
     const source = isMirrored ? 'mirrored' : (isSpotifyPublic ? 'Spotify' : (isITunesLink ? 'iTunes' : (isDeezer ? 'Deezer' : (isLastfmRadio ? 'Last.fm Radio' : (isListenBrainz ? 'ListenBrainz' : (isBeatport ? 'Beatport' : (isQobuz ? 'Qobuz' : (isTidal ? 'Tidal' : 'YouTube'))))))));
     switch (phase) {
         case 'fresh':
-            return `Ready to discover clean ${currentMusicSourceName} metadata for ${source} tracks...`;
+            return `Ready to discover clean ${currentMusicSourceName} metadata for ${source} tracks…`;
         case 'discovering':
-            return `Discovering clean ${currentMusicSourceName} metadata for ${source} tracks...`;
+            return `Discovering clean ${currentMusicSourceName} metadata for ${source} tracks…`;
         case 'discovered':
         case 'downloading':
         case 'download_complete':
             return 'Discovery complete! View the results below.';
         default:
-            return `Discovering clean ${currentMusicSourceName} metadata for ${source} tracks...`;
+            return `Discovering clean ${currentMusicSourceName} metadata for ${source} tracks…`;
     }
 }
 
 function getInitialProgressText(phase, isTidal = false, isBeatport = false, isListenBrainz = false) {
     switch (phase) {
         case 'fresh':
-            return 'Click Start Discovery to begin...';
+            return 'Click Start Discovery to begin…';
         case 'discovering':
-            return 'Starting discovery...';
+            return 'Starting discovery…';
         case 'discovered':
         case 'downloading':
         case 'download_complete':
             return 'Discovery completed!';
         default:
-            return 'Starting discovery...';
+            return 'Starting discovery…';
     }
 }
 
@@ -10194,7 +10194,7 @@ function generateInitialTableRows(tracks, isTidal = false, urlHash = '', isBeatp
         <tr id="discovery-row-${urlHash}-${index}">
             <td class="yt-track">${trackName}</td>
             <td class="yt-artist">${artistName}</td>
-            <td class="discovery-status">🔍 Pending...</td>
+            <td class="discovery-status">🔍 Pending…</td>
             <td class="spotify-track">-</td>
             <td class="spotify-artist">-</td>
             <td class="spotify-album">-</td>
@@ -11480,7 +11480,7 @@ async function startListenBrainzDiscovery(playlistMbid) {
             results: []
         });
 
-        showToast('Starting ListenBrainz discovery...', 'info');
+        showToast('Starting ListenBrainz discovery…', 'info');
 
     } catch (error) {
         console.error('❌ Error starting ListenBrainz discovery:', error);
@@ -11544,7 +11544,7 @@ async function startListenBrainzPlaylistSync(playlistMbid) {
             updateYouTubeModalButtons(playlistMbid, 'syncing');
         }
 
-        showToast('Starting ListenBrainz sync...', 'info');
+        showToast('Starting ListenBrainz sync…', 'info');
 
     } catch (error) {
         console.error('❌ Error starting ListenBrainz sync:', error);

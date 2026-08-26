@@ -142,14 +142,14 @@
             // empty, and fires onStale so the section can poll.
             isStale: null,
             renderStale: null,
-            staleMessage: 'Updating...',
+            staleMessage: 'Updating…',
             // Hooks
             beforeLoad: null,    // (ctx) => void   — before spinner shows
             onSuccess: null,     // (data, ctx) => void — after success gate
             onStale: null,       // (ctx) => void   — when stale state renders
             onRendered: null,    // (ctx) => void   — after content renders
             // UX copy
-            loadingMessage: 'Loading...',
+            loadingMessage: 'Loading…',
             emptyMessage: 'Nothing to show',
             errorMessage: 'Failed to load',
             loadingClass: 'discover-loading',

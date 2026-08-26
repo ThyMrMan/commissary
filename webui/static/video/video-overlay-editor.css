@@ -56,7 +56,7 @@
 /* generic buttons — same shape/weight as .vgm-btn / .vpm-apply across the video UI */
 .voe-btn {
     display: inline-flex; align-items: center; gap: 8px; font: inherit;
-    font-size: 13px; font-weight: 700; padding: 10px 18px; border-radius: 11px; cursor: pointer;
+    font-size: var(--btn-fs-lg); font-weight: var(--btn-fw-bold); padding: 10px 18px; border-radius: var(--btn-r-lg); cursor: pointer;
     color: rgba(255,255,255,.82); background: rgba(255,255,255,.06);
     border: 1px solid rgba(255,255,255,.12); transition: all .15s ease;
 }
@@ -457,7 +457,7 @@ select.voe-input option { background: #17171d; }
 .voe-seg { display: inline-flex; background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.1);
     border-radius: 9px; padding: 2px; gap: 2px; }
 .voe-seg-btn { border: none; background: transparent; color: rgba(255,255,255,.55); cursor: pointer;
-    padding: 6px 10px; border-radius: 7px; font: inherit; font-size: 12px; font-weight: 700; transition: all .12s; display: grid; place-items: center; }
+    padding: 6px 10px; border-radius: var(--btn-r-sm); font: inherit; font-size: var(--btn-fs-md); font-weight: var(--btn-fw-bold); transition: all .12s; display: grid; place-items: center; }
 .voe-seg-btn svg { width: 15px; height: 15px; }
 .voe-seg-btn:hover { color: #fff; }
 .voe-seg-btn--on { background: rgba(var(--a),.25); color: #fff; }

@@ -49,13 +49,13 @@ body[data-side="video"] .side-toggle-thumb {
     justify-content: center;
     gap: 6px;
     padding: 7px 6px;
-    font-size: 11.5px;
-    font-weight: 600;
+    font-size: var(--btn-fs-md);
+    font-weight: var(--btn-fw-medium);
     letter-spacing: 0.02em;
     color: var(--text-secondary, #9aa0aa);
     background: transparent;
     border: none;
-    border-radius: 8px;
+    border-radius: var(--btn-r-md);
     cursor: pointer;
     transition: color 0.2s ease;
 }
@@ -783,7 +783,7 @@ body[data-side="video"] .dashboard-header-sweep {
 .vd-pills { display: flex; flex-wrap: wrap; gap: 9px; }
 .vd-pill-btn { display: inline-flex; align-items: center; gap: 9px; padding: 9px 16px; border-radius: 999px; cursor: pointer;
     background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.14); color: rgba(255,255,255,0.82);
-    font-size: 13.5px; font-weight: 700; transition: all 0.2s ease; }
+    font-size: var(--btn-fs-xl); font-weight: var(--btn-fw-bold); transition: all 0.2s ease; }
 .vd-pill-btn:hover { background: rgba(255,255,255,0.1); border-color: rgba(var(--vd-accent-rgb), 0.4); }
 .vd-pill-btn--active { background: rgba(var(--vd-accent-rgb), 0.9); border-color: transparent; color: #fff;
     box-shadow: 0 4px 16px rgba(var(--vd-accent-rgb), 0.4); }
@@ -1014,8 +1014,8 @@ body[data-side="video"] .dashboard-header-sweep {
 
 /* ── Detail extras: trailer button, providers, More Like This, trailer modal ── */
 .vd-trailer-btn {
-    display: inline-flex; align-items: center; gap: 8px; padding: 7px 18px; border-radius: 8px;
-    font-size: 12.5px; font-weight: 800; letter-spacing: 0.02em; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 8px; padding: 7px 18px; border-radius: var(--btn-r-md);
+    font-size: var(--btn-fs-md); font-weight: var(--btn-fw-bold); letter-spacing: 0.02em; cursor: pointer;
     color: #fff; background: rgb(var(--vd-accent-rgb)); border: 1px solid transparent;
     box-shadow: 0 6px 18px rgba(var(--vd-accent-rgb), 0.4); transition: all 0.2s ease;
 }
@@ -1322,7 +1322,7 @@ a.vd-prov:hover img, a.vd-prov:hover .vd-prov-ph { border-color: rgba(var(--vd-a
 @keyframes vsr-glow { from { opacity: 0.65; } to { opacity: 1; } }
 .vsr-hero-title {
     position: relative; z-index: 1; margin: 0 0 8px;
-    font-size: clamp(2em, 4vw, 3em); font-weight: 900; letter-spacing: -0.02em; color: #fff;
+    font-size: 28px; font-weight: 700; letter-spacing: -0.3px; color: #fff;
     text-shadow: 0 4px 30px rgba(0, 0, 0, 0.6);
 }
 .vsr-hero-sub { position: relative; z-index: 1; margin: 0 0 26px; font-size: 14.5px; color: rgba(255, 255, 255, 0.6); }
@@ -1643,6 +1643,7 @@ a.vd-prov:hover img, a.vd-prov:hover .vd-prov-ph { border-color: rgba(var(--vd-a
        base -40px bleed was overshooting the 16px padding by 24px per side). */
     .vsr-page, .vp-page, .vst-page { margin-left: -16px; margin-right: -16px; }
     .vsr-hero { padding: 34px 18px 22px; }
+    .vsr-hero-title { font-size: 24px; }
     .vsr-body, .vp-body, .vst-body { padding-left: 18px; padding-right: 18px; }
     .vp-hero { flex-direction: column; align-items: center; text-align: center; padding: 104px 18px 24px; }
     .vst-hero { flex-direction: column; align-items: center; text-align: center; padding: 104px 18px 24px; }
@@ -1655,7 +1656,7 @@ a.vd-prov:hover img, a.vd-prov:hover .vd-prov-ph { border-color: rgba(var(--vd-a
     .vsr-page, .vp-page, .vst-page { margin-left: -12px; margin-right: -12px; }
     .vsr-body, .vp-body, .vst-body { padding-left: 14px; padding-right: 14px; }
     .vsr-hero { padding: 28px 14px 20px; }
-    .vsr-hero-title { font-size: 26px; }
+    .vsr-hero-title { font-size: 20px; }
     .vsr-searchbar { height: 50px; border-radius: 13px; }
     .vsr-grid { grid-template-columns: repeat(auto-fill, minmax(108px, 1fr)); gap: 14px 10px; }
 }
@@ -1664,8 +1665,8 @@ a.vd-prov:hover img, a.vd-prov:hover .vd-prov-ph { border-color: rgba(var(--vd-a
 /* Matches .vd-trailer-btn exactly (consistent with the other hero buttons) —
    just green to read as "owned / play". */
 .vd-play-btn {
-    display: inline-flex; align-items: center; gap: 7px; padding: 7px 18px; border-radius: 8px;
-    font-size: 12.5px; font-weight: 800; letter-spacing: 0.02em; cursor: pointer; text-decoration: none;
+    display: inline-flex; align-items: center; gap: 7px; padding: 7px 18px; border-radius: var(--btn-r-md);
+    font-size: var(--btn-fs-md); font-weight: var(--btn-fw-bold); letter-spacing: 0.02em; cursor: pointer; text-decoration: none;
     color: #fff; border: 1px solid transparent;
     /* deeper green so the light Plex/Jellyfin wordmark reads clearly on it */
     background: linear-gradient(135deg, #1fae54, #15803d);
@@ -2010,7 +2011,7 @@ body[data-side="video"] #soulsync-toggle { display: none; }
     width: 860px; height: 390px; pointer-events: none; z-index: 0;
     background: radial-gradient(56% 70% at 50% 0%, rgba(var(--vcal-accent), 0.26), transparent 70%); filter: blur(10px);
 }
-.vcal-title { position: relative; z-index: 1; font-size: 36px; font-weight: 800; letter-spacing: -0.025em; margin: 0; }
+.vcal-title { position: relative; z-index: 1; font-size: 26px; font-weight: 700; letter-spacing: -0.5px; margin: 0; }
 .vcal-sub { position: relative; z-index: 1; margin: 7px 0 0; color: rgba(255, 255, 255, 0.55); font-size: 14px; font-weight: 600; }
 .vcal-body { padding: 4px 40px 0; }
 .vcal-loading { padding: 90px 0; text-align: center; }
@@ -2207,7 +2208,7 @@ body[data-side="video"] #soulsync-toggle { display: none; }
 .vcm-about-ov { font-size: 13.5px; line-height: 1.6; color: rgba(255, 255, 255, 0.72); margin: 0; }
 
 .vcm-actions { display: flex; justify-content: flex-end; gap: 10px; padding: 4px 26px 24px; }
-.vcm-btn { font-size: 13px; font-weight: 800; padding: 11px 18px; border-radius: 12px; cursor: pointer; border: 1px solid transparent; transition: all 0.15s ease; }
+.vcm-btn { font-size: var(--btn-fs-lg); font-weight: var(--btn-fw-bold); padding: 11px 18px; border-radius: var(--btn-r-xl); cursor: pointer; border: 1px solid transparent; transition: all 0.15s ease; }
 .vcm-btn--ghost { background: rgba(255, 255, 255, 0.06); border-color: rgba(255, 255, 255, 0.12); color: rgba(255, 255, 255, 0.82); }
 .vcm-btn--ghost:hover { background: rgba(255, 255, 255, 0.12); color: #fff; }
 .vcm-btn--primary { background: hsl(var(--vcm-h), 68%, 52%); color: #fff; box-shadow: 0 8px 24px hsla(var(--vcm-h), 70%, 45%, 0.4); }
@@ -2249,8 +2250,8 @@ body[data-side="video"] #soulsync-toggle { display: none; }
 .vcal-bb-sub { font-size: 15px; color: rgba(255, 255, 255, 0.82); margin-top: 9px; font-weight: 600; }
 .vcal-bb-se { font-weight: 800; color: #fff; }
 .vcal-bb-actions { display: flex; align-items: center; gap: 14px; margin-top: 22px; }
-.vcal-bb-btn { display: inline-flex; align-items: center; font-size: 13.5px; font-weight: 800; padding: 12px 22px;
-    border-radius: 12px; background: #fff; color: #0a0a0e; box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+.vcal-bb-btn { display: inline-flex; align-items: center; font-size: var(--btn-fs-xl); font-weight: var(--btn-fw-bold); padding: 12px 22px;
+    border-radius: var(--btn-r-xl); background: #fff; color: #0a0a0e; box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
     transition: transform 0.15s ease; }
 .vcal-bb:hover .vcal-bb-btn { transform: translateY(-2px); }
 .vcal-bb-badge { font-size: 12px; font-weight: 800; padding: 6px 13px; border-radius: 999px;
@@ -2314,15 +2315,15 @@ body[data-side="video"] #soulsync-toggle { display: none; }
 .vcal-nav-today:disabled { opacity: 0.34; cursor: default; }
 .vcal-filter { display: inline-flex; gap: 3px; padding: 4px; border-radius: 12px;
     background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.08); }
-.vcal-filter-btn { border: 0; background: transparent; color: rgba(255, 255, 255, 0.7); font-size: 12.5px; font-weight: 700;
-    padding: 7px 14px; border-radius: 8px; cursor: pointer; transition: all 0.15s ease; }
+.vcal-filter-btn { border: 0; background: transparent; color: rgba(255, 255, 255, 0.7); font-size: var(--btn-fs-md); font-weight: var(--btn-fw-bold);
+    padding: 7px 14px; border-radius: var(--btn-r-md); cursor: pointer; transition: all 0.15s ease; }
 .vcal-filter-btn:hover { color: #fff; background: rgba(255, 255, 255, 0.08); }
 .vcal-filter-btn--on { color: #fff; background: rgba(var(--vcal-accent), 0.9); box-shadow: 0 4px 14px rgba(var(--vcal-accent), 0.32); }
 /* view switcher (cards ↔ compact) — mirrors the filter pill group, with icons */
 .vcal-views { display: inline-flex; gap: 3px; padding: 4px; border-radius: 12px;
     background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.08); }
 .vcal-view-btn { display: inline-flex; align-items: center; gap: 6px; border: 0; background: transparent;
-    color: rgba(255, 255, 255, 0.7); font-size: 12.5px; font-weight: 700; padding: 7px 13px; border-radius: 8px;
+    color: rgba(255, 255, 255, 0.7); font-size: var(--btn-fs-md); font-weight: var(--btn-fw-bold); padding: 7px 13px; border-radius: var(--btn-r-md);
     cursor: pointer; transition: all 0.15s ease; }
 .vcal-view-btn svg { opacity: 0.85; }
 .vcal-view-btn:hover { color: #fff; background: rgba(255, 255, 255, 0.08); }
@@ -2417,7 +2418,7 @@ body[data-side="video"] #soulsync-toggle { display: none; }
 /* Requests page (P4) — the in-app Overseerr */
 .vreq-page { padding: 26px 30px 60px; max-width: 900px; margin: 0 auto; }
 .vreq-head { margin-bottom: 20px; }
-.vreq-title-h { margin: 0; font-size: 26px; font-weight: 800; letter-spacing: -0.02em; color: #fff; }
+.vreq-title-h { margin: 0; font-size: 26px; font-weight: 700; letter-spacing: -0.5px; color: #fff; }
 .vreq-sub-h { margin: 6px 0 0; font-size: 13px; color: rgba(255, 255, 255, 0.55); }
 .vreq-row { display: flex; gap: 14px; align-items: flex-start; padding: 14px; border-radius: 14px;
     border: 1px solid rgba(255, 255, 255, 0.07); background: rgba(255, 255, 255, 0.025); margin-bottom: 12px; }
@@ -2435,7 +2436,7 @@ body[data-side="video"] #soulsync-toggle { display: none; }
 .vreq-st--approved { background: rgba(34, 197, 94, 0.16); color: #4ade80; }
 .vreq-st--denied { background: rgba(248, 113, 113, 0.14); color: #f87171; }
 .vreq-actions { display: flex; gap: 8px; flex: 0 0 auto; }
-.vreq-btn { padding: 8px 14px; border-radius: 10px; font-size: 12.5px; font-weight: 700; cursor: pointer;
+.vreq-btn { padding: 8px 14px; border-radius: var(--btn-r-lg); font-size: var(--btn-fs-md); font-weight: var(--btn-fw-bold); cursor: pointer;
     border: 1px solid rgba(255, 255, 255, 0.14); background: rgba(255, 255, 255, 0.05); color: #fff; }
 .vreq-btn:hover { background: rgba(255, 255, 255, 0.1); }
 .vreq-btn:disabled { opacity: 0.5; cursor: default; }
@@ -2564,7 +2565,7 @@ body[data-side="video"] #soulsync-toggle { display: none; }
     background: radial-gradient(56% 70% at 50% 0%, rgba(var(--accent-rgb, 88 101 242), 0.22), transparent 70%); filter: blur(10px); }
 .vwlp-head-row { position: relative; z-index: 1; display: flex; align-items: flex-end;
     justify-content: space-between; gap: 20px; flex-wrap: wrap; }
-.vwlp-title { font-size: 36px; font-weight: 800; letter-spacing: -0.025em; margin: 0; }
+.vwlp-title { font-size: 26px; font-weight: 700; letter-spacing: -0.5px; margin: 0; }
 .vwlp-sub { margin: 7px 0 0; color: rgba(255, 255, 255, 0.55); font-size: 14px; font-weight: 600; }
 
 /* Tabs match the wishlist: individual pills, SELECTED = accent outline + ring glow
@@ -2753,7 +2754,6 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
        phone — the no-wrap row ran the Channels tab clean off-screen. */
     .vwlp-tabs { flex-wrap: wrap; }
     .vwlp-tab { padding: 8px 14px; font-size: 13px; }
-    .vwlp-title { font-size: 28px; }
 }
 
 /* Ensure the show poster box is a positioning context for its .vwl-btn
@@ -2841,13 +2841,8 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
 .vgm-overview { font-size: 14px; line-height: 1.65; color: rgba(255, 255, 255, 0.82); margin: 0; }
 .vgm-overview--none { color: rgba(255, 255, 255, 0.4); font-style: italic; }
 .vgm-actions { display: flex; justify-content: flex-end; gap: 10px; padding: 20px 28px 26px; }
-.vgm-btn { font-size: 13px; font-weight: 800; padding: 11px 20px; border-radius: 12px; cursor: pointer;
+.vgm-btn { font-size: var(--btn-fs-lg); font-weight: var(--btn-fw-bold); padding: 11px 20px; border-radius: var(--btn-r-xl); cursor: pointer;
     border: 1px solid transparent; transition: all 0.15s ease; }
-.vgm-btn--ghost { background: rgba(255, 255, 255, 0.06); border-color: rgba(255, 255, 255, 0.12); color: rgba(255, 255, 255, 0.82); }
-.vgm-btn--ghost:hover { background: rgba(255, 255, 255, 0.12); color: #fff; }
-.vgm-btn--primary { background: rgb(var(--accent-rgb, 88 101 242)); color: #fff;
-    box-shadow: 0 8px 24px rgba(var(--accent-rgb, 88 101 242), 0.4); }
-.vgm-btn--primary:hover { filter: brightness(1.08); transform: translateY(-1px); }
 @media (max-width: 560px) { .vgm-actions { flex-direction: column-reverse; } .vgm-btn { width: 100%; } }
 
 /* ── Get-modal: poster + ratings + owned-note + next-up ───────────────────── */
@@ -2989,8 +2984,6 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
 
 /* footer */
 .vgm-sel-count { margin-right: auto; font-size: 13px; font-weight: 700; color: rgba(255, 255, 255, 0.55); }
-.vgm-btn--text { background: transparent; border-color: transparent; color: rgba(255, 255, 255, 0.6); padding: 11px 8px; }
-.vgm-btn--text:hover { color: #fff; }
 .vgm-btn:disabled { opacity: 0.4; cursor: default; transform: none !important; filter: none !important; }
 
 /* "Add to watchlist" offer in the show get-modal (airing + not-yet-followed) */
@@ -3052,15 +3045,6 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
 .vgm-poster { box-shadow: 0 14px 34px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(0, 0, 0, 0.4),
     0 0 28px -6px hsla(var(--vgm-h, 230), 80%, 58%, 0.5); }
 .vgm-overlay.vgm-open .vgm-poster { animation: vgmRise 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) 0.12s both; }
-
-/* primary CTA — hue-aware gradient + glow + lift */
-.vgm-btn--primary {
-    background: linear-gradient(135deg, hsl(var(--vgm-h, 230), 70%, 58%), hsl(var(--vgm-h, 230), 72%, 47%));
-    box-shadow: 0 10px 30px hsla(var(--vgm-h, 230), 70%, 45%, 0.45);
-}
-.vgm-btn--primary:hover:not(:disabled) { transform: translateY(-2px); filter: brightness(1.07);
-    box-shadow: 0 16px 42px hsla(var(--vgm-h, 230), 75%, 50%, 0.6); }
-.vgm-btn--primary:active:not(:disabled) { transform: translateY(0); }
 
 /* close button spins on hover */
 .vgm-close { transition: transform 0.25s ease, background 0.2s ease, border-color 0.2s ease; }
@@ -3143,7 +3127,7 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
 .vdsc-bar { display: flex; align-items: flex-end; justify-content: space-between; gap: 14px;
     flex-wrap: wrap; margin: 0 0 14px; }
 .vdsc-bar.hidden { display: none; }
-.vdsc-bar-title { font-size: 24px; font-weight: 900; letter-spacing: -0.02em; color: #fff; margin: 0; }
+.vdsc-bar-title { font-size: 26px; font-weight: 700; letter-spacing: -0.5px; color: #fff; margin: 0; }
 .vdsc-bar-sub { font-size: 12.5px; color: rgba(255, 255, 255, 0.45); margin: 3px 0 0; }
 .vdsc-bar-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .vdsc-btn--active { border-color: rgba(var(--accent-rgb, 88 101 242), 0.55);
@@ -3202,7 +3186,7 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
 .vdsc-group { content-visibility: auto; contain-intrinsic-size: auto 760px; }
 
 /* ── Browse button (shared by the Browse panel + grid header) ─────────────── */
-.vdsc-btn { padding: 10px 18px; border-radius: 10px; font-size: 13px; font-weight: 800; cursor: pointer;
+.vdsc-btn { padding: 10px 18px; border-radius: var(--btn-r-lg); font-size: var(--btn-fs-lg); font-weight: var(--btn-fw-bold); cursor: pointer;
     border: 1px solid transparent; background: rgb(var(--accent-rgb, 88 101 242)); color: #fff;
     box-shadow: 0 8px 22px rgba(var(--accent-rgb, 88 101 242), 0.34); transition: all 0.15s ease; }
 .vdsc-btn:hover { filter: brightness(1.08); transform: translateY(-1px); }
@@ -3361,15 +3345,6 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
 .vsr-card:hover .vsr-notint { opacity: 1; }
 .vsr-notint:hover { background: rgba(220, 38, 38, 0.92); color: #fff; transform: scale(1.12); }
 
-/* ── Ignore-list button (top-right of the hero) ────────────────────────────── */
-.vdsc-ignore-btn { position: absolute; top: 16px; right: 18px; z-index: 8;
-    display: inline-flex; align-items: center; gap: 6px; padding: 7px 13px; border-radius: 999px;
-    font-size: 12.5px; font-weight: 600; cursor: pointer; color: rgba(255, 255, 255, 0.82);
-    background: rgba(12, 12, 16, 0.55); border: 1px solid rgba(255, 255, 255, 0.14);
-    backdrop-filter: blur(10px); transition: all .18s ease; }
-.vdsc-ignore-btn:hover { color: #fff; background: rgba(220, 38, 38, 0.5); border-color: rgba(220, 38, 38, 0.6);
-    transform: translateY(-1px); }
-
 /* ── Ignore-list modal ─────────────────────────────────────────────────────── */
 .vdsc-ig-overlay { position: fixed; inset: 0; z-index: 10000; display: flex; align-items: center;
     justify-content: center; background: rgba(0, 0, 0, 0.62); backdrop-filter: blur(6px);
@@ -3461,8 +3436,8 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
 
 /* Filter buttons (chips + segment buttons) — rounded-rect, each tinted from a
    vibey palette (mirrors the music album-detail action buttons); active = filled. */
-.vdsc-chip, .vdsc-seg-btn { flex: 0 0 auto; padding: 8px 15px; border-radius: 9px; cursor: pointer;
-    white-space: nowrap; font-size: 12.5px; font-weight: 700; letter-spacing: -0.01em;
+.vdsc-chip, .vdsc-seg-btn { flex: 0 0 auto; padding: 8px 15px; border-radius: var(--btn-r-md); cursor: pointer;
+    white-space: nowrap; font-size: var(--btn-fs-md); font-weight: var(--btn-fw-bold); letter-spacing: -0.01em;
     color: rgba(var(--c, 200, 205, 230), 0.64);
     background: rgba(var(--c, 200, 205, 230), 0.07);
     border: 1px solid rgba(var(--c, 200, 205, 230), 0.18);
@@ -3555,11 +3530,6 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
 
 /* ── small screens ────────────────────────────────────────────────────────── */
 @media (max-width: 640px) {
-    /* The Ignore-List pill floats top-right over the page on desktop, where the
-       hero body hugs the bottom-left. On a phone the (shorter) hero's text can
-       reach the top row, so the pill sat ON the hero title — flow it above the
-       hero instead, still right-aligned. */
-    .vdsc-ignore-btn { position: static; display: flex; width: max-content; margin: 4px 0 10px auto; }
     .vdsc-browse { padding: 13px 13px 15px; margin-bottom: 22px; }
     .vdsc-browse-top { gap: 10px; }
     .vdsc-shelf { margin-bottom: 24px; }
@@ -3587,7 +3557,7 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
     background: radial-gradient(56% 70% at 50% 0%, rgba(var(--accent-rgb, 88 101 242), 0.22), transparent 70%); filter: blur(10px); }
 .vwsh-head-row { position: relative; z-index: 1; display: flex; align-items: flex-end;
     justify-content: space-between; gap: 20px; flex-wrap: wrap; }
-.vwsh-title { font-size: 36px; font-weight: 800; letter-spacing: -0.025em; margin: 0; }
+.vwsh-title { font-size: 26px; font-weight: 700; letter-spacing: -0.5px; margin: 0; }
 .vwsh-sub { margin: 7px 0 0; color: rgba(255, 255, 255, 0.55); font-size: 14px; font-weight: 600; }
 
 /* Toolbar controls — aligned to the video side's polished language: the
@@ -4134,10 +4104,6 @@ body:not(.video-admin) .vst-combo-panels { grid-template-columns: 1fr; }
 .vc-pl-section { margin-bottom: 40px; }
 .vc-videos-head { display: flex; align-items: baseline; gap: 12px; }
 .vc-tools { margin-left: auto; display: flex; align-items: center; gap: 10px; }
-.vc-tool-btn { border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.05);
-    color: rgba(255,255,255,0.72); font-size: 12px; font-weight: 700; padding: 7px 13px; border-radius: 999px; cursor: pointer; transition: all 0.15s ease; }
-.vc-tool-btn:hover { color: #fff; background: rgba(255,255,255,0.1); }
-.vc-tool-btn--on { background: rgba(108,211,145,0.16); border-color: rgba(108,211,145,0.4); color: #6cd391; }
 .vc-sort { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12); color: #fff;
     font-size: 12px; font-weight: 700; padding: 7px 11px; border-radius: 9px; cursor: pointer; }
 .vc-more { display: block; margin: 22px auto 0; border: 1px solid rgba(255,59,59,0.35); background: rgba(255,59,59,0.08);
@@ -4940,7 +4906,7 @@ a.vdl-r-title--link:hover { color: rgb(var(--accent-light-rgb, 30, 215, 96));
     background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.14); color: rgba(255, 255, 255, 0.7); }
 .vdpg-copy:hover { background: rgba(var(--vt), 0.22); border-color: rgba(var(--vt), 0.5); color: #fff; }
 .vdpg-dr-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
-.vdpg-dr-btn { padding: 8px 16px; border-radius: 9px; cursor: pointer; font-size: 12.5px; font-weight: 700; text-decoration: none;
+.vdpg-dr-btn { padding: 8px 16px; border-radius: var(--btn-r-md); cursor: pointer; font-size: var(--btn-fs-md); font-weight: var(--btn-fw-bold); text-decoration: none;
     background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.14); color: rgba(255, 255, 255, 0.85); transition: all 0.15s; }
 .vdpg-dr-btn:hover { background: rgba(var(--vt), 0.18); border-color: rgba(var(--vt), 0.5); color: #fff; }
 .vdpg-dr-accent { background: rgba(var(--vt), 0.18); border-color: rgba(var(--vt), 0.5); color: #fff; }
@@ -4965,7 +4931,7 @@ a.vdl-r-title--link:hover { color: rgb(var(--accent-light-rgb, 30, 215, 96));
 /* ── Import page (manual / failed-import resolution) — video/video-import.js ──── */
 .vimp-page { max-width: 1080px; margin: 0 auto; padding: 8px 4px 40px; }
 .vimp-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
-.vimp-title { font-size: 26px; font-weight: 800; color: #fff; letter-spacing: -0.02em; margin: 0; display: flex; align-items: center; gap: 10px; }
+.vimp-title { font-size: 26px; font-weight: 700; color: #fff; letter-spacing: -0.5px; margin: 0; display: flex; align-items: center; gap: 10px; }
 .vimp-count { font-size: 13px; font-weight: 800; color: #06210f; background: rgb(var(--accent-rgb)); border-radius: 999px; padding: 2px 10px; min-width: 22px; text-align: center; }
 .vimp-count:empty { display: none; }
 .vimp-sub { font-size: 13.5px; color: rgba(255, 255, 255, 0.5); margin: 4px 0 0; }
@@ -5047,8 +5013,8 @@ a.vdl-r-title--link:hover { color: rgb(var(--accent-light-rgb, 30, 215, 96));
 .vimp-dr-spacer { flex: 1; }
 
 /* buttons — a real CTA for Place, quiet ghost for Dismiss, red for Delete */
-.vimp-btn { display: inline-flex; align-items: center; gap: 7px; padding: 8px 15px; border-radius: 10px;
-    cursor: pointer; font-size: 12.5px; font-weight: 800; border: 1px solid transparent;
+.vimp-btn { display: inline-flex; align-items: center; gap: 7px; padding: 8px 15px; border-radius: var(--btn-r-lg);
+    cursor: pointer; font-size: var(--btn-fs-md); font-weight: var(--btn-fw-bold); border: 1px solid transparent;
     transition: background 0.15s, border-color 0.15s, filter 0.15s, transform 0.15s, box-shadow 0.15s; }
 .vimp-btn--place { color: #fff;
     background: linear-gradient(135deg, rgba(var(--accent-rgb), 0.95), rgba(var(--accent-rgb), 0.72));
@@ -5056,8 +5022,8 @@ a.vdl-r-title--link:hover { color: rgb(var(--accent-light-rgb, 30, 215, 96));
 .vimp-btn--place:hover { filter: brightness(1.1); transform: translateY(-1px);
     box-shadow: 0 6px 18px rgba(var(--accent-rgb), 0.4); }
 .vimp-btn--place:disabled { opacity: 0.5; cursor: default; filter: none; transform: none; }
-.vimp-btn--dismiss, .vimp-btn--ghost { color: rgba(255, 255, 255, 0.85); background: rgba(255, 255, 255, 0.06); border-color: rgba(255, 255, 255, 0.14); }
-.vimp-btn--dismiss:hover, .vimp-btn--ghost:hover { background: rgba(255, 255, 255, 0.12); border-color: rgba(255, 255, 255, 0.28); }
+.vimp-btn--ghost { color: rgba(255, 255, 255, 0.85); background: rgba(255, 255, 255, 0.06); border-color: rgba(255, 255, 255, 0.14); }
+.vimp-btn--ghost:hover { background: rgba(255, 255, 255, 0.12); border-color: rgba(255, 255, 255, 0.28); }
 .vimp-btn--danger { color: #f87171; background: rgba(239, 68, 68, 0.1); border-color: rgba(239, 68, 68, 0.3); }
 .vimp-btn--danger:hover:not(:disabled) { background: rgba(239, 68, 68, 0.2); color: #fca5a5; }
 .vimp-btn--danger:disabled { opacity: 0.45; cursor: default; }
@@ -5159,7 +5125,7 @@ a.vdl-r-title--link:hover { color: rgb(var(--accent-light-rgb, 30, 215, 96));
 
 /* ── Download History modal (.vdh-*) — permanent timeline of every grab ───── */
 .adl-history-btn { display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 13px;
-    border-radius: 10px; cursor: pointer; font-size: 12.5px; font-weight: 700;
+    border-radius: var(--btn-r-lg); cursor: pointer; font-size: var(--btn-fs-md); font-weight: var(--btn-fw-bold);
     color: rgba(255, 255, 255, 0.75); background: rgba(255, 255, 255, 0.05);
     border: 1px solid rgba(255, 255, 255, 0.1); transition: all 0.18s ease; }
 .adl-history-btn:hover { color: #fff; border-color: rgba(var(--accent-rgb, 88 101 242), 0.5);
@@ -5337,8 +5303,8 @@ body[data-side="video"] #gsearch-aura {
 .vd-season-lock { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
     padding: 8px 4px 0; }
 .vd-season-lock-btn { display: inline-flex; align-items: center; gap: 7px;
-    padding: 5px 11px; border-radius: 999px; cursor: pointer; font-size: 11.5px;
-    font-weight: 700; letter-spacing: 0.01em;
+    padding: 5px 11px; border-radius: 999px; cursor: pointer; font-size: var(--btn-fs-md);
+    font-weight: var(--btn-fw-bold); letter-spacing: 0.01em;
     border: 1px solid rgba(255, 255, 255, 0.14); background: rgba(255, 255, 255, 0.03);
     color: rgba(255, 255, 255, 0.62); transition: background 0.15s ease, color 0.15s ease,
     border-color 0.15s ease; }
@@ -5466,7 +5432,7 @@ body[data-side="video"] #gsearch-aura {
    Select N cards → floating action bar (bulk metadata via /api/video/bulk —
    the same edit-and-lock engine as the Manage sidebar). */
 .video-lib-select-btn {
-    padding: 8px 16px; border-radius: 10px; font-size: 12.5px; font-weight: 700;
+    padding: 8px 16px; border-radius: var(--btn-r-lg); font-size: var(--btn-fs-md); font-weight: var(--btn-fw-bold);
     cursor: pointer; background: rgba(255,255,255,0.06);
     border: 1px solid rgba(255,255,255,0.12); color: rgba(255,255,255,0.75);
     transition: all .13s; white-space: nowrap;
@@ -5590,7 +5556,7 @@ body[data-side="video"] #gsearch-aura {
    a TOOL, so it stands out in the row without stealing the Play CTA's job. */
 .vd-manage-btn {
     display: inline-flex; align-items: center; gap: 8px; padding: 7px 18px;
-    border-radius: 999px; font-size: 12.5px; font-weight: 800; letter-spacing: 0.02em;
+    border-radius: 999px; font-size: var(--btn-fs-md); font-weight: var(--btn-fw-bold); letter-spacing: 0.02em;
     cursor: pointer; color: #fff; position: relative;
     border: 1px solid transparent;
     background:
@@ -5658,7 +5624,7 @@ body[data-side="video"] #gsearch-aura {
 }
 .vrf-actions { margin-top: 10px; }
 .vrf-btn {
-    padding: 7px 14px; border-radius: 9px; font-size: 12px; font-weight: 700; cursor: pointer;
+    padding: 7px 14px; border-radius: var(--btn-r-md); font-size: var(--btn-fs-md); font-weight: var(--btn-fw-bold); cursor: pointer;
     background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.14); color: #eef1f7;
     transition: all .13s;
 }
@@ -5850,7 +5816,7 @@ body[data-side="video"] #gsearch-aura {
     border: 1px solid rgba(var(--accent-rgb, 88 101 242), 0.25); color: rgba(255,255,255,0.75);
 }
 .vi-btn-primary {
-    padding: 9px 18px; border-radius: 10px; font-size: 13px; font-weight: 800; cursor: pointer;
+    padding: 9px 18px; border-radius: var(--btn-r-lg); font-size: var(--btn-fs-lg); font-weight: var(--btn-fw-bold); cursor: pointer;
     border: none; background: rgb(var(--accent-rgb, 88 101 242)); color: #fff;
 }
 .vi-btn-primary:disabled { opacity: 0.4; cursor: default; }

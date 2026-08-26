@@ -49,7 +49,7 @@
         return '<button type="button" class="vget-btn"' +
             ' data-vget-kind="' + kind + '" data-vget-source="' + esc(opts.source || 'library') + '"' +
             ' data-vget-id="' + esc(opts.openId) + '" data-vget-title="' + esc(opts.title || '') + '"' +
-            ' title="Get this ' + kind + '" aria-label="Get this ' + kind + '">' + dlSvg() + '</button>';
+            ' title="Download this ' + kind + '" aria-label="Download this ' + kind + '">' + dlSvg() + '</button>';
     }
 
     // ── modal ─────────────────────────────────────────────────────────────────
@@ -634,7 +634,7 @@
                     }
                 }).catch(function () { /* the state chip is a nicety */ });
         }
-        // "Get Missing" (show detail page) asks to land straight in the download
+        // "Download Missing" (show detail page) asks to land straight in the download
         // view — the season/episode grab tree — rather than the details step.
         // Only meaningful for shows; the detail (_detail) it needs is set above.
         if (o && o.startDownload && o.kind === 'show') enterDownload(modalEl, o);

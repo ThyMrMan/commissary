@@ -25,7 +25,7 @@ _CSS = (_ROOT / "webui" / "static" / "video" / "video-side.css").read_text(encod
 def test_result_card_redesigned_as_column_with_get_button():
     assert 'vdl-res-main' in _VIEW          # row wrapper so a tracker can dock below
     assert 'data-vdl-card="' in _VIEW       # addressable card (auto-pick targets it)
-    assert '[ GET ]' in _VIEW               # brutalist grab button is a bracketed label
+    assert '[ DOWNLOAD ]' in _VIEW          # brutalist download button is a bracketed label
     assert '.vdl-res-main' in _CSS
 
 

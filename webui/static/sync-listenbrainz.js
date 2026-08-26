@@ -21,10 +21,10 @@ async function loadListenBrainzSyncPlaylists() {
     const refreshBtn = document.getElementById('listenbrainz-sync-refresh-btn');
     if (!container) return;
 
-    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading ListenBrainz playlists...</div>`;
+    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading ListenBrainz playlists…</div>`;
     if (refreshBtn) {
         refreshBtn.disabled = true;
-        refreshBtn.textContent = '🔄 Loading...';
+        refreshBtn.textContent = '🔄 Loading…';
     }
 
     // Fetch all three LB playlist categories in parallel. The Discover
@@ -169,7 +169,7 @@ async function handleListenBrainzSyncCardClick(playlistMbid, playlistTitle) {
     // fetch + cache the tracks on demand here.
     try {
         if (typeof showLoadingOverlay === 'function') {
-            showLoadingOverlay(`Loading ${playlistTitle}...`);
+            showLoadingOverlay(`Loading ${playlistTitle}…`);
         }
 
         if (typeof listenbrainzTracksCache === 'undefined') {

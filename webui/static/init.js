@@ -711,7 +711,7 @@ async function submitLogin() {
     const showErr = (msg) => { if (errEl) { errEl.textContent = msg; errEl.style.display = 'block'; } };
     if (errEl) errEl.style.display = 'none';
     if (!username || !password) { showErr('Enter your username and password'); return; }
-    if (btn) { btn.disabled = true; btn.textContent = 'Signing in...'; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Signing in…'; }
     try {
         const res = await fetch('/api/auth/login', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -907,7 +907,7 @@ function showLaunchPinScreen() {
         if (!pin) return;
 
         submit.disabled = true;
-        submit.textContent = 'Verifying...';
+        submit.textContent = 'Verifying…';
 
         try {
             const res = await fetch('/api/profiles/verify-launch-pin', {
@@ -1174,7 +1174,7 @@ async function submitRecoveryCredential() {
     if (!credential) return;
 
     btn.disabled = true;
-    btn.textContent = 'Verifying...';
+    btn.textContent = 'Verifying…';
     error.style.display = 'none';
 
     try {
@@ -1241,7 +1241,7 @@ function showProfileForgotPin() {
 
         const btn = document.getElementById('profile-recovery-submit');
         btn.disabled = true;
-        btn.textContent = 'Verifying...';
+        btn.textContent = 'Verifying…';
         error.style.display = 'none';
 
         try {
@@ -1412,7 +1412,7 @@ function showPinDialog(profile) {
         const pin = input.value;
         if (!pin) return;
         submit.disabled = true;
-        submit.textContent = 'Verifying...';
+        submit.textContent = 'Verifying…';
         try {
             const res = await fetch('/api/profiles/select', {
                 method: 'POST',
@@ -1631,7 +1631,7 @@ async function openPersonalSettings() {
     overlay.style.display = 'flex';
 
     const body = document.getElementById('personal-settings-body');
-    body.innerHTML = '<div style="text-align:center;padding:20px;color:rgba(255,255,255,0.4);">Loading...</div>';
+    body.innerHTML = '<div style="text-align:center;padding:20px;color:rgba(255,255,255,0.4);">Loading…</div>';
 
     try {
         body.innerHTML = '';
@@ -1642,7 +1642,7 @@ async function openPersonalSettings() {
         if (isNonAdmin) {
             const serverTab = document.createElement('div');
             serverTab.style.padding = '18px 22px 22px';
-            serverTab.innerHTML = '<div style="text-align:center;padding:20px;color:rgba(255,255,255,0.3);">Loading libraries...</div>';
+            serverTab.innerHTML = '<div style="text-align:center;padding:20px;color:rgba(255,255,255,0.3);">Loading libraries…</div>';
             body.appendChild(serverTab);
             fetch('/api/profiles/me/server-library').then(r => r.json()).then(libData => {
                 serverTab.innerHTML = '';
@@ -1680,7 +1680,7 @@ function renderPersonalSettingsSpotify(body, data) {
                 <div class="ps-connected-icon">🟢</div>
                 <div class="ps-connected-details">
                     <div class="ps-connected-username">Credentials configured</div>
-                    <div class="ps-connected-server">Client ID: ${escapeHtml(clientId.substring(0, 8))}...</div>
+                    <div class="ps-connected-server">Client ID: ${escapeHtml(clientId.substring(0, 8))}…</div>
                     <div class="ps-connected-source">Personal Spotify app</div>
                 </div>
             </div>
@@ -2051,7 +2051,7 @@ async function testPersonalListenBrainz() {
         if (resultEl) resultEl.innerHTML = '<div class="ps-inline-result error">Please enter a token</div>';
         return;
     }
-    if (resultEl) resultEl.innerHTML = '<div class="ps-inline-result" style="color:rgba(255,255,255,0.5);">Testing...</div>';
+    if (resultEl) resultEl.innerHTML = '<div class="ps-inline-result" style="color:rgba(255,255,255,0.5);">Testing…</div>';
     try {
         const res = await fetch('/api/profiles/me/listenbrainz/test', {
             method: 'POST',
@@ -2079,7 +2079,7 @@ async function connectPersonalListenBrainz() {
     }
     // Disable buttons during connect
     document.querySelectorAll('.ps-actions .ps-btn').forEach(b => b.disabled = true);
-    if (resultEl) resultEl.innerHTML = '<div class="ps-inline-result" style="color:rgba(255,255,255,0.5);">Connecting...</div>';
+    if (resultEl) resultEl.innerHTML = '<div class="ps-inline-result" style="color:rgba(255,255,255,0.5);">Connecting…</div>';
     try {
         const res = await fetch('/api/profiles/me/listenbrainz', {
             method: 'POST',

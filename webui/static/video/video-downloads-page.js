@@ -583,7 +583,7 @@
             empty.innerHTML = !list.length
                 ? '<div class="vdpg-empty-ic">📥</div>' +
                   '<div class="vdpg-empty-t">No downloads yet</div>' +
-                  '<div class="vdpg-empty-s">Hit <strong>Grab</strong> on a search result — or add something to the wishlist and let the automations fetch it — and it\'ll show up here.</div>'
+                  '<div class="vdpg-empty-s">Hit <strong>Download</strong> on a search result — or add something to the wishlist and let the automations fetch it — and it\'ll show up here.</div>'
                 : '<div class="vdpg-empty-ic">' + (_filter === 'failed' ? '🎉' : '📂') + '</div>' +
                   '<div class="vdpg-empty-t">Nothing ' + (_filter === 'all' ? 'here' : esc(_filter)) + ' right now</div>' +
                   '<div class="vdpg-empty-s">' + (_filter === 'failed' ? 'No failures — everything went through clean.' : 'Switch filters to see the rest of the queue.') + '</div>';

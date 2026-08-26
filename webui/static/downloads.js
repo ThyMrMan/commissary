@@ -99,7 +99,7 @@ function _wingItAction(urlHash, action) {
 }
 
 async function _wingItSyncFromModal(urlHash, tracks, name, isLB) {
-    showToast('Starting Wing It sync...', 'info');
+    showToast('Starting Wing It sync…', 'info');
     updateYouTubeModalButtons(urlHash, 'syncing');
 
     try {
@@ -255,7 +255,7 @@ function _showWingItChoiceDialog(trackCount, source) {
 
 async function _wingItSync(tracks, playlistName, source, cardIdentifier = null) {
     try {
-        showToast('Syncing playlist to server...', 'info');
+        showToast('Syncing playlist to server…', 'info');
 
         // Format tracks for the sync endpoint
         const syncTracks = tracks.map((t, i) => {
@@ -373,7 +373,7 @@ async function _wingItFromModal(urlHash) {
 
     if (choice === 'sync') {
         // Sync inline — keep modal open, show progress in modal
-        showToast('Starting Wing It sync...', 'info');
+        showToast('Starting Wing It sync…', 'info');
         updateYouTubeModalButtons(urlHash, 'syncing');
 
         try {
@@ -427,7 +427,7 @@ async function _wingItFromModal(urlHash) {
 }
 
 async function openDownloadMissingModalForYouTube(virtualPlaylistId, playlistName, spotifyTracks, artist = null, album = null) {
-    showLoadingOverlay('Loading YouTube playlist...');
+    showLoadingOverlay('Loading YouTube playlist…');
     // Check if a process is already active for this virtual playlist
     if (activeDownloadProcesses[virtualPlaylistId]) {
         console.log(`Modal for ${virtualPlaylistId} already exists. Showing it.`);
@@ -1078,7 +1078,7 @@ function generateMosaicBackground(coverUrls) {
  */
 async function openWishlistOverviewModal() {
     try {
-        showLoadingOverlay('Loading wishlist...');
+        showLoadingOverlay('Loading wishlist…');
 
         // Fetch wishlist stats
         const statsResponse = await fetch('/api/wishlist/stats');
@@ -1179,7 +1179,7 @@ async function openWishlistOverviewModal() {
                             </button>
                         </div>
                         <div id="wishlist-tracks-list" class="playlist-tracks-scroll">
-                            <div class="loading-indicator">Loading tracks...</div>
+                            <div class="loading-indicator">Loading tracks…</div>
                         </div>
                     </div>
                 </div>
@@ -1341,7 +1341,7 @@ async function openWishlistIgnoreModal() {
             </div>
             <p style="opacity:0.7;font-size:13px;margin:8px 16px 0;">Removed or cancelled tracks are skipped by auto-download until they expire. Un-ignore to allow auto-download again (you can always download manually).</p>
             <div id="wishlist-ignore-list" class="playlist-tracks-scroll" style="flex:1;overflow-y:auto;padding:12px 16px;">
-                <div class="loading-indicator">Loading...</div>
+                <div class="loading-indicator">Loading…</div>
             </div>
             <div class="playlist-modal-footer">
                 <div class="playlist-modal-footer-left">
@@ -1440,7 +1440,7 @@ async function cleanupWishlistOverview() {
     }
 
     try {
-        showLoadingOverlay('Cleaning up wishlist...');
+        showLoadingOverlay('Cleaning up wishlist…');
 
         const response = await fetch('/api/wishlist/cleanup', {
             method: 'POST'
@@ -1495,7 +1495,7 @@ async function clearEntireWishlist() {
     console.log('User confirmed, proceeding with clear...');
 
     try {
-        showLoadingOverlay('Clearing wishlist...');
+        showLoadingOverlay('Clearing wishlist…');
         console.log('Loading overlay shown');
 
         const response = await fetch('/api/wishlist/clear', {
@@ -1546,7 +1546,7 @@ async function selectWishlistCategory(category) {
         downloadBtn.style.display = 'inline-block';
         categoryName.textContent = category === 'albums' ? 'Albums / EPs' : 'Singles';
 
-        tracksList.innerHTML = '<div class="loading-indicator">Loading tracks...</div>';
+        tracksList.innerHTML = '<div class="loading-indicator">Loading tracks…</div>';
 
         const _wlPageSize = window._wlNextLimit || 200;
         window._wlNextLimit = null;
@@ -1840,7 +1840,7 @@ async function selectWishlistCategory(category) {
 
 async function loadMoreWishlistTracks() {
     const btn = document.querySelector('.wishlist-load-more-btn');
-    if (btn) { btn.textContent = 'Loading...'; btn.disabled = true; }
+    if (btn) { btn.textContent = 'Loading…'; btn.disabled = true; }
     // Increase page size and reload
     window._wlOffset = (window._wlOffset || 200) + 200;
     // Override the page size for this reload
@@ -2308,7 +2308,7 @@ async function downloadSelectedCategory() {
 }
 
 async function openDownloadMissingWishlistModal(category = null, selectedTrackIds = null) {
-    showLoadingOverlay('Loading wishlist...');
+    showLoadingOverlay('Loading wishlist…');
     const playlistId = "wishlist"; // Use a consistent ID for wishlist
 
     // Check if a process is already active for the wishlist
@@ -2528,7 +2528,7 @@ async function startWishlistMissingTracksProcess(playlistId) {
             // Special handling for auto-processing conflict
             if (response.status === 409) {
                 console.log('🤖 [Wishlist] Auto-processing is running, redirecting to download manager');
-                showToast('Wishlist auto-processing is already running. Opening Download Manager...', 'info');
+                showToast('Wishlist auto-processing is already running. Opening Download Manager…', 'info');
 
                 // Close wishlist modal and show download manager
                 const wishlistModal = document.getElementById('download-modal-wishlist');
@@ -3699,7 +3699,7 @@ function _renderCandidatesModal(data) {
                 <input type="text"
                        class="candidates-manual-search-input"
                        id="candidates-manual-search-input"
-                       placeholder="Search, or paste a Tidal / Qobuz track link..."
+                       placeholder="Search, or paste a Tidal / Qobuz track link…"
                        value="${escapeHtml(prefill)}"
                        maxlength="300" />
                 ${sourceControl}
@@ -3798,7 +3798,7 @@ function _wireManualSearch(overlay, taskId, trackName, multiSource, availableSou
 
     const _renderTableShell = () => {
         resultsContainer.innerHTML = `
-            <div class="candidates-manual-search-status" id="candidates-manual-search-status">Searching...</div>
+            <div class="candidates-manual-search-status" id="candidates-manual-search-status">Searching…</div>
             <div id="candidates-manual-groups"></div>
             <div id="candidates-manual-releases" class="candidates-release-section" style="display: none;">
                 <div class="candidates-release-note">
@@ -3873,7 +3873,7 @@ function _wireManualSearch(overlay, taskId, trackName, multiSource, availableSou
             countEl.dataset.count = String(n);
             countEl.textContent = `${n} result${n !== 1 ? 's' : ''}`;
         }
-        _setStatus(`${currentResults.length} result${currentResults.length !== 1 ? 's' : ''} so far...`);
+        _setStatus(`${currentResults.length} result${currentResults.length !== 1 ? 's' : ''} so far…`);
 
         // Wire newly-appended buttons
         tbody.querySelectorAll('.candidates-download-btn').forEach(btn => {
@@ -3929,7 +3929,7 @@ function _wireManualSearch(overlay, taskId, trackName, multiSource, availableSou
         inFlight = true;
         button.disabled = true;
         const originalLabel = button.textContent;
-        button.textContent = 'Searching...';
+        button.textContent = 'Searching…';
         currentResults = [];
         _renderTableShell();
 
@@ -4055,7 +4055,7 @@ async function approveQuarantineFromDownloadRow(button) {
 
     const originalText = button.textContent;
     button.disabled = true;
-    button.textContent = 'Approving...';
+    button.textContent = 'Approving…';
     try {
         const response = await fetch(`/api/quarantine/${encodeURIComponent(entryId)}/approve`, {
             method: 'POST',
@@ -4276,7 +4276,7 @@ function processModalStatusUpdate(playlistId, data) {
         if (data.phase === 'downloading' && missingCount > 0 && (!data.tasks || data.tasks.length === 0)) {
             // No tasks yet, but we're in downloading phase with missing tracks
             if (downloadProgressText) {
-                downloadProgressText.textContent = 'Preparing downloads...';
+                downloadProgressText.textContent = 'Preparing downloads…';
                 console.log(`📥 [Download Phase] Preparing ${missingCount} downloads...`);
             }
         }
@@ -4314,21 +4314,21 @@ function processModalStatusUpdate(playlistId, data) {
             let isQuarantinedTask = false;
             // V2 SYSTEM: Handle UI state override for cancelling tasks
             if (isV2Task && uiState === 'cancelling' && task.status !== 'cancelled') {
-                statusText = '🔄 Cancelling...';
+                statusText = '🔄 Cancelling…';
             } else {
                 switch (task.status) {
                     case 'pending': statusText = '⏸️ Pending'; break;
                     case 'searching':
-                        statusText = '🔍 Searching...';
+                        statusText = '🔍 Searching…';
                         // Quarantine-retry engine: show which attempt we're on
                         // ("retry 2/5") while it walks the next-best candidates.
                         if (task.retry_info) statusText += ` 🔁 retry ${task.retry_info}`;
                         break;
                     case 'downloading':
-                        statusText = `⏬ Downloading... ${Math.round(task.progress || 0)}%`;
+                        statusText = `⏬ Downloading… ${Math.round(task.progress || 0)}%`;
                         if (task.retry_info) statusText += ` 🔁 retry ${task.retry_info}`;
                         break;
-                    case 'post_processing': statusText = '⌛ Processing...'; break;
+                    case 'post_processing': statusText = '⌛ Processing…'; break;
                     case 'completed': {
                         statusText = '✅ Completed';
                         // Verification badge — how this file passed verification:
@@ -4428,7 +4428,7 @@ function processModalStatusUpdate(playlistId, data) {
             if (actionsEl && !['completed', 'failed', 'cancelled', 'not_found', 'post_processing'].includes(task.status)) {
                 // Check if we're in a cancelling state
                 if (isV2Task && uiState === 'cancelling') {
-                    actionsEl.innerHTML = '<span style="color: #666;">Cancelling...</span>';
+                    actionsEl.innerHTML = '<span style="color: #666;">Cancelling…</span>';
                 } else {
                     // Create V2 cancel button for all active tasks
                     const onclickHandler = isV2Task ? 'cancelTrackDownloadV2' : 'cancelTrackDownload';
@@ -4825,7 +4825,7 @@ async function updateModalWithLiveDownloadProgress() {
                     const state = downloadInfo.state || '';
 
                     if (statusElement && state.includes('InProgress') && progress > 0) {
-                        statusElement.textContent = `⏬ Downloading... ${Math.round(progress)}%`;
+                        statusElement.textContent = `⏬ Downloading… ${Math.round(progress)}%`;
                         statusElement.className = 'track-download-status download-downloading';
                     } else if (statusElement && (state.includes('Completed') || state.includes('Succeeded'))) {
                         statusElement.textContent = '✅ Completed';
@@ -4901,7 +4901,7 @@ async function cancelAllOperations(playlistId) {
 
     console.log(`🚫 Cancel All clicked for playlist ${playlistId} - closing modal and cleaning up server`);
 
-    showToast('Cancelling all operations and closing modal...', 'info');
+    showToast('Cancelling all operations and closing modal…', 'info');
 
     // Mark process as complete immediately so polling stops
     process.status = 'complete';
@@ -5021,13 +5021,13 @@ async function cancelTrackDownloadV2(playlistId, trackIndex) {
 
     // Show loading state only - no optimistic "cancelled" state
     if (statusEl) {
-        statusEl.textContent = '🔄 Cancelling...';
+        statusEl.textContent = '🔄 Cancelling…';
     }
 
     // Disable the cancel button to prevent double-clicks
     const actionsEl = document.getElementById(`actions-${playlistId}-${trackIndex}`);
     if (actionsEl) {
-        actionsEl.innerHTML = '<span style="color: #666;">Cancelling...</span>';
+        actionsEl.innerHTML = '<span style="color: #666;">Cancelling…</span>';
     }
 
     try {
@@ -5102,7 +5102,7 @@ async function cancelTrackDownload(playlistId, trackIndex) {
 
     // UI update for immediate feedback - mark as cancelled FIRST to prevent race conditions
     row.dataset.locallyCancelled = 'true';
-    document.getElementById(`download-${playlistId}-${trackIndex}`).textContent = '🚫 Cancelling...';
+    document.getElementById(`download-${playlistId}-${trackIndex}`).textContent = '🚫 Cancelling…';
     document.getElementById(`actions-${playlistId}-${trackIndex}`).innerHTML = '-';
 
     try {
@@ -5164,7 +5164,7 @@ async function startPlaylistSync(playlistId, syncModeOverride = null) {
     const syncBtn = document.getElementById(`sync-btn-${playlistId}`);
     if (syncBtn) {
         syncBtn.disabled = true;
-        syncBtn.textContent = '⏳ Syncing...';
+        syncBtn.textContent = '⏳ Syncing…';
     }
 
     // Ensure we have the full track list before starting
@@ -5417,9 +5417,9 @@ function updateRefreshButtonState() {
         const hasActiveSyncs = Object.keys(activeSyncPollers).length > 0;
         const hasSequentialSync = sequentialSyncManager && sequentialSyncManager.isRunning;
         if (hasActiveSyncs || hasSequentialSync) {
-            refreshBtn.textContent = '🔄 Syncing...';
+            refreshBtn.textContent = '🔄 Syncing…';
         } else {
-            refreshBtn.textContent = '📥 Downloading...';
+            refreshBtn.textContent = '📥 Downloading…';
         }
     } else {
         refreshBtn.disabled = false;
@@ -5434,7 +5434,7 @@ function updateCardToSyncing(playlistId, percent, progress = null) {
     const progressBar = card.querySelector('.sync-progress-indicator');
     progressBar.style.display = 'block';
 
-    let progressText = 'Starting...';
+    let progressText = 'Starting…';
     let actualPercent = percent || 0;
 
     if (progress) {
@@ -5654,7 +5654,7 @@ async function performDownloadsSearch() {
         cancelButton.classList.remove('hidden');
         spinner.classList.remove('hidden');
         dots.classList.remove('hidden');
-        statusText.textContent = `Searching for '${query}'...`;
+        statusText.textContent = `Searching for '${query}'…`;
         displayDownloadsResults([]); // Clear previous results
 
         // --- 2. Perform the Fetch Request ---
@@ -6131,7 +6131,7 @@ async function loadArtistsData() {
 // UTILITY FUNCTIONS
 // ===============================
 
-function showLoadingOverlay(message = 'Loading...') {
+function showLoadingOverlay(message = 'Loading…') {
     const overlay = document.getElementById('loading-overlay');
     const messageElement = overlay.querySelector('.loading-message');
     messageElement.textContent = message;
@@ -7106,7 +7106,7 @@ function _gsRenderFromState(state) {
     // In-flight, nothing cached yet — loading state.
     if (isLoading && !cached) {
         const info = SOURCE_LABELS[activeSrc];
-        body.innerHTML = `<div class="gsearch-loading"><div class="server-search-spinner"></div>Searching ${_escToast((info && info.text) || activeSrc)}...</div>`;
+        body.innerHTML = `<div class="gsearch-loading"><div class="server-search-spinner"></div>Searching ${_escToast((info && info.text) || activeSrc)}…</div>`;
         results.classList.add('visible');
         return;
     }
@@ -7254,7 +7254,7 @@ async function _gsLazyLoadArtistImages() {
 async function _gsClickAlbum(albumId, albumName, artistName, imageUrl, source) {
     _gsDeactivate();
     // Same flow as handleEnhancedSearchAlbumClick — fetch album, open download modal
-    showLoadingOverlay('Loading album...');
+    showLoadingOverlay('Loading album…');
     try {
         const params = new URLSearchParams({ name: albumName, artist: artistName });
         if (source && source !== 'spotify') params.set('source', source);
@@ -7322,7 +7322,7 @@ async function _gsClickTrack(artistName, trackName, albumName, trackId, imageUrl
     const playlistName = `${artistName} - ${trackName}`;
 
     try {
-        showLoadingOverlay('Loading track...');
+        showLoadingOverlay('Loading track…');
         await openDownloadMissingModalForArtistAlbum(
             virtualPlaylistId, playlistName, [enrichedTrack], albumObject, artistObject, false
         );
@@ -7355,7 +7355,7 @@ async function _gsClickTrack(artistName, trackName, albumName, trackId, imageUrl
 
 async function _gsPlayTrack(trackName, artistName, albumName) {
     try {
-        showToast('Searching for stream...', 'info');
+        showToast('Searching for stream…', 'info');
         const res = await fetch('/api/enhanced-search/stream-track', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

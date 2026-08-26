@@ -585,7 +585,7 @@ async function openAutoSyncScheduleModal() {
                 </div>
                 <button class="auto-sync-close" onclick="closeAutoSyncScheduleModal()">&times;</button>
             </div>
-            <div class="auto-sync-loading">Loading schedule...</div>
+            <div class="auto-sync-loading">Loading schedule…</div>
         </div>
     `;
     overlay.style.display = 'flex';
@@ -1213,7 +1213,7 @@ function renderAutoSyncHistoryPanel(history, total) {
             </div>
         </div>
         <div class="auto-sync-history-list" data-renderer="pending">
-            <div class="auto-sync-history-loading">Preparing run history...</div>
+            <div class="auto-sync-history-loading">Preparing run history…</div>
         </div>
         ${canLoadMore ? `
             <div class="auto-sync-history-load-more-row">
@@ -2451,11 +2451,11 @@ async function runMirroredPlaylistPipeline(playlistId, name) {
             body: JSON.stringify({})
         });
         const data = await parseMirroredPipelineResponse(res, 'Failed to start Auto-Sync');
-        applyMirroredPipelineState(playlistId, data.state || { status: 'running', progress: 0, phase: 'Starting pipeline...' });
+        applyMirroredPipelineState(playlistId, data.state || { status: 'running', progress: 0, phase: 'Starting pipeline…' });
         showToast(`Auto-Sync started for ${name}`, 'success');
         _autoSyncScheduleState.playlists = _autoSyncScheduleState.playlists.map(p => (
             parseInt(p.id, 10) === parseInt(playlistId, 10)
-                ? { ...p, pipeline_state: data.state || { status: 'running', progress: 0, phase: 'Starting pipeline...' } }
+                ? { ...p, pipeline_state: data.state || { status: 'running', progress: 0, phase: 'Starting pipeline…' } }
                 : p
         ));
         renderAutoSyncScheduleModal();

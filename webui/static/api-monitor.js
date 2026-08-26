@@ -1109,7 +1109,7 @@ async function toggleWatchlist(event, artistId, artistName) {
 
     // Show loading state
     const originalText = text.textContent;
-    text.textContent = 'Loading...';
+    text.textContent = 'Loading…';
     button.disabled = true;
 
     try {
@@ -1156,7 +1156,7 @@ async function toggleWatchlist(event, artistId, artistName) {
         } else {
             // Was not watching, now added
             icon.textContent = '👁️';
-            text.textContent = 'Watching...';
+            text.textContent = 'Watching…';
             button.classList.add('watching');
             if (gearBtn) gearBtn.classList.remove('hidden');
             console.log(`✅ Added ${artistName} to watchlist`);
@@ -1244,7 +1244,7 @@ async function updateArtistCardWatchlistStatus() {
                 const gearBtn = button.parentElement?.querySelector('.watchlist-settings-btn');
                 if (data.results[artistId]) {
                     if (icon) icon.textContent = '👁️';
-                    if (text) text.textContent = 'Watching...';
+                    if (text) text.textContent = 'Watching…';
                     button.classList.add('watching');
                     if (gearBtn) gearBtn.classList.remove('hidden');
                 } else {
@@ -1415,7 +1415,7 @@ async function initializeWatchlistPage() {
         if (scanStatus === 'scanning') {
             if (scanStatusEl) scanStatusEl.style.display = '';
             if (liveActivityEl) liveActivityEl.style.display = 'flex';
-            if (scanBtn) { scanBtn.disabled = true; scanBtn.classList.add('btn-processing'); scanBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Scanning...'; }
+            if (scanBtn) { scanBtn.disabled = true; scanBtn.classList.add('btn-processing'); scanBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Scanning…'; }
             if (cancelBtn) cancelBtn.style.display = '';
             pollWatchlistScanStatus();
         } else {
@@ -1733,6 +1733,7 @@ function _renderWishlistNebula(albumTracks, singleTracks, artistImageMap, curren
                  retry,
                  failing: retry >= WL_FAILING_ATTEMPTS,
                  lastTried: track.last_attempted || '',
+                 added: track.date_added || '',
                  failReason: track.failure_reason || '' };
     }
 
@@ -1741,11 +1742,22 @@ function _renderWishlistNebula(albumTracks, singleTracks, artistImageMap, curren
 
     if (artistMap.size === 0) { field.innerHTML = '<div class="wl-nebula-empty">Your wishlist is empty</div>'; return; }
 
-    const sorted = [...artistMap.entries()].sort((a, b) => {
-        const ac = [...a[1].albums.values()].reduce((s, al) => s + al.tracks.length, 0) + a[1].singles.length;
-        const bc = [...b[1].albums.values()].reduce((s, al) => s + al.tracks.length, 0) + b[1].singles.length;
-        return bc - ac;
-    });
+    // Roll each artist up to the keys the sort needs: total tracks, and the most
+    // recent date_added across everything of theirs (so "recently added" means the
+    // artist you most recently added anything for).
+    const _wlKey = (data) => {
+        let newest = '';
+        for (const [, ad] of data.albums) for (const t of ad.tracks) if ((t.added || '') > newest) newest = t.added || '';
+        for (const sg of data.singles) if ((sg.added || '') > newest) newest = sg.added || '';
+        return { total: [...data.albums.values()].reduce((s, al) => s + al.tracks.length, 0) + data.singles.length,
+                 newest };
+    };
+    const _wlSel = document.getElementById('wl-nebula-sort');
+    if (_wlSel && _wlSel.value) _wlSort = _wlSel.value;
+    const sorted = [...artistMap.entries()]
+        .map(([name, data]) => { const k = _wlKey(data); return { name, data, total: k.total, added: k.newest }; })
+        .sort(_wlCompare)
+        .map(x => [x.name, x.data]);
 
     function _hue(n) { let h = 0; for (let i = 0; i < n.length; i++) h = n.charCodeAt(i) + ((h << 5) - h); return Math.abs(h) % 360; }
 
@@ -1772,7 +1784,7 @@ function _renderWishlistNebula(albumTracks, singleTracks, artistImageMap, curren
         // Enhancement 7: staggered entry animation
         const delay = Math.min(idx * 60, 800);
 
-        html += `<div class="wl-orb-group" data-artist="${escapeHtml(name)}" data-failing="${failingCount}" style="animation-delay:${delay}ms">`;
+        html += `<div class="wl-orb-group" data-artist="${escapeHtml(name)}" data-failing="${failingCount}" data-total="${total}" data-added="${_wlAttr(_wlKey(data).newest)}" style="animation-delay:${delay}ms">`;
 
         // Enhancement 2: hover tooltip
         html += `<div class="wl-orb-tooltip">${escapeHtml(name)}<br><span>${total} track${total !== 1 ? 's' : ''}</span></div>`;
@@ -1955,6 +1967,41 @@ function _toggleFailingFilter() {
     _wlFailingOnly = !_wlFailingOnly;
     document.getElementById('wl-failing-filter')?.classList.toggle('active', _wlFailingOnly);
     _filterNebula();
+}
+
+// Wishlist sort. The nebula always ordered artists by track count; this keeps that
+// as the default and adds the rest, matching the Music watchlist's option naming
+// (name-asc / added-newest) rather than the video side's, so the two Music pages
+// read the same. One comparator serves both the render and the live re-sort.
+let _wlSort = 'tracks-desc';
+
+function _wlCompare(a, b) {
+    switch (_wlSort) {
+        case 'tracks-asc':   return a.total - b.total || a.name.localeCompare(b.name);
+        case 'name-asc':     return a.name.localeCompare(b.name);
+        case 'name-desc':    return b.name.localeCompare(a.name);
+        // Blank dates sort last in both directions rather than clumping at one end.
+        case 'added-newest': return (b.added || '').localeCompare(a.added || '') || a.name.localeCompare(b.name);
+        case 'added-oldest': return (!a.added) - (!b.added) || (a.added || '').localeCompare(b.added || '') || a.name.localeCompare(b.name);
+        default:             return b.total - a.total || a.name.localeCompare(b.name);
+    }
+}
+
+// Re-order the orbs already on screen — no refetch, so it stays instant. The field
+// holds nothing but .wl-orb-group when there are any, so re-appending is safe, and
+// moving a node keeps its listeners and expanded state.
+function _sortNebula() {
+    const sel = document.getElementById('wl-nebula-sort');
+    if (sel) _wlSort = sel.value;
+    const field = document.getElementById('wl-nebula-field');
+    if (!field) return;
+    const groups = [...field.querySelectorAll('.wl-orb-group')];
+    if (!groups.length) return;
+    groups
+        .map(g => ({ el: g, name: g.dataset.artist || '',
+                     total: Number(g.dataset.total) || 0, added: g.dataset.added || '' }))
+        .sort(_wlCompare)
+        .forEach(x => field.appendChild(x.el));
 }
 
 function _filterNebula() {
@@ -2307,19 +2354,19 @@ async function showWatchlistModal() {
                                 <!-- Artist Photo -->
                                 <div class="watchlist-live-activity-col">
                                     <img id="watchlist-artist-img" class="watchlist-live-activity-artist-img" src="" alt="Artist" onerror="this.style.display='none';" />
-                                    <div id="watchlist-artist-name" class="watchlist-live-activity-label">Waiting...</div>
+                                    <div id="watchlist-artist-name" class="watchlist-live-activity-label">Waiting…</div>
                                 </div>
 
                                 <!-- Album Cover -->
                                 <div class="watchlist-live-activity-col">
                                     <img id="watchlist-album-img" class="watchlist-live-activity-album-img" src="" alt="Album" onerror="this.style.display='none';" />
-                                    <div id="watchlist-album-name" class="watchlist-live-activity-label">Waiting...</div>
+                                    <div id="watchlist-album-name" class="watchlist-live-activity-label">Waiting…</div>
                                 </div>
 
                                 <!-- Track and Wishlist Feed -->
                                 <div class="watchlist-live-activity-feed">
                                     <div class="watchlist-live-activity-feed-label">Current Track:</div>
-                                    <div id="watchlist-track-name" class="watchlist-live-activity-track">Waiting...</div>
+                                    <div id="watchlist-track-name" class="watchlist-live-activity-track">Waiting…</div>
 
                                     <div class="watchlist-live-activity-feed-label-orange">✨ Recently Added:</div>
                                     <div id="watchlist-additions-feed" style="max-height: 80px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; font-size: 10px;">
@@ -2349,7 +2396,7 @@ async function showWatchlistModal() {
                                 onclick="startWatchlistScan()"
                                 ${scanStatus === 'scanning' ? 'disabled' : ''}>
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-                            ${scanStatus === 'scanning' ? 'Scanning...' : 'Scan for New Releases'}
+                            ${scanStatus === 'scanning' ? 'Scanning…' : 'Scan for New Releases'}
                         </button>
                         <button class="playlist-modal-btn playlist-modal-btn-secondary watchlist-btn-cancel"
                                 id="cancel-watchlist-scan-btn"
@@ -2400,7 +2447,7 @@ async function showWatchlistModal() {
                         <input type="text"
                                id="watchlist-search-input"
                                class="watchlist-search-input"
-                               placeholder="Search watchlist..."
+                               placeholder="Search watchlist…"
                                oninput="filterWatchlistArtists()">
                     </div>
 
@@ -2611,7 +2658,7 @@ function _populateLinkedProviderSection(artistId, artistName, spotifyId, itunesI
     let html = '<div class="wl-linked-sources">';
     for (const src of sources) {
         const matched = !!src.id;
-        const shortId = src.id ? (src.id.length > 16 ? src.id.substring(0, 14) + '...' : src.id) : '';
+        const shortId = src.id ? (src.id.length > 16 ? src.id.substring(0, 14) + '…' : src.id) : '';
         html += `
             <div class="wl-linked-row ${matched ? 'matched' : 'unmatched'}" data-source="${src.key}">
                 <span class="wl-linked-icon">${src.icon}</span>
@@ -2634,7 +2681,7 @@ function _populateLinkedProviderSection(artistId, artistName, spotifyId, itunesI
         </div>
         <div class="wl-linked-search-input-row">
             <input type="text" id="wl-linked-search-input" class="watchlist-linked-search-input"
-                   placeholder="Search..." value="${escapeHtml(artistName)}">
+                   placeholder="Search…" value="${escapeHtml(artistName)}">
             <button class="watchlist-linked-search-btn" id="wl-linked-search-go">Search</button>
         </div>
         <div class="wl-linked-search-results" id="wl-linked-search-results"></div>
@@ -2672,7 +2719,7 @@ async function _searchSourceArtists(sourceKey, watchlistArtistId) {
     const query = input?.value?.trim();
     if (!query || !container) return;
 
-    container.innerHTML = '<div style="padding:12px;color:#888;text-align:center">Searching...</div>';
+    container.innerHTML = '<div style="padding:12px;color:#888;text-align:center">Searching…</div>';
 
     try {
         const response = await fetch('/api/library/search-service', {
@@ -3258,7 +3305,7 @@ async function saveWatchlistGlobalConfig() {
         const saveBtn = document.getElementById('save-global-config-btn');
         if (saveBtn) {
             saveBtn.disabled = true;
-            saveBtn.textContent = 'Saving...';
+            saveBtn.textContent = 'Saving…';
         }
 
         const response = await fetch('/api/watchlist/global-config', {
@@ -3336,7 +3383,7 @@ async function saveWatchlistArtistConfig(artistId) {
         const saveBtn = document.getElementById('save-artist-config-btn');
         if (saveBtn) {
             saveBtn.disabled = true;
-            saveBtn.textContent = 'Saving...';
+            saveBtn.textContent = 'Saving…';
         }
 
         // Send update to backend
@@ -3447,7 +3494,7 @@ async function cancelWatchlistScan() {
         const cancelBtn = document.getElementById('cancel-watchlist-scan-btn');
         if (cancelBtn) {
             cancelBtn.disabled = true;
-            cancelBtn.textContent = 'Cancelling...';
+            cancelBtn.textContent = 'Cancelling…';
         }
 
         const response = await fetch('/api/watchlist/scan/cancel', {
@@ -3477,7 +3524,7 @@ async function startWatchlistScan() {
     try {
         const button = document.getElementById('scan-watchlist-btn');
         button.disabled = true;
-        _wlSetChipLabel(button, 'Starting scan...');
+        _wlSetChipLabel(button, 'Starting scan…');
         button.classList.add('btn-processing');
 
         const response = await fetch('/api/watchlist/scan', {
@@ -3490,7 +3537,7 @@ async function startWatchlistScan() {
             throw new Error(data.error || 'Failed to start scan');
         }
 
-        _wlSetChipLabel(button, 'Scanning...');
+        _wlSetChipLabel(button, 'Scanning…');
 
         // Show cancel button
         const cancelBtn = document.getElementById('cancel-watchlist-scan-btn');
@@ -3856,7 +3903,7 @@ async function updateSimilarArtists() {
         const scanButton = document.getElementById('scan-watchlist-btn');
 
         button.disabled = true;
-        _wlSetChipLabel(button, 'Updating...');
+        _wlSetChipLabel(button, 'Updating…');
         button.classList.add('btn-processing');
         if (scanButton) scanButton.disabled = true;
 
@@ -3870,7 +3917,7 @@ async function updateSimilarArtists() {
             throw new Error(data.error || 'Failed to update similar artists');
         }
 
-        showToast('Updating similar artists in background...', 'success');
+        showToast('Updating similar artists in background…', 'success');
 
         // Poll for completion
         pollSimilarArtistsUpdate();
@@ -3925,7 +3972,7 @@ async function pollSimilarArtistsUpdate() {
             } else if (data.status === 'running') {
                 // Update button text with progress
                 if (button && data.current_artist) {
-                    button.textContent = `Updating... (${data.artists_processed || 0}/${data.total_artists || 0})`;
+                    button.textContent = `Updating… (${data.artists_processed || 0}/${data.total_artists || 0})`;
                 }
             }
         }
@@ -4098,7 +4145,7 @@ async function handleMetadataUpdateButtonClick() {
 
         try {
             button.disabled = true;
-            button.textContent = 'Starting...';
+            button.textContent = 'Starting…';
 
             const response = await fetch('/api/metadata/start', {
                 method: 'POST',
@@ -4126,7 +4173,7 @@ async function handleMetadataUpdateButtonClick() {
         // Stop metadata update
         try {
             button.disabled = true;
-            button.textContent = 'Stopping...';
+            button.textContent = 'Stopping…';
 
             const response = await fetch('/api/metadata/stop', {
                 method: 'POST',
@@ -4221,7 +4268,7 @@ function updateMetadataProgressUI(status) {
         refreshSelect.disabled = true;
 
         // Update current artist display
-        const currentArtist = status.current_artist || 'Processing...';
+        const currentArtist = status.current_artist || 'Processing…';
         phaseLabel.textContent = `Current Artist: ${currentArtist}`;
 
         // Update progress
@@ -4233,9 +4280,9 @@ function updateMetadataProgressUI(status) {
         progressBar.style.width = `${percentage}%`;
 
     } else if (status.status === 'stopping') {
-        button.textContent = 'Stopping...';
+        button.textContent = 'Stopping…';
         button.disabled = true;
-        phaseLabel.textContent = 'Current Artist: Stopping...';
+        phaseLabel.textContent = 'Current Artist: Stopping…';
 
     } else if (status.status === 'completed') {
         button.textContent = 'Begin Update';
@@ -4360,10 +4407,10 @@ async function handleMediaScanButtonClick() {
     try {
         // Disable button and update UI
         button.disabled = true;
-        phaseLabel.textContent = 'Requesting scan...';
+        phaseLabel.textContent = 'Requesting scan…';
         progressBar.style.width = '30%';
         progressLabel.textContent = 'Sending scan request to Plex';
-        statusValue.textContent = 'Scanning...';
+        statusValue.textContent = 'Scanning…';
         statusValue.style.color = 'rgb(var(--accent-rgb))';
 
         // Request scan (database update handled by system automation)
@@ -4392,7 +4439,7 @@ async function handleMediaScanButtonClick() {
             }
 
             // Start countdown timer (visual feedback during delay)
-            phaseLabel.textContent = 'Scan scheduled...';
+            phaseLabel.textContent = 'Scan scheduled…';
             progressBar.style.width = '0%';
 
             countdownInterval = setInterval(() => {
@@ -4404,9 +4451,9 @@ async function handleMediaScanButtonClick() {
 
                 // Update progress label with countdown
                 if (remainingSeconds > 0) {
-                    progressLabel.textContent = `Starting scan in ${remainingSeconds}s...`;
+                    progressLabel.textContent = `Starting scan in ${remainingSeconds}s…`;
                 } else {
-                    progressLabel.textContent = 'Scan starting now...';
+                    progressLabel.textContent = 'Scan starting now…';
                 }
 
                 // When countdown reaches 0, start polling
@@ -4414,9 +4461,9 @@ async function handleMediaScanButtonClick() {
                     clearInterval(countdownInterval);
 
                     // Transition to scanning phase
-                    phaseLabel.textContent = 'Scan in progress...';
+                    phaseLabel.textContent = 'Scan in progress…';
                     progressBar.style.width = '100%';
-                    progressLabel.textContent = 'Media server is scanning library...';
+                    progressLabel.textContent = 'Media server is scanning library…';
                     showToast('📡 Media scan started', 'success', 3000);
 
                     // Start polling for scan completion (5 minutes = 150 polls × 2s)
@@ -4449,7 +4496,7 @@ async function handleMediaScanButtonClick() {
 
                                 // Update status display
                                 if (status.is_scanning) {
-                                    phaseLabel.textContent = 'Media server scanning...';
+                                    phaseLabel.textContent = 'Media server scanning…';
                                     progressLabel.textContent = status.progress_message || 'Scan in progress';
                                 } else if (status.status === 'idle') {
                                     // Scan completed
@@ -4534,7 +4581,7 @@ function initializeLiveLogViewer() {
     if (!logArea) return;
 
     // Set initial content
-    logArea.value = 'Loading activity feed...';
+    logArea.value = 'Loading activity feed…';
 
     // Start log polling
     startLogPolling();
@@ -4578,7 +4625,7 @@ async function loadLogs() {
     } catch (error) {
         console.warn('Could not load activity logs for sync page:', error);
         const logArea = document.getElementById('sync-log-area');
-        if (logArea && (logArea.value === 'Loading logs...' || logArea.value === '')) {
+        if (logArea && (logArea.value === 'Loading logs…' || logArea.value === '')) {
             logArea.value = 'Error loading activity feed. Check console for details.';
         }
     }

@@ -235,7 +235,7 @@ async function searchDiscoveryFix() {
         ? [allSources[activeIdx], ...allSources.filter((_, i) => i !== activeIdx)]
         : allSources;
 
-    resultsContainer.innerHTML = `<div class="loading">🔍 Searching ${searchSources[0].label}...</div>`;
+    resultsContainer.innerHTML = `<div class="loading">🔍 Searching ${searchSources[0].label}…</div>`;
 
     try {
         for (let i = 0; i < searchSources.length; i++) {
@@ -250,7 +250,7 @@ async function searchDiscoveryFix() {
                 }
                 // No results from this source — show next source status if there is one
                 if (i < searchSources.length - 1) {
-                    resultsContainer.innerHTML = `<div class="loading">🔍 Trying ${searchSources[i + 1].label}...</div>`;
+                    resultsContainer.innerHTML = `<div class="loading">🔍 Trying ${searchSources[i + 1].label}…</div>`;
                 }
             } catch (e) {
                 console.warn(`Discovery fix search failed on ${source.label}: ${e.message}`);
@@ -298,7 +298,7 @@ async function lookupDiscoveryFixByMbid() {
     }
 
     if (resultsContainer) {
-        resultsContainer.innerHTML = '<div class="loading">🔗 Looking up MusicBrainz recording...</div>';
+        resultsContainer.innerHTML = '<div class="loading">🔗 Looking up MusicBrainz recording…</div>';
     }
 
     try {
@@ -793,7 +793,7 @@ let wishlistModalVersion = 0;
  */
 async function openAddToWishlistModal(album, artist, tracks, albumType, trackOwnership) {
     wishlistModalVersion++;
-    showLoadingOverlay('Preparing wishlist...');
+    showLoadingOverlay('Preparing wishlist…');
     console.log(`🎵 Opening Add to Wishlist modal for: ${artist.name} - ${album.name}`);
 
     try {
@@ -950,7 +950,7 @@ async function handleAddToWishlist() {
         // Show loading state
         if (addToWishlistBtn) {
             addToWishlistBtn.classList.add('loading');
-            addToWishlistBtn.textContent = 'Adding...';
+            addToWishlistBtn.textContent = 'Adding…';
             addToWishlistBtn.disabled = true;
         }
 
@@ -1317,7 +1317,7 @@ async function handleWishlistDownloadNow() {
     }
 
     // Open download missing modal (reuses existing function)
-    showLoadingOverlay('Loading album...');
+    showLoadingOverlay('Loading album…');
     await openDownloadMissingModalForArtistAlbum(
         virtualPlaylistId, playlistName, tracks, album, artist, false
     );
@@ -1498,7 +1498,7 @@ async function addModalTracksToWishlist(playlistId) {
     if (wishlistBtn) {
         wishlistBtn.disabled = true;
         wishlistBtn.classList.add('loading');
-        wishlistBtn.textContent = 'Adding...';
+        wishlistBtn.textContent = 'Adding…';
     }
 
     try {
@@ -1964,7 +1964,7 @@ function setupModalEventListeners() {
 
 async function fetchArtistSuggestions() {
     try {
-        showLoadingCards('artist-suggestions', 'Finding artist...');
+        showLoadingCards('artist-suggestions', 'Finding artist…');
 
         const response = await fetch('/api/match/suggestions', {
             method: 'POST',
@@ -1993,7 +1993,7 @@ async function fetchAlbumSuggestions() {
     if (!currentMatchingData.selectedArtist) return;
 
     try {
-        showLoadingCards('album-suggestions', 'Finding album...');
+        showLoadingCards('album-suggestions', 'Finding album…');
 
         const response = await fetch('/api/match/suggestions', {
             method: 'POST',
@@ -2215,7 +2215,7 @@ function handleAlbumSearch(event) {
 
 async function performArtistSearch(query) {
     try {
-        showLoadingCards('artist-manual-results', 'Searching artists...');
+        showLoadingCards('artist-manual-results', 'Searching artists…');
 
         const requestBody = {
             query: query,
@@ -2248,7 +2248,7 @@ async function performAlbumSearch(query) {
     if (!currentMatchingData.selectedArtist) return;
 
     try {
-        showLoadingCards('album-manual-results', 'Searching albums...');
+        showLoadingCards('album-manual-results', 'Searching albums…');
 
         const response = await fetch('/api/match/search', {
             method: 'POST',
@@ -2526,7 +2526,7 @@ async function confirmMatch() {
         });
 
         confirmBtn.disabled = true;
-        confirmBtn.textContent = 'Starting...';
+        confirmBtn.textContent = 'Starting…';
 
         // Determine the correct data to send
         const downloadPayload = currentMatchingData.isAlbumDownload
@@ -2535,7 +2535,7 @@ async function confirmMatch() {
 
         // --- NEW: For album downloads, fetch Spotify tracklist and match tracks ---
         if (currentMatchingData.isAlbumDownload && currentMatchingData.selectedAlbum) {
-            confirmBtn.textContent = 'Matching tracks...';
+            confirmBtn.textContent = 'Matching tracks…';
             console.log('🎵 Fetching Spotify tracklist for album:', currentMatchingData.selectedAlbum.name);
 
             try {
@@ -2567,7 +2567,7 @@ async function confirmMatch() {
                 console.log(`🎯 Matched ${enhancedTracks.matched.length}/${enhancedTracks.total} tracks to Spotify`);
 
                 // Send enhanced data with full Spotify track objects
-                confirmBtn.textContent = 'Downloading...';
+                confirmBtn.textContent = 'Downloading…';
                 const response = await fetch('/api/download/matched', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -2615,7 +2615,7 @@ async function confirmMatch() {
             }
         } else {
             // Single track download - fetch release data for full details
-            confirmBtn.textContent = 'Searching release data...';
+            confirmBtn.textContent = 'Searching release data…';
 
             try {
                 // Parse track name from Soulseek filename
@@ -2655,7 +2655,7 @@ async function confirmMatch() {
                 const fullTrack = await trackResponse.json();
 
                 // Send with full Spotify metadata (single track enhanced)
-                confirmBtn.textContent = 'Downloading...';
+                confirmBtn.textContent = 'Downloading…';
                 const response = await fetch('/api/download/matched', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -2801,7 +2801,7 @@ async function handleReconcileIdsButtonClick() {
 
     try {
         button.disabled = true;
-        button.textContent = 'Starting...';
+        button.textContent = 'Starting…';
         const response = await fetch('/api/library/reconcile-embedded-ids', { method: 'POST' });
         if (response.ok) {
             showToast('Tag import started!', 'success');
@@ -2904,7 +2904,7 @@ async function handleDuplicateCleanButtonClick() {
     if (currentAction === 'Clean Duplicates') {
         try {
             button.disabled = true;
-            button.textContent = 'Starting...';
+            button.textContent = 'Starting…';
             const response = await fetch('/api/duplicate-cleaner/start', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' }
@@ -3002,7 +3002,7 @@ function updateDuplicateCleanProgressUI(state) {
         button.textContent = 'Stop Cleaning';
         button.disabled = false;
 
-        phaseLabel.textContent = state.phase || 'Scanning...';
+        phaseLabel.textContent = state.phase || 'Scanning…';
         progressLabel.textContent = `${state.files_scanned} / ${state.total_files} files scanned (${state.progress.toFixed(1)}%)`;
         progressBar.style.width = `${state.progress}%`;
     } else { // idle, finished, or error
@@ -3105,7 +3105,7 @@ async function handleBackupNowClick() {
     if (!button) return;
     const origText = button.textContent;
     button.disabled = true;
-    button.textContent = 'Backing up...';
+    button.textContent = 'Backing up…';
     try {
         const res = await fetch('/api/database/backup', { method: 'POST' });
         const data = await res.json();
@@ -3260,7 +3260,7 @@ async function loadLibraryHistory() {
     const list = document.getElementById('library-history-list');
     const pagination = document.getElementById('library-history-pagination');
     if (!list) return;
-    list.innerHTML = '<div class="library-history-loading">Loading...</div>';
+    list.innerHTML = '<div class="library-history-loading">Loading…</div>';
     if (pagination) pagination.innerHTML = '';
 
     try {
@@ -4167,7 +4167,7 @@ async function loadSyncHistory() {
     const list = document.getElementById('sync-history-list');
     const tabsContainer = document.getElementById('sync-history-tabs');
     if (!list) return;
-    list.innerHTML = '<div class="sync-history-loading">Loading...</div>';
+    list.innerHTML = '<div class="sync-history-loading">Loading…</div>';
 
     try {
         const params = new URLSearchParams({ page, limit });
@@ -4252,7 +4252,7 @@ function renderSyncHistoryEntry(entry) {
                 <div class="sync-history-progress-bar-fill" id="sync-history-bar-${entry.id}"></div>
             </div>
             <div class="sync-history-progress-text">
-                <span class="sync-history-progress-step" id="sync-history-step-${entry.id}">Starting sync...</span>
+                <span class="sync-history-progress-step" id="sync-history-step-${entry.id}">Starting sync…</span>
                 <div class="sync-history-progress-stats">
                     <span class="matched" id="sync-history-matched-${entry.id}">0 matched</span>
                     <span class="failed" id="sync-history-failed-${entry.id}">0 failed</span>
@@ -4346,7 +4346,7 @@ async function retriggerSync(entryId) {
 async function _startSyncHistoryResync(entryId, entry) {
     // Disable the re-sync button
     const btn = document.getElementById(`resync-btn-${entryId}`);
-    if (btn) { btn.disabled = true; btn.textContent = 'Syncing...'; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Syncing…'; }
 
     // Show the progress area
     const wrapper = document.getElementById(`sync-history-wrapper-${entryId}`);
@@ -4497,7 +4497,7 @@ async function cancelSyncHistoryResync(entryId) {
         });
 
         const stepEl = document.getElementById(`sync-history-step-${entryId}`);
-        if (stepEl) stepEl.textContent = 'Cancelling...';
+        if (stepEl) stepEl.textContent = 'Cancelling…';
 
     } catch (err) {
         console.error('Error cancelling sync:', err);
@@ -4558,7 +4558,7 @@ async function syncPlaylistToServer(playlistId) {
 
     // Disable the sync button
     const btn = document.getElementById(`sync-server-btn-${playlistId}`);
-    if (btn) { btn.disabled = true; btn.textContent = 'Syncing...'; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Syncing…'; }
 
     // Show progress area
     const progressArea = document.getElementById(`modal-sync-progress-${playlistId}`);
@@ -4689,7 +4689,7 @@ async function cancelModalSync(playlistId) {
             body: JSON.stringify({ playlist_id: active.syncPlaylistId })
         });
         const stepEl = document.getElementById(`modal-sync-step-${playlistId}`);
-        if (stepEl) stepEl.textContent = 'Cancelling...';
+        if (stepEl) stepEl.textContent = 'Cancelling…';
     } catch (err) {
         console.error('Error cancelling modal sync:', err);
     }
@@ -4745,7 +4745,7 @@ async function openBlacklistModal() {
                 <button class="redownload-close" onclick="document.getElementById('blacklist-modal-overlay')?.remove()">&times;</button>
             </div>
             <div class="blacklist-modal-body" id="blacklist-modal-body">
-                <div class="redownload-loading"><div class="server-search-spinner"></div>Loading...</div>
+                <div class="redownload-loading"><div class="server-search-spinner"></div>Loading…</div>
             </div>
         </div>
     `;
@@ -4876,7 +4876,7 @@ async function loadMetadataCacheBrowse() {
     const search = document.getElementById('mcache-search')?.value || '';
     const sort = document.getElementById('mcache-sort-filter')?.value || 'last_accessed_at';
 
-    grid.innerHTML = '<div class="mcache-empty"><div class="mcache-empty-icon">...</div><div class="mcache-empty-sub">Loading...</div></div>';
+    grid.innerHTML = '<div class="mcache-empty"><div class="mcache-empty-icon">…</div><div class="mcache-empty-sub">Loading…</div></div>';
 
     try {
         let data;
@@ -5012,7 +5012,7 @@ function renderMetadataCachePagination(total, offset) {
 
     if (start > 0) {
         html += `<button class="mcache-page-btn" onclick="_mcachePage=0;loadMetadataCacheBrowse()">1</button>`;
-        if (start > 1) html += `<span style="color:rgba(255,255,255,0.2);padding:0 4px">...</span>`;
+        if (start > 1) html += `<span style="color:rgba(255,255,255,0.2);padding:0 4px">…</span>`;
     }
 
     for (let i = start; i < end; i++) {
@@ -5020,7 +5020,7 @@ function renderMetadataCachePagination(total, offset) {
     }
 
     if (end < totalPages) {
-        if (end < totalPages - 1) html += `<span style="color:rgba(255,255,255,0.2);padding:0 4px">...</span>`;
+        if (end < totalPages - 1) html += `<span style="color:rgba(255,255,255,0.2);padding:0 4px">…</span>`;
         html += `<button class="mcache-page-btn" onclick="_mcachePage=${totalPages - 1};loadMetadataCacheBrowse()">${totalPages}</button>`;
     }
 
@@ -5037,8 +5037,8 @@ async function openMetadataCacheDetail(source, entityType, entityId) {
     if (!modal || !body) return;
 
     modal.style.display = 'flex';
-    body.innerHTML = '<div style="text-align:center;padding:40px;color:rgba(255,255,255,0.4)">Loading...</div>';
-    if (title) title.textContent = 'Loading...';
+    body.innerHTML = '<div style="text-align:center;padding:40px;color:rgba(255,255,255,0.4)">Loading…</div>';
+    if (title) title.textContent = 'Loading…';
 
     try {
         const response = await fetch(`/api/metadata-cache/entity/${source}/${entityType}/${entityId}`);
@@ -6344,7 +6344,7 @@ const TOOL_HELP_CONTENT = {
 
             <h4>JSON payload</h4>
             <p>The POST body always includes all event variables as JSON fields:</p>
-            <pre style="background:rgba(255,255,255,0.05);padding:8px;border-radius:6px;font-size:11px;">{"time": "2026-04-02 ...", "name": "My Automation", "status": "success", ...}</pre>
+            <pre style="background:rgba(255,255,255,0.05);padding:8px;border-radius:6px;font-size:11px;">{"time": "2026-04-02 …", "name": "My Automation", "status": "success", ...}</pre>
 
             <h4>Available variables</h4>
             <p>Use these in your message or header values:</p>
@@ -6603,7 +6603,7 @@ async function openRetagModal() {
     if (clearBtn) { clearBtn.textContent = 'Clear All'; clearBtn.dataset.confirming = ''; clearBtn.style.background = ''; }
 
     const body = document.getElementById('retag-modal-body');
-    body.innerHTML = '<div class="retag-loading">Loading downloads...</div>';
+    body.innerHTML = '<div class="retag-loading">Loading downloads…</div>';
 
     try {
         const response = await fetch('/api/retag/groups');
@@ -6667,7 +6667,7 @@ function renderRetagGroups(groups, container) {
                     </div>
                 </div>
                 <div class="retag-group-tracks" id="retag-tracks-${group.id}" style="display:none;">
-                    <div class="retag-tracks-loading">Loading tracks...</div>
+                    <div class="retag-tracks-loading">Loading tracks…</div>
                 </div>
             </div>`;
         });
@@ -6842,7 +6842,7 @@ async function searchRetagAlbums(query) {
     if (!query || !query.trim()) return;
     const resultsDiv = document.getElementById('retag-search-results');
     if (!resultsDiv) return;
-    resultsDiv.innerHTML = '<div class="retag-search-loading">Searching...</div>';
+    resultsDiv.innerHTML = '<div class="retag-search-loading">Searching…</div>';
 
     try {
         const response = await fetch(`/api/retag/search?q=${encodeURIComponent(query.trim())}`);
@@ -7396,7 +7396,7 @@ function updateLibraryStatusCard(dbStats) {
         // State: Scanning
         card.classList.add('scanning');
         if (title) title.textContent = 'Library Scan';
-        if (subtitle) subtitle.textContent = 'Updating library database...';
+        if (subtitle) subtitle.textContent = 'Updating library database…';
         if (scanBtn) {
             scanBtn.style.display = '';
             scanBtn.classList.add('scanning');
@@ -7553,7 +7553,7 @@ async function dashboardLibraryScan(fullRefresh = false) {
                 const barFill = document.getElementById('library-status-bar-fill');
                 const detail = document.getElementById('library-status-progress-detail');
 
-                if (phase) phase.textContent = status.phase || 'Scanning...';
+                if (phase) phase.textContent = status.phase || 'Scanning…';
                 if (barFill) barFill.style.width = `${status.progress || 0}%`;
                 if (detail && status.processed !== undefined) {
                     detail.textContent = `${status.processed} / ${status.total || '?'}`;
@@ -7635,7 +7635,7 @@ async function dashboardLibraryDeepScan() {
                 const barFill = document.getElementById('library-status-bar-fill');
                 const detail = document.getElementById('library-status-progress-detail');
 
-                if (phase) phase.textContent = status.phase || 'Deep scanning...';
+                if (phase) phase.textContent = status.phase || 'Deep scanning…';
                 if (barFill) barFill.style.width = `${status.progress || 0}%`;
                 if (detail && status.processed !== undefined) {
                     detail.textContent = `${status.processed} / ${status.total || '?'}`;
@@ -7844,7 +7844,9 @@ function updateDbUpdaterCardInfo(stats) {
     const toolCardTitle = document.querySelector('#db-updater-card .tool-card-title');
     if (toolCardTitle && stats.server_source) {
         const serverName = stats.server_source.charAt(0).toUpperCase() + stats.server_source.slice(1);
-        toolCardTitle.textContent = `${serverName} Database Updater`;
+        // Keep the card emoji the static markup sets — this line owns the whole
+        // title, so without it the tool cards lose their icon the moment stats land.
+        toolCardTitle.textContent = `🗄️ ${serverName} Database Updater`;
     }
 }
 
@@ -7982,7 +7984,7 @@ function armDbUpdateSafetyPoll() {
             }
         } catch (e) { /* transient — keep the safety net armed */ }
     };
-    tick();  // immediate: flip off "Starting..." as soon as the server confirms state
+    tick();  // immediate: flip off "Starting…" as soon as the server confirms state
     _dbUpdateSafetyPoll = setInterval(tick, 5000);
 }
 
@@ -8000,7 +8002,7 @@ function updateDbProgressUI(state) {
         button.disabled = false;
         refreshSelect.disabled = true;
 
-        phaseLabel.textContent = state.phase || 'Processing...';
+        phaseLabel.textContent = state.phase || 'Processing…';
         progressLabel.textContent = `${state.processed} / ${state.total} artists (${state.progress.toFixed(1)}%)`;
         progressBar.style.width = `${state.progress}%`;
     } else { // idle, finished, or error

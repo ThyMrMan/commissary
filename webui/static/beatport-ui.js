@@ -1857,8 +1857,8 @@ async function handleBeatportReleaseCardClick(cardElement, release) {
     }
 
     try {
-        showToast(`Loading ${release.title}...`, 'info');
-        showLoadingOverlay(`Getting tracks from ${release.title}...`);
+        showToast(`Loading ${release.title}…`, 'info');
+        showLoadingOverlay(`Getting tracks from ${release.title}…`);
 
         // Fetch structured release metadata for direct download modal
         console.log(`🎵 Fetching release metadata: ${release.url}`);
@@ -1952,7 +1952,7 @@ async function _enrichTracksWithProgress(tracks, chartName) {
                     // Update loading overlay with live progress
                     const overlayText = document.querySelector('#loading-overlay .loading-message');
                     if (overlayText) {
-                        overlayText.textContent = `Fetching track metadata... (${progress.completed}/${progress.total}) ${progress.current_track || ''}`;
+                        overlayText.textContent = `Fetching track metadata… (${progress.completed}/${progress.total}) ${progress.current_track || ''}`;
                     }
 
                     if (progress.done) {
@@ -2065,8 +2065,8 @@ async function handleBeatportChartCardClick(cardElement, chart) {
 
     try {
         const chartName = `${chart.name} - ${chart.creator}`;
-        showToast(`Loading ${chart.name}...`, 'info');
-        showLoadingOverlay(`Scraping ${chart.name}...`);
+        showToast(`Loading ${chart.name}…`, 'info');
+        showLoadingOverlay(`Scraping ${chart.name}…`);
 
         const response = await fetch('/api/beatport/chart/extract', {
             method: 'POST',
@@ -2111,8 +2111,8 @@ async function handleBeatportDJChartCardClick(cardElement, chart) {
 
     try {
         const chartName = `${chart.name} - ${chart.creator}`;
-        showToast(`Loading ${chart.name}...`, 'info');
-        showLoadingOverlay(`Scraping ${chart.name}...`);
+        showToast(`Loading ${chart.name}…`, 'info');
+        showLoadingOverlay(`Scraping ${chart.name}…`);
 
         const response = await fetch('/api/beatport/chart/extract', {
             method: 'POST',
@@ -2155,7 +2155,7 @@ async function handleBeatportTop100Click() {
     console.log('💯 Beatport Top 100 button clicked');
 
     try {
-        showLoadingOverlay('Scraping Beatport Top 100...');
+        showLoadingOverlay('Scraping Beatport Top 100…');
 
         // Fetch track list without enrichment (fast)
         const response = await fetch('/api/beatport/top-100?enrich=false', { method: 'GET' });
@@ -2191,7 +2191,7 @@ async function handleHypeTop100Click() {
     console.log('🔥 Hype Top 100 button clicked');
 
     try {
-        showLoadingOverlay('Scraping Hype Top 100...');
+        showLoadingOverlay('Scraping Hype Top 100…');
 
         // Fetch track list without enrichment (fast)
         const response = await fetch('/api/beatport/hype-top-100?enrich=false', { method: 'GET' });
@@ -2340,7 +2340,7 @@ async function loadGenreBrowserGenres() {
     genresGrid.innerHTML = `
         <div class="genre-browser-loading-container">
             <div class="genre-browser-loading-spinner"></div>
-            <p class="genre-browser-loading-text">🔍 Discovering current Beatport genres...</p>
+            <p class="genre-browser-loading-text">🔍 Discovering current Beatport genres…</p>
         </div>
     `;
 
@@ -2703,7 +2703,7 @@ function showGenrePageView(genreSlug, genreId, genreName) {
             <div class="genre-hero-slider-container" id="genre-hero-slider-container">
                 <div class="genre-loading-container">
                     <div class="genre-loading-spinner"></div>
-                    <p class="genre-loading-text">🎠 Loading hero releases...</p>
+                    <p class="genre-loading-text">🎠 Loading hero releases…</p>
                 </div>
             </div>
             <div class="genre-nav-buttons-section">
@@ -2717,13 +2717,13 @@ function showGenrePageView(genreSlug, genreId, genreName) {
             <div class="genre-top10-lists-container" id="genre-top10-lists-container">
                 <div class="genre-top10-loading-container">
                     <div class="genre-loading-spinner"></div>
-                    <p class="genre-loading-text">🎵 Loading Top 10 lists...</p>
+                    <p class="genre-loading-text">🎵 Loading Top 10 lists…</p>
                 </div>
             </div>
             <div class="genre-top10-releases-container" id="genre-top10-releases-container">
                 <div class="genre-top10-releases-loading-container">
                     <div class="genre-loading-spinner"></div>
-                    <p class="genre-loading-text">💿 Loading Top 10 releases...</p>
+                    <p class="genre-loading-text">💿 Loading Top 10 releases…</p>
                 </div>
             </div>
         `;
@@ -2798,7 +2798,7 @@ async function loadGenreHeroSlider(genreSlug, genreId, genreName) {
         container.innerHTML = `
             <div class="genre-loading-container">
                 <div class="genre-loading-spinner"></div>
-                <p class="genre-loading-text">🎠 Loading ${genreName} hero releases...</p>
+                <p class="genre-loading-text">🎠 Loading ${genreName} hero releases…</p>
             </div>
         `;
 
@@ -3316,7 +3316,7 @@ async function handleGenreChartClick(trackDataKey, chartName, chartType) {
         }
 
         console.log(`✅ Got ${trackData.length} tracks from ${chartName}, enriching one-by-one...`);
-        showLoadingOverlay(`Fetching track metadata... (0/${trackData.length})`);
+        showLoadingOverlay(`Fetching track metadata… (0/${trackData.length})`);
 
         const enrichedTracks = await _enrichTracksWithProgress(trackData, chartName);
 
@@ -3392,7 +3392,7 @@ async function handleGenreTop100Click(genreSlug, genreId, genreName) {
     const chartName = `${genreName} Top 100`;
 
     try {
-        showLoadingOverlay(`Scraping ${chartName}...`);
+        showLoadingOverlay(`Scraping ${chartName}…`);
 
         // Use the genre tracks endpoint without enrichment
         const response = await fetch(`/api/beatport/genre/${genreSlug}/${genreId}/tracks?enrich=false`, { method: 'GET' });
@@ -3547,8 +3547,8 @@ async function handleGenreReleaseCardClick(cardElement, release) {
     }
 
     try {
-        showToast(`Loading ${release.title}...`, 'info');
-        showLoadingOverlay(`Getting tracks from ${release.title}...`);
+        showToast(`Loading ${release.title}…`, 'info');
+        showLoadingOverlay(`Getting tracks from ${release.title}…`);
 
         // Fetch structured release metadata for direct download modal
         console.log(`🎵 Fetching release metadata: ${release.url}`);

@@ -564,7 +564,7 @@ function updateMediaScanFromData(data) {
     const statusValue = document.getElementById('media-scan-status');
 
     if (status.is_scanning) {
-        if (phaseLabel) phaseLabel.textContent = 'Media server scanning...';
+        if (phaseLabel) phaseLabel.textContent = 'Media server scanning…';
         if (progressLabel) progressLabel.textContent = status.progress_message || 'Scan in progress';
     } else if (status.status === 'idle') {
         if (button) button.disabled = false;
@@ -633,7 +633,7 @@ async function updateStreamStatus() {
                 // Update loading text with progress
                 const loadingText = document.querySelector('.loading-text');
                 if (loadingText && data.progress > 0) {
-                    loadingText.textContent = `Downloading... ${Math.round(data.progress)}%`;
+                    loadingText.textContent = `Downloading… ${Math.round(data.progress)}%`;
                 }
                 break;
 
@@ -641,7 +641,7 @@ async function updateStreamStatus() {
                 // Show queue status with better messaging
                 const queueText = document.querySelector('.loading-text');
                 if (queueText) {
-                    queueText.textContent = 'Queuing with uploader...';
+                    queueText.textContent = 'Queuing with uploader…';
                 }
                 setLoadingProgress(0); // Reset progress for queue state
                 break;
@@ -729,7 +729,7 @@ async function startAudioPlayback() {
         // Show loading state while preparing audio
         const loadingText = document.querySelector('.loading-text');
         if (loadingText) {
-            loadingText.textContent = 'Preparing playback...';
+            loadingText.textContent = 'Preparing playback…';
         }
 
         // Set audio source with cache-busting timestamp

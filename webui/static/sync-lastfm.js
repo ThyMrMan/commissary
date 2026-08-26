@@ -24,10 +24,10 @@ async function loadLastfmSyncPlaylists() {
     const refreshBtn = document.getElementById('lastfm-sync-refresh-btn');
     if (!container) return;
 
-    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading Last.fm Radio playlists...</div>`;
+    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading Last.fm Radio playlists…</div>`;
     if (refreshBtn) {
         refreshBtn.disabled = true;
-        refreshBtn.textContent = '🔄 Loading...';
+        refreshBtn.textContent = '🔄 Loading…';
     }
 
     try {

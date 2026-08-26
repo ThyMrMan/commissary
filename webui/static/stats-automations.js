@@ -500,7 +500,7 @@ function mirrorPlaylist(source, sourceId, name, tracks, metadata = {}) {
 async function loadMirroredPlaylists() {
     const container = document.getElementById('mirrored-playlist-container');
     if (!container) return;
-    container.innerHTML = `<div class="playlist-placeholder">Loading mirrored playlists...</div>`;
+    container.innerHTML = `<div class="playlist-placeholder">Loading mirrored playlists…</div>`;
 
     try {
         const res = await fetch('/api/mirrored-playlists');
@@ -561,9 +561,9 @@ function renderMirroredCard(p, container) {
         const total = state.spotify_total || p.track_count;
         phaseHtml = `<span style="color:#22c55e;">Discovered ${matches}/${total}</span>`;
     } else if (phase === 'syncing' || phase === 'sync_complete') {
-        phaseHtml = `<span style="color:#3b82f6;">${phase === 'syncing' ? 'Syncing...' : 'Synced'}</span>`;
+        phaseHtml = `<span style="color:#3b82f6;">${phase === 'syncing' ? 'Syncing…' : 'Synced'}</span>`;
     } else if (phase === 'downloading') {
-        phaseHtml = `<span style="color:#f59e0b;">Downloading...</span>`;
+        phaseHtml = `<span style="color:#f59e0b;">Downloading…</span>`;
     } else if (phase === 'download_complete') {
         phaseHtml = `<span style="color:#22c55e;">Downloaded</span>`;
     }
@@ -840,7 +840,7 @@ function updateMirroredCardPhase(urlHash, phase) {
             phaseHtml = `<span style="color:#ef4444;">Pipeline error</span>`;
             break;
         case 'discovering':
-            phaseHtml = `<span style="color:#a78bfa;">Discovering...</span>`;
+            phaseHtml = `<span style="color:#a78bfa;">Discovering…</span>`;
             break;
         case 'discovered':
             const matches = state?.spotifyMatches || state?.spotify_matches || 0;
@@ -848,13 +848,13 @@ function updateMirroredCardPhase(urlHash, phase) {
             phaseHtml = `<span style="color:#22c55e;">Discovered ${matches}/${total}</span>`;
             break;
         case 'syncing':
-            phaseHtml = `<span style="color:#3b82f6;">Syncing...</span>`;
+            phaseHtml = `<span style="color:#3b82f6;">Syncing…</span>`;
             break;
         case 'sync_complete':
             phaseHtml = `<span style="color:#3b82f6;">Synced</span>`;
             break;
         case 'downloading':
-            phaseHtml = `<span style="color:#f59e0b;">Downloading...</span>`;
+            phaseHtml = `<span style="color:#f59e0b;">Downloading…</span>`;
             break;
         case 'download_complete':
             phaseHtml = `<span style="color:#22c55e;">Downloaded</span>`;
@@ -1013,9 +1013,9 @@ async function hydrateMirroredDiscoveryStates() {
                     } else if (s.phase === 'discovered') {
                         metaEl.insertAdjacentHTML('beforeend', `<span style="color:#22c55e;">Discovered ${s.spotify_matches || 0}/${s.spotify_total || 0}</span>`);
                     } else if (s.phase === 'syncing' || s.phase === 'sync_complete') {
-                        metaEl.insertAdjacentHTML('beforeend', `<span style="color:#3b82f6;">${s.phase === 'syncing' ? 'Syncing...' : 'Synced'}</span>`);
+                        metaEl.insertAdjacentHTML('beforeend', `<span style="color:#3b82f6;">${s.phase === 'syncing' ? 'Syncing…' : 'Synced'}</span>`);
                     } else if (s.phase === 'downloading') {
-                        metaEl.insertAdjacentHTML('beforeend', `<span style="color:#f59e0b;">Downloading...</span>`);
+                        metaEl.insertAdjacentHTML('beforeend', `<span style="color:#f59e0b;">Downloading…</span>`);
                     } else if (s.phase === 'download_complete') {
                         metaEl.insertAdjacentHTML('beforeend', `<span style="color:#22c55e;">Downloaded</span>`);
                     }
@@ -1054,7 +1054,7 @@ function timeAgo(dateStr) {
  * Open modal showing all tracks in a mirrored playlist.
  */
 async function openMirroredPlaylistModal(playlistId) {
-    showLoadingOverlay('Loading mirrored playlist...');
+    showLoadingOverlay('Loading mirrored playlist…');
     try {
         const res = await fetch(`/api/mirrored-playlists/${playlistId}`);
         const data = await res.json();
@@ -1279,7 +1279,7 @@ async function openDiscoveryPoolModal(playlistId = null) {
                     <div class="pool-list-header">
                         <button class="pool-back-btn" onclick="showPoolCategories()">&larr; Back</button>
                         <span class="pool-list-title" id="pool-list-title"></span>
-                        <input type="text" class="pool-list-search" id="pool-list-search" placeholder="Filter tracks..." oninput="renderPoolList()">
+                        <input type="text" class="pool-list-search" id="pool-list-search" placeholder="Filter tracks…" oninput="renderPoolList()">
                     </div>
                     <div class="pool-list-content" id="pool-list-content"></div>
                 </div>
@@ -1430,7 +1430,7 @@ async function openWingItPoolModal(playlistId = null) {
                     <div class="pool-list-header">
                         <button class="pool-back-btn" onclick="showWingItCategories()">&larr; Back</button>
                         <span class="pool-list-title" id="wing-it-list-title"></span>
-                        <input type="text" class="pool-list-search" id="wing-it-list-search" placeholder="Filter tracks..." oninput="renderWingItPoolList()">
+                        <input type="text" class="pool-list-search" id="wing-it-list-search" placeholder="Filter tracks…" oninput="renderWingItPoolList()">
                     </div>
                     <div class="pool-list-content" id="wing-it-list-content"></div>
                 </div>
@@ -1771,7 +1771,7 @@ function openPoolRematchModal(cacheId, trackName, artistName) {
                 </div>
                 <div class="pool-fix-results-area">
                     <div id="pool-fix-results" class="pool-fix-results-list">
-                        <div class="pool-fix-empty">Searching...</div>
+                        <div class="pool-fix-empty">Searching…</div>
                     </div>
                 </div>
             </div>
@@ -1865,7 +1865,7 @@ function openPoolFixModal(trackId, trackName, artistName) {
                 </div>
                 <div class="pool-fix-results-area">
                     <div id="pool-fix-results" class="pool-fix-results-list">
-                        <div class="pool-fix-empty">Searching...</div>
+                        <div class="pool-fix-empty">Searching…</div>
                     </div>
                 </div>
             </div>
@@ -1911,7 +1911,7 @@ async function searchPoolFix() {
         return;
     }
 
-    resultsContainer.innerHTML = '<div class="pool-fix-empty"><div class="pool-fix-spinner"></div>Searching...</div>';
+    resultsContainer.innerHTML = '<div class="pool-fix-empty"><div class="pool-fix-spinner"></div>Searching…</div>';
 
     try {
         const params = new URLSearchParams();
@@ -2046,7 +2046,7 @@ async function discoverMirroredPlaylist(playlistId) {
         return;
     }
 
-    showLoadingOverlay('Preparing discovery...');
+    showLoadingOverlay('Preparing discovery…');
     try {
         // Register the mirrored playlist on the backend so the YouTube discovery pipeline can find it
         const prepRes = await fetch(`/api/mirrored-playlists/${playlistId}/prepare-discovery`, { method: 'POST' });
@@ -2177,7 +2177,7 @@ async function retryFailedMirroredDiscovery(urlHash) {
         // Start polling for progress
         startYouTubeDiscoveryPolling(urlHash);
 
-        showToast(`Retrying ${data.retry_count} failed tracks...`, 'info');
+        showToast(`Retrying ${data.retry_count} failed tracks…`, 'info');
     } catch (err) {
         showToast(`Error retrying discovery: ${err.message}`, 'error');
     }
@@ -4025,7 +4025,7 @@ function _showGroupDropdown(event, autoId, currentGroup) {
         html += `<div class="auto-group-option${isActive ? ' active' : ''}" onclick="_assignGroup(${autoId}, '${_escJs(g)}')">${_esc(g)}</div>`;
     });
     if (allGroups.size) html += '<div class="auto-group-divider"></div>';
-    html += `<input class="auto-group-input" placeholder="New group name..." onkeydown="if(event.key==='Enter'){_assignGroup(${autoId}, this.value.trim()); event.preventDefault();}">`;
+    html += `<input class="auto-group-input" placeholder="New group name…" onkeydown="if(event.key==='Enter'){_assignGroup(${autoId}, this.value.trim()); event.preventDefault();}">`;
 
     dropdown.innerHTML = html;
 
@@ -4514,7 +4514,7 @@ async function showAutomationHistory(automationId, automationName, actionType) {
         modal.className = 'modal-overlay';
         document.body.appendChild(modal);
     }
-    modal.innerHTML = '<div class="modal-container automation-history-modal"><div class="history-modal-header"><h3>Run History: ' + _esc(automationName) + '</h3><button class="history-close-btn" onclick="document.getElementById(\'automation-history-modal\').style.display=\'none\'">&times;</button></div><div class="history-modal-body"><div class="history-loading">Loading...</div></div></div>';
+    modal.innerHTML = '<div class="modal-container automation-history-modal"><div class="history-modal-header"><h3>Run History: ' + _esc(automationName) + '</h3><button class="history-close-btn" onclick="document.getElementById(\'automation-history-modal\').style.display=\'none\'">&times;</button></div><div class="history-modal-body"><div class="history-loading">Loading…</div></div></div>';
     modal.style.display = 'flex';
     modal.onclick = function (e) { if (e.target === modal) modal.style.display = 'none'; };
 
@@ -4966,7 +4966,7 @@ function _renderBlockConfigFields(slotKey, blockType, config) {
                 const data = await resp.json();
                 const sel = document.getElementById(selectId);
                 if (sel && data.scripts) {
-                    sel.innerHTML = '<option value="">Select a script...</option>' +
+                    sel.innerHTML = '<option value="">Select a script…</option>' +
                         data.scripts.map(s => `<option value="${_escAttr(s.name)}"${s.name === scriptName ? ' selected' : ''}>${escapeHtml(s.name)} (${s.extension})</option>`).join('');
                 }
             } catch (e) { console.warn('Failed to load scripts:', e); }
@@ -4974,7 +4974,7 @@ function _renderBlockConfigFields(slotKey, blockType, config) {
         return `<div class="config-row">
             <label>Script</label>
             <select id="${selectId}">
-                <option value="${scriptName}">${scriptName || 'Loading...'}</option>
+                <option value="${scriptName}">${scriptName || 'Loading…'}</option>
             </select>
         </div>
         <div class="config-row">
@@ -4991,7 +4991,7 @@ function _renderBlockConfigFields(slotKey, blockType, config) {
         return `<div class="config-row">
             <label>Playlist</label>
             <select id="cfg-${slotKey}-playlist_id" class="mirrored-playlist-select" data-block-type="refresh_mirrored" data-value="${_escAttr(config.playlist_id || '')}">
-                <option value="">Loading...</option>
+                <option value="">Loading…</option>
             </select>
         </div>
         <div class="config-row">
@@ -5002,7 +5002,7 @@ function _renderBlockConfigFields(slotKey, blockType, config) {
         return `<div class="config-row">
             <label>Playlist</label>
             <select id="cfg-${slotKey}-playlist_id" class="mirrored-playlist-select" data-value="${_escAttr(config.playlist_id || '')}">
-                <option value="">Loading...</option>
+                <option value="">Loading…</option>
             </select>
         </div>`;
     }
@@ -5011,7 +5011,7 @@ function _renderBlockConfigFields(slotKey, blockType, config) {
         return `<div class="config-row">
             <label>Playlist</label>
             <select id="cfg-${slotKey}-playlist_id" class="mirrored-playlist-select" data-value="${_escAttr(config.playlist_id || '')}">
-                <option value="">Loading...</option>
+                <option value="">Loading…</option>
             </select>
         </div>
         <div class="config-row">
@@ -5024,7 +5024,7 @@ function _renderBlockConfigFields(slotKey, blockType, config) {
         return `<div class="config-row">
             <label>Playlist</label>
             <select id="cfg-${slotKey}-playlist_id" class="mirrored-playlist-select" data-value="${_escAttr(config.playlist_id || '')}">
-                <option value="">Loading...</option>
+                <option value="">Loading…</option>
             </select>
         </div>
         <div class="config-row">
@@ -5078,11 +5078,11 @@ function _renderBlockConfigFields(slotKey, blockType, config) {
         const url = _escAttr(config.webhook_url || '');
         return `<div class="config-row">
             <label>Webhook URL</label>
-            <input type="text" id="cfg-${slotKey}-webhook_url" value="${url}" placeholder="https://discord.com/api/webhooks/...">
+            <input type="text" id="cfg-${slotKey}-webhook_url" value="${url}" placeholder="https://discord.com/api/webhooks/…">
         </div>
         <div class="config-row">
             <label>Message</label>
-            <textarea id="cfg-${slotKey}-message" placeholder="Message with {variables}...">${config.message || '{name} completed with status: {status}'}</textarea>
+            <textarea id="cfg-${slotKey}-message" placeholder="Message with {variables}…">${config.message || '{name} completed with status: {status}'}</textarea>
         </div>
         ${_notifyVarHtml(slotKey)}`;
     }
@@ -5098,7 +5098,7 @@ function _renderBlockConfigFields(slotKey, blockType, config) {
         </div>
         <div class="config-row">
             <label>Message</label>
-            <textarea id="cfg-${slotKey}-message" placeholder="Message with {variables}...">${config.message || 'Completed with status: {status}'}</textarea>
+            <textarea id="cfg-${slotKey}-message" placeholder="Message with {variables}…">${config.message || 'Completed with status: {status}'}</textarea>
         </div>
         ${_notifyVarHtml(slotKey)}`;
     }
@@ -5120,7 +5120,7 @@ function _renderBlockConfigFields(slotKey, blockType, config) {
         </div>
         <div class="config-row">
             <label>Message</label>
-            <textarea id="cfg-${slotKey}-message" placeholder="Message with {variables}...">${config.message || '{name} completed with status: {status}'}</textarea>
+            <textarea id="cfg-${slotKey}-message" placeholder="Message with {variables}…">${config.message || '{name} completed with status: {status}'}</textarea>
         </div>
         ${_notifyVarHtml(slotKey)}`;
     }
@@ -5137,7 +5137,7 @@ function _renderBlockConfigFields(slotKey, blockType, config) {
         </div>
         <div class="config-row">
             <label>Custom Message <span style="opacity:0.4;font-weight:400">(optional)</span></label>
-            <textarea id="cfg-${slotKey}-message" placeholder="Message with {variables}...">${config.message || ''}</textarea>
+            <textarea id="cfg-${slotKey}-message" placeholder="Message with {variables}…">${config.message || ''}</textarea>
         </div>
         <div class="config-row" style="color:rgba(255,255,255,0.35);font-size:11px;">
             Sends a JSON POST with all event variables. Custom message added as "message" field if set.
@@ -5233,7 +5233,7 @@ function _renderConditionRow(slotKey, index, fields, cond) {
     const usePlaylistSelect = ((triggerType === 'playlist_changed' || triggerType === 'discovery_completed') && field === 'playlist_name');
     const valueHtml = usePlaylistSelect
         ? `<select class="cond-value mirrored-playlist-name-select" data-slot="${slotKey}" data-idx="${index}" data-value="${value}"></select>`
-        : `<input type="text" class="cond-value" data-slot="${slotKey}" data-idx="${index}" value="${value}" placeholder="value...">`;
+        : `<input type="text" class="cond-value" data-slot="${slotKey}" data-idx="${index}" value="${value}" placeholder="value…">`;
 
     return `<div class="condition-row" data-index="${index}">
         <select class="cond-field" data-slot="${slotKey}" data-idx="${index}">${fieldOpts}</select>
@@ -6058,9 +6058,9 @@ async function submitEnhanceQuality() {
     const footerInfo = document.getElementById('enhance-footer-info');
     if (submitBtn) {
         submitBtn.disabled = true;
-        submitBtn.innerHTML = '<span class="enhance-spinner"></span>Processing...';
+        submitBtn.innerHTML = '<span class="enhance-spinner"></span>Processing…';
     }
-    if (footerInfo) footerInfo.textContent = 'Matching tracks across metadata sources and adding to wishlist...';
+    if (footerInfo) footerInfo.textContent = 'Matching tracks across metadata sources and adding to wishlist…';
 
     try {
         const resp = await fetch(`/api/library/artist/${_enhanceArtistId}/enhance`, {

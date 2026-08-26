@@ -91,9 +91,9 @@ def test_episode_per_source_auto_is_wired():
 
 def test_grab_whole_season_button_and_batch():
     assert 'data-vdl-season-grab="' in _VIEW          # per-season button
-    assert '>Grab season<' in _VIEW
+    assert '>Download season<' in _VIEW
     assert 'function grabSeason(' in _VIEW
-    # autoGrabEpisode is gone: Grab season fetches ONE pack, so there is no
+    # autoGrabEpisode is gone: Download season fetches ONE pack, so there is no
     # per-episode auto-grab helper left to call.
     assert 'function autoGrabEpisode(' not in _VIEW
     assert "scope: 'season'" in _VIEW

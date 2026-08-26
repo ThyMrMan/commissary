@@ -1050,7 +1050,7 @@ function getCompletionStatusText(completionData) {
         case 'missing':
             return 'Missing';
         case 'downloading':
-            return 'Downloading...';
+            return 'Downloading…';
         case 'downloaded':
             return 'Downloaded';
         case 'error':
@@ -1444,7 +1444,7 @@ function playlistModalDownloadSyncFooterHtml(playlistId, options = {}) {
             <option value="reconcile">Reconcile (keep image/desc)</option>
             <option value="append">Append only</option>
         </select>
-        <button id="sync-btn-${playlistId}" class="playlist-modal-btn playlist-modal-btn-primary" onclick="startPlaylistSync('${playlistId}')" ${isSyncing ? 'disabled' : ''}>${isSyncing ? '⏳ Syncing...' : 'Sync Playlist'}</button>`;
+        <button id="sync-btn-${playlistId}" class="playlist-modal-btn playlist-modal-btn-primary" onclick="startPlaylistSync('${playlistId}')" ${isSyncing ? 'disabled' : ''}>${isSyncing ? '⏳ Syncing…' : 'Sync Playlist'}</button>`;
 }
 
 async function restartPlaylistDownloadMissing(playlistId) {
@@ -1499,7 +1499,7 @@ async function navigateToMirroredPlaylist(playlistRef, source = 'spotify') {
 
 async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlistName, spotifyTracks, album, artist, showLoadingOverlayParam = true, contextType = 'artist_album') {
     if (showLoadingOverlayParam) {
-        showLoadingOverlay('Loading album...');
+        showLoadingOverlay('Loading album…');
     }
     // Check if a process is already active for this virtual playlist
     if (activeDownloadProcesses[virtualPlaylistId]) {
@@ -1704,7 +1704,7 @@ async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlis
                     <div class="modal-sync-progress-bar-fill" id="modal-sync-bar-${virtualPlaylistId}"></div>
                 </div>
                 <div class="modal-sync-progress-info">
-                    <span class="modal-sync-step" id="modal-sync-step-${virtualPlaylistId}">Starting sync...</span>
+                    <span class="modal-sync-step" id="modal-sync-step-${virtualPlaylistId}">Starting sync…</span>
                     <div class="modal-sync-stats">
                         <span class="matched" id="modal-sync-matched-${virtualPlaylistId}">0 matched</span>
                         <span class="failed" id="modal-sync-failed-${virtualPlaylistId}">0 failed</span>
@@ -2375,7 +2375,7 @@ async function reopenDownloadModal(virtualPlaylistId) {
         console.log(`📥 [REOPEN] Recreating album modal for: ${item.name}`);
 
         // Fetch album tracks (pass name/artist for Hydrabase support)
-        showLoadingOverlay(`Loading ${item.name}...`);
+        showLoadingOverlay(`Loading ${item.name}…`);
 
         try {
             const _sap2 = new URLSearchParams({ name: item.name || '', artist: item.artist || '' });

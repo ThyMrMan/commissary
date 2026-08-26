@@ -22,6 +22,7 @@
     var BOOT_PATH = window.location.pathname;
 
     var SIDE_KEY = 'soulsync_side';
+    var APP_NAME = 'Commissary';
     var MUSIC_SUBTITLE = 'Music Sync & Manager';
     var VIDEO_SUBTITLE = 'Movies, TV & YouTube';
     var DEFAULT_VIDEO_PAGE = 'video-dashboard';
@@ -253,6 +254,7 @@
         // Drives the CSS that reveals shared music pages (e.g. Settings) and
         // hides the video host for them.
         document.body.setAttribute('data-video-page', meta.id);
+        updateTitle();
 
         var sharedMusicId = SHARED_PAGES[meta.id];
         if (sharedMusicId) {
@@ -325,12 +327,87 @@
         } catch (e) { /* ignore */ }
     }
 
+    // ── Tab title ────────────────────────────────────────────────────────────
+    // "<Page> · Commissary - <side subtitle>". Page first, so a truncated tab
+    // still says WHICH page; the side subtitle then separates the ten names that
+    // exist on BOTH sides (Library, Search, Downloads, Watchlist…). With no page
+    // known yet it falls back to the bare app title, which is byte-identical to
+    // index.html's static <title> — so a music boot never flashes.
+    //
+    // Labels are read out of the sidebar itself rather than a table here, so
+    // renaming a nav item renames its tab title with no second edit.
+    function navTextFor(sel) {
+        var a = document.querySelector(sel);
+        var t = a && a.querySelector('.nav-text');
+        return t ? (t.textContent || '').trim() : '';
+    }
+    function musicPageLabel() {
+        // Read the DOM the observer just saw change, NOT location.pathname:
+        // setActivePageChrome() stamps aria-current before TanStack has swapped
+        // the URL, so deriving from the path leaves every title one page stale.
+        //
+        // Drill-ins come first — they have no nav entry of their own (the sidebar
+        // deliberately stays anchored on Library), and showLegacyPage() marks the
+        // page .active before the chrome update, so this is already correct here.
+        var ad = document.querySelector('#artist-detail-page.active');
+        if (ad) {
+            var an = ad.querySelector('.artist-name');
+            return (an && (an.textContent || '').trim()) || 'Artist';
+        }
+        var ld = document.querySelector('#label-detail-page.active');
+        if (ld) {
+            var ln = ld.querySelector('.label-detail-name');
+            return (ln && (ln.textContent || '').trim()) || 'Label';
+        }
+        return navTextFor('.sidebar-nav:not(.video-nav) .nav-button[aria-current="page"]');
+    }
+    function videoPageLabel() {
+        var vp = document.body.getAttribute('data-video-page');
+        if (!vp) return '';
+        if (DETAIL_PAGES[vp]) return detailTitleOf(vp) || pageMeta(vp).label;
+        return pageMeta(vp).label || '';
+    }
+    function updateTitle() {
+        var side = document.body.getAttribute('data-side') === 'video' ? 'video' : 'music';
+        var base = APP_NAME + ' - ' + (side === 'video' ? VIDEO_SUBTITLE : MUSIC_SUBTITLE);
+        var label = '';
+        try { label = side === 'video' ? videoPageLabel() : musicPageLabel(); } catch (e) { label = ''; }
+        var next = label ? (label + ' · ' + base) : base;
+        if (document.title !== next) document.title = next;
+    }
+
+    // The music side never calls in here (isolation contract), so watch its DOM
+    // instead: setActivePageChrome() stamps aria-current on the active nav button
+    // on every music navigation, React routes included. Detail names arrive after
+    // their fetch, so the four title nodes are watched for text too.
+    function watchForTitleChanges() {
+        var nav = document.querySelector('.sidebar-nav:not(.video-nav)');
+        if (nav) {
+            new MutationObserver(updateTitle).observe(nav, {
+                attributes: true, subtree: true, attributeFilter: ['aria-current'] });
+        }
+        var names = ['#artist-detail-page .artist-name', '#label-detail-page .label-detail-name',
+            '[data-video-detail] [data-vd-title]', '[data-video-person] [data-vp-name]',
+            '[data-video-studio] [data-vst-name]'];
+        for (var i = 0; i < names.length; i++) {
+            var nodes = document.querySelectorAll(names[i]);
+            for (var j = 0; j < nodes.length; j++) {
+                new MutationObserver(updateTitle).observe(nodes[j], {
+                    childList: true, characterData: true, subtree: true });
+            }
+        }
+        window.addEventListener('popstate', updateTitle);
+    }
+
     // Flip the shell chrome to a side (data-side drives the CSS). Does NOT navigate
     // — callers decide which page to show and whether to push a URL.
     function applySide(side) {
         document.body.setAttribute('data-side', side);
+        var sub = side === 'video' ? VIDEO_SUBTITLE : MUSIC_SUBTITLE;
         var subtitle = document.querySelector('.sidebar-header .app-subtitle');
-        if (subtitle) subtitle.textContent = side === 'video' ? VIDEO_SUBTITLE : MUSIC_SUBTITLE;
+        if (subtitle) subtitle.textContent = sub;
+        // The tab/window title tracks the side as well as the page (see updateTitle).
+        updateTitle();
         var toggleButtons = document.querySelectorAll('.side-toggle-btn');
         for (var i = 0; i < toggleButtons.length; i++) {
             toggleButtons[i].classList.toggle(
@@ -461,6 +538,9 @@
         var defaultNav = document.querySelector(
             '.video-nav .nav-button[data-video-page="' + DEFAULT_VIDEO_PAGE + '"]');
         if (defaultNav) defaultNav.classList.add('active');
+
+        // Attach before the first applySide() so nothing is missed.
+        watchForTitleChanges();
 
         var bootSide = (bootDetail || bootPage) ? 'video' : readSide();
         // Side access: if the profile is already known at boot (fast path),

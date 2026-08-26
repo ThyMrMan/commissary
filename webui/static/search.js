@@ -131,7 +131,7 @@ function initializeSearchModeToggle() {
             const loadingText = document.getElementById('enhanced-loading-text');
             if (loadingText) {
                 const info = SOURCE_LABELS[src];
-                loadingText.textContent = `Searching ${(info && info.text) || src} and your library...`;
+                loadingText.textContent = `Searching ${(info && info.text) || src} and your library…`;
             }
             showDropdown();
             return;
@@ -821,7 +821,7 @@ function initializeSearchModeToggle() {
     async function handleEnhancedSearchAlbumClick(album) {
         console.log(`💿 Enhanced search album clicked: ${album.name} by ${album.artist}`);
 
-        showLoadingOverlay('Loading album...');
+        showLoadingOverlay('Loading album…');
 
         try {
             // Fetch full album data with tracks — pass source for correct routing
@@ -953,7 +953,7 @@ function initializeSearchModeToggle() {
     async function streamEnhancedSearchTrack(track) {
         console.log(`▶️ Stream enhanced search track: ${track.name} by ${track.artist}`);
 
-        showLoadingOverlay(`Searching for ${track.name}...`);
+        showLoadingOverlay(`Searching for ${track.name}…`);
 
         try {
             // Send track metadata to backend for quick slskd search
@@ -1010,7 +1010,7 @@ function initializeSearchModeToggle() {
     async function handleEnhancedSearchTrackClick(track) {
         console.log(`🎵 Enhanced search track clicked: ${track.name} by ${track.artist}`);
 
-        showLoadingOverlay('Loading track...');
+        showLoadingOverlay('Loading track…');
 
         try {
             // Create virtual playlist ID for enhanced search tracks
@@ -1147,7 +1147,7 @@ async function performSearch() {
     }
 
     try {
-        showLoadingOverlay('Searching...');
+        showLoadingOverlay('Searching…');
         displaySearchResults([]);  // Clear previous results
 
         const response = await fetch(API.search, {

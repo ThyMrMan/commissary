@@ -22,10 +22,10 @@ async function loadSoulsyncDiscoverySyncPlaylists() {
     const refreshBtn = document.getElementById('soulsync-discovery-sync-refresh-btn');
     if (!container) return;
 
-    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading Commissary Discovery playlists...</div>`;
+    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading Commissary Discovery playlists…</div>`;
     if (refreshBtn) {
         refreshBtn.disabled = true;
-        refreshBtn.textContent = '🔄 Loading...';
+        refreshBtn.textContent = '🔄 Loading…';
     }
 
     try {

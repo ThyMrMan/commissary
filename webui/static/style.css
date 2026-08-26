@@ -2,6 +2,18 @@
 
 /* Accent Color Variables — overridden by JS when user picks a custom accent */
 :root {
+    /* ── Button scale ────────────────────────────────────────────────────────
+       Named from the values the Music side already converged on: radius and
+       size each cluster into four values covering ~70-80% of buttons, weight
+       into three covering 93%. Nothing here changes how a Music button renders
+       — these are the existing numbers, given names — and the Video rules below
+       now resolve through them instead of their own near-miss literals.
+       Padding is deliberately NOT tokenised: it has 65 distinct values with no
+       natural tiers, and changing it moves layout rather than just appearance. */
+    --btn-r-sm: 6px;   --btn-r-md: 8px;   --btn-r-lg: 10px;  --btn-r-xl: 12px;
+    --btn-fs-sm: 11px; --btn-fs-md: 12px; --btn-fs-lg: 13px; --btn-fs-xl: 14px;
+    --btn-fw-normal: 500; --btn-fw-medium: 600; --btn-fw-bold: 700;
+
     --accent-rgb: 29, 185, 84;
     --accent-light-rgb: 30, 215, 96;
     --accent-neon-rgb: 34, 255, 107;
@@ -5002,21 +5014,6 @@ body.helper-mode-active #dashboard-activity-feed:hover {
     transform: translateY(-1px);
 }
 
-.cancel-button {
-    padding: 6px 12px;
-    background: rgba(255, 107, 107, 0.1);
-    color: #ff6b6b;
-    border: 1px solid rgba(255, 107, 107, 0.3);
-    border-radius: 6px;
-    font-size: 12px;
-    cursor: pointer;
-    margin-top: 8px;
-}
-
-.cancel-button:hover {
-    background: rgba(255, 107, 107, 0.2);
-}
-
 .status-display {
     margin-top: 12px;
     padding: 8px 12px;
@@ -5242,43 +5239,6 @@ body.helper-mode-active #dashboard-activity-feed:hover {
     margin-top: 4px;
 }
 
-/* Toggle Download Manager Button */
-.toggle-manager-btn {
-    background: linear-gradient(135deg,
-            rgba(35, 35, 35, 0.8) 0%,
-            rgba(25, 25, 25, 0.9) 100%);
-    backdrop-filter: blur(10px);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 50%;
-    width: 44px;
-    height: 44px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-    flex-shrink: 0;
-    box-shadow:
-        0 4px 12px rgba(0, 0, 0, 0.3),
-        inset 0 1px 0 rgba(255, 255, 255, 0.1);
-}
-
-.toggle-manager-btn:hover {
-    background: linear-gradient(135deg,
-            rgba(45, 45, 45, 0.9) 0%,
-            rgba(35, 35, 35, 0.95) 100%);
-    border-color: rgba(var(--accent-rgb), 0.4);
-    transform: scale(1.05);
-    box-shadow:
-        0 6px 16px rgba(0, 0, 0, 0.4),
-        0 0 20px rgba(var(--accent-rgb), 0.2),
-        inset 0 1px 0 rgba(255, 255, 255, 0.15);
-}
-
-.toggle-manager-btn:active {
-    transform: scale(0.95);
-}
-
 .toggle-icon {
     font-size: 20px;
     font-weight: 600;
@@ -5309,11 +5269,6 @@ body.helper-mode-active #dashboard-activity-feed:hover {
         gap: 12px;
     }
 
-    .toggle-manager-btn {
-        width: 40px;
-        height: 40px;
-    }
-
     .toggle-icon {
         font-size: 20px;
     }
@@ -5330,11 +5285,6 @@ body.helper-mode-active #dashboard-activity-feed:hover {
 @media (max-width: 480px) {
     .downloads-header-content {
         gap: 10px;
-    }
-
-    .toggle-manager-btn {
-        width: 36px;
-        height: 36px;
     }
 
     .toggle-icon {
@@ -5558,24 +5508,6 @@ body.helper-mode-active #dashboard-activity-feed:hover {
     transform: scale(1.1);
 }
 
-.action-btn--stream {
-    background: linear-gradient(to bottom, #ffc107, #ff9800);
-    border-color: rgba(255, 193, 7, 0.3);
-    color: #000;
-}
-
-.action-btn--download {
-    background: linear-gradient(to bottom, rgb(var(--accent-light-rgb)), rgb(var(--accent-rgb)));
-    border-color: rgba(var(--accent-rgb), 0.3);
-    color: #000;
-}
-
-.action-btn--matched {
-    background: linear-gradient(to bottom, #9333ea, #7c28c0);
-    border-color: rgba(147, 51, 234, 0.3);
-    color: #fff;
-}
-
 /* AlbumResultItem Styling */
 .album-result-item {
     background: linear-gradient(to bottom, rgba(52, 52, 58, 0.95), rgba(42, 42, 48, 0.98));
@@ -5656,37 +5588,6 @@ body.helper-mode-active #dashboard-activity-feed:hover {
     display: flex;
     flex-direction: column;
     gap: 4px;
-}
-
-.album-action-btn {
-    height: 36px;
-    width: 160px;
-    border-radius: 18px;
-    border: 2px solid;
-    font-size: 12px;
-    font-weight: bold;
-    cursor: pointer;
-    transition: background 0.2s ease;
-}
-
-.album-action-btn--download {
-    background: linear-gradient(to bottom, rgb(var(--accent-light-rgb)), rgb(var(--accent-rgb)));
-    border-color: rgba(var(--accent-rgb), 0.3);
-    color: #000;
-}
-
-.album-action-btn--download:hover {
-    background: linear-gradient(to bottom, #1fdf64, rgb(var(--accent-light-rgb)));
-}
-
-.album-action-btn--matched {
-    background: linear-gradient(to bottom, #9333ea, #7c28c0);
-    border-color: rgba(147, 51, 234, 0.3);
-    color: #fff;
-}
-
-.album-action-btn--matched:hover {
-    background: linear-gradient(to bottom, #a747fe, #903fdd);
 }
 
 
@@ -5781,41 +5682,6 @@ body.helper-mode-active #dashboard-activity-feed:hover {
 
 .controls-panel__actions {
     padding: 6px;
-}
-
-.controls-panel__clear-btn {
-    width: 100%;
-    height: 28px;
-    background: linear-gradient(to bottom, rgba(220, 53, 69, 0.4), rgba(220, 53, 69, 0.25));
-    border: 1px solid rgba(220, 53, 69, 0.8);
-    color: #dc3545;
-    border-radius: 14px;
-    font-size: 10px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.2s ease;
-}
-
-.controls-panel__clear-btn:hover {
-    background: linear-gradient(to bottom, rgba(220, 53, 69, 0.5), rgba(220, 53, 69, 0.35));
-}
-
-.controls-panel__cancel-all-btn {
-    width: 100%;
-    height: 28px;
-    margin-top: 4px;
-    background: linear-gradient(to bottom, rgba(255, 152, 0, 0.4), rgba(255, 152, 0, 0.25));
-    border: 1px solid rgba(255, 152, 0, 0.8);
-    color: #ff9800;
-    border-radius: 14px;
-    font-size: 10px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.2s ease;
-}
-
-.controls-panel__cancel-all-btn:hover {
-    background: linear-gradient(to bottom, rgba(255, 152, 0, 0.5), rgba(255, 152, 0, 0.35));
 }
 
 /* Download Manager (Tabs & Queue) */
@@ -5944,43 +5810,9 @@ body.helper-mode-active #dashboard-activity-feed:hover {
     color: #c0c0c0;
 }
 
-.download-item__cancel-btn {
-    width: 60px;
-    height: 35px;
-    background: rgba(220, 53, 69, 0.9);
-    color: white;
-    border: 1px solid rgba(220, 53, 69, 0.6);
-    border-radius: 4px;
-    font-size: 9px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: background 0.2s ease;
-}
-
-.download-item__cancel-btn:hover {
-    background: rgba(240, 73, 89, 1.0);
-}
-
 .download-item__status-container {
     width: auto;
     text-align: right;
-}
-
-.download-item__open-btn {
-    width: 60px;
-    height: 35px;
-    background: rgba(40, 167, 69, 0.9);
-    color: white;
-    border: 1px solid rgba(var(--accent-rgb), 0.6);
-    border-radius: 4px;
-    font-size: 9px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: background 0.2s ease;
-}
-
-.download-item__open-btn:hover {
-    background: rgba(50, 187, 79, 1.0);
 }
 
 .download-item__status-text {
@@ -6966,22 +6798,6 @@ body:has(.vrn-panel.vrn-open) #helper-float-btn {
 .wing-it-dropdown-hint {
     font-size: 10px;
     color: rgba(255, 255, 255, 0.25);
-}
-
-.wing-it-btn-sm {
-    background: transparent;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    color: rgba(255, 255, 255, 0.5);
-    font-size: 11px;
-    font-weight: 600;
-    border-radius: 6px;
-    padding: 4px 10px;
-    cursor: pointer;
-    transition: all 0.2s;
-}
-.wing-it-btn-sm:hover {
-    background: rgba(255, 255, 255, 0.08);
-    color: rgba(255, 255, 255, 0.8);
 }
 
 /* Desktop-Only Optimizations */
@@ -8278,53 +8094,6 @@ body:has(.vrn-panel.vrn-open) #helper-float-btn {
     align-items: center;
 }
 
-/* Action Buttons */
-.download-item__cancel-btn {
-    background: linear-gradient(to bottom,
-            rgba(255, 69, 58, 0.9),
-            rgba(255, 45, 85, 0.8));
-    border: 1px solid rgba(255, 69, 58, 0.4);
-    border-radius: 6px;
-    color: #ffffff;
-    font-size: 11px;
-    font-weight: 600;
-    padding: 12px 12px !important;
-    cursor: pointer;
-    transition: opacity 0.15s ease, background 0.2s ease, border-color 0.2s ease, transform 0.15s ease;
-    align-self: flex-start;
-    width: fit-content !important;
-    height: fit-content !important;
-    /* Reveal on hover only — keeps the card clean until the user actually
-       wants to act. Space is reserved (opacity + pointer-events, not display)
-       so the layout doesn't jump when the button shows. */
-    opacity: 0;
-    pointer-events: none;
-    transform: translateX(4px);
-}
-
-.download-item:hover .download-item__cancel-btn,
-.download-item:focus-within .download-item__cancel-btn {
-    opacity: 1;
-    pointer-events: auto;
-    transform: translateX(0);
-}
-
-/* Touch devices have no hover — keep cancel visible so it's reachable. */
-@media (hover: none) {
-    .download-item__cancel-btn {
-        opacity: 1;
-        pointer-events: auto;
-        transform: none;
-    }
-}
-
-.download-item__cancel-btn:hover {
-    background: linear-gradient(to bottom,
-            rgba(255, 69, 58, 1.0),
-            rgba(255, 45, 85, 0.9));
-    border-color: rgba(255, 69, 58, 0.6);
-}
-
 .download-item__status-container {
     display: flex;
     align-items: center;
@@ -8354,17 +8123,6 @@ body:has(.vrn-panel.vrn-open) #helper-float-btn {
     background: rgba(255, 69, 58, 0.2);
     color: #ff453a;
     border: 1px solid rgba(255, 69, 58, 0.4);
-}
-
-.download-item__open-btn {
-    background: rgba(var(--accent-rgb), 0.1);
-    color: rgba(var(--accent-rgb), 0.6);
-    border: 1px solid rgba(var(--accent-rgb), 0.2);
-    border-radius: 6px;
-    font-size: 11px;
-    padding: 6px 12px;
-    cursor: not-allowed;
-    opacity: 0.6;
 }
 
 /* Tab Management */
@@ -8613,39 +8371,8 @@ body:has(.vrn-panel.vrn-open) #helper-float-btn {
     transform: translateY(0);
 }
 
-/* Album stream buttons - modal style */
-.album-stream-btn {
-    padding: 10px 18px;
-    border: none;
-    border-radius: 12px;
-    font-size: 14px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.2s ease;
-    font-family: 'SF Pro Text', -apple-system, BlinkMacSystemFont, sans-serif;
-    outline: none;
-    user-select: none;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    margin-right: 8px;
-    background: rgba(255, 255, 255, 0.1);
-    color: rgba(255, 255, 255, 0.8);
-}
-
-.album-stream-btn:hover {
-    background: rgba(255, 255, 255, 0.2);
-    color: #ffffff;
-    transform: translateY(-1px);
-}
-
 /* Disabled states - modal style */
-.track-stream-btn:disabled,
-.track-download-btn:disabled,
-.track-matched-btn:disabled,
-.album-stream-btn:disabled,
-.album-download-btn:disabled,
-.album-matched-btn:disabled {
+.track-stream-btn:disabled, .track-download-btn:disabled, .track-matched-btn:disabled, .album-download-btn:disabled, .album-matched-btn:disabled {
     background: rgba(255, 255, 255, 0.1);
     color: rgba(255, 255, 255, 0.4);
     cursor: not-allowed;
@@ -8653,15 +8380,13 @@ body:has(.vrn-panel.vrn-open) #helper-float-btn {
 }
 
 /* Playing states - modal style */
-.track-stream-btn.playing,
-.album-stream-btn.playing {
+.track-stream-btn.playing {
     background: rgb(var(--accent-rgb));
     color: #ffffff;
 }
 
 /* Loading states - modal style */
-.track-stream-btn.loading,
-.album-stream-btn.loading {
+.track-stream-btn.loading {
     background: rgba(255, 193, 7, 0.9);
     color: #000000;
     animation: pulse-loading 1.5s infinite;
@@ -8698,17 +8423,23 @@ body:has(.vrn-panel.vrn-open) #helper-float-btn {
     justify-content: center;
     gap: 8px;
     padding: 12px 24px;
-    border-radius: 12px;
-    font-size: 14px;
+    border-radius: var(--btn-r-xl);
+    font-size: var(--btn-fs-xl);
     font-weight: 600;
     font-family: inherit;
     line-height: 1;
     cursor: pointer;
     border: none;
-    outline: none;
     transition: all 0.2s ease;
 }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+/* `outline: none` used to sit in the base with nothing to replace it, so every
+   .btn was invisible to keyboard users. :focus-visible only paints for keyboard
+   focus, so mouse clicks look exactly as before. */
+.btn:focus-visible {
+    outline: 2px solid rgb(var(--accent-rgb));
+    outline-offset: 2px;
+}
 
 .btn--primary {
     background: linear-gradient(135deg, rgb(var(--accent-rgb)), rgb(var(--accent-light-rgb)));
@@ -8771,8 +8502,8 @@ body:has(.vrn-panel.vrn-open) #helper-float-btn {
    with a color modifier, e.g. `.btn .btn--sm .btn--secondary`. */
 .btn--sm {
     padding: 6px 14px;
-    font-size: 12px;
-    border-radius: 8px;
+    font-size: var(--btn-fs-md);
+    border-radius: var(--btn-r-md);
     gap: 6px;
 }
 
@@ -19557,7 +19288,7 @@ body:has(.vrn-panel.vrn-open) #helper-float-btn {
 .youtube-discovery-modal .modal-btn {
     padding: 12px 24px;
     border-radius: 12px;
-    font-size: 14px;
+    font-size: var(--btn-fs-xl);
     font-weight: 600;
     cursor: pointer;
     transition: all 0.3s ease;
@@ -25151,30 +24882,6 @@ body:has(.vrn-panel.vrn-open) #helper-float-btn {
     gap: 20px;
 }
 
-.artists-back-button {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 12px 20px;
-    font-size: 14px;
-    font-weight: 600;
-    color: rgba(255, 255, 255, 0.8);
-
-    background: rgba(255, 255, 255, 0.08);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 16px;
-    cursor: pointer;
-    transition: all 0.2s ease;
-    outline: none;
-    font-family: 'SF Pro Text', -apple-system, BlinkMacSystemFont, sans-serif;
-}
-
-.artists-back-button:hover {
-    background: rgba(255, 255, 255, 0.12);
-    color: #ffffff;
-    transform: translateY(-1px);
-}
-
 .back-icon {
     font-size: 16px;
 }
@@ -25830,113 +25537,11 @@ body:has(.vrn-panel.vrn-open) #helper-float-btn {
     flex: 1;
 }
 
-.artist-detail-back-button {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 12px 20px;
-    font-size: 14px;
-    font-weight: 600;
-    color: rgba(255, 255, 255, 0.8);
-
-    background: rgba(255, 255, 255, 0.08);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 16px;
-    cursor: pointer;
-    transition: all 0.2s ease;
-    outline: none;
-    font-family: 'SF Pro Text', -apple-system, BlinkMacSystemFont, sans-serif;
-}
-
-.artist-detail-back-button:hover {
-    background: rgba(255, 255, 255, 0.12);
-    color: #ffffff;
-    transform: translateY(-1px);
-}
-
-.artist-detail-watchlist-btn {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 12px 18px;
-    font-size: 14px;
-    font-weight: 600;
-    color: #e0e0e0;
-
-    background: rgba(255, 255, 255, 0.08);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 16px;
-    cursor: pointer;
-    transition: all 0.2s ease;
-    outline: none;
-    font-family: 'SF Pro Text', -apple-system, BlinkMacSystemFont, sans-serif;
-}
-
-.artist-detail-watchlist-btn:hover:not(:disabled) {
-    background: rgba(var(--accent-rgb), 0.15);
-    color: #ffffff;
-    border-color: rgba(var(--accent-rgb), 0.3);
-    transform: translateY(-1px);
-}
-
-.artist-detail-watchlist-btn.watching {
-    background: rgba(255, 193, 7, 0.15);
-    color: #ffc107;
-    border-color: rgba(255, 193, 7, 0.3);
-}
-
-.artist-detail-watchlist-btn.watching:hover:not(:disabled) {
-    background: rgba(255, 193, 7, 0.25);
-    color: #ffffff;
-    border-color: rgba(255, 193, 7, 0.5);
-}
-
-.artist-detail-watchlist-btn:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-    transform: none;
-}
-
 /* Artist Detail Watchlist Button Group (with settings gear) */
 .artist-detail-watchlist-group {
     display: flex;
     align-items: center;
     gap: 6px;
-}
-
-.artist-detail-watchlist-settings-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 40px;
-    height: 40px;
-    padding: 0;
-    font-size: 18px;
-    color: #aaa;
-    background: rgba(255, 255, 255, 0.08);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 12px;
-    cursor: pointer;
-    transition: all 0.2s ease;
-    outline: none;
-}
-
-.artist-detail-watchlist-settings-btn:hover {
-    background: rgba(255, 193, 7, 0.15);
-    color: #ffc107;
-    border-color: rgba(255, 193, 7, 0.3);
-    transform: translateY(-1px);
-}
-
-/* Artist Card Watchlist Button Group (artists/discover page) */
-.watchlist-btn-group {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-}
-
-.watchlist-btn-group .watchlist-toggle-btn {
-    flex: 1;
 }
 
 .watchlist-settings-btn {
@@ -33689,9 +33294,9 @@ div.artist-hero-badge {
 
 .modal-btn {
     padding: 10px 20px;
-    border-radius: 8px;
-    font-size: 14px;
-    font-weight: 500;
+    border-radius: var(--btn-r-md);
+    font-size: var(--btn-fs-xl);
+    font-weight: var(--btn-fw-normal);
     cursor: pointer;
     transition: all 0.2s ease;
     border: none;
@@ -33707,6 +33312,52 @@ div.artist-hero-badge {
 .modal-btn.secondary:hover {
     background: rgba(255, 255, 255, 0.08);
     color: rgba(255, 255, 255, 0.9);
+}
+
+/* The modal-btn intents were only ever declared under .youtube-discovery-modal,
+   so the same classes anywhere else — the playlist sync modal above all — fell
+   through to the UA default button: a light-grey box with black text on a dark
+   modal. The scoped rules still win inside the YouTube modal (higher specificity);
+   these only catch everything else. The base gets a ground for the same reason,
+   so a bare .modal-btn is a neutral button rather than an OS one. */
+.modal-btn {
+    background: rgba(255, 255, 255, 0.06);
+    color: rgba(255, 255, 255, 0.85);
+}
+.modal-btn:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+.modal-btn:focus-visible { outline: 2px solid rgb(var(--accent-rgb)); outline-offset: 2px; }
+.modal-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.modal-btn-primary {
+    background: linear-gradient(135deg, rgb(var(--accent-rgb)) 0%, rgb(var(--accent-light-rgb)) 100%);
+    color: #ffffff;
+    border: 1px solid rgba(var(--accent-rgb), 0.3);
+}
+.modal-btn-primary:hover {
+    background: linear-gradient(135deg, rgb(var(--accent-light-rgb)) 0%, #1fbc56 100%);
+    border-color: rgba(var(--accent-rgb), 0.5);
+    color: #ffffff;
+}
+
+.modal-btn-secondary {
+    background: rgba(255, 255, 255, 0.1);
+    color: #ffffff;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+}
+.modal-btn-secondary:hover {
+    background: rgba(255, 255, 255, 0.2);
+    border-color: rgba(255, 255, 255, 0.3);
+}
+
+.modal-btn-danger {
+    background: linear-gradient(135deg, #ff6b6b 0%, #ff5555 100%);
+    color: #ffffff;
+    border: 1px solid rgba(255, 107, 107, 0.3);
+}
+.modal-btn-danger:hover {
+    background: linear-gradient(135deg, #ff5555 0%, #ff4444 100%);
+    border-color: rgba(255, 107, 107, 0.5);
+    color: #ffffff;
 }
 
 /* Action buttons in discovery table */
@@ -34364,23 +34015,6 @@ div.artist-hero-badge {
     font-size: 13px;
     font-weight: 600;
     color: rgba(255, 255, 255, 0.8);
-}
-
-.retag-batch-remove-btn {
-    background: none;
-    border: 1px solid rgba(255, 59, 48, 0.4);
-    color: #ff6b6b;
-    padding: 6px 14px;
-    border-radius: 8px;
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s ease;
-}
-
-.retag-batch-remove-btn:hover {
-    background: rgba(255, 59, 48, 0.2);
-    border-color: rgba(255, 59, 48, 0.6);
 }
 
 /* Artist sections */
@@ -37352,38 +36986,6 @@ div.artist-hero-badge {
     flex-shrink: 0;
 }
 
-.spotify-library-action-btn {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 8px 16px;
-    border-radius: 8px;
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    border: none;
-    transition: all 0.2s ease;
-}
-
-.spotify-library-refresh-btn {
-    background: rgba(255, 255, 255, 0.08);
-    color: #b3b3b3;
-}
-
-.spotify-library-refresh-btn:hover {
-    background: rgba(255, 255, 255, 0.14);
-    color: #fff;
-}
-
-.spotify-library-download-btn {
-    background: rgba(var(--accent-rgb), 0.15);
-    color: rgb(var(--accent-rgb));
-}
-
-.spotify-library-download-btn:hover {
-    background: rgba(var(--accent-rgb), 0.25);
-}
-
 .spotify-library-filters {
     display: flex;
     gap: 12px;
@@ -39353,12 +38955,6 @@ div.artist-hero-badge {
         font-size: 9px;
     }
 
-    .album-action-btn {
-        height: 32px;
-        width: 140px;
-        font-size: 11px;
-    }
-
     .track-item {
         margin: 2px 12px 6px 50px;
         padding: 6px 10px;
@@ -41086,28 +40682,6 @@ div.artist-hero-badge {
     gap: 16px;
 }
 
-.enh-sr-back-btn {
-    background: rgba(40, 40, 40, 0.8);
-    border: 1px solid rgba(138, 43, 226, 0.4);
-    border-radius: 10px;
-    padding: 10px 20px;
-    color: rgba(255, 255, 255, 0.9);
-    font-size: 14px;
-    font-weight: 600;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    transition: all 0.2s ease;
-    align-self: flex-start;
-}
-
-.enh-sr-back-btn:hover {
-    background: rgba(50, 50, 50, 0.9);
-    border-color: rgba(138, 43, 226, 0.6);
-    transform: translateX(-4px);
-}
-
 .enh-sr-back-icon {
     font-size: 16px;
 }
@@ -41173,25 +40747,6 @@ div.artist-hero-badge {
     color: rgba(255, 255, 255, 0.95);
     margin: 0;
     flex-grow: 1;
-}
-
-.enh-sr-download-btn {
-    background: linear-gradient(135deg, rgba(138, 43, 226, 0.8), rgba(123, 31, 162, 0.8));
-    border: none;
-    border-radius: 8px;
-    padding: 8px 16px;
-    color: #ffffff;
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.2s ease;
-    margin-left: 12px;
-}
-
-.enh-sr-download-btn:hover {
-    background: linear-gradient(135deg, rgba(138, 43, 226, 1), rgba(123, 31, 162, 1));
-    transform: translateY(-2px);
-    box-shadow: 0 4px 12px rgba(138, 43, 226, 0.4);
 }
 
 .enh-sr-download-meta {
@@ -44693,39 +44248,6 @@ div.artist-hero-badge {
     /* Ensure positioning context */
 }
 
-.mb-link-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 6px 12px;
-    background: rgba(255, 255, 255, 0.1);
-    border: 1px solid rgba(255, 255, 255, 0.2);
-    border-radius: 6px;
-    color: #fff;
-    text-decoration: none;
-    font-size: 13px;
-    font-weight: 500;
-    transition: all 0.2s ease;
-    margin-left: 10px;
-    cursor: pointer;
-    vertical-align: middle;
-}
-
-.mb-link-btn:hover {
-    background: rgba(186, 71, 143, 0.4);
-    /* MusicBrainz Purple-ish */
-    border-color: rgba(186, 71, 143, 0.6);
-    transform: translateY(-1px);
-}
-
-.mb-link-btn img,
-.mb-link-btn svg {
-    width: 16px;
-    height: 16px;
-    margin-right: 6px;
-    vertical-align: middle;
-}
-
 /* Legacy .mb-card-icon override removed — now handled by .source-card-icon inside .card-badge-container */
 
 /* Badge container for artist cards */
@@ -45237,24 +44759,6 @@ div.artist-hero-badge {
     display: flex;
     flex-direction: column;
     gap: 10px;
-}
-.quarantine-chooser-btn {
-    padding: 12px 16px;
-    border-radius: 10px;
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    background: rgba(255, 255, 255, 0.05);
-    color: #fff;
-    font-size: 14px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s ease, border-color 0.15s ease;
-}
-.quarantine-chooser-btn:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.12);
-}
-.quarantine-chooser-btn:disabled {
-    opacity: 0.6;
-    cursor: default;
 }
 .quarantine-chooser-accept {
     border-color: rgba(var(--accent-rgb), 0.5);
@@ -57378,36 +56882,6 @@ tr.tag-diff-same {
     gap: 8px;
     padding: 8px 16px 14px;
 }
-.stg-btn {
-    padding: 8px 16px;
-    border-radius: 8px;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    background: rgba(255, 255, 255, 0.05);
-    color: rgba(255, 255, 255, 0.75);
-    font-size: 0.82em;
-    font-family: inherit;
-    cursor: pointer;
-    transition: all 0.2s;
-}
-.stg-btn:hover {
-    background: rgba(255, 255, 255, 0.08);
-    color: #fff;
-    transform: translateY(-1px);
-    box-shadow: 0 3px 12px rgba(0, 0, 0, 0.2);
-}
-.stg-btn:active {
-    transform: scale(0.97);
-    box-shadow: none;
-}
-.stg-btn-primary {
-    background: var(--accent-color, #1db954);
-    border-color: var(--accent-color, #1db954);
-    color: #fff;
-    font-weight: 500;
-}
-.stg-btn-primary:hover {
-    filter: brightness(1.15);
-}
 
 /* Toggle switch (replaces checkbox for booleans) */
 .stg-toggle {
@@ -64078,7 +63552,7 @@ body.max-performance #page-particles-canvas {
     display: flex;
     align-items: center;
     gap: 10px;
-    font-size: 26px;
+    font-size: 30px;
     font-weight: 700;
     color: #fff;
     margin: 0;
@@ -64199,10 +63673,6 @@ body.max-performance #page-particles-canvas {
         margin: -16px -16px 16px -16px;
         border-top-left-radius: 16px;
         border-top-right-radius: 16px;
-    }
-
-    .tools-page-title {
-        font-size: 22px;
     }
 
     .tools-maintenance-header {
@@ -64629,9 +64099,6 @@ body.max-performance #page-particles-canvas {
     font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
 }
 
-.wishlist-page-title-icon {
-    font-size: 26px;
-}
 
 .wishlist-page-meta {
     display: flex;
@@ -64751,6 +64218,38 @@ body.max-performance #page-particles-canvas {
 .wl-nebula-search { flex: 1; min-width: 200px; padding: 10px 16px; border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; background: rgba(255,255,255,0.03); color: #fff; font-size: 13px; transition: all 0.2s; box-sizing: border-box; }
 .wl-nebula-search:focus { border-color: rgba(var(--accent-rgb),0.4); background: rgba(255,255,255,0.05); box-shadow: 0 0 12px rgba(var(--accent-rgb),0.1); outline: none; }
 .wl-nebula-search::placeholder { color: rgba(255,255,255,0.25); }
+/* Wishlist sort — sits beside .wl-nebula-search in the same bar, so it borrows that
+   bar's radius/size and the Music watchlist select's chevron treatment. No flex-grow:
+   the search field takes the slack. */
+.wl-nebula-sort {
+    flex: 0 0 auto;
+    padding: 10px 32px 10px 14px;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    background-color: rgba(255,255,255,0.03);
+    color: rgba(255,255,255,0.65);
+    font-size: 13px;
+    font-weight: 500;
+    font-family: inherit;
+    cursor: pointer;
+    transition: all 0.2s;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='rgba(255,255,255,0.4)' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+    white-space: nowrap;
+}
+.wl-nebula-sort:hover { border-color: rgba(255,255,255,0.2); color: rgba(255,255,255,0.85); }
+.wl-nebula-sort:focus {
+    border-color: rgba(var(--accent-rgb),0.4);
+    background-color: rgba(255,255,255,0.05);
+    box-shadow: 0 0 12px rgba(var(--accent-rgb),0.1);
+    outline: none;
+}
+/* The native dropdown list renders in the OS palette; force the dark ground so the
+   options aren't white-on-white the way every other bare select in here is. */
+.wl-nebula-sort option { background: #16181a; color: #fff; }
 .wl-nebula-bar-actions { display: flex; gap: 8px; }
 
 .wl-nebula-field { display: flex; flex-wrap: wrap; gap: 20px; justify-content: center; padding: 10px 0 30px; }
@@ -71269,7 +70768,6 @@ body.em-scroll-lock { overflow: hidden; }
    by album). Reuses .library-header/.library-controls/.library-search-*
    from the Library page for the header+search chrome; only the
    album-card/track-row list below is new. ── */
-.purchased-page-title-icon { margin-right: 4px; }
 
 .purchased-albums-list {
     display: flex; flex-direction: column; gap: 10px;
@@ -72312,3 +71810,27 @@ body.app-locked > *:not(#launch-pin-overlay):not(#login-overlay):not(#plex-signi
 /* An import-only token has nothing to show for an existing file. Dimmed rather
    than hidden, so a template that uses one explains itself via the tooltip. */
 .vrn-chip-dim { opacity: 0.5; }
+
+
+/* ── Global keyboard focus ring ──────────────────────────────────────────────
+   Only two button families in the entire app declared a focus style, so tabbing
+   through the UI was very nearly invisible. Kept at low specificity (0,1,1) on
+   purpose: any component defining its own :focus-visible still wins, including
+   the overlay and collection editors, which draw a box-shadow ring instead.
+   :focus-visible matches keyboard focus only, so mouse clicks are unchanged.
+
+   Placed last in this file deliberately — a handful of button rules set
+   `outline: none` in their base at the same specificity, and source order is
+   what settles those ties.
+
+   .nav-button is an <a>, not a <button>, and it is the main keyboard path into
+   the app; its ring is inset so the sidebar's overflow can never clip it. */
+button:focus-visible,
+[role="button"]:focus-visible {
+    outline: 2px solid rgb(var(--accent-rgb));
+    outline-offset: 2px;
+}
+.nav-button:focus-visible {
+    outline: 2px solid rgb(var(--accent-rgb));
+    outline-offset: -2px;
+}

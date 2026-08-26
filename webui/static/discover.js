@@ -565,7 +565,7 @@ async function checkAndUpdateDiscoverHeroWatchlistButton(artistId) {
         if (data.is_watching) {
             // Artist is in watchlist
             if (icon) icon.textContent = '👁️';
-            if (text) text.textContent = 'Watching...';
+            if (text) text.textContent = 'Watching…';
             addBtn.classList.add('watching');
         } else {
             // Artist not in watchlist
@@ -605,7 +605,7 @@ async function watchAllHeroArtists(btn) {
 
     // Loading state
     btn.disabled = true;
-    if (textEl) textEl.textContent = 'Adding...';
+    if (textEl) textEl.textContent = 'Adding…';
 
     try {
         const artists = discoverHeroArtists.map(a => ({
@@ -702,13 +702,13 @@ async function openRecommendedArtistsModal() {
                 <div class="playlist-header-content" style="width: 100%;">
                     <h2>Recommended Artists</h2>
                     <div class="playlist-quick-info">
-                        <span class="playlist-track-count">Loading...</span>
+                        <span class="playlist-track-count">Loading…</span>
                     </div>
                 </div>
                 <span class="playlist-modal-close" onclick="closeRecommendedArtistsModal()">&times;</span>
             </div>
             <div class="playlist-modal-body">
-                <div class="recommended-loading">Loading recommended artists...</div>
+                <div class="recommended-loading">Loading recommended artists…</div>
             </div>
         </div>
     `;
@@ -826,7 +826,7 @@ function renderRecommendedArtistsModal(modal, artists, source = null) {
                         <input type="text"
                                class="recommended-search-input"
                                id="recommended-search-input"
-                               placeholder="Search recommended artists..."
+                               placeholder="Search recommended artists…"
                                oninput="filterRecommendedArtists()">
                     </div>
                     <button class="recommended-add-all-btn" id="recommended-add-all-btn"
@@ -898,7 +898,7 @@ async function addAllRecommendedToWatchlist(btn) {
 
     const originalText = btn.textContent;
     btn.disabled = true;
-    btn.textContent = 'Adding...';
+    btn.textContent = 'Adding…';
 
     try {
         const artists = _recommendedArtistsCache.map(a => ({
@@ -1065,7 +1065,7 @@ async function loadRecommendedArtistsSection() {
                 _enrichRecommendedCarouselCards((data && data.artists || []).slice(0, 18), source);
                 _clampGrid(carousel);
             },
-            loadingMessage: 'Finding recommendations...',
+            loadingMessage: 'Finding recommendations…',
             emptyMessage: 'No recommendations yet — let the Similar Artists worker run',
             errorMessage: 'Failed to load recommendations',
         });
@@ -1108,7 +1108,7 @@ async function loadListeningRecommendations() {
                 _enrichRecommendedCarouselCards((data && data.artists || []).slice(0, 18), source, 'listening-recs-carousel');
                 _clampGrid(carousel);
             },
-            loadingMessage: 'Reading your listening...',
+            loadingMessage: 'Reading your listening…',
             emptyMessage: 'Play more music and run a watchlist scan to see picks based on your listening',
             errorMessage: 'Failed to load listening recommendations',
         });
@@ -1315,7 +1315,7 @@ async function loadDiscoverRecentReleases() {
                 discoverRecentAlbums = items;
                 return items.map((album, i) => _renderRecentReleaseCard(album, i)).join('');
             },
-            loadingMessage: 'Loading recent releases...',
+            loadingMessage: 'Loading recent releases…',
             emptyMessage: 'No recent releases found',
             errorMessage: 'Failed to load recent releases',
             showErrorToast: true,
@@ -1369,7 +1369,7 @@ async function loadYourAlbums() {
                 return Boolean(data && data.stale) && total === 0;
             },
             renderStale: () =>
-                '<div class="discover-loading"><div class="loading-spinner"></div><p>Fetching your albums from connected services...</p></div>',
+                '<div class="discover-loading"><div class="loading-spinner"></div><p>Fetching your albums from connected services…</p></div>',
             onStale: () => _pollYourAlbums(),
             // Side-effects against sibling DOM (subtitle / filters /
             // download button) belong here, not in renderItems.
@@ -1426,7 +1426,7 @@ function _pollYourAlbums() {
 async function loadYourAlbumsGrid() {
     const grid = document.getElementById('your-albums-grid');
     if (!grid) return;
-    grid.innerHTML = '<div class="discover-loading"><div class="loading-spinner"></div><p>Loading...</p></div>';
+    grid.innerHTML = '<div class="discover-loading"><div class="loading-spinner"></div><p>Loading…</p></div>';
     try {
         const search = (document.getElementById('your-albums-search')?.value || '').trim();
         const status = document.getElementById('your-albums-status-filter')?.value || 'all';
@@ -1506,7 +1506,7 @@ function _yourAlbumsNextPage() {
 async function openYourAlbumDownload(index) {
     const album = yourAlbums[index];
     if (!album) { showToast('Album data not found', 'error'); return; }
-    showLoadingOverlay(`Loading tracks for ${album.album_name}...`);
+    showLoadingOverlay(`Loading tracks for ${album.album_name}…`);
     try {
         // Per-source dispatch: open with whichever source has an ID for
         // this album. For pure-Discogs collection items (no Spotify/
@@ -1580,10 +1580,10 @@ async function refreshYourAlbums() {
     const btn = document.getElementById('your-albums-refresh-btn');
     if (btn) btn.disabled = true;
     const subtitle = document.getElementById('your-albums-subtitle');
-    if (subtitle) subtitle.textContent = 'Refreshing from connected services...';
+    if (subtitle) subtitle.textContent = 'Refreshing from connected services…';
     try {
         await fetch('/api/discover/your-albums/refresh?clear=true', { method: 'POST' });
-        showToast('Refresh started — checking for new albums...', 'info');
+        showToast('Refresh started — checking for new albums…', 'info');
         const poll = setInterval(async () => {
             try {
                 const resp = await fetch('/api/discover/your-albums?page=1&per_page=48');
@@ -1932,7 +1932,7 @@ async function _startYourAlbumsBatchAddToWishlist() {
             <div class="discog-prog-art">${row.image_url ? `<img src="${escapeHtml(row.image_url)}">` : '🎵'}</div>
             <div class="discog-prog-info">
                 <div class="discog-prog-title">${escapeHtml(row.album_name || '')}</div>
-                <div class="discog-prog-status">Waiting...</div>
+                <div class="discog-prog-status">Waiting…</div>
             </div>
             <div class="discog-prog-icon"><div class="discog-spinner"></div></div>
         `;
@@ -1943,7 +1943,7 @@ async function _startYourAlbumsBatchAddToWishlist() {
     if (submitBtn) submitBtn.style.display = 'none';
     if (footer) {
         const info = document.getElementById('your-albums-batch-footer-info');
-        if (info) info.textContent = 'Processing... this may take a moment';
+        if (info) info.textContent = 'Processing… this may take a moment';
     }
 
     // Build per-album payload matching the discography endpoint contract.
@@ -2065,7 +2065,7 @@ async function loadDiscoverReleaseRadar() {
             fetchUrl: '/api/discover/release-radar',
             extractItems: (data) => data.tracks || [],
             renderItems: (items) => { discoverReleaseRadarTracks = items; return ''; },
-            loadingMessage: 'Loading release radar...',
+            loadingMessage: 'Loading release radar…',
             emptyMessage: 'No new releases available',
             errorMessage: 'Failed to load release radar',
             verboseErrors: true,
@@ -2094,7 +2094,7 @@ async function loadDiscoverWeekly() {
             fetchUrl: '/api/discover/weekly',
             extractItems: (data) => data.tracks || [],
             renderItems: (items) => { discoverWeeklyTracks = items; return ''; },
-            loadingMessage: 'Curating your discovery playlist...',
+            loadingMessage: 'Curating your discovery playlist…',
             emptyMessage: 'No tracks available yet',
             errorMessage: 'Failed to load discovery weekly',
             verboseErrors: true,
@@ -2147,7 +2147,7 @@ async function loadDecadeBrowser() {
             fetchUrl: '/api/discover/decades/available',
             extractItems: (data) => data.decades || [],
             renderItems: (items) => items.map(d => _renderDecadeCard(d)).join(''),
-            loadingMessage: 'Loading decades...',
+            loadingMessage: 'Loading decades…',
             emptyMessage: 'No decade content available yet. Run a watchlist scan to populate your discovery pool!',
             errorMessage: 'Failed to load decades',
             verboseErrors: true,
@@ -2173,7 +2173,7 @@ function getDecadeIcon(year) {
 
 async function openDecadePlaylist(decade) {
     try {
-        showLoadingOverlay(`Loading ${decade}s playlist...`);
+        showLoadingOverlay(`Loading ${decade}s playlist…`);
 
         const response = await fetch(`/api/discover/decade/${decade}`);
         if (!response.ok) {
@@ -2238,7 +2238,7 @@ async function loadGenreBrowser() {
             fetchUrl: '/api/discover/genres/available',
             extractItems: (data) => data.genres || [],
             renderItems: (items) => items.map(g => _renderGenreCard(g)).join(''),
-            loadingMessage: 'Loading genres...',
+            loadingMessage: 'Loading genres…',
             emptyMessage: 'No genre content available yet. Run a watchlist scan to populate your discovery pool!',
             errorMessage: 'Failed to load genres',
             verboseErrors: true,
@@ -2333,7 +2333,7 @@ function escapeHtml(text) {
 
 async function openGenrePlaylist(genre) {
     try {
-        showLoadingOverlay(`Loading ${capitalizeGenre(genre)} playlist...`);
+        showLoadingOverlay(`Loading ${capitalizeGenre(genre)} playlist…`);
 
         const response = await fetch(`/api/discover/genre/${encodeURIComponent(genre)}`);
         if (!response.ok) {
@@ -2384,7 +2384,7 @@ function _renderSyncStatusBlock(idPrefix) {
             <div class="sync-status-content">
                 <div class="sync-status-label">
                     <span class="sync-icon">⟳</span>
-                    <span>Syncing to media server...</span>
+                    <span>Syncing to media server…</span>
                 </div>
                 <div class="sync-status-stats">
                     <span class="sync-stat">✓ <span id="${idPrefix}-sync-completed">0</span></span>
@@ -2578,7 +2578,7 @@ function _getDecadeBrowserTabsCtrl() {
 
                     <!-- Track List -->
                     <div class="discover-playlist-container compact" id="${tabId}-playlist">
-                        <div class="discover-loading"><div class="loading-spinner"></div><p>Loading ${decade.year}s tracks...</p></div>
+                        <div class="discover-loading"><div class="loading-spinner"></div><p>Loading ${decade.year}s tracks…</p></div>
                     </div>
                 </div>
             `;
@@ -3000,7 +3000,7 @@ function _getGenreBrowserTabsCtrl() {
 
                     <!-- Track List -->
                     <div class="discover-playlist-container compact" id="${tabId}-playlist">
-                        <div class="discover-loading"><div class="loading-spinner"></div><p>Loading ${capitalizeGenre(genre.name)} tracks...</p></div>
+                        <div class="discover-loading"><div class="loading-spinner"></div><p>Loading ${capitalizeGenre(genre.name)} tracks…</p></div>
                     </div>
                 </div>
             `;
@@ -3621,7 +3621,7 @@ function buildListenBrainzPlaylistsHtml(playlists, tabId) {
         const statusHtml = `
             <div class="discover-sync-status" id="${playlistId}-sync-status" style="display:none">
                 <div class="sync-status-content">
-                    <div class="sync-status-label"><span class="sync-icon">&#10227;</span><span>Syncing to media server...</span></div>
+                    <div class="sync-status-label"><span class="sync-icon">&#10227;</span><span>Syncing to media server…</span></div>
                     <div class="sync-status-stats">
                         <span class="sync-stat">&#9834; <span id="${playlistId}-sync-total">0</span></span>
                         <span class="sync-separator">/</span>
@@ -4169,7 +4169,7 @@ async function openDownloadModalForListenBrainzPlaylist(identifier, title) {
 
 async function openListenBrainzPlaylist(playlistMbid, playlistName) {
     try {
-        showLoadingOverlay(`Loading ${playlistName}...`);
+        showLoadingOverlay(`Loading ${playlistName}…`);
 
         const response = await fetch(`/api/discover/listenbrainz/playlist/${playlistMbid}`);
         if (!response.ok) {
@@ -4224,10 +4224,10 @@ async function refreshListenBrainzPlaylists() {
         // Show loading state on button
         const originalContent = button.innerHTML;
         button.disabled = true;
-        button.innerHTML = '<span class="button-icon">⏳</span><span class="button-text">Refreshing...</span>';
+        button.innerHTML = '<span class="button-icon">⏳</span><span class="button-text">Refreshing…</span>';
 
         console.log('🔄 Refreshing ListenBrainz playlists...');
-        showToast('Refreshing ListenBrainz playlists...', 'info');
+        showToast('Refreshing ListenBrainz playlists…', 'info');
 
         const response = await fetch('/api/discover/listenbrainz/refresh', {
             method: 'POST'
@@ -4384,7 +4384,7 @@ async function loadSeasonalPlaylist(seasonData) {
             fetchUrl: `/api/discover/seasonal/${currentSeasonKey}/playlist`,
             extractItems: (data) => data.tracks || [],
             renderItems: (items) => { discoverSeasonalTracks = items; return ''; },
-            loadingMessage: 'Loading playlist...',
+            loadingMessage: 'Loading playlist…',
             emptyMessage: 'No tracks available yet',
             errorMessage: 'Failed to load playlist',
             verboseErrors: true,
@@ -4453,7 +4453,7 @@ async function openDownloadModalForSeasonalAlbum(albumIndex) {
     }
 
     console.log(`📥 Opening Download Missing Tracks modal for seasonal album: ${album.album_name}`);
-    showLoadingOverlay(`Loading tracks for ${album.album_name}...`);
+    showLoadingOverlay(`Loading tracks for ${album.album_name}…`);
 
     try {
         // Determine source and album ID - use source-agnostic endpoint (matches Recent Releases)
@@ -4879,7 +4879,7 @@ function openMixModal(mix) {
     const syncStatus = mix.statusHtml || (base ? `
         <div class="discover-sync-status" id="${base}-sync-status" style="display:none">
             <div class="sync-status-content">
-                <div class="sync-status-label"><span class="sync-icon">&#10227;</span><span>Syncing to media server...</span></div>
+                <div class="sync-status-label"><span class="sync-icon">&#10227;</span><span>Syncing to media server…</span></div>
                 <div class="sync-status-stats">
                     <span class="sync-stat">&#10003; <span id="${base}-sync-completed">0</span></span>
                     <span class="sync-stat">&#9203; <span id="${base}-sync-pending">0</span></span>
@@ -5004,11 +5004,11 @@ async function openDiscoveryBlacklistModal() {
                 <button class="watch-all-close" onclick="document.getElementById('discovery-blacklist-modal-overlay').remove()">&times;</button>
             </div>
             <div class="discover-blacklist-modal-search">
-                <input type="text" id="dbl-search-input" placeholder="Search for an artist to block..." autocomplete="off">
+                <input type="text" id="dbl-search-input" placeholder="Search for an artist to block…" autocomplete="off">
                 <div id="dbl-search-results" class="dbl-search-results" style="display:none"></div>
             </div>
             <div class="discover-blacklist-modal-list" id="dbl-list">
-                <div class="discover-blacklist-empty">Loading...</div>
+                <div class="discover-blacklist-empty">Loading…</div>
             </div>
             <div class="discover-blacklist-modal-footer">
                 <button class="watch-all-btn watch-all-btn-cancel" onclick="document.getElementById('discovery-blacklist-modal-overlay').remove()">Close</button>
@@ -5166,11 +5166,11 @@ async function loadYourArtists() {
 
                 // Stale + empty — show custom "still fetching" message
                 if (items.length === 0 && data.stale) {
-                    if (subtitle) subtitle.textContent = 'Discovering your artists across connected services...';
+                    if (subtitle) subtitle.textContent = 'Discovering your artists across connected services…';
                     return `
                         <div class="ya-loading">
                             <div class="watch-all-loading-spinner"></div>
-                            <span>Fetching and matching artists from your services...</span>
+                            <span>Fetching and matching artists from your services…</span>
                         </div>
                     `;
                 }
@@ -5182,7 +5182,7 @@ async function loadYourArtists() {
                 const sourceList = [...sources].map(s => sourceNames[s] || s).join(' and ');
                 if (subtitle) {
                     subtitle.textContent = `Artists you follow on ${sourceList || 'your music services'}`;
-                    if (data.stale) subtitle.textContent += ' (updating...)';
+                    if (data.stale) subtitle.textContent += ' (updating…)';
                 }
 
                 // Store for modal access and render carousel cards
@@ -5195,7 +5195,7 @@ async function loadYourArtists() {
                 // Continue polling while upstream is still discovering.
                 if (data.stale) _pollYourArtists();
             },
-            loadingMessage: 'Loading your artists...',
+            loadingMessage: 'Loading your artists…',
             emptyMessage: 'No followed artists found',
             errorMessage: 'Failed to load your artists',
             verboseErrors: true,
@@ -5333,7 +5333,7 @@ async function openYourArtistInfoModal(poolId) {
                 </div>
             </div>
             <div class="ya-info-body" id="ya-info-body">
-                <div class="cache-health-loading"><div class="watch-all-loading-spinner"></div><div>Loading artist info...</div></div>
+                <div class="cache-health-loading"><div class="watch-all-loading-spinner"></div><div>Loading artist info…</div></div>
             </div>
             <div class="ya-info-footer" id="ya-info-footer"></div>
         </div>
@@ -5381,7 +5381,7 @@ async function openYourArtistInfoModal(poolId) {
             if (cleanBio) {
                 bodyHTML += `<div class="ya-info-section">
                     <div class="ya-info-section-title">About</div>
-                    <div class="ya-info-bio">${escapeHtml(cleanBio.length > 600 ? cleanBio.substring(0, 600) + '...' : cleanBio)}</div>
+                    <div class="ya-info-bio">${escapeHtml(cleanBio.length > 600 ? cleanBio.substring(0, 600) + '…' : cleanBio)}</div>
                 </div>`;
             }
         }
@@ -5512,7 +5512,7 @@ async function refreshYourArtists() {
     const btn = document.getElementById('your-artists-refresh-btn');
     if (btn) { btn.disabled = true; btn.style.opacity = '0.5'; }
     const subtitle = document.getElementById('your-artists-subtitle');
-    if (subtitle) subtitle.textContent = 'Refreshing from your services...';
+    if (subtitle) subtitle.textContent = 'Refreshing from your services…';
 
     try {
         await fetch('/api/discover/your-artists/refresh?clear=true', { method: 'POST' });
@@ -5662,12 +5662,12 @@ async function openYourArtistsModal() {
             <div class="ya-modal-header">
                 <div>
                     <h2 class="ya-modal-title">Your Artists</h2>
-                    <p class="ya-modal-subtitle" id="ya-modal-subtitle">Loading...</p>
+                    <p class="ya-modal-subtitle" id="ya-modal-subtitle">Loading…</p>
                 </div>
                 <button class="watch-all-close" onclick="document.getElementById('your-artists-modal-overlay').remove()">&times;</button>
             </div>
             <div class="ya-modal-toolbar">
-                <input type="text" id="ya-modal-search" class="ya-modal-search" placeholder="Search artists...">
+                <input type="text" id="ya-modal-search" class="ya-modal-search" placeholder="Search artists…">
                 <div class="ya-modal-filters">
                     <button class="ya-filter-btn active" data-source="" onclick="_yaFilterSource('')">All</button>
                     <button class="ya-filter-btn" data-source="spotify" onclick="_yaFilterSource('spotify')">Spotify</button>
@@ -5682,7 +5682,7 @@ async function openYourArtistsModal() {
                 </select>
             </div>
             <div class="ya-modal-body" id="ya-modal-body">
-                <div class="cache-health-loading"><div class="watch-all-loading-spinner"></div><div>Loading...</div></div>
+                <div class="cache-health-loading"><div class="watch-all-loading-spinner"></div><div>Loading…</div></div>
             </div>
             <div class="ya-modal-footer" id="ya-modal-footer"></div>
         </div>
@@ -8237,7 +8237,7 @@ async function openArtistMap() {
     _artMap.ctx.fillStyle = 'rgba(255,255,255,0.3)';
     _artMap.ctx.font = '14px system-ui';
     _artMap.ctx.textAlign = 'center';
-    _artMap.ctx.fillText('Building artist map...', _artMap.width / 2, _artMap.height / 2);
+    _artMap.ctx.fillText('Building artist map…', _artMap.width / 2, _artMap.height / 2);
 
     try {
         const resp = await fetch('/api/discover/artist-map');
@@ -8271,7 +8271,7 @@ async function openArtistMap() {
         loadingEl.innerHTML = `
             <div class="artist-map-loading-content">
                 <div class="watch-all-loading-spinner"></div>
-                <div class="artist-map-loading-text" id="artmap-loading-text">Placing ${_artMap.placed.length} artists on the map...</div>
+                <div class="artist-map-loading-text" id="artmap-loading-text">Placing ${_artMap.placed.length} artists on the map…</div>
             </div>
         `;
         container.appendChild(loadingEl);
@@ -9361,9 +9361,9 @@ async function _showGenrePickerModal() {
                         <p>Choose a genre to explore its artists</p>
                     </div>
                 </div>
-                <input type="text" class="artmap-genre-picker-search" placeholder="Filter genres..." oninput="_filterGenrePicker(this.value)">
+                <input type="text" class="artmap-genre-picker-search" placeholder="Filter genres…" oninput="_filterGenrePicker(this.value)">
                 <div class="artmap-genre-picker-list" id="artmap-genre-picker-list">
-                    <div class="cache-health-loading"><div class="watch-all-loading-spinner"></div><div>Loading genres...</div></div>
+                    <div class="cache-health-loading"><div class="watch-all-loading-spinner"></div><div>Loading genres…</div></div>
                 </div>
             </div>
         `;
@@ -9481,12 +9481,12 @@ async function _openGenreMapWithSelection(selectedGenre) {
     // Show loading
     const loadingEl = document.createElement('div');
     loadingEl.id = 'artist-map-loading';
-    loadingEl.innerHTML = `<div class="artist-map-loading-content"><div class="watch-all-loading-spinner"></div><div class="artist-map-loading-text" id="artmap-genre-loading-text">Loading genre map...</div></div>`;
+    loadingEl.innerHTML = `<div class="artist-map-loading-content"><div class="watch-all-loading-spinner"></div><div class="artist-map-loading-text" id="artmap-genre-loading-text">Loading genre map…</div></div>`;
     container.appendChild(loadingEl);
 
     // Update toolbar
     document.querySelector('.artmap-brand-text').textContent = 'Genre Map';
-    document.getElementById('artist-map-stats').textContent = 'Loading...';
+    document.getElementById('artist-map-stats').textContent = 'Loading…';
 
     try {
         // Use cached data from picker or fetch fresh
@@ -9539,7 +9539,7 @@ async function _openGenreMapWithSelection(selectedGenre) {
         _artMapSetupInteraction(canvas);
 
         // Load images + render
-        if (loadingText) loadingText.textContent = `Rendering ${placedCount} artists...`;
+        if (loadingText) loadingText.textContent = `Rendering ${placedCount} artists…`;
 
         const le = document.getElementById('artist-map-loading');
         if (le) le.remove();
@@ -9606,7 +9606,7 @@ async function _openArtistMapExplorerWithName(name) {
 
     const loadingEl = document.createElement('div');
     loadingEl.id = 'artist-map-loading';
-    loadingEl.innerHTML = `<div class="artist-map-loading-content"><div class="watch-all-loading-spinner"></div><div class="artist-map-loading-text">Exploring ${escapeHtml(name)}...</div></div>`;
+    loadingEl.innerHTML = `<div class="artist-map-loading-content"><div class="watch-all-loading-spinner"></div><div class="artist-map-loading-text">Exploring ${escapeHtml(name)}…</div></div>`;
     container.appendChild(loadingEl);
 
     document.querySelector('.artmap-brand-text').textContent = 'Artist Explorer';
@@ -9652,7 +9652,7 @@ async function _openArtistMapExplorerWithName(name) {
 
         // Load images
         const loadingText = container.querySelector('.artist-map-loading-text');
-        if (loadingText) loadingText.textContent = `Loading ${_artMap.placed.length} artists...`;
+        if (loadingText) loadingText.textContent = `Loading ${_artMap.placed.length} artists…`;
 
         const le = document.getElementById('artist-map-loading');
         if (le) le.remove();
@@ -10427,7 +10427,7 @@ async function openCacheDiscoverAlbum(sectionKey, index) {
             return;
         }
 
-        showLoadingOverlay(`Loading ${albumName}...`);
+        showLoadingOverlay(`Loading ${albumName}…`);
         try {
             let resolvedSource = trackSource;
             let resolvedId = trackAlbumId;
@@ -10486,7 +10486,7 @@ async function openCacheDiscoverAlbum(sectionKey, index) {
     // Close genre deep dive modal if open
     document.getElementById('genre-deep-dive-modal')?.remove();
 
-    showLoadingOverlay(`Loading ${item.name || 'album'}...`);
+    showLoadingOverlay(`Loading ${item.name || 'album'}…`);
     try {
         const _params = new URLSearchParams({ name: item.name || '', artist: item.artist_name || '' });
         let response = await fetch(`/api/discover/album/${source}/${albumId}?${_params}`);
@@ -10705,7 +10705,7 @@ async function openGenreDeepDive(genre) {
                 <button class="genre-dive-close" onclick="document.getElementById('genre-deep-dive-modal').remove()">&times;</button>
             </div>
             <div class="genre-dive-body" id="genre-dive-body">
-                <div class="genre-dive-loading"><div class="genre-dive-spinner"></div>Exploring ${_esc(genre)}...</div>
+                <div class="genre-dive-loading"><div class="genre-dive-spinner"></div>Exploring ${_esc(genre)}…</div>
             </div>
         </div>
     `;
@@ -11424,7 +11424,7 @@ async function openDownloadModalForRecentAlbum(albumIndex) {
     }
 
     console.log(`📥 Opening Download Missing Tracks modal for album: ${album.album_name}`);
-    showLoadingOverlay(`Loading tracks for ${album.album_name}...`);
+    showLoadingOverlay(`Loading tracks for ${album.album_name}…`);
 
     try {
         // Determine source and album ID - use source-agnostic endpoint

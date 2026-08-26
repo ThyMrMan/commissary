@@ -242,7 +242,7 @@ const HELPER_CONTENT = {
         tips: [
             '"Test Connection" verifies the API is responding',
             'Response time indicates network latency to the service',
-            'If stuck on "Checking...", the service may be rate-limited'
+            'If stuck on "Checking…", the service may be rate-limited'
         ],
         docsId: 'gs-connecting',
         actions: [
@@ -512,7 +512,7 @@ const HELPER_CONTENT = {
         description: 'Shows total track count across all categories and countdown to the next automatic processing cycle. The wishlist alternates between Albums/EPs and Singles each cycle.',
         tips: [
             '"Next Auto" shows which category processes next and when',
-            'Cycles alternate: Albums/EPs → Singles → Albums/EPs → ...',
+            'Cycles alternate: Albums/EPs → Singles → Albums/EPs → …',
             'Auto-processing is triggered by the Watchlist automation'
         ],
         docsId: 'art-wishlist'
@@ -3123,7 +3123,7 @@ async function openSetupPanel() {
         </div>
         <div class="helper-setup-loading">
             <div class="loading-spinner"></div>
-            <span>Checking your setup...</span>
+            <span>Checking your setup…</span>
         </div>
     `;
     document.body.appendChild(loader);
@@ -3303,12 +3303,12 @@ function openHelperSearch() {
         <div class="helper-search-header">
             <div class="helper-search-input-wrap">
                 <span class="helper-search-icon">🔍</span>
-                <input type="text" class="helper-search-input" placeholder="Search help topics..." autofocus>
+                <input type="text" class="helper-search-input" placeholder="Search help topics…" autofocus>
             </div>
             <button class="helper-popover-close" onclick="exitHelperMode()">&times;</button>
         </div>
         <div class="helper-search-results">
-            <div class="helper-search-hint">Type to search 200+ help topics, tours, and shortcuts...</div>
+            <div class="helper-search-hint">Type to search 200+ help topics, tours, and shortcuts…</div>
         </div>
     `;
 
@@ -3321,7 +3321,7 @@ function openHelperSearch() {
     input.addEventListener('input', () => {
         const q = input.value.trim().toLowerCase();
         if (q.length < 2) {
-            resultsContainer.innerHTML = '<div class="helper-search-hint">Type to search 200+ help topics, tours, and shortcuts...</div>';
+            resultsContainer.innerHTML = '<div class="helper-search-hint">Type to search 200+ help topics, tours, and shortcuts…</div>';
             return;
         }
 
@@ -3370,7 +3370,7 @@ function openHelperSearch() {
                     <span class="helper-search-result-type" title="${typeLabel}">${typeIcon}</span>
                     <div class="helper-search-result-body">
                         <div class="helper-search-result-title">${_highlightMatch(m.title, q)}</div>
-                        <div class="helper-search-result-desc">${m.desc.slice(0, 120)}${m.desc.length > 120 ? '...' : ''}</div>
+                        <div class="helper-search-result-desc">${m.desc.slice(0, 120)}${m.desc.length > 120 ? '…' : ''}</div>
                     </div>
                 </button>`;
         }).join('');
@@ -3491,6 +3491,20 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.1.0': [
+        { date: 'August 2026 — 2.1.0' },
+        { title: "The two sides now read as one app", desc: "a full audit of Music against Video found the plumbing sound — every page routed, deep-linked and updated its badges identically — but the visual language had drifted apart wherever the Video side built its own instead of reusing the shell's. This release closes that gap." },
+        { title: "One heading scale instead of seven", desc: "Video's page titles ranged from 24px to 48px across three weights while Music sat in a 24-30px band. Search alone was 48px/900 against Music's 28px/700. Every shared destination now renders the same heading on both sides; Music's Tools page, the one outlier in the other direction, joined the shared 30px." },
+        { title: "Download is the only word for downloading", desc: "the Video side said Get, Grab and Download for the same action — a single show page offered 'Get Show' and 'Grab season' side by side, while the sidebar item both sides share says Downloads. It is Download everywhere now. 'Grabbed' survives where it means a state rather than an action, because it sits next to 'Finished' and the two are different moments." },
+        { title: "Automations and Settings no longer share an icon", desc: "the Video sidebar drew the same cog for both, four rows apart, leaving the label as the only thing telling them apart. Automations is the bolt Music uses. The Tools wrench was two different drawings of one object and is now one." },
+        { title: "The window title says which side you are on", desc: "the tab read 'Music Sync & Manager' even deep inside the Video side, and every page shared one title so history and bookmarks were indistinguishable. It now reads '<Page> — Commissary - <side>', and the page names come from the sidebar itself, so renaming a nav item renames its tab." },
+        { title: "Keyboard focus is visible again", desc: "of roughly 440 button families in the app, exactly one declared a focus style — and the most-used class actively removed its own with 'outline: none'. Tabbing through the UI was very nearly invisible. All 864 focusable buttons now show a ring; components that already had their own treatment keep it." },
+        { title: "Primary buttons in the sync modals were unstyled", desc: "the modal-btn intents were only ever defined inside the YouTube discovery modal, so the same classes elsewhere — the playlist sync modal above all — fell through to the browser's default button: a light-grey box with black text on a dark modal. Around 41 buttons were affected." },
+        { title: "Dialogs announce themselves as dialogs", desc: "the 19 modals built into the shell carried no role, no aria-modal and no accessible name, so a screen reader met them as anonymous containers. Each now names itself — from its own title where it has one, explicitly where it fills its header dynamically." },
+        { title: "Sort your wishlist", desc: "the wishlist nebula was locked to most-tracks-first. Six orderings now: most or fewest tracks, A-Z, Z-A, and recently or least recently added, the last two reading the most recent thing you added for each artist. The previous order stays the default." },
+        { title: "A shared scale for buttons, and less dead weight", desc: "the app had 65 distinct button paddings, 18 radii and 19 sizes with no shared vocabulary at all — and the two sides had different house styles, Video favouring half-pixel sizes Music never used. There is now a named scale, Video is snapped onto it, and 36 button classes that were declared but never applied to anything were removed." },
+        { title: "Smaller things that were simply inconsistent", desc: "tool cards carry an icon on both sides now and page titles carry none; the same job takes the same glyph across sides. 'All Status' became 'All Statuses' to match the 'All Categories' beside it. 602 ASCII ellipses became typographic ones. The RSS Sync automation is 'Instant Downloads', renamed in place for databases already carrying the old name." },
+    ],
     '2.0.11': [
         { date: 'August 2026 · 2.0.11' },
         { title: "Download a whole album by choosing the release, not track by track", desc: "Artist → Album → Download Now opens the Download Missing Tracks window, and its only manual option was the per-track picker — you had to tick exactly one song, pick a file for it, and repeat. There is now a <strong>💿 Choose Release</strong> button beside it that asks every source indexing whole albums what it has, shows the releases side by side — format, track count, size, seeders, tracker — and downloads the one you pick as a complete set." },
@@ -3626,7 +3640,7 @@ const WHATS_NEW = {
     '1.9.20': [
         { date: 'August 2026 · 1.9.20' },
         { title: 'Fixed: songs downloaded for a playlist never joined the playlist', desc: 'reported as "a server playlist created in Commissary doesn\'t sync properly with Plex — the songs get downloaded but don\'t get matched onto the playlist without manual intervention", and the log had it to the minute. A sync matches your library <em>at that moment</em>, writes the server playlist, and hands whatever is left to the wishlist. So the downloads start <strong>after</strong> the playlist is already written. Your log: a 50-track playlist synced with 3 matches at 09:06, 41 tracks downloaded and imported by 09:13, the library database caught up at 09:20 — and then nothing, for the remaining hour. The playlist still held 3 tracks while all 41 songs sat correctly in the library.' },
-        { title: 'The chain now has its last link', desc: 'a finished download already triggers a media-server scan, and a finished scan already triggers a library database update. That chain then just... stopped, leaving the playlist to wait for whenever you next synced it by hand. A new <strong>Auto-Sync Playlists After Database Update</strong> automation closes it: the instant newly imported tracks become matchable, every playlist whose last sync came up short is re-synced. Playlists that already matched in full are left alone. A schedule could never have covered this — there are roughly 14 minutes between "sync queues the downloads" and "the downloads exist as far as a sync is concerned", so a periodic re-sync mostly lands inside that window and just re-confirms the tracks are missing.' },
+        { title: 'The chain now has its last link', desc: 'a finished download already triggers a media-server scan, and a finished scan already triggers a library database update. That chain then just… stopped, leaving the playlist to wait for whenever you next synced it by hand. A new <strong>Auto-Sync Playlists After Database Update</strong> automation closes it: the instant newly imported tracks become matchable, every playlist whose last sync came up short is re-synced. Playlists that already matched in full are left alone. A schedule could never have covered this — there are roughly 14 minutes between "sync queues the downloads" and "the downloads exist as far as a sync is concerned", so a periodic re-sync mostly lands inside that window and just re-confirms the tracks are missing.' },
         { title: 'And a sync that changes nothing now touches nothing', desc: 'the default <em>replace</em> mode deleted and recreated your Plex playlist on every sync, re-keying it and churning a "… Backup" copy each time, even when the result was identical to what was already there. Harmless at one sync a day; not harmless now that the chain above re-syncs after every database update. A playlist that already holds exactly the right tracks in the right order is now left untouched. Membership or order actually differing still rewrites, exactly as before.' },
         { title: 'One less red herring in the log', desc: 'every single successful playlist creation logged <code>ERROR — CreatePlaylist failed: Must include items to add when creating new playlist</code>. The retry on the very next line always succeeded, so nothing was ever wrong — but it sat at ERROR level right beside the real playlist problems, in exactly the file you would read to diagnose them. Demoted to debug; the rest of the fallback chain stays loud, because reaching those genuinely does mean something failed.' },
     ],
@@ -3917,6 +3931,23 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.1.0: the two sides now read as one app",
+        description: "A full audit of the Music side against the Video side. The plumbing was already sound - every page routed, deep-linked and updated its badges the same way, with no errors anywhere - but the visual language had drifted wherever the Video side built its own instead of reusing the shell's. Where it reused, the two matched exactly; where it did not, it diverged from Music and from itself.",
+        features: [
+            "one heading scale: Video ranged 24px to 48px across three weights, Search alone sitting at 48px against Music's 28px - every shared page now matches, and Music's Tools page joined the shared size too",
+            "one word for downloading: the Video side said Get, Grab and Download for the same action, with 'Get Show' and 'Grab season' on the same page - it is Download everywhere now",
+            "Automations and Settings no longer draw the same cog in the Video sidebar, and the Tools wrench is no longer two different drawings of one object",
+            "the window title names the page and the side, instead of saying 'Music Sync & Manager' everywhere including deep inside Video",
+            "keyboard focus is visible: one button family in roughly 440 had a focus style, and the most-used class removed its own - all 864 focusable buttons now show a ring",
+            "primary buttons in the playlist sync modal were rendering as plain grey browser buttons on a dark background, because their styling only existed inside a different modal",
+            "the 19 modals built into the shell now announce themselves as dialogs with a real name, rather than as anonymous containers",
+            "the wishlist can be sorted six ways instead of being locked to most-tracks-first",
+            "a named scale for button sizes and radii, Video snapped onto it, and 36 button classes that were never applied to anything removed",
+            "tool cards carry an icon on both sides and page titles carry none; 'All Statuses' matches the 'All Categories' beside it; 602 ellipses made typographic",
+        ],
+        usage_note: "Nothing to configure - this release is almost entirely things looking and behaving the same on both sides. The one behaviour change worth knowing: the RSS Sync automation is now called 'RSS Sync (Instant Downloads)', renamed in place, so an existing schedule keeps running untouched."
+    },
     {
         title: "2.0.11: choose the release for a whole album",
         description: "Artist - Album - Download Now could only ever hand you the per-track picker: tick one song, pick a file, repeat. Albums now get a release picker of their own.",

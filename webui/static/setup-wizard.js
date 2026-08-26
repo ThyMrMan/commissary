@@ -394,7 +394,7 @@ async function _wizardTestConnection(service) {
     const btns = document.querySelectorAll('.setup-test-btn');
     const btn = btns[btns.length - 1];
     if (btn) {
-        btn.innerHTML = '<span class="setup-spinner"></span>Testing...';
+        btn.innerHTML = '<span class="setup-spinner"></span>Testing…';
         btn.className = 'setup-test-btn';
     }
 
@@ -613,7 +613,7 @@ function _renderWatchlist(el) {
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
                 </span>
                 <input class="setup-search-input" type="text" id="setup-artist-search"
-                       placeholder="Search for an artist..." autocomplete="off"
+                       placeholder="Search for an artist…" autocomplete="off"
                        oninput="_wizardArtistSearch(this.value)">
             </div>
             <div class="setup-artist-results" id="setup-artist-results"></div>
@@ -638,7 +638,7 @@ function _wizardArtistSearch(query) {
     _wizardSearchTimeout = setTimeout(async () => {
         const results = document.getElementById('setup-artist-results');
         if (!results) return;
-        results.innerHTML = '<div style="text-align:center;padding:12px;color:rgba(255,255,255,0.4);"><span class="setup-spinner"></span> Searching...</div>';
+        results.innerHTML = '<div style="text-align:center;padding:12px;color:rgba(255,255,255,0.4);"><span class="setup-spinner"></span> Searching…</div>';
 
         try {
             // Use the discover artist search endpoint — works with whatever metadata source is active
@@ -782,7 +782,7 @@ function _renderFirstDownload(el) {
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
                 </span>
                 <input class="setup-search-input" type="text" id="setup-track-search"
-                       placeholder="Search for a song..." autocomplete="off"
+                       placeholder="Search for a song…" autocomplete="off"
                        oninput="_wizardTrackSearch(this.value)">
             </div>
             <div class="setup-track-results" id="setup-track-results"></div>
@@ -807,7 +807,7 @@ function _wizardTrackSearch(query) {
     _wizardSearchTimeout = setTimeout(async () => {
         const results = document.getElementById('setup-track-results');
         if (!results) return;
-        results.innerHTML = '<div style="text-align:center;padding:12px;color:rgba(255,255,255,0.4);"><span class="setup-spinner"></span> Searching...</div>';
+        results.innerHTML = '<div style="text-align:center;padding:12px;color:rgba(255,255,255,0.4);"><span class="setup-spinner"></span> Searching…</div>';
 
         try {
             // Use enhanced-search which searches the configured metadata source
@@ -863,7 +863,7 @@ async function _wizardDownloadTrack(index) {
 
     const track = tracks[index];
     row.classList.add('downloading');
-    status.innerHTML = '<span class="setup-spinner"></span>Searching...';
+    status.innerHTML = '<span class="setup-spinner"></span>Searching…';
 
     try {
         // Step 1: Search for the best match via the configured download source
@@ -886,7 +886,7 @@ async function _wizardDownloadTrack(index) {
         }
 
         // Step 2: Start matched download with full metadata context from the search result
-        status.innerHTML = '<span class="setup-spinner"></span>Downloading...';
+        status.innerHTML = '<span class="setup-spinner"></span>Downloading…';
 
         const artistName = track.artist || 'Unknown Artist';
         const dlResp = await fetch('/api/download/matched', {

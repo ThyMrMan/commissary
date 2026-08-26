@@ -127,7 +127,7 @@
 /* ── buttons ─────────────────────────────────────────────────────────────── */
 .vce-btn {
     display: inline-flex; align-items: center; gap: 8px; font: inherit;
-    font-size: 13px; font-weight: 700; padding: 9px 16px; border-radius: 11px; cursor: pointer;
+    font-size: var(--btn-fs-lg); font-weight: var(--btn-fw-bold); padding: 9px 16px; border-radius: var(--btn-r-lg); cursor: pointer;
     color: rgba(255,255,255,.85); background: var(--s2);
     border: 1px solid rgba(255,255,255,.12);
     box-shadow: inset 0 1px 0 var(--line-lit);

@@ -682,7 +682,7 @@ const DOCS_SECTIONS = [
                 <h3 class="docs-subsection-title">Spotify Public Links</h3>
                 <p class="docs-text">Sync Spotify playlists and albums <strong>without OAuth credentials</strong>. Paste any public Spotify playlist or album URL and Commissary will load the tracks for download. Useful when you don't want to connect a Spotify account or want to sync from someone else's public playlist.</p>
                 <ul class="docs-list">
-                    <li>Paste any <code>open.spotify.com/playlist/...</code> or <code>open.spotify.com/album/...</code> URL</li>
+                    <li>Paste any <code>open.spotify.com/playlist/…</code> or <code>open.spotify.com/album/…</code> URL</li>
                     <li>Works without Spotify API credentials</li>
                     <li>Previously loaded URLs appear in the history bar for quick re-access</li>
                     <li>Loaded playlists become mirrored for persistent state</li>
@@ -706,7 +706,7 @@ const DOCS_SECTIONS = [
                 <h3 class="docs-subsection-title">Deezer Link</h3>
                 <p class="docs-text">Import any public Deezer playlist by URL without needing an ARL token. Paste a Deezer playlist URL, click <strong>Load Playlist</strong>, and Commissary parses the tracks for discovery and download.</p>
                 <ul class="docs-list">
-                    <li>Paste any <code>deezer.com/playlist/...</code> URL or raw playlist ID</li>
+                    <li>Paste any <code>deezer.com/playlist/…</code> URL or raw playlist ID</li>
                     <li>Track matching uses the same fuzzy discovery pipeline as YouTube and Tidal</li>
                     <li>Previously loaded URLs appear in the history bar for quick re-access</li>
                     <li>Loaded playlists are automatically mirrored for persistent state</li>
@@ -2140,13 +2140,13 @@ const DOCS_SECTIONS = [
                         <tr><td>GET</td><td><code>/library/resolutions</code>, <code>/library/genres</code></td><td>Facet values for the library filters</td></tr>
                         <tr><td>GET</td><td><code>/detail/{show|movie}/{id}</code></td><td>Full detail record (seasons/episodes for shows)</td></tr>
                         <tr><td>GET</td><td><code>/detail/{kind}/{id}/history</code>, <code>/extras</code></td><td>Per-title grab/import history and extras</td></tr>
-                        <tr><td>GET</td><td><code>/tmdb/{kind}/{tmdb_id}</code>, <code>/episode/...</code>, <code>/person/{id}</code></td><td>Live TMDB lookups for detail, seasons, episodes, people</td></tr>
+                        <tr><td>GET</td><td><code>/tmdb/{kind}/{tmdb_id}</code>, <code>/episode/…</code>, <code>/person/{id}</code></td><td>Live TMDB lookups for detail, seasons, episodes, people</td></tr>
                         <tr><td>GET</td><td><code>/search</code>, <code>/search/studios</code>, <code>/trending</code></td><td>Search movies/shows/people/studios; trending feed</td></tr>
                         <tr><td>GET</td><td><code>/studio/{id}</code>, <code>/studio/{id}/movies</code>, <code>/studio/presets</code></td><td>Studio detail, paged filmography, preset studios</td></tr>
                         <tr><td>GET</td><td><code>/discover/{hero|foryou|taste|morelike|gaps|genres|list|trailer}</code></td><td>Discover feed surfaces</td></tr>
                         <tr><td>GET/POST</td><td><code>/discover/{ignore|languages|providers-pref}</code></td><td>Per-profile discover preferences</td></tr>
                         <tr><td>GET</td><td><code>/calendar</code>, <code>/calendar.ics</code></td><td>Upcoming airings/releases (JSON + iCal feed)</td></tr>
-                        <tr><td>GET</td><td><code>/poster/{kind}/{id}</code>, <code>/backdrop/...</code>, <code>/img</code></td><td>Poster/backdrop/art proxy</td></tr>
+                        <tr><td>GET</td><td><code>/poster/{kind}/{id}</code>, <code>/backdrop/…</code>, <code>/img</code></td><td>Poster/backdrop/art proxy</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -2185,17 +2185,17 @@ const DOCS_SECTIONS = [
                 <table class="docs-table">
                     <thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead>
                     <tbody>
-                        <tr><td>GET/POST/PUT/DELETE</td><td><code>/overlays/templates...</code></td><td>Overlay template CRUD, duplicate, thumbnails</td></tr>
+                        <tr><td>GET/POST/PUT/DELETE</td><td><code>/overlays/templates…</code></td><td>Overlay template CRUD, duplicate, thumbnails</td></tr>
                         <tr><td>GET/PUT</td><td><code>/overlays/assignments</code></td><td>Assign templates to filtered title sets</td></tr>
                         <tr><td>POST</td><td><code>/overlays/apply</code>, <code>/overlays/cleanup</code>, <code>/overlays/filter/preview</code></td><td>Render &amp; write overlays to the server; remove them</td></tr>
                         <tr><td>GET/POST</td><td><code>/overlays/{logopack|upload|preview...}</code></td><td>Logo packs, uploads, preview filmstrip</td></tr>
-                        <tr><td>GET/POST/PUT/DELETE</td><td><code>/collections...</code></td><td>Collection CRUD, presets, preview, members, missing</td></tr>
+                        <tr><td>GET/POST/PUT/DELETE</td><td><code>/collections…</code></td><td>Collection CRUD, presets, preview, members, missing</td></tr>
                         <tr><td>POST</td><td><code>/collections/{id}/sync</code>, <code>/collections/sync</code>, <code>/collections/server/adopt</code></td><td>Sync collections to Plex/Jellyfin; adopt existing</td></tr>
                         <tr><td>POST</td><td><code>/collections/{id}/wishlist_missing</code>, <code>/collections/posters/regenerate</code></td><td>Wishlist gaps; regenerate posters</td></tr>
-                        <tr><td>GET/POST/PUT</td><td><code>/repair/jobs...</code>, <code>/repair/{status|toggle|pause|resume}</code></td><td>Library Maintenance jobs &amp; scheduler</td></tr>
-                        <tr><td>GET/POST</td><td><code>/repair/findings...</code></td><td>Findings: fix, bulk-fix, resolve, dismiss, clear</td></tr>
+                        <tr><td>GET/POST/PUT</td><td><code>/repair/jobs…</code>, <code>/repair/{status|toggle|pause|resume}</code></td><td>Library Maintenance jobs &amp; scheduler</td></tr>
+                        <tr><td>GET/POST</td><td><code>/repair/findings…</code></td><td>Findings: fix, bulk-fix, resolve, dismiss, clear</td></tr>
                         <tr><td>GET/POST</td><td><code>/import/failed</code>, <code>/import/{id}/{place|dismiss}</code></td><td>Manual import of failed downloads</td></tr>
-                        <tr><td>GET/POST/DELETE</td><td><code>/backups...</code></td><td>Create, restore, download, delete backups</td></tr>
+                        <tr><td>GET/POST/DELETE</td><td><code>/backups…</code></td><td>Create, restore, download, delete backups</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -2212,8 +2212,8 @@ const DOCS_SECTIONS = [
                         <tr><td>GET</td><td><code>/enrichment/{services|coverage|status-all}</code></td><td>Coverage &amp; per-service status</td><td>video</td></tr>
                         <tr><td>POST</td><td><code>/enrichment/{service}/{pause|resume|test|retry}</code>, <code>/enrichment/retry-all-failed</code></td><td>Control an enrichment service</td><td>admin</td></tr>
                         <tr><td>POST</td><td><code>/enrichment/matches/{kind}/{id}/{search|apply}</code></td><td>Manually re-match a title</td><td>admin</td></tr>
-                        <tr><td>GET/POST/DELETE</td><td><code>/notifications...</code>, <code>/notifications/test</code></td><td>Event notification connectors</td><td>admin</td></tr>
-                        <tr><td>GET/POST</td><td><code>/organization</code>, <code>/organization/rename/...</code></td><td>Naming scheme &amp; mass rename</td><td>admin</td></tr>
+                        <tr><td>GET/POST/DELETE</td><td><code>/notifications…</code>, <code>/notifications/test</code></td><td>Event notification connectors</td><td>admin</td></tr>
+                        <tr><td>GET/POST</td><td><code>/organization</code>, <code>/organization/rename/…</code></td><td>Naming scheme &amp; mass rename</td><td>admin</td></tr>
                         <tr><td>POST</td><td><code>/poster/set</code>, <code>/poster/options/{kind}/{id}</code></td><td>Choose/refresh a title's poster</td><td>admin (set)</td></tr>
                     </tbody>
                 </table>
@@ -2288,17 +2288,17 @@ const DOCS_SECTIONS = [
                             P('limit', 'int', false, 'Results per page (max 200)', '50'),
                             P('fields', 'string', false, 'Comma-separated field names to include', 'all')
                         ], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "artists": [\n      {\n        "id": 1,\n        "name": "Radiohead",\n        "thumb_url": "https://...",\n        "banner_url": "https://...",\n        "genres": ["alternative rock", "art rock"],\n        "summary": "English rock band...",\n        "style": "Alternative/Indie", "mood": "Melancholy",\n        "label": "XL Recordings",\n        "musicbrainz_id": "a74b1b7f-...",\n        "spotify_artist_id": "4Z8W4fKeB5YxbusRsdQVPb",\n        "itunes_artist_id": "657515",\n        "deezer_id": "399", "tidal_id": "3746724",\n        "qobuz_id": "61592", "genius_id": "604",\n        "lastfm_listeners": 5832451,\n        "lastfm_playcount": 328456789,\n        "genius_url": "https://genius.com/artists/Radiohead",\n        "album_count": 9, "track_count": 101,\n        "...": "all 50+ fields included"\n      }\n    ]\n  },\n  "pagination": {\n    "page": 1, "limit": 50, "total": 342, "total_pages": 7,\n    "has_next": true, "has_prev": false\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "artists": [\n      {\n        "id": 1,\n        "name": "Radiohead",\n        "thumb_url": "https://…",\n        "banner_url": "https://…",\n        "genres": ["alternative rock", "art rock"],\n        "summary": "English rock band…",\n        "style": "Alternative/Indie", "mood": "Melancholy",\n        "label": "XL Recordings",\n        "musicbrainz_id": "a74b1b7f-…",\n        "spotify_artist_id": "4Z8W4fKeB5YxbusRsdQVPb",\n        "itunes_artist_id": "657515",\n        "deezer_id": "399", "tidal_id": "3746724",\n        "qobuz_id": "61592", "genius_id": "604",\n        "lastfm_listeners": 5832451,\n        "lastfm_playcount": 328456789,\n        "genius_url": "https://genius.com/artists/Radiohead",\n        "album_count": 9, "track_count": 101,\n        "…": "all 50+ fields included"\n      }\n    ]\n  },\n  "pagination": {\n    "page": 1, "limit": 50, "total": 342, "total_pages": 7,\n    "has_next": true, "has_prev": false\n  }\n}'
                         }),
                         E('GET', '/library/artists/{artist_id}', 'Get a single artist with all metadata and album list', [
                             P('fields', 'string', false, 'Comma-separated fields', 'all')
                         ], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "artist": {\n      "id": 1, "name": "Radiohead",\n      "thumb_url": "https://...", "banner_url": "https://...",\n      "genres": ["alternative rock", "art rock"],\n      "summary": "English rock band formed in 1985...",\n      "style": "Alternative/Indie", "mood": "Melancholy",\n      "label": "XL Recordings",\n      "server_source": "plex",\n      "created_at": "2026-01-15T10:00:00Z",\n      "updated_at": "2026-03-13T08:00:00Z",\n      "musicbrainz_id": "a74b1b7f-71a3-4b73-8c51-5c1f3a71c9e8",\n      "spotify_artist_id": "4Z8W4fKeB5YxbusRsdQVPb",\n      "itunes_artist_id": "657515",\n      "audiodb_id": "111239",\n      "deezer_id": "399",\n      "tidal_id": "3746724",\n      "qobuz_id": "61592",\n      "genius_id": "604",\n      "musicbrainz_match_status": "matched",\n      "spotify_match_status": "matched",\n      "itunes_match_status": "matched",\n      "audiodb_match_status": "matched",\n      "deezer_match_status": "matched",\n      "lastfm_match_status": "matched",\n      "genius_match_status": "matched",\n      "tidal_match_status": "matched",\n      "qobuz_match_status": "matched",\n      "musicbrainz_last_attempted": "2026-03-10T08:00:00Z",\n      "spotify_last_attempted": "2026-03-10T08:00:00Z",\n      "itunes_last_attempted": "2026-03-10T08:00:00Z",\n      "audiodb_last_attempted": "2026-03-10T08:00:00Z",\n      "deezer_last_attempted": "2026-03-10T08:00:00Z",\n      "lastfm_last_attempted": "2026-03-10T08:00:00Z",\n      "genius_last_attempted": "2026-03-10T08:00:00Z",\n      "tidal_last_attempted": "2026-03-10T08:00:00Z",\n      "qobuz_last_attempted": "2026-03-10T08:00:00Z",\n      "lastfm_listeners": 5832451,\n      "lastfm_playcount": 328456789,\n      "lastfm_tags": "alternative, rock, experimental",\n      "lastfm_similar": "Thom Yorke, Atoms for Peace, Portishead",\n      "lastfm_bio": "Radiohead are an English rock band...",\n      "lastfm_url": "https://www.last.fm/music/Radiohead",\n      "genius_description": "Radiohead is an English rock band...",\n      "genius_alt_names": "On a Friday",\n      "genius_url": "https://genius.com/artists/Radiohead",\n      "album_count": 9, "track_count": 101\n    },\n    "albums": [\n      { "id": 10, "title": "OK Computer", "year": 1997, "track_count": 12, "record_type": "album" }\n    ]\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "artist": {\n      "id": 1, "name": "Radiohead",\n      "thumb_url": "https://…", "banner_url": "https://…",\n      "genres": ["alternative rock", "art rock"],\n      "summary": "English rock band formed in 1985…",\n      "style": "Alternative/Indie", "mood": "Melancholy",\n      "label": "XL Recordings",\n      "server_source": "plex",\n      "created_at": "2026-01-15T10:00:00Z",\n      "updated_at": "2026-03-13T08:00:00Z",\n      "musicbrainz_id": "a74b1b7f-71a3-4b73-8c51-5c1f3a71c9e8",\n      "spotify_artist_id": "4Z8W4fKeB5YxbusRsdQVPb",\n      "itunes_artist_id": "657515",\n      "audiodb_id": "111239",\n      "deezer_id": "399",\n      "tidal_id": "3746724",\n      "qobuz_id": "61592",\n      "genius_id": "604",\n      "musicbrainz_match_status": "matched",\n      "spotify_match_status": "matched",\n      "itunes_match_status": "matched",\n      "audiodb_match_status": "matched",\n      "deezer_match_status": "matched",\n      "lastfm_match_status": "matched",\n      "genius_match_status": "matched",\n      "tidal_match_status": "matched",\n      "qobuz_match_status": "matched",\n      "musicbrainz_last_attempted": "2026-03-10T08:00:00Z",\n      "spotify_last_attempted": "2026-03-10T08:00:00Z",\n      "itunes_last_attempted": "2026-03-10T08:00:00Z",\n      "audiodb_last_attempted": "2026-03-10T08:00:00Z",\n      "deezer_last_attempted": "2026-03-10T08:00:00Z",\n      "lastfm_last_attempted": "2026-03-10T08:00:00Z",\n      "genius_last_attempted": "2026-03-10T08:00:00Z",\n      "tidal_last_attempted": "2026-03-10T08:00:00Z",\n      "qobuz_last_attempted": "2026-03-10T08:00:00Z",\n      "lastfm_listeners": 5832451,\n      "lastfm_playcount": 328456789,\n      "lastfm_tags": "alternative, rock, experimental",\n      "lastfm_similar": "Thom Yorke, Atoms for Peace, Portishead",\n      "lastfm_bio": "Radiohead are an English rock band…",\n      "lastfm_url": "https://www.last.fm/music/Radiohead",\n      "genius_description": "Radiohead is an English rock band…",\n      "genius_alt_names": "On a Friday",\n      "genius_url": "https://genius.com/artists/Radiohead",\n      "album_count": 9, "track_count": 101\n    },\n    "albums": [\n      { "id": 10, "title": "OK Computer", "year": 1997, "track_count": 12, "record_type": "album" }\n    ]\n  }\n}'
                         }),
                         E('GET', '/library/artists/{artist_id}/albums', 'List albums for an artist', [
                             P('fields', 'string', false, 'Comma-separated fields', 'all')
                         ], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "albums": [\n      {\n        "id": 10, "artist_id": 1, "title": "OK Computer", "year": 1997,\n        "thumb_url": "https://...", "track_count": 12, "duration": 3214000,\n        "genres": ["alternative rock"],\n        "style": "Art Rock", "mood": "Atmospheric",\n        "label": "Parlophone", "record_type": "album", "explicit": false,\n        "upc": "0724385522529", "copyright": "1997 Parlophone Records",\n        "spotify_album_id": "6dVIqQ8qmQ5GBnJ9shOYGE",\n        "tidal_id": "17914997", "qobuz_id": "0724385522529",\n        "lastfm_listeners": 1543000, "lastfm_playcount": 89234567,\n        "...": "all 45+ fields included"\n      }\n    ]\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "albums": [\n      {\n        "id": 10, "artist_id": 1, "title": "OK Computer", "year": 1997,\n        "thumb_url": "https://…", "track_count": 12, "duration": 3214000,\n        "genres": ["alternative rock"],\n        "style": "Art Rock", "mood": "Atmospheric",\n        "label": "Parlophone", "record_type": "album", "explicit": false,\n        "upc": "0724385522529", "copyright": "1997 Parlophone Records",\n        "spotify_album_id": "6dVIqQ8qmQ5GBnJ9shOYGE",\n        "tidal_id": "17914997", "qobuz_id": "0724385522529",\n        "lastfm_listeners": 1543000, "lastfm_playcount": 89234567,\n        "…": "all 45+ fields included"\n      }\n    ]\n  }\n}'
                         }),
                         E('GET', '/library/albums', 'List or search albums with pagination', [
                             P('search', 'string', false, 'Substring filter on album title', '""'),
@@ -2313,17 +2313,17 @@ const DOCS_SECTIONS = [
                         E('GET', '/library/albums/{album_id}', 'Get a single album with metadata and embedded tracks', [
                             P('fields', 'string', false, 'Comma-separated fields', 'all')
                         ], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "album": {\n      "id": 10, "artist_id": 1, "title": "OK Computer", "year": 1997,\n      "thumb_url": "https://...",\n      "genres": ["alternative rock"],\n      "track_count": 12, "duration": 3214000,\n      "style": "Art Rock", "mood": "Atmospheric",\n      "label": "Parlophone", "explicit": false, "record_type": "album",\n      "server_source": "plex",\n      "created_at": "2026-01-15T10:00:00Z",\n      "updated_at": "2026-03-13T08:00:00Z",\n      "upc": "0724385522529", "copyright": "1997 Parlophone Records",\n      "musicbrainz_release_id": "b1a9c0e7-...",\n      "spotify_album_id": "6dVIqQ8qmQ5GBnJ9shOYGE",\n      "itunes_album_id": "1097861387",\n      "audiodb_id": "2115888",\n      "deezer_id": "6575789",\n      "tidal_id": "17914997",\n      "qobuz_id": "0724385522529",\n      "musicbrainz_match_status": "matched",\n      "spotify_match_status": "matched",\n      "itunes_match_status": "matched",\n      "audiodb_match_status": "matched",\n      "deezer_match_status": "matched",\n      "lastfm_match_status": "matched",\n      "tidal_match_status": "matched",\n      "qobuz_match_status": "matched",\n      "musicbrainz_last_attempted": "2026-03-10T08:00:00Z",\n      "spotify_last_attempted": "2026-03-10T08:00:00Z",\n      "itunes_last_attempted": "2026-03-10T08:00:00Z",\n      "audiodb_last_attempted": "2026-03-10T08:00:00Z",\n      "deezer_last_attempted": "2026-03-10T08:00:00Z",\n      "lastfm_last_attempted": "2026-03-10T08:00:00Z",\n      "tidal_last_attempted": "2026-03-10T08:00:00Z",\n      "qobuz_last_attempted": "2026-03-10T08:00:00Z",\n      "lastfm_listeners": 1543000,\n      "lastfm_playcount": 89234567,\n      "lastfm_tags": "alternative, 90s, rock",\n      "lastfm_wiki": "OK Computer is the third studio album...",\n      "lastfm_url": "https://www.last.fm/music/Radiohead/OK+Computer"\n    },\n    "tracks": [\n      { "id": 100, "title": "Airbag", "track_number": 1, "duration": 284000, "bitrate": 1411 }\n    ]\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "album": {\n      "id": 10, "artist_id": 1, "title": "OK Computer", "year": 1997,\n      "thumb_url": "https://…",\n      "genres": ["alternative rock"],\n      "track_count": 12, "duration": 3214000,\n      "style": "Art Rock", "mood": "Atmospheric",\n      "label": "Parlophone", "explicit": false, "record_type": "album",\n      "server_source": "plex",\n      "created_at": "2026-01-15T10:00:00Z",\n      "updated_at": "2026-03-13T08:00:00Z",\n      "upc": "0724385522529", "copyright": "1997 Parlophone Records",\n      "musicbrainz_release_id": "b1a9c0e7-…",\n      "spotify_album_id": "6dVIqQ8qmQ5GBnJ9shOYGE",\n      "itunes_album_id": "1097861387",\n      "audiodb_id": "2115888",\n      "deezer_id": "6575789",\n      "tidal_id": "17914997",\n      "qobuz_id": "0724385522529",\n      "musicbrainz_match_status": "matched",\n      "spotify_match_status": "matched",\n      "itunes_match_status": "matched",\n      "audiodb_match_status": "matched",\n      "deezer_match_status": "matched",\n      "lastfm_match_status": "matched",\n      "tidal_match_status": "matched",\n      "qobuz_match_status": "matched",\n      "musicbrainz_last_attempted": "2026-03-10T08:00:00Z",\n      "spotify_last_attempted": "2026-03-10T08:00:00Z",\n      "itunes_last_attempted": "2026-03-10T08:00:00Z",\n      "audiodb_last_attempted": "2026-03-10T08:00:00Z",\n      "deezer_last_attempted": "2026-03-10T08:00:00Z",\n      "lastfm_last_attempted": "2026-03-10T08:00:00Z",\n      "tidal_last_attempted": "2026-03-10T08:00:00Z",\n      "qobuz_last_attempted": "2026-03-10T08:00:00Z",\n      "lastfm_listeners": 1543000,\n      "lastfm_playcount": 89234567,\n      "lastfm_tags": "alternative, 90s, rock",\n      "lastfm_wiki": "OK Computer is the third studio album…",\n      "lastfm_url": "https://www.last.fm/music/Radiohead/OK+Computer"\n    },\n    "tracks": [\n      { "id": 100, "title": "Airbag", "track_number": 1, "duration": 284000, "bitrate": 1411 }\n    ]\n  }\n}'
                         }),
                         E('GET', '/library/albums/{album_id}/tracks', 'List tracks in an album', [
                             P('fields', 'string', false, 'Comma-separated fields', 'all')
                         ], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "tracks": [\n      {\n        "id": 100, "album_id": 10, "artist_id": 1, "title": "Airbag",\n        "track_number": 1, "duration": 284000,\n        "file_path": "/music/Radiohead/OK Computer/01 Airbag.flac",\n        "bitrate": 1411, "bpm": 120.5, "explicit": false,\n        "isrc": "GBAYE9700106",\n        "spotify_track_id": "6anwyDGQmsg45JKiVKpKGA",\n        "tidal_id": "17914998", "genius_id": "1342",\n        "lastfm_listeners": 892000, "lastfm_playcount": 4567890,\n        "genius_url": "https://genius.com/Radiohead-airbag-lyrics",\n        "...": "all 55+ fields included"\n      }\n    ]\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "tracks": [\n      {\n        "id": 100, "album_id": 10, "artist_id": 1, "title": "Airbag",\n        "track_number": 1, "duration": 284000,\n        "file_path": "/music/Radiohead/OK Computer/01 Airbag.flac",\n        "bitrate": 1411, "bpm": 120.5, "explicit": false,\n        "isrc": "GBAYE9700106",\n        "spotify_track_id": "6anwyDGQmsg45JKiVKpKGA",\n        "tidal_id": "17914998", "genius_id": "1342",\n        "lastfm_listeners": 892000, "lastfm_playcount": 4567890,\n        "genius_url": "https://genius.com/Radiohead-airbag-lyrics",\n        "…": "all 55+ fields included"\n      }\n    ]\n  }\n}'
                         }),
                         E('GET', '/library/tracks/{track_id}', 'Get a single track with all metadata', [
                             P('fields', 'string', false, 'Comma-separated fields', 'all')
                         ], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "track": {\n      "id": 100, "album_id": 10, "artist_id": 1, "title": "Airbag",\n      "track_number": 1, "duration": 284000,\n      "file_path": "/music/Radiohead/OK Computer/01 Airbag.flac",\n      "bitrate": 1411, "bpm": 120.5, "explicit": false,\n      "style": "Art Rock", "mood": "Atmospheric",\n      "repair_status": null, "repair_last_checked": null,\n      "server_source": "plex",\n      "created_at": "2026-01-15T10:00:00Z",\n      "updated_at": "2026-03-13T08:00:00Z",\n      "isrc": "GBAYE9700106", "copyright": "1997 Parlophone Records",\n      "musicbrainz_recording_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",\n      "spotify_track_id": "6anwyDGQmsg45JKiVKpKGA",\n      "itunes_track_id": "1097861700",\n      "audiodb_id": null,\n      "deezer_id": "72420132",\n      "tidal_id": "17914998",\n      "qobuz_id": "24517824",\n      "genius_id": "1342",\n      "musicbrainz_match_status": "matched",\n      "spotify_match_status": "matched",\n      "itunes_match_status": "matched",\n      "audiodb_match_status": "not_found",\n      "deezer_match_status": "matched",\n      "lastfm_match_status": "matched",\n      "genius_match_status": "matched",\n      "tidal_match_status": "matched",\n      "qobuz_match_status": "matched",\n      "musicbrainz_last_attempted": "2026-03-10T08:00:00Z",\n      "spotify_last_attempted": "2026-03-10T08:00:00Z",\n      "itunes_last_attempted": "2026-03-10T08:00:00Z",\n      "audiodb_last_attempted": "2026-03-10T08:00:00Z",\n      "deezer_last_attempted": "2026-03-10T08:00:00Z",\n      "lastfm_last_attempted": "2026-03-10T08:00:00Z",\n      "genius_last_attempted": "2026-03-10T08:00:00Z",\n      "tidal_last_attempted": "2026-03-10T08:00:00Z",\n      "qobuz_last_attempted": "2026-03-10T08:00:00Z",\n      "lastfm_listeners": 892000,\n      "lastfm_playcount": 4567890,\n      "lastfm_tags": "alternative rock, radiohead",\n      "lastfm_url": "https://www.last.fm/music/Radiohead/_/Airbag",\n      "genius_lyrics": "In the next world war, in a jackknifed juggernaut...",\n      "genius_description": "The opening track of OK Computer...",\n      "genius_url": "https://genius.com/Radiohead-airbag-lyrics"\n    }\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "track": {\n      "id": 100, "album_id": 10, "artist_id": 1, "title": "Airbag",\n      "track_number": 1, "duration": 284000,\n      "file_path": "/music/Radiohead/OK Computer/01 Airbag.flac",\n      "bitrate": 1411, "bpm": 120.5, "explicit": false,\n      "style": "Art Rock", "mood": "Atmospheric",\n      "repair_status": null, "repair_last_checked": null,\n      "server_source": "plex",\n      "created_at": "2026-01-15T10:00:00Z",\n      "updated_at": "2026-03-13T08:00:00Z",\n      "isrc": "GBAYE9700106", "copyright": "1997 Parlophone Records",\n      "musicbrainz_recording_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",\n      "spotify_track_id": "6anwyDGQmsg45JKiVKpKGA",\n      "itunes_track_id": "1097861700",\n      "audiodb_id": null,\n      "deezer_id": "72420132",\n      "tidal_id": "17914998",\n      "qobuz_id": "24517824",\n      "genius_id": "1342",\n      "musicbrainz_match_status": "matched",\n      "spotify_match_status": "matched",\n      "itunes_match_status": "matched",\n      "audiodb_match_status": "not_found",\n      "deezer_match_status": "matched",\n      "lastfm_match_status": "matched",\n      "genius_match_status": "matched",\n      "tidal_match_status": "matched",\n      "qobuz_match_status": "matched",\n      "musicbrainz_last_attempted": "2026-03-10T08:00:00Z",\n      "spotify_last_attempted": "2026-03-10T08:00:00Z",\n      "itunes_last_attempted": "2026-03-10T08:00:00Z",\n      "audiodb_last_attempted": "2026-03-10T08:00:00Z",\n      "deezer_last_attempted": "2026-03-10T08:00:00Z",\n      "lastfm_last_attempted": "2026-03-10T08:00:00Z",\n      "genius_last_attempted": "2026-03-10T08:00:00Z",\n      "tidal_last_attempted": "2026-03-10T08:00:00Z",\n      "qobuz_last_attempted": "2026-03-10T08:00:00Z",\n      "lastfm_listeners": 892000,\n      "lastfm_playcount": 4567890,\n      "lastfm_tags": "alternative rock, radiohead",\n      "lastfm_url": "https://www.last.fm/music/Radiohead/_/Airbag",\n      "genius_lyrics": "In the next world war, in a jackknifed juggernaut…",\n      "genius_description": "The opening track of OK Computer…",\n      "genius_url": "https://genius.com/Radiohead-airbag-lyrics"\n    }\n  }\n}'
                         }),
                         E('GET', '/library/tracks', 'Search tracks by title and/or artist', [
                             P('title', 'string', false, 'Track title to search (at least one of title/artist required)', '""'),
@@ -2367,21 +2367,21 @@ const DOCS_SECTIONS = [
                             P('limit', 'int', false, 'Max results (1-50)', '20')
                         ], {
                             request: '{\n  "query": "Karma Police",\n  "source": "auto",\n  "limit": 10\n}',
-                            response: '{\n  "success": true,\n  "data": {\n    "tracks": [\n      {\n        "id": "3SVAN3BRByDmHOhKyIDxfC",\n        "name": "Karma Police",\n        "artists": ["Radiohead"],\n        "album": "OK Computer",\n        "duration_ms": 264066,\n        "popularity": 78,\n        "image_url": "https://...",\n        "release_date": "1997-05-28"\n      }\n    ],\n    "source": "spotify"\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "tracks": [\n      {\n        "id": "3SVAN3BRByDmHOhKyIDxfC",\n        "name": "Karma Police",\n        "artists": ["Radiohead"],\n        "album": "OK Computer",\n        "duration_ms": 264066,\n        "popularity": 78,\n        "image_url": "https://…",\n        "release_date": "1997-05-28"\n      }\n    ],\n    "source": "spotify"\n  }\n}'
                         }),
                         E('POST', '/search/albums', 'Search for albums', [], [
                             P('query', 'string', true, 'Search query'),
                             P('limit', 'int', false, 'Max results (1-50)', '20')
                         ], {
                             request: '{\n  "query": "OK Computer",\n  "limit": 5\n}',
-                            response: '{\n  "success": true,\n  "data": {\n    "albums": [\n      {\n        "id": "6dVIqQ8qmQ5GBnJ9shOYGE",\n        "name": "OK Computer",\n        "artists": ["Radiohead"],\n        "release_date": "1997-05-28",\n        "total_tracks": 12,\n        "album_type": "album",\n        "image_url": "https://..."\n      }\n    ],\n    "source": "spotify"\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "albums": [\n      {\n        "id": "6dVIqQ8qmQ5GBnJ9shOYGE",\n        "name": "OK Computer",\n        "artists": ["Radiohead"],\n        "release_date": "1997-05-28",\n        "total_tracks": 12,\n        "album_type": "album",\n        "image_url": "https://…"\n      }\n    ],\n    "source": "spotify"\n  }\n}'
                         }),
                         E('POST', '/search/artists', 'Search for artists', [], [
                             P('query', 'string', true, 'Search query'),
                             P('limit', 'int', false, 'Max results (1-50)', '20')
                         ], {
                             request: '{\n  "query": "Radiohead",\n  "limit": 5\n}',
-                            response: '{\n  "success": true,\n  "data": {\n    "artists": [\n      {\n        "id": "4Z8W4fKeB5YxbusRsdQVPb",\n        "name": "Radiohead",\n        "popularity": 79,\n        "genres": ["alternative rock", "art rock"],\n        "followers": 8500000,\n        "image_url": "https://..."\n      }\n    ],\n    "source": "spotify"\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "artists": [\n      {\n        "id": "4Z8W4fKeB5YxbusRsdQVPb",\n        "name": "Radiohead",\n        "popularity": 79,\n        "genres": ["alternative rock", "art rock"],\n        "followers": 8500000,\n        "image_url": "https://…"\n      }\n    ],\n    "source": "spotify"\n  }\n}'
                         })
                     ]
                 },
@@ -2408,18 +2408,18 @@ const DOCS_SECTIONS = [
                         E('GET', '/playlists', 'List user playlists from Spotify or Tidal', [
                             P('source', 'string', false, '"spotify" or "tidal"', '"spotify"')
                         ], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "playlists": [\n      {\n        "id": "37i9dQZF1DXcBWIGoYBM5M",\n        "name": "Today\'s Top Hits",\n        "owner": "spotify",\n        "track_count": 50,\n        "image_url": "https://..."\n      }\n    ],\n    "source": "spotify"\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "playlists": [\n      {\n        "id": "37i9dQZF1DXcBWIGoYBM5M",\n        "name": "Today\'s Top Hits",\n        "owner": "spotify",\n        "track_count": 50,\n        "image_url": "https://…"\n      }\n    ],\n    "source": "spotify"\n  }\n}'
                         }),
                         E('GET', '/playlists/{playlist_id}', 'Get playlist details with tracks', [
                             P('source', 'string', false, 'Only "spotify" is supported', '"spotify"')
                         ], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "playlist": {\n      "id": "37i9dQZF1DXcBWIGoYBM5M",\n      "name": "Today\'s Top Hits",\n      "owner": "spotify",\n      "total_tracks": 50,\n      "tracks": [\n        {\n          "id": "3SVAN3BRByDmHOhKyIDxfC",\n          "name": "Karma Police",\n          "artists": ["Radiohead"],\n          "album": "OK Computer",\n          "duration_ms": 264066,\n          "image_url": "https://..."\n        }\n      ]\n    },\n    "source": "spotify"\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "playlist": {\n      "id": "37i9dQZF1DXcBWIGoYBM5M",\n      "name": "Today\'s Top Hits",\n      "owner": "spotify",\n      "total_tracks": 50,\n      "tracks": [\n        {\n          "id": "3SVAN3BRByDmHOhKyIDxfC",\n          "name": "Karma Police",\n          "artists": ["Radiohead"],\n          "album": "OK Computer",\n          "duration_ms": 264066,\n          "image_url": "https://…"\n        }\n      ]\n    },\n    "source": "spotify"\n  }\n}'
                         }),
                         E('POST', '/playlists/{playlist_id}/sync', 'Trigger playlist sync and download', [], [
                             P('playlist_name', 'string', true, 'Name of the playlist'),
                             P('tracks', 'array', true, 'Array of track objects to sync')
                         ], {
-                            request: '{\n  "playlist_name": "My Playlist",\n  "tracks": [\n    { "id": "3SVAN3...", "name": "Karma Police", "artists": [{ "name": "Radiohead" }] }\n  ]\n}',
+                            request: '{\n  "playlist_name": "My Playlist",\n  "tracks": [\n    { "id": "3SVAN3…", "name": "Karma Police", "artists": [{ "name": "Radiohead" }] }\n  ]\n}',
                             response: '{\n  "success": true,\n  "data": { "message": "Playlist sync started.", "playlist_id": "37i9dQZF1DXcBWIGoYBM5M" }\n}'
                         })
                     ]
@@ -2430,7 +2430,7 @@ const DOCS_SECTIONS = [
                         E('GET', '/watchlist', 'List all watchlist artists for the current profile', [
                             P('fields', 'string', false, 'Comma-separated fields', 'all')
                         ], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "artists": [\n      {\n        "id": 1,\n        "artist_name": "Radiohead",\n        "spotify_artist_id": "4Z8W4fKeB5YxbusRsdQVPb",\n        "image_url": "https://...",\n        "date_added": "2026-01-15T10:00:00Z",\n        "include_albums": true,\n        "include_eps": true,\n        "include_singles": true,\n        "include_live": false,\n        "include_remixes": false,\n        "profile_id": 1\n      }\n    ]\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "artists": [\n      {\n        "id": 1,\n        "artist_name": "Radiohead",\n        "spotify_artist_id": "4Z8W4fKeB5YxbusRsdQVPb",\n        "image_url": "https://…",\n        "date_added": "2026-01-15T10:00:00Z",\n        "include_albums": true,\n        "include_eps": true,\n        "include_singles": true,\n        "include_live": false,\n        "include_remixes": false,\n        "profile_id": 1\n      }\n    ]\n  }\n}'
                         }),
                         E('POST', '/watchlist', 'Add an artist to the watchlist', [], [
                             P('artist_id', 'string', true, 'Spotify or iTunes artist ID'),
@@ -2495,10 +2495,10 @@ const DOCS_SECTIONS = [
                             P('metadata', 'object', false, 'Optional passthrough metadata echoed back')
                         ], {
                             request: '{\n  "query": "Radiohead Karma Police",\n  "notify_url": "https://example.com/hook"\n}',
-                            response: '{\n  "success": true,\n  "data": {\n    "request_id": "b1e7...",\n    "status": "queued",\n    "query": "Radiohead Karma Police"\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "request_id": "b1e7…",\n    "status": "queued",\n    "query": "Radiohead Karma Police"\n  }\n}'
                         }),
                         E('GET', '/request/{request_id}', 'Poll the status of a request', [], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "request_id": "b1e7...",\n    "status": "downloading",\n    "download_id": "abc123",\n    "error": null,\n    "completed_at": null\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "request_id": "b1e7…",\n    "status": "downloading",\n    "download_id": "abc123",\n    "error": null,\n    "completed_at": null\n  }\n}'
                         })
                     ]
                 },
@@ -2512,7 +2512,7 @@ const DOCS_SECTIONS = [
                             P('limit', 'int', false, 'Max tracks (max 500)', '100'),
                             P('fields', 'string', false, 'Comma-separated fields', 'all')
                         ], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "tracks": [\n      {\n        "id": 1,\n        "spotify_track_id": "3SVAN3...",\n        "track_name": "Karma Police",\n        "artist_name": "Radiohead",\n        "album_name": "OK Computer",\n        "album_cover_url": "https://...",\n        "duration_ms": 264066,\n        "popularity": 78,\n        "is_new_release": false,\n        "source": "spotify"\n      }\n    ]\n  },\n  "pagination": { "page": 1, "limit": 100, "total": 850, "total_pages": 9, "has_next": true, "has_prev": false }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "tracks": [\n      {\n        "id": 1,\n        "spotify_track_id": "3SVAN3…",\n        "track_name": "Karma Police",\n        "artist_name": "Radiohead",\n        "album_name": "OK Computer",\n        "album_cover_url": "https://…",\n        "duration_ms": 264066,\n        "popularity": 78,\n        "is_new_release": false,\n        "source": "spotify"\n      }\n    ]\n  },\n  "pagination": { "page": 1, "limit": 100, "total": 850, "total_pages": 9, "has_next": true, "has_prev": false }\n}'
                         }),
                         E('GET', '/discover/similar-artists', 'List top similar artists from the watchlist', [
                             P('limit', 'int', false, 'Max artists (max 200)', '50'),
@@ -2524,13 +2524,13 @@ const DOCS_SECTIONS = [
                             P('limit', 'int', false, 'Max releases (max 200)', '50'),
                             P('fields', 'string', false, 'Comma-separated fields', 'all')
                         ], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "releases": [\n      {\n        "id": 1,\n        "album_name": "A Moon Shaped Pool",\n        "album_spotify_id": "2ix8vWvvSp2Yo7rKMiWpkg",\n        "release_date": "2016-05-08",\n        "album_cover_url": "https://...",\n        "track_count": 11,\n        "source": "spotify"\n      }\n    ]\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "releases": [\n      {\n        "id": 1,\n        "album_name": "A Moon Shaped Pool",\n        "album_spotify_id": "2ix8vWvvSp2Yo7rKMiWpkg",\n        "release_date": "2016-05-08",\n        "album_cover_url": "https://…",\n        "track_count": 11,\n        "source": "spotify"\n      }\n    ]\n  }\n}'
                         }),
                         E('GET', '/discover/pool/metadata', 'Get discovery pool metadata', [], null, {
                             response: '{\n  "success": true,\n  "data": {\n    "last_populated": "2026-03-12T10:00:00Z",\n    "track_count": 850,\n    "updated_at": "2026-03-12T10:00:00Z"\n  }\n}'
                         }),
                         E('GET', '/discover/bubbles', 'List all bubble snapshots for the current profile', [], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "snapshots": {\n      "artist_bubbles": { "snapshot_data": [...], "updated_at": "..." },\n      "search_bubbles": null,\n      "discover_downloads": null\n    }\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "snapshots": {\n      "artist_bubbles": { "snapshot_data": [...], "updated_at": "…" },\n      "search_bubbles": null,\n      "discover_downloads": null\n    }\n  }\n}'
                         }),
                         E('GET', '/discover/bubbles/{snapshot_type}', 'Get a specific bubble snapshot (artist_bubbles, search_bubbles, discover_downloads)', [], null, {
                             response: '{\n  "success": true,\n  "data": {\n    "snapshot": { "snapshot_data": [...], "updated_at": "2026-03-12T10:00:00Z" }\n  }\n}'
@@ -2584,13 +2584,13 @@ const DOCS_SECTIONS = [
                             response: '{\n  "success": true,\n  "data": {\n    "message": "Settings updated.",\n    "updated_keys": ["spotify.country", "download_path"]\n  }\n}'
                         }),
                         E('GET', '/api-keys', 'List all API keys (prefix and label only, never the full key)', [], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "keys": [\n      {\n        "id": "a1b2c3d4-...",\n        "label": "My Bot",\n        "key_prefix": "sk_AbCdEfGh",\n        "created_at": "2026-03-01T10:00:00Z",\n        "last_used_at": "2026-03-13T09:15:00Z"\n      }\n    ]\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "keys": [\n      {\n        "id": "a1b2c3d4-…",\n        "label": "My Bot",\n        "key_prefix": "sk_AbCdEfGh",\n        "created_at": "2026-03-01T10:00:00Z",\n        "last_used_at": "2026-03-13T09:15:00Z"\n      }\n    ]\n  }\n}'
                         }),
                         E('POST', '/api-keys', 'Generate a new API key (raw key returned once)', [], [
                             P('label', 'string', false, 'Descriptive label for the key', '""')
                         ], {
                             request: '{\n  "label": "Home Assistant"\n}',
-                            response: '{\n  "success": true,\n  "data": {\n    "key": "sk_AbCdEfGhIjKlMnOpQrStUvWxYz123456789...",\n    "id": "a1b2c3d4-...",\n    "label": "Home Assistant",\n    "key_prefix": "sk_AbCdEfGh",\n    "created_at": "2026-03-13T10:00:00Z"\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "key": "sk_AbCdEfGhIjKlMnOpQrStUvWxYz123456789…",\n    "id": "a1b2c3d4-…",\n    "label": "Home Assistant",\n    "key_prefix": "sk_AbCdEfGh",\n    "created_at": "2026-03-13T10:00:00Z"\n  }\n}'
                         }),
                         E('DELETE', '/api-keys/{key_id}', 'Revoke an API key by its UUID', [], null, {
                             response: '{\n  "success": true,\n  "data": { "message": "API key revoked." }\n}'
@@ -2599,7 +2599,7 @@ const DOCS_SECTIONS = [
                             P('label', 'string', false, 'Label for the key', '"Default"')
                         ], {
                             request: '{\n  "label": "My First Key"\n}',
-                            response: '{\n  "success": true,\n  "data": {\n    "key": "sk_...",\n    "id": "...",\n    "label": "My First Key",\n    "key_prefix": "sk_...",\n    "created_at": "2026-03-13T10:00:00Z"\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "key": "sk_…",\n    "id": "…",\n    "label": "My First Key",\n    "key_prefix": "sk_…",\n    "created_at": "2026-03-13T10:00:00Z"\n  }\n}'
                         })
                     ]
                 },
@@ -2610,7 +2610,7 @@ const DOCS_SECTIONS = [
                             response: '{\n  "success": true,\n  "data": {\n    "groups": [\n      {\n        "id": 1,\n        "original_artist": "Radiohed",\n        "corrected_artist": "Radiohead",\n        "track_count": 5,\n        "created_at": "2026-03-12T10:00:00Z"\n      }\n    ]\n  }\n}'
                         }),
                         E('GET', '/retag/groups/{group_id}', 'Get a retag group with its tracks', [], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "group": { "id": 1, "original_artist": "Radiohed", "corrected_artist": "Radiohead" },\n    "tracks": [\n      { "id": 100, "title": "Airbag", "file_path": "/music/..." }\n    ]\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "group": { "id": 1, "original_artist": "Radiohed", "corrected_artist": "Radiohead" },\n    "tracks": [\n      { "id": 100, "title": "Airbag", "file_path": "/music/…" }\n    ]\n  }\n}'
                         }),
                         E('DELETE', '/retag/groups/{group_id}', 'Delete a retag group and its tracks', [], null, {
                             response: '{\n  "success": true,\n  "data": { "message": "Retag group 1 deleted." }\n}'
@@ -2632,7 +2632,7 @@ const DOCS_SECTIONS = [
                             P('page', 'int', false, 'Page number', '1'),
                             P('limit', 'int', false, 'Results per page (max 200)', '50')
                         ], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "entries": [\n      {\n        "entity_type": "artist",\n        "entity_name": "Radiohead",\n        "musicbrainz_id": "a74b1b7f-...",\n        "last_updated": "2026-03-12T10:00:00Z",\n        "metadata_json": { "type": "Group", "country": "GB" }\n      }\n    ]\n  },\n  "pagination": { "page": 1, "limit": 50, "total": 342, "total_pages": 7, "has_next": true, "has_prev": false }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "entries": [\n      {\n        "entity_type": "artist",\n        "entity_name": "Radiohead",\n        "musicbrainz_id": "a74b1b7f-…",\n        "last_updated": "2026-03-12T10:00:00Z",\n        "metadata_json": { "type": "Group", "country": "GB" }\n      }\n    ]\n  },\n  "pagination": { "page": 1, "limit": 50, "total": 342, "total_pages": 7, "has_next": true, "has_prev": false }\n}'
                         }),
                         E('GET', '/cache/musicbrainz/stats', 'Get MusicBrainz cache statistics', [], null, {
                             response: '{\n  "success": true,\n  "data": {\n    "total": 1024,\n    "matched": 890,\n    "unmatched": 134,\n    "by_type": { "artist": 342, "album": 450, "track": 232 }\n  }\n}'
@@ -2643,7 +2643,7 @@ const DOCS_SECTIONS = [
                             P('page', 'int', false, 'Page number', '1'),
                             P('limit', 'int', false, 'Results per page (max 200)', '50')
                         ], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "entries": [\n      {\n        "provider": "spotify",\n        "original_title": "Karma Police",\n        "original_artist": "Radiohead",\n        "matched_data_json": { "id": "3SVAN3...", "confidence": 0.95 },\n        "use_count": 3,\n        "last_used_at": "2026-03-12T10:00:00Z"\n      }\n    ]\n  },\n  "pagination": { "page": 1, "limit": 50, "total": 5000, "total_pages": 100, "has_next": true, "has_prev": false }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "entries": [\n      {\n        "provider": "spotify",\n        "original_title": "Karma Police",\n        "original_artist": "Radiohead",\n        "matched_data_json": { "id": "3SVAN3…", "confidence": 0.95 },\n        "use_count": 3,\n        "last_used_at": "2026-03-12T10:00:00Z"\n      }\n    ]\n  },\n  "pagination": { "page": 1, "limit": 50, "total": 5000, "total_pages": 100, "has_next": true, "has_prev": false }\n}'
                         }),
                         E('GET', '/cache/discovery-matches/stats', 'Get discovery match cache statistics', [], null, {
                             response: '{\n  "success": true,\n  "data": {\n    "total": 5000,\n    "total_uses": 18500,\n    "avg_confidence": 0.872,\n    "by_provider": { "spotify": 3200, "itunes": 1800 }\n  }\n}'
@@ -2658,10 +2658,10 @@ const DOCS_SECTIONS = [
                             P('page', 'int', false, 'Page number', '1'),
                             P('limit', 'int', false, 'Results per page (max 200)', '50')
                         ], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "playlists": [\n      {\n        "id": 1,\n        "playlist_mbid": "a1b2c3d4-...",\n        "title": "Weekly Jams for user",\n        "playlist_type": "weekly-jams",\n        "track_count": 50,\n        "created_at": "2026-03-10T00:00:00Z"\n      }\n    ]\n  },\n  "pagination": { "page": 1, "limit": 50, "total": 12, "total_pages": 1, "has_next": false, "has_prev": false }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "playlists": [\n      {\n        "id": 1,\n        "playlist_mbid": "a1b2c3d4-…",\n        "title": "Weekly Jams for user",\n        "playlist_type": "weekly-jams",\n        "track_count": 50,\n        "created_at": "2026-03-10T00:00:00Z"\n      }\n    ]\n  },\n  "pagination": { "page": 1, "limit": 50, "total": 12, "total_pages": 1, "has_next": false, "has_prev": false }\n}'
                         }),
                         E('GET', '/listenbrainz/playlists/{playlist_id}', 'Get a ListenBrainz playlist with tracks (ID or MBID)', [], null, {
-                            response: '{\n  "success": true,\n  "data": {\n    "playlist": {\n      "id": 1,\n      "playlist_mbid": "a1b2c3d4-...",\n      "title": "Weekly Jams for user",\n      "playlist_type": "weekly-jams"\n    },\n    "tracks": [\n      {\n        "id": 1,\n        "position": 0,\n        "recording_mbid": "e1f2g3h4-...",\n        "title": "Karma Police",\n        "artist": "Radiohead"\n      }\n    ]\n  }\n}'
+                            response: '{\n  "success": true,\n  "data": {\n    "playlist": {\n      "id": 1,\n      "playlist_mbid": "a1b2c3d4-…",\n      "title": "Weekly Jams for user",\n      "playlist_type": "weekly-jams"\n    },\n    "tracks": [\n      {\n        "id": 1,\n        "position": 0,\n        "recording_mbid": "e1f2g3h4-…",\n        "title": "Karma Police",\n        "artist": "Radiohead"\n      }\n    ]\n  }\n}'
                         })
                     ]
                 }
@@ -2763,15 +2763,15 @@ const DOCS_SECTIONS = [
             sectionsHTML += '<p class="docs-text">All API v1 endpoints require an API key (except <code>POST /api-keys/bootstrap</code>). Generate keys in <strong>Settings &rarr; API Keys</strong> or via the bootstrap endpoint.</p>';
             sectionsHTML += '<div class="api-detail-label">Two authentication methods</div>';
             sectionsHTML += '<table class="api-params-table"><thead><tr><th>Method</th><th>Format</th><th>Example</th></tr></thead><tbody>';
-            sectionsHTML += '<tr><td>Header</td><td>Authorization: Bearer {key}</td><td><code>Authorization: Bearer sk_AbCd...</code></td></tr>';
-            sectionsHTML += '<tr><td>Query</td><td>?api_key={key}</td><td><code>/api/v1/system/status?api_key=sk_AbCd...</code></td></tr>';
+            sectionsHTML += '<tr><td>Header</td><td>Authorization: Bearer {key}</td><td><code>Authorization: Bearer sk_AbCd…</code></td></tr>';
+            sectionsHTML += '<tr><td>Query</td><td>?api_key={key}</td><td><code>/api/v1/system/status?api_key=sk_AbCd…</code></td></tr>';
             sectionsHTML += '</tbody></table>';
             sectionsHTML += '<div class="api-note">Keys use the <code>sk_</code> prefix. The raw key is shown exactly once at creation time. Only a SHA-256 hash is stored server-side. Rate limit: 60 requests per minute per IP.</div>';
             sectionsHTML += '<div class="api-detail-label">Base URL</div>';
             sectionsHTML += '<p class="docs-text">All endpoints are prefixed with <code class="api-base-url">/api/v1</code></p>';
             sectionsHTML += '<div class="api-detail-label">Response Envelope</div>';
             sectionsHTML += '<p class="docs-text">Every response follows this structure:</p>';
-            sectionsHTML += '<div class="api-example-json">{\n  "success": true | false,\n  "data": { ... } | null,\n  "error": { "code": "ERROR_CODE", "message": "..." } | null,\n  "pagination": { "page": 1, "limit": 50, "total": 342, "total_pages": 7, "has_next": true, "has_prev": false } | null\n}</div>';
+            sectionsHTML += '<div class="api-example-json">{\n  "success": true | false,\n  "data": { … } | null,\n  "error": { "code": "ERROR_CODE", "message": "…" } | null,\n  "pagination": { "page": 1, "limit": 50, "total": 342, "total_pages": 7, "has_next": true, "has_prev": false } | null\n}</div>';
             sectionsHTML += '<div class="api-detail-label">Error Codes</div>';
             sectionsHTML += '<table class="api-params-table"><thead><tr><th>Status</th><th>Code</th><th>Meaning</th></tr></thead><tbody>';
             sectionsHTML += '<tr><td>400</td><td>BAD_REQUEST</td><td>Missing or invalid parameters</td></tr>';
@@ -2783,13 +2783,13 @@ const DOCS_SECTIONS = [
             sectionsHTML += '<tr><td>500</td><td>*_ERROR</td><td>Internal server error</td></tr>';
             sectionsHTML += '</tbody></table>';
             sectionsHTML += '<div class="api-detail-label">cURL Example</div>';
-            sectionsHTML += '<div class="api-example-json">curl -H "Authorization: Bearer sk_abc123..." \\\n     http://localhost:5000/api/v1/system/status</div>';
+            sectionsHTML += '<div class="api-example-json">curl -H "Authorization: Bearer sk_abc123…" \\\n     http://localhost:5000/api/v1/system/status</div>';
             sectionsHTML += '</div>';
 
             // API key input bar
             sectionsHTML += '<div class="api-key-bar">';
             sectionsHTML += '<label>API Key</label>';
-            sectionsHTML += '<input type="password" id="api-tester-key" placeholder="sk_..." autocomplete="off">';
+            sectionsHTML += '<input type="password" id="api-tester-key" placeholder="sk_…" autocomplete="off">';
             sectionsHTML += '<span class="api-key-status" id="api-key-status">Enter key to test endpoints</span>';
             sectionsHTML += '</div>';
 
@@ -2923,7 +2923,7 @@ const DOCS_SECTIONS = [
                 }
 
                 btn.classList.add('loading');
-                btn.innerHTML = '&#9203; Sending...';
+                btn.innerHTML = '&#9203; Sending…';
                 resultDiv.innerHTML = '';
 
                 const startTime = performance.now();
@@ -3074,7 +3074,7 @@ function initializeDocsPage() {
             const logLines = document.getElementById('debug-log-lines').value;
             const logSource = document.getElementById('debug-log-source').value;
             try {
-                debugBtn.textContent = 'Collecting...';
+                debugBtn.textContent = 'Collecting…';
                 const resp = await fetch(`/api/debug-info?lines=${logLines}&log=${logSource}`);
                 const data = await resp.json();
 

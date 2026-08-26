@@ -64,7 +64,7 @@
     var FIXABLE_TYPES = {
         missing_episodes: 'Send to Wishlist',
         incomplete_collection: 'Add to Wishlist',
-        quality_upgrade: 'Grab Upgrade',
+        quality_upgrade: 'Download Upgrade',
         broken_file: 'Re-download',
         metadata_gap: 'Re-enrich',
         stale_wishlist: 'Remove',

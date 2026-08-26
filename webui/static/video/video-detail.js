@@ -598,11 +598,11 @@
                 '<span class="watchlist-text">' + (watching ? 'In Watchlist' : 'Watchlist') + '</span></button>';
         }
         // Movies are terminal — no "watch for new" follow, so give them the shared
-        // Get control instead (unowned → add to wishlist, owned → re-download /
+        // Download control instead (unowned → add to wishlist, owned → re-download /
         // upgrade). Opens the same VideoGet modal the discover/search cards use.
         if (d.kind === 'movie' && window.VideoGet && _canDl) {
             var wished = !!d._wl_wished;
-            // TWO buttons, like the shows' follow+get pair: 'Get' is ALWAYS
+            // TWO buttons, like the shows' follow+get pair: 'Download' is ALWAYS
             // visible (the modal offers download-now / manual search / grab),
             // and the wishlist button is a separate TOGGLE showing membership.
             // The old single button wore three states, so a wishlisted movie
@@ -610,7 +610,7 @@
             html +=
                 '<button class="library-artist-watchlist-btn" type="button" data-vd-act="get">' +
                 '<span class="watchlist-icon">⬇</span>' +
-                '<span class="watchlist-text">Get</span></button>';
+                '<span class="watchlist-text">Download</span></button>';
             html +=
                 '<button class="library-artist-watchlist-btn' + (wished ? ' watching' : '') + '" type="button" data-vd-act="wishtoggle">' +
                 '<span class="watchlist-icon">' + (wished ? '✓' : '＋') + '</span>' +
@@ -629,13 +629,13 @@
             }
         }
         // Acquisition CTA for shows — opens the season/episode grab view. Shown on
-        // EVERY show page, owned or not: a show already in the library reads "Get
-        // Missing" (fill the gaps), one you don't have reads "Get Show" (grab it
+        // EVERY show page, owned or not: a show already in the library reads "Download
+        // Missing" (fill the gaps), one you don't have reads "Download Show" (grab it
         // all). A library-sourced page is inherently owned; a TMDB page keys off
         // d.owned (the same flag that drives the "In library" badge).
         if (d.kind === 'show' && window.VideoGet && _canDl) {
             var haveShow = (d.source !== 'tmdb') || !!d.owned;
-            var showGetLabel = haveShow ? 'Get Missing' : 'Get Show';
+            var showGetLabel = haveShow ? 'Download Missing' : 'Download Show';
             html += '<button class="discog-download-btn discog-btn-compact" type="button" data-vd-act="missing">' +
                 '<span class="discog-btn-icon">⭳</span><span class="discog-btn-text">' + showGetLabel + '</span>' +
                 '<span class="discog-btn-shimmer"></span></button>';
@@ -765,7 +765,7 @@
             source: data.source || currentSource || 'library',
             id: (data.id != null) ? data.id : currentId,
             title: data.title || '',
-            // "Get Missing" jumps straight to the season/episode grab view.
+            // "Download Missing" jumps straight to the season/episode grab view.
             startDownload: !!startDownload,
         });
     }
@@ -1620,7 +1620,7 @@
                 : '<div class="vd-ep-get" data-vd-ep-get="' + ep.episode_number + '">' +
                     '<span class="vd-ep-dl" data-vd-ep-dl></span>' +
                     '<button class="vd-ep-getbtn vd-ep-grab" type="button" data-vd-ep-grab="' + ep.episode_number +
-                        '" title="' + (ep.owned ? 'Search &amp; download again (upgrade)' : 'Auto-search &amp; download this episode') + '" aria-label="Get episode">⭳</button>' +
+                        '" title="' + (ep.owned ? 'Search &amp; download again (upgrade)' : 'Auto-search &amp; download this episode') + '" aria-label="Download episode">⭳</button>' +
                     '<button class="vd-ep-getbtn vd-ep-search" type="button" data-vd-ep-search="' + ep.episode_number +
                         '" title="Manual search — pick a release" aria-label="Manual search">⌕</button>' +
                     '<button class="vd-ep-getbtn vd-ep-wish" type="button" data-vd-ep-wish="' + ep.episode_number +
@@ -1748,7 +1748,7 @@
                 '<button class="discog-download-btn discog-btn-compact" type="button" data-vd-season-grab ' +
                     'title="' + (isYt ? 'Download every missing video in this year'
                                       : 'Auto-search &amp; download every missing episode in this season') + '">' +
-                    '<span class="discog-btn-icon">⭳</span><span class="discog-btn-text">Grab ' + (isYt ? 'year' : 'season') + '</span>' +
+                    '<span class="discog-btn-icon">⭳</span><span class="discog-btn-text">Download ' + (isYt ? 'year' : 'season') + '</span>' +
                     '<span class="discog-btn-shimmer"></span></button>' +
                 (isYt ? '' :
                 '<button class="discog-download-btn discog-btn-compact" type="button" data-vd-season-search ' +
@@ -2882,7 +2882,7 @@
         var done = 0;
         var next = function (i) {
             if (i >= missing.length) {
-                btn.disabled = false; _btnLabel(btn, 'Grab year');
+                btn.disabled = false; _btnLabel(btn, 'Download year');
                 toast('Queued ' + done + ' of ' + missing.length + ' video' + (missing.length === 1 ? '' : 's'), done ? 'success' : 'info');
                 if (done) document.dispatchEvent(new CustomEvent('soulsync:video-download-started'));
                 startDlTracking();
@@ -2930,11 +2930,11 @@
                 poster: _showPoster(), rootFolderId: data.root_folder_id },
                 function (en, state) { _setEpSynthetic(en, state); });
         }).then(function (res) {
-            btn.disabled = false; _btnLabel(btn, 'Grab season'); startDlTracking();
+            btn.disabled = false; _btnLabel(btn, 'Download season'); startDlTracking();
             // One PACK now, not N episodes — "grabbing 12 of 12" would describe
             // twelve downloads that aren't happening.
             toast(res.pack
-                ? 'Grabbing the season pack — it imports per episode when it lands'
+                ? 'Downloading the season pack — it imports per episode when it lands'
                 : 'No season pack found — use Auto on individual episodes instead',
                 res.pack ? 'success' : 'info');
         });

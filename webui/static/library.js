@@ -444,7 +444,7 @@ async function openWatchAllUnwatchedModal() {
             <div class="watch-all-body">
                 <div class="watch-all-loading-state">
                     <div class="watch-all-loading-spinner"></div>
-                    <div class="watch-all-loading-text">Loading unwatched artists...</div>
+                    <div class="watch-all-loading-text">Loading unwatched artists…</div>
                     <div class="watch-all-loading-count" id="watch-all-load-count"></div>
                 </div>
             </div>
@@ -466,7 +466,7 @@ async function openWatchAllUnwatchedModal() {
 
         while (true) {
             if (!document.getElementById('watch-all-modal-overlay')) return;
-            if (countEl) countEl.textContent = `${eligible.length + ineligible.length} artists loaded...`;
+            if (countEl) countEl.textContent = `${eligible.length + ineligible.length} artists loaded…`;
 
             const params = new URLSearchParams({ search: '', letter: 'all', page, limit: pageSize, watchlist: 'unwatched' });
             const response = await fetch(`/api/library/artists?${params}`);
@@ -580,7 +580,7 @@ function _filterWatchAllList(query) {
 async function _confirmWatchAllUnwatched(overlay, expectedCount) {
     const confirmBtn = overlay.querySelector('#watch-all-confirm-btn');
     const cancelBtn = overlay.querySelector('.watch-all-btn-cancel');
-    if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.textContent = 'Adding...'; }
+    if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.textContent = 'Adding…'; }
     if (cancelBtn) cancelBtn.disabled = true;
 
     try {
@@ -629,7 +629,7 @@ async function toggleLibraryCardWatchlist(btn, artist) {
     const label = btn.querySelector('.watch-icon-label') || btn.querySelector('.watchlist-text');
     const isWatching = btn.classList.contains('watched') || btn.classList.contains('watching');
 
-    if (label) label.textContent = '...';
+    if (label) label.textContent = '…';
 
     try {
         // Use the ID matching the active metadata source
@@ -1353,19 +1353,19 @@ function updateArtistSummaryStats(discography) {
     // Update owned albums count
     const ownedElement = document.getElementById("owned-albums-count");
     if (ownedElement) {
-        ownedElement.textContent = hasChecking ? '...' : ownedAlbums;
+        ownedElement.textContent = hasChecking ? '…' : ownedAlbums;
     }
 
     // Update missing albums count
     const missingElement = document.getElementById("missing-albums-count");
     if (missingElement) {
-        missingElement.textContent = hasChecking ? '...' : missingAlbums;
+        missingElement.textContent = hasChecking ? '…' : missingAlbums;
     }
 
     // Update completion percentage
     const completionElement = document.getElementById("completion-percentage");
     if (completionElement) {
-        completionElement.textContent = hasChecking ? 'Checking...' : `${completionPercentage}%`;
+        completionElement.textContent = hasChecking ? 'Checking…' : `${completionPercentage}%`;
     }
 }
 
@@ -1593,7 +1593,7 @@ async function playTrackByMetadata(title, artist, album = '') {
 
     // 2. Library miss — fall back to streaming via the enhanced-search streamer.
     if (typeof showLoadingOverlay === 'function') {
-        showLoadingOverlay(`Searching for ${title}...`);
+        showLoadingOverlay(`Searching for ${title}…`);
     }
     try {
         const streamResp = await fetch('/api/enhanced-search/stream-track', {
@@ -1832,7 +1832,7 @@ function updateCategoryStats(category, releases) {
     // Update stats text (compact: "3/12")
     const statsElement = document.getElementById(`${category}-stats`);
     if (statsElement) {
-        statsElement.textContent = hasChecking ? '...' : `${owned}/${total}`;
+        statsElement.textContent = hasChecking ? '…' : `${owned}/${total}`;
     }
 
     // Update completion bar
@@ -1918,7 +1918,7 @@ function populateReleaseSection(sectionType, releases) {
     const missingElement = document.getElementById(missingCountId);
 
     if (ownedElement) {
-        ownedElement.textContent = hasChecking ? 'Checking...' : `${ownedCount} owned`;
+        ownedElement.textContent = hasChecking ? 'Checking…' : `${ownedCount} owned`;
     }
 
     if (missingElement) {
@@ -2187,7 +2187,7 @@ function createReleaseCard(release) {
 
         if (isChecking || release.track_completion === 'checking') {
             overlayCls = 'checking';
-            overlayLabel = 'Checking...';
+            overlayLabel = 'Checking…';
         } else if (release.owned) {
             const tc = release.track_completion;
             if (tc && typeof tc === 'object') {
@@ -2268,11 +2268,11 @@ function createReleaseCard(release) {
 
         // Still checking - ignore click
         if (rel.owned === null) {
-            showToast(`Still checking ownership for ${rel.title}...`, "info");
+            showToast(`Still checking ownership for ${rel.title}…`, "info");
             return;
         }
 
-        showLoadingOverlay('Loading album...');
+        showLoadingOverlay('Loading album…');
 
         // For missing or incomplete releases, open wishlist modal
         try {
@@ -2783,7 +2783,7 @@ async function openDiscographyModal() {
 
         let metadataArtistId = null;
         try {
-            showToast('Loading discography...', 'info');
+            showToast('Loading discography…', 'info');
 
             // Fetch the artist's metadata IDs from the DB (enhanced view may not be loaded)
             let lookupId = libId;
@@ -3087,7 +3087,7 @@ async function startDiscographyDownload() {
                 <div class="discog-prog-art">${img ? `<img src="${img}">` : '🎵'}</div>
                 <div class="discog-prog-info">
                     <div class="discog-prog-title">${_esc(title)}</div>
-                    <div class="discog-prog-status">Waiting...</div>
+                    <div class="discog-prog-status">Waiting…</div>
                 </div>
                 <div class="discog-prog-icon"><div class="discog-spinner"></div></div>
             `;
@@ -3100,7 +3100,7 @@ async function startDiscographyDownload() {
     if (submitBtn) submitBtn.style.display = 'none';
     if (footer) {
         const info = document.getElementById('discog-footer-info');
-        if (info) info.textContent = 'Processing... this may take a moment';
+        if (info) info.textContent = 'Processing… this may take a moment';
     }
 
     // Mark all items as active
@@ -3201,7 +3201,7 @@ function _handleDiscogProgress(data) {
         const iconEl = item.querySelector('.discog-prog-icon');
 
         if (data.status === 'processing') {
-            statusEl.textContent = `Processing ${data.tracks_total} tracks...`;
+            statusEl.textContent = `Processing ${data.tracks_total} tracks…`;
             item.classList.add('active');
         } else if (data.status === 'done') {
             statusEl.textContent = _discogItemStatus(data);
@@ -3320,7 +3320,7 @@ async function loadEnhancedViewData(artistId) {
     const container = document.getElementById('enhanced-view-container');
     if (!container) return;
 
-    container.innerHTML = '<div class="enhanced-loading">Loading library data...</div>';
+    container.innerHTML = '<div class="enhanced-loading">Loading library data…</div>';
 
     try {
         const response = await fetch(`/api/library/artist/${artistId}/enhanced`);
@@ -3557,7 +3557,7 @@ function renderArtistMetaPanel(artist) {
     syncBtn.onclick = async (e) => {
         e.stopPropagation();
         syncBtn.disabled = true;
-        syncBtn.textContent = 'Syncing...';
+        syncBtn.textContent = 'Syncing…';
         try {
             const res = await fetch(`/api/library/artist/${artist.id}/sync`, { method: 'POST' });
             const data = await res.json();
@@ -3672,7 +3672,7 @@ function renderArtistMetaPanel(artist) {
             const ta = document.createElement('textarea');
             ta.className = 'enhanced-meta-field-input';
             ta.dataset.field = f.key;
-            ta.placeholder = f.label + '...';
+            ta.placeholder = f.label + '…';
             ta.textContent = val;
             fieldDiv.appendChild(ta);
         } else {
@@ -3681,7 +3681,7 @@ function renderArtistMetaPanel(artist) {
             inp.className = 'enhanced-meta-field-input';
             inp.dataset.field = f.key;
             inp.value = val;
-            inp.placeholder = f.label + '...';
+            inp.placeholder = f.label + '…';
             fieldDiv.appendChild(inp);
         }
 
@@ -5499,7 +5499,7 @@ async function showTrackSourceInfo(track, anchorEl) {
     const popover = document.createElement('div');
     popover.id = 'source-info-popover';
     popover.className = 'source-info-popover';
-    popover.innerHTML = '<div class="source-info-loading"><div class="server-search-spinner"></div>Loading source info...</div>';
+    popover.innerHTML = '<div class="source-info-loading"><div class="server-search-spinner"></div>Loading source info…</div>';
 
     document.body.appendChild(popover);
 
@@ -5689,7 +5689,7 @@ async function showTrackRedownloadModal(track, album) {
             <div class="redownload-body" id="redownload-body">
                 <div class="redownload-loading">
                     <div class="server-search-spinner"></div>
-                    Searching metadata sources...
+                    Searching metadata sources…
                 </div>
             </div>
         </div>
@@ -5807,7 +5807,7 @@ function _renderRedownloadStep1(overlay, track, data) {
         // Body gets the scrollable content, footer is sticky outside the scroll
         body.innerHTML = `
             <div class="rdl-src-columns" id="rdl-src-columns">
-                <div class="redownload-loading" id="rdl-src-loading"><div class="server-search-spinner"></div>Searching download sources...</div>
+                <div class="redownload-loading" id="rdl-src-loading"><div class="server-search-spinner"></div>Searching download sources…</div>
             </div>
         `;
         // Add sticky footer outside the scrollable body
@@ -5823,7 +5823,7 @@ function _renderRedownloadStep1(overlay, track, data) {
             </label>
             <div class="redownload-actions">
                 <button class="redownload-btn secondary" onclick="document.getElementById('redownload-overlay')?.remove()">Cancel</button>
-                <button class="redownload-btn primary" id="redownload-start-btn" disabled>Waiting for results...</button>
+                <button class="redownload-btn primary" id="redownload-start-btn" disabled>Waiting for results…</button>
             </div>
         `;
         modal.appendChild(footer);
@@ -5852,7 +5852,7 @@ function _renderRedownloadStep1(overlay, track, data) {
                     <div class="redownload-progress-title">Downloading: ${_esc(cand.display_name)}</div>
                     <div class="redownload-progress-from">from ${_esc(cand.source_service === 'soulseek' ? cand.username : (cand.source_service || 'unknown'))}</div>
                     <div class="redownload-progress-bar-wrap"><div class="redownload-progress-bar" id="redownload-progress-bar"></div></div>
-                    <div class="redownload-progress-status" id="redownload-progress-status">Starting download...</div>
+                    <div class="redownload-progress-status" id="redownload-progress-status">Starting download…</div>
                 </div>
             `;
 
@@ -6091,7 +6091,7 @@ if (false) {
                 <div class="redownload-progress-title">Downloading: ${_esc(candidate.display_name)}</div>
                 <div class="redownload-progress-from">from ${_esc(candidate.username)}</div>
                 <div class="redownload-progress-bar-wrap"><div class="redownload-progress-bar" id="redownload-progress-bar"></div></div>
-                <div class="redownload-progress-status" id="redownload-progress-status">Starting download...</div>
+                <div class="redownload-progress-status" id="redownload-progress-status">Starting download…</div>
             </div>
         `;
 
@@ -6148,13 +6148,13 @@ function _pollRedownloadProgress(taskId, overlay) {
                 if (bar) bar.style.width = `${Math.min(95, pct)}%`;
                 if (status) {
                     status.textContent = total > 0
-                        ? `Downloading... ${Math.round(pct)}% (${transferredMB} / ${totalMB} MB)`
-                        : `Downloading... ${Math.round(pct)}%`;
+                        ? `Downloading… ${Math.round(pct)}% (${transferredMB} / ${totalMB} MB)`
+                        : `Downloading… ${Math.round(pct)}%`;
                 }
             } else {
                 // No active slskd transfer — streaming source or post-processing
                 if (bar) bar.style.width = '80%';
-                if (status) status.textContent = 'Processing...';
+                if (status) status.textContent = 'Processing…';
             }
 
             // Check for batch completion
@@ -6215,7 +6215,7 @@ async function redownloadLibraryAlbum(album, artistName, btn) {
 
     const origText = btn ? btn.innerHTML : '';
     try {
-        if (btn) { btn.disabled = true; btn.textContent = 'Loading...'; }
+        if (btn) { btn.disabled = true; btn.textContent = 'Loading…'; }
 
         let albumData = null;
 
@@ -6682,19 +6682,19 @@ function showBulkEditModal() {
     body.innerHTML = `
         <div class="enhanced-bulk-modal-field">
             <label>Track Number (leave blank to skip)</label>
-            <input type="number" id="bulk-edit-track-number" placeholder="Track number..." min="1">
+            <input type="number" id="bulk-edit-track-number" placeholder="Track number…" min="1">
         </div>
         <div class="enhanced-bulk-modal-field">
             <label>BPM (leave blank to skip)</label>
-            <input type="number" id="bulk-edit-bpm" placeholder="BPM..." step="0.1">
+            <input type="number" id="bulk-edit-bpm" placeholder="BPM…" step="0.1">
         </div>
         <div class="enhanced-bulk-modal-field">
             <label>Style (leave blank to skip)</label>
-            <input type="text" id="bulk-edit-style" placeholder="Style...">
+            <input type="text" id="bulk-edit-style" placeholder="Style…">
         </div>
         <div class="enhanced-bulk-modal-field">
             <label>Mood (leave blank to skip)</label>
-            <input type="text" id="bulk-edit-mood" placeholder="Mood...">
+            <input type="text" id="bulk-edit-mood" placeholder="Mood…">
         </div>
         <div class="enhanced-bulk-modal-field">
             <label>Explicit</label>
@@ -6964,7 +6964,7 @@ function openManualMatchModal(entityType, entityId, service, defaultQuery, artis
     searchInput.className = 'enhanced-match-search-input';
     searchInput.placeholder = service === 'musicbrainz'
         ? `Search ${serviceLabels[service]}… or paste a MusicBrainz ID/URL`
-        : `Search ${serviceLabels[service] || service}...`;
+        : `Search ${serviceLabels[service] || service}…`;
     searchInput.value = defaultQuery;
     searchRow.appendChild(searchInput);
     const searchBtn = document.createElement('button');
@@ -7031,7 +7031,7 @@ async function doManualMatchSearch(service, entityType, query, container, entity
         return;
     }
 
-    container.innerHTML = '<div class="enhanced-loading">Searching...</div>';
+    container.innerHTML = '<div class="enhanced-loading">Searching…</div>';
 
     try {
         const response = await fetch('/api/library/search-service', {
@@ -7104,7 +7104,7 @@ async function doManualMatchSearch(service, entityType, query, container, entity
 
 async function applyManualMatch(entityType, entityId, service, serviceId, artistId) {
     try {
-        showToast(`Matching ${entityType} to ${service}...`, 'info');
+        showToast(`Matching ${entityType} to ${service}…`, 'info');
 
         const response = await fetch('/api/library/manual-match', {
             method: 'PUT',
@@ -7284,11 +7284,11 @@ function openHaveMissingTrackModal(track, album) {
             <div class="enhanced-have-target-meta">${escapeHtml(artistName)} &middot; ${escapeHtml(album.title || '')}</div>
         </div>
         <div class="enhanced-match-search-row">
-            <input class="enhanced-match-search-input" id="enhanced-have-track-search" type="text" value="${escapeHtml(`${track.title || ''} ${artistName}`.trim())}" placeholder="Search your library...">
+            <input class="enhanced-match-search-input" id="enhanced-have-track-search" type="text" value="${escapeHtml(`${track.title || ''} ${artistName}`.trim())}" placeholder="Search your library…">
             <button class="enhanced-enrich-btn" id="enhanced-have-track-search-btn" type="button">Search</button>
         </div>
         <div class="enhanced-match-results" id="enhanced-have-track-results">
-            <div class="enhanced-match-results-hint">Searching your library...</div>
+            <div class="enhanced-match-results-hint">Searching your library…</div>
         </div>
         <div class="enhanced-have-selected" id="enhanced-have-selected" hidden>
             <span>Selected</span>
@@ -7298,7 +7298,7 @@ function openHaveMissingTrackModal(track, album) {
         <div class="enhanced-have-import-status" id="enhanced-have-import-status" hidden>
             <div class="enhanced-have-import-status-top">
                 <span class="enhanced-have-import-spinner"></span>
-                <span class="enhanced-have-import-title">Preparing import...</span>
+                <span class="enhanced-have-import-title">Preparing import…</span>
                 <span class="enhanced-have-import-time">0s</span>
             </div>
             <div class="enhanced-have-import-detail">Waiting to start.</div>
@@ -7406,7 +7406,7 @@ function openHaveMissingTrackModal(track, album) {
         selectedTrackSummary = '';
         selectedEl.hidden = true;
         confirmBtn.disabled = true;
-        resultsEl.innerHTML = '<div class="enhanced-loading">Searching...</div>';
+        resultsEl.innerHTML = '<div class="enhanced-loading">Searching…</div>';
         searchResultsById.clear();
         try {
             const res = await fetch(`/api/library/search-tracks?q=${encodeURIComponent(query)}&limit=12`);
@@ -7451,7 +7451,7 @@ function openHaveMissingTrackModal(track, album) {
         if (!selectedTrackId) return;
         isImporting = true;
         confirmBtn.disabled = true;
-        confirmBtn.textContent = 'Importing...';
+        confirmBtn.textContent = 'Importing…';
         cancelBtn.disabled = true;
         closeBtn.disabled = true;
         searchBtn.disabled = true;
@@ -7495,7 +7495,7 @@ function openHaveMissingTrackModal(track, album) {
                     total_discs: Math.max(1, ...discs),
                 }),
             });
-            setImportStatus('Finalizing import', 'Backend finished. Refreshing the enhanced library view...');
+            setImportStatus('Finalizing import', 'Backend finished. Refreshing the enhanced library view…');
             const data = await res.json();
             if (!data.success) throw new Error(data.error || 'Failed to import track');
             if (importTimer) clearInterval(importTimer);
@@ -7563,7 +7563,7 @@ async function runEnrichment(entityType, entityId, service, name, artistName, ar
         }
     });
 
-    showToast(`Enriching ${entityType} from ${service}...`, 'info');
+    showToast(`Enriching ${entityType} from ${service}…`, 'info');
 
     try {
         const response = await fetch('/api/library/enrich', {
@@ -7642,7 +7642,7 @@ async function showTagPreview(trackId) {
     if (!overlay || !body) return;
 
     title.textContent = 'Write Tags to File';
-    body.innerHTML = '<div class="tag-preview-loading">Loading tag comparison...</div>';
+    body.innerHTML = '<div class="tag-preview-loading">Loading tag comparison…</div>';
     overlay.classList.remove('hidden');
 
     // Hide sync checkbox until we know server type
@@ -7713,7 +7713,7 @@ async function executeWriteTags() {
     const writeBtn = document.getElementById('tag-preview-write-btn');
     if (writeBtn) {
         writeBtn.disabled = true;
-        writeBtn.textContent = 'Writing...';
+        writeBtn.textContent = 'Writing…';
     }
 
     const embedCover = document.getElementById('tag-preview-embed-cover')?.checked ?? true;
@@ -7777,7 +7777,7 @@ async function showBatchTagPreview(trackIds, albumTitle) {
     if (!overlay || !body) return;
 
     titleEl.textContent = albumTitle ? `Write Tags — ${albumTitle}` : `Write Tags — ${trackIds.length} Tracks`;
-    body.innerHTML = '<div class="tag-preview-loading">Loading tag previews...</div>';
+    body.innerHTML = '<div class="tag-preview-loading">Loading tag previews…</div>';
     summary.innerHTML = '';
     writeBtn.disabled = true;
     overlay.classList.remove('hidden');
@@ -7917,7 +7917,7 @@ async function executeBatchWriteTags() {
     const writeBtn = document.getElementById('batch-tag-preview-write-btn');
     if (writeBtn) {
         writeBtn.disabled = true;
-        writeBtn.textContent = 'Writing...';
+        writeBtn.textContent = 'Writing…';
     }
 
     const embedCover = document.getElementById('batch-tag-preview-embed-cover')?.checked ?? true;
@@ -7943,7 +7943,7 @@ async function _startBatchWriteTags(trackIds, embedCover, syncToServer = false) 
         const result = await response.json();
         if (!result.success) throw new Error(result.error);
 
-        showToast(`Writing tags for ${trackIds.length} tracks...`, 'info');
+        showToast(`Writing tags for ${trackIds.length} tracks…`, 'info');
         _pollBatchWriteTagsStatus();
 
     } catch (error) {
@@ -7964,7 +7964,7 @@ function _pollBatchWriteTagsStatus() {
             if (state.status === 'running') {
                 if (state.sync_phase === 'syncing') {
                     const serverName = state.sync_server === 'plex' ? 'Plex' : state.sync_server === 'jellyfin' ? 'Jellyfin' : state.sync_server;
-                    showToast(`Syncing to ${serverName}...`, 'info');
+                    showToast(`Syncing to ${serverName}…`, 'info');
                 } else {
                     const pct = state.total > 0 ? Math.round(state.processed / state.total * 100) : 0;
                     showToast(`Writing tags: ${state.processed}/${state.total} (${pct}%) — ${state.current_track}`, 'info');
@@ -8288,7 +8288,7 @@ async function loadReorganizePreview() {
     if (!previewBody || !_reorganizeAlbumId) return;
 
     if (applyBtn) applyBtn.disabled = true;
-    previewBody.innerHTML = '<div class="reorganize-preview-loading">Loading preview...</div>';
+    previewBody.innerHTML = '<div class="reorganize-preview-loading">Loading preview…</div>';
 
     // Final apply-button state: only enable when the preview actually
     // produced movable tracks AND no collisions blocked it. Any error
@@ -8392,7 +8392,7 @@ async function executeReorganize() {
     const applyBtn = document.getElementById('reorganize-apply-btn');
     if (applyBtn) {
         applyBtn.disabled = true;
-        applyBtn.textContent = 'Queueing...';
+        applyBtn.textContent = 'Queueing…';
     }
 
     const albumTitle = document.getElementById('reorganize-modal-title')?.textContent
@@ -8586,7 +8586,7 @@ async function _executeReorganizeAll() {
     if (!confirmed) return;
 
     const applyBtn = document.getElementById('reorganize-apply-btn');
-    if (applyBtn) { applyBtn.disabled = true; applyBtn.textContent = 'Queueing...'; }
+    if (applyBtn) { applyBtn.disabled = true; applyBtn.textContent = 'Queueing…'; }
 
     const overlay = document.getElementById('reorganize-overlay');
     if (overlay) overlay.classList.add('hidden');
@@ -9167,7 +9167,7 @@ async function playLibraryTrack(track, albumTitle, artistName) {
         showLoadingAnimation();
         const loadingText = document.querySelector('.loading-text');
         if (loadingText) {
-            loadingText.textContent = 'Loading library track...';
+            loadingText.textContent = 'Loading library track…';
         }
 
         // POST to library play endpoint
@@ -9308,7 +9308,7 @@ async function toggleLibraryWatchlist(event, artistId, artistName) {
 
     // Show loading state
     const originalText = text.textContent;
-    text.textContent = 'Loading...';
+    text.textContent = 'Loading…';
     button.disabled = true;
 
     try {
@@ -9354,7 +9354,7 @@ async function toggleLibraryWatchlist(event, artistId, artistName) {
         } else {
             // Was not watching, now added
             icon.textContent = '👁️';
-            text.textContent = 'Watching...';
+            text.textContent = 'Watching…';
             button.classList.add('watching');
             console.log(`✅ Added ${artistName} to watchlist`);
         }
@@ -9400,7 +9400,7 @@ async function updateLibraryWatchlistButtonStatus(artistId) {
 
             if (data.is_watching) {
                 icon.textContent = '👁️';
-                text.textContent = 'Watching...';
+                text.textContent = 'Watching…';
                 button.classList.add('watching');
             } else {
                 icon.textContent = '👁️';

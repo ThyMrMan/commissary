@@ -733,7 +733,7 @@
         if (r.files && r.files.length > 1) return _packCardHTML(r, i);
         // Flat / brutalist release card: a bracketed quality block + release name on
         // line 1, an UPPERCASE dot-separated spec line, then the verdict + a hard
-        // [ GET ] button. Monospace, sharp, no chrome. .vdl-res stays a column so the
+        // [ DOWNLOAD ] button. Monospace, sharp, no chrome. .vdl-res stays a column so the
         // live download tracker docks under it on grab.
         var meta = [SRC_LABEL[r.source] || r.source || ''];
         if (r.codec) meta.push(String(r.codec).toUpperCase());
@@ -750,7 +750,7 @@
         // takes accepted releases; here we let them GET a below-profile one anyway.
         var grab = r.username
             ? '<button class="vdl-res-grab' + (r.accepted ? '' : ' vdl-res-grab--override') + '" type="button" data-vdl-grab="' + i +
-                '" title="' + (r.accepted ? 'Download this release' : 'Below your quality profile — download anyway') + '">[ GET ]</button>'
+                '" title="' + (r.accepted ? 'Download this release' : 'Below your quality profile — download anyway') + '">[ DOWNLOAD ]</button>'
             : '';
         return '<div class="vdl-res' + (r.accepted ? ' vdl-res--ok' : ' vdl-res--rejected') + '" data-vdl-card="' + i + '">' +
             '<div class="vdl-res-main">' +
@@ -925,7 +925,7 @@
                 '<input type="checkbox" class="vdl-season-cb" data-vdl-season-all="' + sn + '">' +
                 '<span class="vdl-season-name">' + esc(s.title || ('Season ' + sn)) + '</span>' +
                 '<span class="vdl-season-meta" data-vdl-season-meta>' + total + ' eps</span>' +
-                '<button class="vdl-season-grab" type="button" data-vdl-season-grab="' + sn + '" title="Find a single season pack covering this season, and grab that">Grab season</button>' +
+                '<button class="vdl-season-grab" type="button" data-vdl-season-grab="' + sn + '" title="Find a single season pack covering this season, and download that">Download season</button>' +
                 '<button class="vdl-season-search" type="button" data-vdl-season-search="' + sn + '" title="Search this season as a pack">⌕</button>' +
                 '<span class="vdl-season-chev" aria-hidden="true">⌄</span>' +
             '</div>' +
@@ -1189,7 +1189,7 @@
         if (card) card.classList.add('vdl-season--open');
         var btn = container.querySelector('[data-vdl-season-grab="' + sn + '"]');
         var reset = function (label) {
-            if (btn) { btn.disabled = false; btn.textContent = label || 'Grab season'; }
+            if (btn) { btn.disabled = false; btn.textContent = label || 'Download season'; }
         };
         if (btn) { btn.disabled = true; btn.textContent = 'Finding pack…'; }
         // Every missing row lights up: they are all being fetched, just as ONE
@@ -1214,7 +1214,7 @@
                           ' — use Auto on individual episodes instead', 'info');
                     return;
                 }
-                if (btn) btn.textContent = 'Grabbing pack…';
+                if (btn) btn.textContent = 'Downloading pack…';
                 // A soulseek pack is a FOLDER of files and goes through grab-pack
                 // (which fans it out server-side); a torrent/usenet pack is one
                 // release and rides the normal grab, where the download monitor
@@ -1226,9 +1226,9 @@
                     if (res && res.ok) {
                         document.dispatchEvent(new CustomEvent('soulsync:video-download-started'));
                         toast(isFolder
-                            ? 'Grabbing ' + res.started + ' episode' + (res.started === 1 ? '' : 's') +
+                            ? 'Downloading ' + res.started + ' episode' + (res.started === 1 ? '' : 's') +
                               ' from the pack' + (res.skipped ? ' · ' + res.skipped + ' skipped' : '')
-                            : 'Grabbing the season ' + sn + ' pack — it imports per episode when it lands',
+                            : 'Downloading the season ' + sn + ' pack — it imports per episode when it lands',
                             'success');
                         reset('Pack grabbed');
                     } else {
@@ -1341,7 +1341,7 @@
                 if (res && res.ok) {
                     gp.textContent = '[ GRABBING ' + res.started + ' ]'; gp.classList.add('vms-grabbed');
                     document.dispatchEvent(new CustomEvent('soulsync:video-download-started'));
-                    toast('Grabbing ' + res.started + ' episode' + (res.started === 1 ? '' : 's') +
+                    toast('Downloading ' + res.started + ' episode' + (res.started === 1 ? '' : 's') +
                         (res.skipped ? ' · ' + res.skipped + ' skipped' : ''), 'success');
                 } else { gp.disabled = false; gp.textContent = '[ GET PACK ]'; toast((res && res.error) || 'Pack grab failed', 'error'); }
             });
@@ -1395,7 +1395,7 @@
                         gb.textContent = '[ GRABBED ]'; gb.classList.add('vms-grabbed');
                         document.dispatchEvent(new CustomEvent('soulsync:video-download-started'));
                         toast('Download started — track it on the episode row', 'success');
-                    } else { gb.disabled = false; gb.textContent = '[ GET ]'; toast((res && res.error) || 'Grab failed', 'error'); }
+                    } else { gb.disabled = false; gb.textContent = '[ DOWNLOAD ]'; toast((res && res.error) || 'Download failed', 'error'); }
                 });
             }
         });

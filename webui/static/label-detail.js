@@ -199,7 +199,7 @@
             btn.hidden = false;
             btn.classList.toggle('watching', !!watching);
             const txt = btn.querySelector('.watchlist-text');
-            if (txt) txt.textContent = watching ? 'Watching...' : 'Add to Watchlist';
+            if (txt) txt.textContent = watching ? 'Watching…' : 'Add to Watchlist';
         }
         if (backlog) backlog.hidden = !watching;
     }
@@ -215,7 +215,7 @@
         if (!_current.id) return;
         const btn = document.getElementById('label-detail-watch-btn');
         const txt = btn && btn.querySelector('.watchlist-text');
-        if (txt) txt.textContent = 'Loading...';
+        if (txt) txt.textContent = 'Loading…';
         try {
             const url = _current.watching ? '/api/labels/watchlist/remove' : '/api/labels/watchlist/add';
             const body = _current.watching
@@ -414,7 +414,7 @@
             }
             return;
         }
-        if (typeof showLoadingOverlay === 'function') showLoadingOverlay('Loading album...');
+        if (typeof showLoadingOverlay === 'function') showLoadingOverlay('Loading album…');
         try {
             // MusicBrainz gives us tracks but only Cover Art Archive images
             // (unreachable) + no artist image. So resolve the release to a real

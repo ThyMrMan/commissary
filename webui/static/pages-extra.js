@@ -39,7 +39,7 @@ function initExplorer() {
                 if (card) {
                     const meta = card.querySelector('.explorer-picker-card-meta');
                     if (meta && data.progress != null) {
-                        meta.innerHTML = `<span class="explorer-discovering-live">Discovering... ${Math.round(data.progress)}%</span>`;
+                        meta.innerHTML = `<span class="explorer-discovering-live">Discovering… ${Math.round(data.progress)}%</span>`;
                     }
                 }
             }
@@ -182,7 +182,7 @@ function explorerSelectPlaylist(id, el) {
 }
 
 function explorerRedirectToDiscover(playlistId) {
-    showToast('This playlist needs more tracks discovered before exploring. Redirecting to Sync...', 'info');
+    showToast('This playlist needs more tracks discovered before exploring. Redirecting to Sync…', 'info');
     navigateToPage('sync');
     setTimeout(() => {
         const mirroredBtn = document.querySelector('.sync-tab-button[data-tab="mirrored"]');
@@ -193,7 +193,7 @@ function explorerRedirectToDiscover(playlistId) {
 async function explorerStartDiscovery(playlistId) {
     const card = document.querySelector(`.explorer-picker-card[data-id="${playlistId}"]`);
     const btn = card?.querySelector('.explorer-picker-discover-btn');
-    if (btn) { btn.disabled = true; btn.textContent = 'Starting...'; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
 
     try {
         if (typeof discoverMirroredPlaylist === 'function') {
@@ -268,7 +268,7 @@ async function explorerBuildTree() {
     if (empty) empty.style.display = 'none';
     if (actionBar) actionBar.style.display = 'none';
     if (progress) progress.style.display = 'flex';
-    if (buildBtn) { buildBtn.disabled = true; buildBtn.textContent = 'Building...'; }
+    if (buildBtn) { buildBtn.disabled = true; buildBtn.textContent = 'Building…'; }
     // Clear tree but preserve the SVG element (it lives inside the tree)
     tree.innerHTML = '<svg class="explorer-svg" id="explorer-svg"></svg>';
     _explorer._zoom = 1;
@@ -321,7 +321,7 @@ async function explorerBuildTree() {
                         const fill = document.getElementById('explorer-progress-fill');
                         const text = document.getElementById('explorer-progress-text');
                         if (fill) fill.style.width = pct + '%';
-                        if (text) text.textContent = `Discovering artists... ${artistCount} of ${totalArtists}`;
+                        if (text) text.textContent = `Discovering artists… ${artistCount} of ${totalArtists}`;
                     } else if (data.type === 'complete') {
                         // Done
                     }
@@ -790,7 +790,7 @@ async function _explorerWishlistSubmit(artistSections) {
                     <div class="discog-prog-art">${album.img ? `<img src="${album.img}">` : '&#9835;'}</div>
                     <div class="discog-prog-info">
                         <div class="discog-prog-title">${_esc(album.title)}</div>
-                        <div class="discog-prog-status">Waiting...</div>
+                        <div class="discog-prog-status">Waiting…</div>
                     </div>
                     <div class="discog-prog-icon"><div class="discog-spinner"></div></div>
                 `;
@@ -800,7 +800,7 @@ async function _explorerWishlistSubmit(artistSections) {
     }
 
     const info = document.getElementById('explorer-wishlist-info');
-    if (info) info.textContent = 'Processing...';
+    if (info) info.textContent = 'Processing…';
 
     let totalAdded = 0;
 
@@ -1152,7 +1152,7 @@ async function loadServerPlaylists() {
 
     if (editor) editor.style.display = 'none';
     if (container) container.style.display = '';
-    if (btn) { btn.disabled = true; btn.textContent = '🔄 Loading...'; }
+    if (btn) { btn.disabled = true; btn.textContent = '🔄 Loading…'; }
 
     // Show skeleton loader
     if (container) {
@@ -1395,10 +1395,10 @@ async function _openServerCompareView(playlistId, playlistName, mirroredPlaylist
     const serverScroll = document.getElementById('server-col-server-scroll');
 
     if (nameEl) nameEl.textContent = playlistName;
-    if (metaEl) metaEl.textContent = 'Loading comparison...';
+    if (metaEl) metaEl.textContent = 'Loading comparison…';
     if (banner) banner.style.display = 'none';
-    if (sourceScroll) sourceScroll.innerHTML = '<div style="text-align:center;padding:30px;color:rgba(255,255,255,0.2);font-size:12px">Loading...</div>';
-    if (serverScroll) serverScroll.innerHTML = '<div style="text-align:center;padding:30px;color:rgba(255,255,255,0.2);font-size:12px">Loading...</div>';
+    if (sourceScroll) sourceScroll.innerHTML = '<div style="text-align:center;padding:30px;color:rgba(255,255,255,0.2);font-size:12px">Loading…</div>';
+    if (serverScroll) serverScroll.innerHTML = '<div style="text-align:center;padding:30px;color:rgba(255,255,255,0.2);font-size:12px">Loading…</div>';
 
     // Store state
     _serverEditorState = {
@@ -1918,13 +1918,13 @@ async function serverSearchReplace(trackIndex, mode) {
                 <div class="server-search-input-icon">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
                 </div>
-                <input type="text" class="server-search-input" id="server-search-input" value="${_esc(searchQuery)}" placeholder="Search by track name, artist, or album..." onkeydown="if(event.key==='Enter') _serverSearchExecute()">
+                <input type="text" class="server-search-input" id="server-search-input" value="${_esc(searchQuery)}" placeholder="Search by track name, artist, or album…" onkeydown="if(event.key==='Enter') _serverSearchExecute()">
             </div>
             <div class="server-search-results-header" id="server-search-results-header"></div>
             <div class="server-search-results" id="server-search-results">
                 <div class="server-search-hint">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" style="margin-bottom:6px;opacity:0.4"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-                    <br>Searching...
+                    <br>Searching…
                 </div>
             </div>
         </div>
@@ -1965,7 +1965,7 @@ async function _serverSearchExecute() {
         return;
     }
 
-    results.innerHTML = '<div class="server-search-hint"><div class="server-search-spinner"></div>Searching library...</div>';
+    results.innerHTML = '<div class="server-search-hint"><div class="server-search-spinner"></div>Searching library…</div>';
     if (resultsHeader) resultsHeader.textContent = '';
 
     try {
@@ -2024,7 +2024,7 @@ async function _serverSelectTrack(trackIndex, mode, newTrackId, el) {
     if (!track) return;
 
     const btn = el.querySelector('.server-search-select-btn');
-    if (btn) { btn.disabled = true; btn.textContent = '...'; }
+    if (btn) { btn.disabled = true; btn.textContent = '…'; }
 
     try {
         let response;
@@ -2299,7 +2299,7 @@ async function _readdSyncWishlist(entryId, index, el) {
 
 async function openSyncDetailModal(entryId) {
     try {
-        showLoadingOverlay('Loading sync details...');
+        showLoadingOverlay('Loading sync details…');
         const response = await fetch(`/api/sync/history/${entryId}`);
         const data = await response.json();
         hideLoadingOverlay();
@@ -3817,7 +3817,7 @@ function _adlRenderBatchPanel() {
             phaseText = 'Queued';
             phaseIcon = '<span style="margin-right:4px;opacity:0.6">⏳</span>';
         } else if (batch.phase === 'analysis') {
-            phaseText = 'Analyzing...';
+            phaseText = 'Analyzing…';
             phaseIcon = '<span class="adl-spinner" style="margin-right:4px"></span>';
         } else if (batch.phase === 'album_downloading') {
             phaseText = _adlBundleProgressText(albumBundle);

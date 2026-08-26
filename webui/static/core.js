@@ -306,7 +306,7 @@ function showWitnessMeDialog(orphanCount) {
                     To confirm you understand the risk, type <strong style="color:#e74c3c;">witness me</strong> below:
                 </p>
                 <input type="text" id="witness-me-input" autocomplete="off" spellcheck="false"
-                       placeholder="Type the phrase here..."
+                       placeholder="Type the phrase here…"
                        style="width:100%;padding:10px;border:1px solid #555;border-radius:6px;background:var(--bg-primary, #111);color:var(--text-primary, #fff);font-size:1em;margin:8px 0 16px;box-sizing:border-box;">
                 <div style="display:flex;gap:10px;justify-content:flex-end;">
                     <button id="witness-cancel" style="padding:8px 20px;border:1px solid #555;border-radius:6px;background:transparent;color:var(--text-primary, #fff);cursor:pointer;font-size:0.9em;">
