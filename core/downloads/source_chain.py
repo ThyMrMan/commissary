@@ -127,6 +127,65 @@ def resolve_chain(config_get: Optional[Callable] = None,
     return _clean(DEFAULT_CHAIN, normalize, drop_unknown=False) or list(DEFAULT_CHAIN)
 
 
+# The config leaf each key is posted as. `download_source.mode` arrives in a
+# settings body as `{"download_source": {"mode": ...}}`, so a payload names its
+# keys by leaf.
+_PAYLOAD_LEAVES = {
+    SOURCES_KEY: "sources",
+    LEGACY_MODE_KEY: "mode",
+    LEGACY_ORDER_KEY: "hybrid_order",
+    LEGACY_PRIMARY_KEY: "hybrid_primary",
+    LEGACY_SECONDARY_KEY: "hybrid_secondary",
+}
+
+
+def chain_from_payload(payload, config_get: Optional[Callable] = None,
+                       normalize: Optional[Callable] = None) -> List[str]:
+    """The chain a WRITE is asking for, derived from the write itself.
+
+    ``resolve_chain`` answers "what is configured?", and consulting the stored
+    collapsed list first is exactly right for that. A save asks a DIFFERENT
+    question — "what did this request just ask for?" — and answering it with
+    ``resolve_chain`` let the stored list shadow the very keys the request had
+    written a moment earlier.
+
+    That is what "rearranging the download sources doesn't save, and switching
+    tabs puts it back" was. The settings POST wrote ``hybrid_order`` and then
+    called ``store_chain(resolve_chain(get))``, which read the PREVIOUS
+    ``sources`` and wrote it straight back over the new order. The first save
+    after upgrading stuck, because nothing was stored yet; every save after it
+    was reverted to that first one. The same shadowing made the sidebar's
+    quick-switch modal inert (it writes only legacy keys, so downloads kept
+    using the stale collapsed list) and reverted a switch to a single source
+    back to "hybrid".
+
+    The rule: a key the payload NAMES beats the stored value, and the stored
+    collapsed list answers only when the payload named no source key at all —
+    in which case the request was not about sources and the chain stands.
+
+    Precedence WITHIN the payload is unchanged, because this is literally the
+    same derivation with its reads re-pointed.
+    """
+    get = _config_get(config_get)
+    posted = payload if isinstance(payload, dict) else {}
+
+    if not any(leaf in posted for leaf in _PAYLOAD_LEAVES.values()):
+        return resolve_chain(get, normalize)
+
+    def _overlay(key, default=None):
+        leaf = _PAYLOAD_LEAVES.get(key)
+        if leaf is not None and leaf in posted:
+            return posted[leaf]
+        if key == SOURCES_KEY:
+            # The request spoke about sources in legacy terms, so the stored
+            # collapsed list is the value being REPLACED. Letting it answer
+            # here is the whole bug.
+            return None
+        return get(key, default)
+
+    return resolve_chain(_overlay, normalize)
+
+
 def is_multi_source(config_get: Optional[Callable] = None,
                     normalize: Optional[Callable] = None) -> bool:
     """Whether anything can be fallen back TO — the old ``mode == 'hybrid'``.
@@ -167,15 +226,24 @@ def store_chain(sources, config_set: Optional[Callable] = None) -> List[str]:
         return resolve_chain()
     config_set(SOURCES_KEY, chain)
     config_set(LEGACY_MODE_KEY, "hybrid" if len(chain) > 1 else chain[0])
-    config_set(LEGACY_ORDER_KEY, chain)
-    config_set(LEGACY_PRIMARY_KEY, chain[0])
-    config_set(LEGACY_SECONDARY_KEY, chain[1] if len(chain) > 1 else chain[0])
+    if len(chain) > 1:
+        config_set(LEGACY_ORDER_KEY, chain)
+        config_set(LEGACY_PRIMARY_KEY, chain[0])
+        config_set(LEGACY_SECONDARY_KEY, chain[1])
+    # A single-source chain deliberately leaves the multi-source keys ALONE.
+    # `hybrid_order` and the pair are the legacy list-for-hybrid-mode, and the
+    # legacy derivation above never reads them while the mode names one source
+    # — so collapsing them to [that source] would change nothing a reader sees
+    # and would silently discard an ordering the user spent time on. Picking
+    # "Soulseek Only", saving, and switching back to Hybrid has always returned
+    # you to your list; it still does.
     return chain
 
 
 __all__ = [
     "DEFAULT_CHAIN",
     "SOURCES_KEY",
+    "chain_from_payload",
     "clean_sources",
     "is_multi_source",
     "primary_source",

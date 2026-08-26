@@ -3491,6 +3491,14 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.1.2': [
+        { date: 'August 2026 · 2.1.2' },
+        { title: "Rearranging your download sources actually saves now", desc: "you could reorder the sources, add one, or remove one, hit Save — and find the old arrangement back the moment you left the page and returned. The save was reaching the server; the server was then <em>undoing</em> it, which is why nothing about it looked broken." },
+        { title: "What was happening", desc: "the sources are stored twice: as the list you arrange, and as a single collapsed list everything else reads. After writing your new arrangement, the save re-read the collapsed list to keep the two in step — but the collapsed list still held the <em>previous</em> arrangement, and that got written straight back over the one you had just made. The very first save after updating stuck, because there was nothing stored yet to overwrite it with. <strong>Every save after that was quietly reverted to your first one.</strong>" },
+        { title: "Choosing a single source stuck as “Hybrid” too", desc: "the same overwrite reached the Download Source dropdown: pick “Soulseek Only”, save, and it was hybrid again. And picking a single source no longer costs you the priority list you arranged — it is kept for when you switch back." },
+        { title: "The quick-switch in the sidebar was doing nothing at all", desc: "reordering your sources there redrew the list, said “Updated”, and changed <strong>nothing</strong> about where music was actually downloaded from — it wrote only the old-style settings, so the collapsed list carried on answering. Both places write the same thing now, so they cannot disagree about what is in force." },
+        { title: "If your sources have been ignoring you", desc: "nothing is corrupt and there is nothing to clean up — open Settings, arrange the sources the way you want them, and save once. This time it stays." },
+    ],
     '2.1.1': [
         { date: 'August 2026 · 2.1.1' },
         { title: "Downloads that got stuck saying “Downloading” forever", desc: "a batch of downloads counts how many of its workers are busy, and it was counting wrong — every time. The result was the one you saw: tracks that finished, a batch that never did, and a page that kept saying work was in progress. On the logs behind this fix it happened to <strong>five batches out of five</strong>." },
@@ -3940,6 +3948,19 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.1.2: the download source order that saved itself back",
+        description: "Rearranging your download sources, adding one, or switching to a single source appeared to save and then reverted. The save was fine; the step that ran after it wrote the old arrangement back on top.",
+        features: [
+            "the sources are stored twice - as the list you arrange, and as a collapsed list everything else reads",
+            "after writing your new arrangement, the save re-read the collapsed list to keep the two in step - and that list still held the previous one",
+            "so your new order was written and then immediately overwritten with the old one, on every save after the first",
+            "the first save after updating stuck, because there was nothing stored yet to overwrite it with - which is why it looked intermittent rather than broken",
+            "picking a single source was flipped back to Hybrid the same way, and no longer flattens the priority list you arranged",
+            "the sidebar quick-switch wrote only the old-style settings, so reordering there changed its own display and nothing about where music came from",
+        ],
+        usage_note: "Nothing is corrupt and there is nothing to migrate. If your sources have not been behaving, open Settings, arrange them how you want, and save once - it stays now. The sidebar quick-switch and the Settings page write the same thing, so they can no longer disagree about which source is in force.",
+    },
     {
         title: "2.1.1: downloads that never stopped saying Downloading",
         description: "A batch miscounted its own workers on every single run, so tracks finished and the batch never did. Plus the explicit/clean distinction now works on Deezer and the other catalogue sources.",

@@ -52,7 +52,7 @@ logger = setup_logging(_log_level, _log_path)
 # the published image moved (ghcr.io/thymrman/commissary) even though nothing
 # about the data changed — see tests/test_branding.py for what deliberately
 # kept its old `soulsync` name.
-_SOULSYNC_BASE_VERSION = "2.1.1"
+_SOULSYNC_BASE_VERSION = "2.1.2"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -3936,12 +3936,19 @@ def handle_settings():
                 if any(k in _ds for k in ('sources', 'mode', 'hybrid_order',
                                           'hybrid_primary', 'hybrid_secondary')):
                     try:
-                        from core.downloads.source_chain import resolve_chain, store_chain
-                        # Resolve from what was just saved, then write it back
-                        # in the collapsed form. Reading through resolve_chain
-                        # means the UI can keep sending whichever shape it
-                        # sends and the derivation stays in one place.
-                        store_chain(resolve_chain(config_manager.get))
+                        from core.downloads.source_chain import chain_from_payload, store_chain
+                        # Derive from THE REQUEST, not from the stored config.
+                        # This used to read through resolve_chain(), which
+                        # consults the collapsed `sources` list FIRST — so the
+                        # previous chain answered for the keys this very POST
+                        # had just written, and store_chain wrote it straight
+                        # back over them. The first save after upgrading stuck
+                        # (nothing was stored yet) and every save after it was
+                        # silently reverted to that first one: "rearranging the
+                        # download sources doesn't save, switching tabs puts it
+                        # back". It also flipped a switch to a single source
+                        # back to "hybrid".
+                        store_chain(chain_from_payload(_ds, config_manager.get))
                     except Exception as _chain_err:
                         logger.error(f"Download source chain sync failed: {_chain_err}")
 
@@ -30648,17 +30655,47 @@ def set_active_sources():
                         c.reload_config()
             changed.append('server')
 
+        _ds_patch = {}
         if 'download_mode' in data:
             mode = data['download_mode']
             if mode not in (_QS_DOWNLOAD_SOURCES + ['hybrid']):
                 return jsonify({'success': False, 'error': 'Unknown download mode'}), 400
             config_manager.set('download_source.mode', mode)
+            _ds_patch['mode'] = mode
             changed.append('download')
 
         if 'hybrid_order' in data and isinstance(data['hybrid_order'], list):
-            clean = [s for s in data['hybrid_order'] if s in _QS_DOWNLOAD_SOURCES]
+            # This modal RENDERS the stored order verbatim — including sources
+            # its own card grid has never heard of. Settings offers eleven;
+            # _QS_DOWNLOAD_SOURCES lists seven, so Deezer, Amazon, Lidarr and
+            # SoundCloud show up in the drag list and are not in the whitelist.
+            # Filtering a reorder down to the grid's seven would delete a source
+            # the user was looking at while they dragged, and now that this
+            # endpoint actually reaches the download chain, that deletion would
+            # stop music coming from it. So accept anything the modal could
+            # legitimately have displayed — a source it knows, or one already in
+            # the chain — and still reject names it could not have shown.
+            from core.downloads.source_chain import resolve_chain as _resolve_chain
+            _offerable = set(_QS_DOWNLOAD_SOURCES) | set(_resolve_chain(config_manager.get))
+            clean = [s for s in data['hybrid_order'] if s in _offerable]
             config_manager.set('download_source.hybrid_order', clean)
+            _ds_patch['hybrid_order'] = clean
             changed.append('download')
+
+        if _ds_patch:
+            # Collapse what this patch asked for into `download_source.sources`,
+            # the form every consumer resolves through. Writing only the legacy
+            # keys made this whole modal INERT for downloads: the stored
+            # collapsed list still answered, so reordering here changed what the
+            # modal displayed and nothing about where music came from — and the
+            # next Settings save put the display back too. Derived from the
+            # patch rather than from config for the same reason the settings
+            # POST is (see core/downloads/source_chain.chain_from_payload).
+            try:
+                from core.downloads.source_chain import chain_from_payload, store_chain
+                store_chain(chain_from_payload(_ds_patch, config_manager.get))
+            except Exception as _chain_err:
+                logger.error(f"Download source chain sync failed: {_chain_err}")
 
         if 'download' in changed and download_orchestrator:
             download_orchestrator.reload_settings()
