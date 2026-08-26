@@ -10,10 +10,12 @@ import time
 
 from config.settings import config_manager
 from core.runtime_state import (
+    TERMINAL_TASK_STATUSES,
     download_batches,
     download_tasks,
     matched_context_lock,
     matched_downloads_context,
+    task_is_active,
     tasks_lock,
 )
 from utils.async_helpers import run_async
@@ -1118,10 +1120,21 @@ class WebUIDownloadMonitor:
                     for task_id in queue:
                         if task_id in download_tasks:
                             task_status = download_tasks[task_id]['status']
-                            if task_status in ['searching', 'downloading', 'queued', 'post_processing']:
+                            # Both branches derive from ONE set (runtime_state).
+                            # They used to enumerate their own, and the active
+                            # list was missing 'pending' — the status every task
+                            # is created with. A pending task matched neither
+                            # branch and simply vanished from the count, so this
+                            # validator repeatedly "fixed" a correct count down,
+                            # freed a slot that was in use, and started another
+                            # worker whose task was also pending. The orphan list
+                            # had the mirror-image gap: it omitted 'skipped' and
+                            # 'already_owned', so those sat in the live queue
+                            # region unnoticed.
+                            if task_is_active(task_status):
                                 if task_id not in completed_task_ids:
                                     actually_active += 1
-                            elif task_status in ['failed', 'completed', 'cancelled', 'not_found'] and task_id in queue[queue_index:]:
+                            elif task_status in TERMINAL_TASK_STATUSES and task_id in queue[queue_index:]:
                                 # These are orphaned tasks - they're done but still in active queue
                                 orphaned_tasks.append(task_id)
 

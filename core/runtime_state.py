@@ -29,6 +29,32 @@ TERMINAL_TASK_STATUSES = frozenset({
     'completed', 'failed', 'not_found', 'cancelled', 'skipped', 'already_owned',
 })
 
+
+def task_is_active(status) -> bool:
+    """Whether a download task still holds a batch worker slot.
+
+    DERIVED from the terminal set rather than listing the live states, because
+    the enumerated version drifted and cost a wedged batch every time. The
+    worker-count validator listed ('searching', 'downloading', 'queued',
+    'post_processing') and omitted 'pending' — the status a task is created
+    with, and therefore the status of every worker the validator had just
+    started. Such a task matched neither the active branch nor the orphaned
+    branch: it was invisible, so the validator "corrected" a count that was
+    right, freed a slot still in use, and launched a replacement — whose task
+    was also pending, so the next pass did it again. Observed on five batches
+    out of five, oscillating 3->2 every few seconds for two minutes.
+
+    Deriving it also fails in the safe direction: a status nobody thought about
+    reads as STILL WORKING, so a batch waits rather than declaring itself free
+    and spawning phantom workers.
+
+    A missing/blank status is NOT active: a task that isn't in ``download_tasks``
+    has no slot to hold, and ``_wait_for_batch_drain`` would otherwise block on
+    something that does not exist."""
+    if not status:
+        return False
+    return str(status) not in TERMINAL_TASK_STATUSES
+
 activity_feed = []
 activity_feed_lock = threading.Lock()
 _activity_toast_emitter = None

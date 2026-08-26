@@ -744,6 +744,10 @@ class DeezerDownloadClient(DownloadSourcePlugin):
                     title=title,
                     album=album,
                     track_number=item.get('track_position'),
+                    # Deezer reports this on every search result. It is the
+                    # whole reason the preference can work here at all — no
+                    # filename to read, but a straight answer instead.
+                    explicit=item.get('explicit_lyrics'),
                 )
                 # Stamp CD-quality FLAC (16/44.1) so lossless ranks correctly.
                 tr.set_quality(quality_from_deezer(self._quality))

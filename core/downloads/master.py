@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import json
 import logging
+
+from utils.logging_config import get_logger
 import re
 import time
 import uuid
@@ -36,9 +38,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from core.downloads import album_bundle_dispatch as _album_bundle_dispatch
-from core.runtime_state import download_batches, download_tasks, tasks_lock
+from core.runtime_state import (
+    download_batches,
+    download_tasks,
+    task_is_active,
+    tasks_lock,
+)
 
-logger = logging.getLogger(__name__)
+# See the note in core/downloads/lifecycle.py: the file handler listens on the
+# `soulsync` logger, so a plain module logger never reaches app.log.
+logger = get_logger("downloads.master")
 
 
 _ALBUM_PREFLIGHT_MIN_SCORE = 0.62
@@ -365,9 +374,10 @@ class _BatchStateAccessImpl:
                 row['album_bundle_state'] = 'failed'
 
 
-# Task states that mean a batch still has work in flight. While ANY of a batch's
-# tasks is in one of these, a serialized album-pool worker keeps its slot.
-_NON_TERMINAL_TASK_STATUSES = ('pending', 'queued', 'searching', 'downloading', 'post_processing')
+# "Still has work in flight" now has ONE implementation, in runtime_state.
+# The enumerated list that used to live here happened to be right and the
+# validator's copy in downloads/monitor.py did not — which is the whole argument
+# against keeping two.
 
 
 def _wait_for_batch_drain(batch_id: str, poll_seconds: float = 1.5,
@@ -395,7 +405,7 @@ def _wait_for_batch_drain(batch_id: str, poll_seconds: float = 1.5,
                 return
             queue = list(batch.get('queue', ()) or ())
             still_working = any(
-                download_tasks.get(t, {}).get('status') in _NON_TERMINAL_TASK_STATUSES
+                task_is_active(download_tasks.get(t, {}).get('status'))
                 for t in queue
             )
         if not still_working:

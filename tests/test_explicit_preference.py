@@ -186,3 +186,166 @@ def test_folder_guards_hold_on_full_paths(engine):
                  r"Music\Mr. Clean OST\01 - Theme.flac",
                  r"Music\DJ Clean - Mixtape\01 - Intro.flac"):
         assert engine.detect_version_type(path)[0] == 'original', path
+
+
+# ── the same preference, for sources with no filename to read ───────────────
+# Deezer/Tidal/Qobuz/HiFi/Amazon never reach detect_version_type at all —
+# validation.py says so outright ("structured metadata; don't fall back to
+# filename matching"), so everything above did nothing for them. They return
+# the AUTHORITATIVE answer instead, and it was discarded before the candidate
+# was even built.
+
+import pathlib                                               # noqa: E402
+
+from core.download_plugins.types import TrackResult          # noqa: E402
+from core.downloads import explicit_preference as ep         # noqa: E402
+from core.spotify_client import Track                        # noqa: E402
+
+_SRC = pathlib.Path(__file__).resolve().parents[1]
+
+
+def _wanted(explicit=None, name="Song Title"):
+    return Track(id="i", name=name, artists=["A"], album="Al",
+                 duration_ms=1000, popularity=0, explicit=explicit)
+
+
+def _candidate(**kw):
+    base = dict(username="deezer_dl", filename="1||A - Song Title", size=0,
+                bitrate=None, duration=None, quality="flac", free_upload_slots=0,
+                upload_speed=0, queue_length=0, artist="A", title="Song Title")
+    base.update(kw)
+    return TrackResult(**base)
+
+
+class TestTheFlagOnlyMeansSomethingRelatively:
+    """The decision the whole module turns on, and the one that would do real
+    damage if it were wrong."""
+
+    def test_a_song_with_no_explicit_cut_is_never_penalised(self):
+        """`explicit=False` overwhelmingly means "this song has no explicit
+        content", not "this is the censored cut". Sinking every False would
+        break the correct result for most music ever recorded."""
+        assert ep.verdict(_wanted(False), _candidate(explicit=False)) == ep.UNKNOWN
+
+    def test_nor_when_nobody_said_what_was_wanted(self):
+        assert ep.verdict(_wanted(None), _candidate(explicit=False)) == ep.UNKNOWN
+
+    def test_the_censored_cut_of_an_explicit_track_is_the_case_that_counts(self):
+        assert ep.verdict(_wanted(True), _candidate(explicit=False)) == ep.CENSORED
+
+    def test_and_the_explicit_cut_is_preferred(self):
+        assert ep.verdict(_wanted(True), _candidate(explicit=True)) == ep.MATCH
+
+    def test_a_source_that_did_not_say_is_not_guessed_at(self):
+        """None and False are different answers. Collapsing them is the misread
+        this module exists to avoid."""
+        assert ep.verdict(_wanted(True), _candidate(explicit=None)) == ep.UNKNOWN
+
+
+class TestSourcesWithNoFlagFallBackToTheName:
+    """Torrent, usenet and YouTube have a release title and nothing else — this
+    is what brings them into the preference at all."""
+
+    @pytest.mark.parametrize("title,expect", [
+        ("Song Title (Clean)", ep.CENSORED),
+        ("Song Title [Clean]", ep.CENSORED),
+        ("Song Title - Clean", ep.CENSORED),
+        ("Song Title (Censored)", ep.CENSORED),
+        ("Song Title (Edited Version)", ep.CENSORED),
+        ("Song Title (Explicit)", ep.MATCH),
+        ("Song Title", ep.UNKNOWN),
+    ])
+    def test_markers(self, title, expect):
+        assert ep.verdict(_wanted(True), _candidate(explicit=None, title=title)) == expect
+
+    def test_a_title_containing_the_word_clean_is_not_a_censored_cut(self):
+        """Same discipline detect_version_type uses: bracket- and dash-bound
+        only. 'Mr. Clean' and 'Clean Bandit' must survive."""
+        for title in ("Mr. Clean", "Clean Bandit - Rockabye", "Come Clean"):
+            assert ep.verdict(_wanted(True),
+                              _candidate(explicit=None, title=title)) == ep.UNKNOWN
+
+
+class TestItRanksAndNeverFilters:
+    def test_the_ladder(self):
+        assert ep.adjust(0.80, ep.MATCH, enabled=True) > 0.80
+        assert ep.adjust(0.80, ep.UNKNOWN, enabled=True) == 0.80
+        assert ep.adjust(0.80, ep.CENSORED, enabled=True) < 0.80
+
+    def test_the_setting_off_changes_nothing(self):
+        for v in (ep.MATCH, ep.CENSORED, ep.UNKNOWN):
+            assert ep.adjust(0.80, v, enabled=False) == 0.80
+
+    def test_it_stays_inside_zero_and_one(self):
+        assert ep.adjust(0.99, ep.MATCH, enabled=True) <= 1.0
+        assert ep.adjust(0.02, ep.CENSORED, enabled=True) >= 0.0
+
+    def test_junk_confidence_does_not_raise(self):
+        assert ep.adjust(None, ep.MATCH, enabled=True) == 0.0
+        assert ep.adjust("nonsense", ep.CENSORED, enabled=True) == 0.0
+
+    def test_the_acceptance_gate_is_never_what_gets_adjusted(self):
+        """The promise from #923 — a clean cut still downloads when it is all
+        that exists. validation.py must keep gating on the true confidence and
+        apply the preference only to the sort, or a penalty could push a lone
+        candidate under 0.60 and leave the user with nothing at all."""
+        src = (_SRC / "core" / "downloads" / "validation.py").read_text(encoding="utf-8")
+        block = src.split("r.explicit_verdict = explicit_preference.verdict", 1)[1]
+        gate = block.split("scored.append(r)", 1)[0]
+        assert "confidence >= 0.60" in gate
+        assert "explicit_preference.adjust" not in gate, \
+            "the acceptance gate must read the true confidence"
+        # ...and the sort key must BE the adjusted confidence, not merely mention
+        # it somewhere nearby: a reverted `key=lambda x: x.confidence` with the
+        # old call left dangling below would satisfy a substring check.
+        after_key = src.split("scored.sort(key=", 1)[1]
+        assert after_key.startswith("lambda x: explicit_preference.adjust("),             "the sort key must be the preference-adjusted confidence"
+
+    def test_it_is_gated_on_both_settings(self):
+        """Preferring explicit while the content filter blocks explicit is a
+        contradiction — the parent toggle wins, same as the Soulseek path."""
+        src = (_SRC / "core" / "downloads" / "validation.py").read_text(encoding="utf-8")
+        block = src.split("if scored:", 1)[1][:900]
+        assert "content_filter.prefer_explicit" in block
+        assert "content_filter.allow_explicit" in block
+
+
+class TestTheSourcesCarryTheFlag:
+    def test_spotify_stops_discarding_it(self):
+        """It was reported on every track and dropped in from_spotify_track,
+        which left nothing to compare a candidate against."""
+        t = Track.from_spotify_track({
+            "id": "x", "name": "S", "artists": [{"name": "A"}],
+            "album": {"name": "Al", "images": []}, "duration_ms": 1,
+            "explicit": True})
+        assert t.explicit is True
+
+    def test_an_absent_flag_stays_none_not_false(self):
+        t = Track.from_spotify_track({
+            "id": "x", "name": "S", "artists": [{"name": "A"}],
+            "album": {"name": "Al", "images": []}, "duration_ms": 1})
+        assert t.explicit is None
+
+    def test_deezer_carries_its_own(self):
+        src = (_SRC / "core" / "deezer_download_client.py").read_text(encoding="utf-8")
+        assert "explicit=item.get('explicit_lyrics')" in src
+
+    def test_the_candidate_type_has_somewhere_to_put_it(self):
+        assert _candidate(explicit=True).explicit is True
+        assert _candidate().explicit is None
+
+
+class TestItSaysWhenEverythingIsCensored:
+    def test_the_case_worth_reporting(self):
+        """The download succeeds, looks entirely normal, and the file is
+        quietly the clean cut. Both facts were already held and never
+        compared."""
+        note = ep.summarize([ep.CENSORED, ep.CENSORED])
+        assert "clean cut" in note and "2 of 2" in note
+
+    def test_a_mixed_field_just_says_it_is_ranking(self):
+        assert "ranking explicit first" in ep.summarize([ep.MATCH, ep.CENSORED])
+
+    def test_nothing_to_report_stays_silent(self):
+        assert ep.summarize([ep.UNKNOWN, ep.MATCH]) == ""
+        assert ep.summarize([]) == ""

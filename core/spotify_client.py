@@ -444,6 +444,12 @@ class Track:
     release_date: Optional[str] = None
     album_type: Optional[str] = None
     total_tracks: Optional[int] = None
+    # Whether THIS is the explicit cut. Spotify has always reported it and it
+    # was dropped on the floor here, which left the explicit preference with
+    # nothing to compare a candidate against: a source's own explicit flag is
+    # meaningless in isolation (see core/downloads/explicit_preference.py).
+    # None means nobody said — never "no".
+    explicit: Optional[bool] = None
 
     @classmethod
     def from_spotify_track(cls, track_data: Dict[str, Any]) -> 'Track':
@@ -461,6 +467,7 @@ class Track:
             album=track_data['album']['name'],
             duration_ms=track_data['duration_ms'],
             popularity=track_data.get('popularity', 0),
+            explicit=track_data.get('explicit'),
             preview_url=track_data.get('preview_url'),
             external_urls=track_data.get('external_urls'),
             image_url=album_image_url,

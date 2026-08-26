@@ -3491,6 +3491,15 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.1.1': [
+        { date: 'August 2026 · 2.1.1' },
+        { title: "Downloads that got stuck saying “Downloading” forever", desc: "a batch of downloads counts how many of its workers are busy, and it was counting wrong — every time. The result was the one you saw: tracks that finished, a batch that never did, and a page that kept saying work was in progress. On the logs behind this fix it happened to <strong>five batches out of five</strong>." },
+        { title: "What was actually happening", desc: "a freshly started download sits in a <em>pending</em> state for a moment before it begins searching. The watchdog that checks a batch’s worker count did not recognise that state at all, so a worker it had <em>just started itself</em> was invisible to it. It concluded a slot was free, took the count down, and started another worker — which was also pending, so it did the same thing again, every few seconds, for minutes." },
+        { title: "And why it could never recover", desc: "each of those miscounts left the batch believing it had fewer workers than it really did. As the real ones finished, the count went <strong>below zero</strong> — and the test for “is this batch done?” asked whether the count was exactly zero. A negative number never is, so the batch could not finish even once every last track had. There is now one shared definition of “still working” instead of two lists that disagreed, the count cannot go below zero, and the completion test no longer depends on it landing exactly." },
+        { title: "The part that made it invisible", desc: "the code that decides whether a batch is finished was writing its logs to the console only, never to the log file. <strong>2.7 MB of a real log contained not one line from it</strong> while five batches hung — the problem could only be found by reading the source. It now logs where you can see it." },
+        { title: "Explicit and clean versions are finally told apart on Deezer and friends", desc: "“Prefer explicit versions” has existed for a while but only worked for Soulseek, where it reads the marker out of a filename. Deezer, Tidal, Qobuz and HiFi never went through that code — yet they report the answer <em>directly</em>, and Commissary was throwing it away. It now compares what a source is offering against the track you actually asked for." },
+        { title: "It only ever asks the question that makes sense", desc: "a track marked “not explicit” almost always means the song simply has no explicit content — not that this is the censored cut. So the comparison only happens when the track <em>you asked for</em> is itself explicit; otherwise nothing is nudged at all. And it only ever re-orders candidates: a clean cut still downloads when it is the only thing on offer, and the log now says so plainly rather than leaving you to notice later." },
+    ],
     '2.1.0': [
         { date: 'August 2026 — 2.1.0' },
         { title: "The two sides now read as one app", desc: "a full audit of Music against Video found the plumbing sound — every page routed, deep-linked and updated its badges identically — but the visual language had drifted apart wherever the Video side built its own instead of reusing the shell's. This release closes that gap." },
@@ -3931,6 +3940,20 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.1.1: downloads that never stopped saying Downloading",
+        description: "A batch miscounted its own workers on every single run, so tracks finished and the batch never did. Plus the explicit/clean distinction now works on Deezer and the other catalogue sources.",
+        features: [
+            "a just-started download sits in a 'pending' state, and the worker watchdog did not recognise it - so a worker it had just started was invisible to it",
+            "it therefore freed a slot that was in use, started a replacement that was also invisible, and repeated every few seconds for minutes",
+            "those miscounts drove the worker count below zero, and the 'is this batch done?' test asked for exactly zero - which a negative number never is",
+            "one shared definition of 'still working' now replaces two lists that disagreed; the count cannot go negative; the completion test no longer depends on it",
+            "the code that decides whether a batch finishes was logging to the console only - 2.7 MB of a real log had not one line from it while five batches hung",
+            "'Prefer explicit versions' now works for Deezer, Tidal, Qobuz and HiFi, which report the answer directly instead of hiding it in a filename",
+            "it only compares when the track you asked for is itself explicit, and it only re-orders - a clean cut still downloads when it is all there is",
+        ],
+        usage_note: "The download fixes need nothing from you. The explicit preference is the existing 'Prefer explicit versions' setting under content filtering - off by default, and still ignored entirely while explicit content is blocked. Amazon cannot take part: its search results carry no such flag and it strips the Explicit marker from titles.",
+    },
     {
         title: "2.1.0: the two sides now read as one app",
         description: "A full audit of the Music side against the Video side. The plumbing was already sound - every page routed, deep-linked and updated its badges the same way, with no errors anywhere - but the visual language had drifted wherever the Video side built its own instead of reusing the shell's. Where it reused, the two matched exactly; where it did not, it diverged from Music and from itself.",

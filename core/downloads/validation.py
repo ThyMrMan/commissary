@@ -9,6 +9,7 @@ import logging
 import re
 
 from config.settings import config_manager
+from core.downloads import explicit_preference
 from core.imports.file_integrity import resolve_duration_tolerance
 
 logger = logging.getLogger(__name__)
@@ -339,15 +340,36 @@ def get_valid_candidates(results, spotify_track, query):
 
             r.confidence = confidence
             r.version_type = 'wrong_version' if is_wrong_version else match_type
+            # Censored-cut detection (#923 extended to structured sources).
+            # Stamped on the result, NOT folded into r.confidence: the gate
+            # below reads the true match confidence, so preferring the explicit
+            # cut can reorder candidates but can never drop one and leave you
+            # with nothing. A clean cut still downloads when it is all there is.
+            r.explicit_verdict = explicit_preference.verdict(spotify_track, r)
             if confidence >= 0.60:
                 scored.append(r)
 
         if scored:
-            # Sort by confidence (best match first)
-            scored.sort(key=lambda x: x.confidence, reverse=True)
+            _prefer_explicit = False
+            try:
+                _prefer_explicit = bool(config_manager.get('content_filter.prefer_explicit', False))                     and bool(config_manager.get('content_filter.allow_explicit', True))
+            except Exception:   # noqa: BLE001 - config trouble = feature off
+                _prefer_explicit = False
+            # Sort by confidence (best match first), with the explicit cut
+            # preferred when the wanted track is explicit and the setting is on.
+            scored.sort(key=lambda x: explicit_preference.adjust(
+                x.confidence, getattr(x, 'explicit_verdict', explicit_preference.UNKNOWN),
+                enabled=_prefer_explicit), reverse=True)
             best = scored[0]
             logger.info(f"[{source_label}] {len(scored)}/{len(results)} candidates passed validation "
                   f"(best: {best.confidence:.2f} '{best.artist} - {best.title}')")
+            # Worth saying out loud when everything on offer is the clean cut:
+            # the download succeeds, looks entirely normal, and the file is
+            # quietly censored. Both facts were already held and never compared.
+            _note = explicit_preference.summarize(
+                [getattr(x, 'explicit_verdict', explicit_preference.UNKNOWN) for x in scored])
+            if _note:
+                logger.info("[%s] %s", source_label, _note)
             return scored
         else:
             if results[0].username == 'youtube':

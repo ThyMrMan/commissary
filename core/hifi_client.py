@@ -1067,6 +1067,9 @@ class HiFiClient(DownloadSourcePlugin):
             title=track.get('title'),
             album=track.get('album'),
             track_number=track.get('track_number'),
+            # Present on some payloads, absent on others — .get gives None for
+            # the latter, which reads as "not reported" rather than "clean".
+            explicit=track.get('explicit'),
             _source_metadata={
                 'source': 'hifi',
                 'track_id': track.get('id'),

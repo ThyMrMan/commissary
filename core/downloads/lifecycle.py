@@ -41,8 +41,15 @@ from core.runtime_state import (
     download_tasks,
     tasks_lock,
 )
+from utils.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+# The project factory, NOT logging.getLogger(__name__): the file handler is
+# attached to the `soulsync` logger, so a plain module logger reaches the
+# console and never app.log. This module decides whether a batch completes, and
+# 2.7 MB of a real app.log contained ZERO of its lines while five batches wedged
+# — the failure was diagnosable only by reading the source. Same trap that hid
+# `[Album Bundle] flow failed` during the #721 triage.
+logger = get_logger("downloads.lifecycle")
 
 
 # A task that has been in 'post_processing' longer than this is treated as stuck.
@@ -481,9 +488,16 @@ def on_download_completed(batch_id: str, task_id: str, success: bool, deps: Life
                 except Exception as wishlist_error:
                     logger.error(f"[Batch Manager] Error checking wishlist removal for successful download: {wishlist_error}")
 
-            # Decrement active count
+            # Decrement active count, floored at zero. Unclamped, a count
+            # that had already been driven below the number of live workers
+            # (see runtime_state.task_is_active) went NEGATIVE as those workers
+            # finished — and the completion gate below tested `== 0`, which a
+            # negative number never satisfies. The batch then hung with every
+            # task finished. The worker-recovery path in web_server learned this
+            # already ("Only decrement if there are active workers to prevent
+            # negative counts"); this one was missed.
             old_active = download_batches[batch_id]['active_count']
-            download_batches[batch_id]['active_count'] -= 1
+            download_batches[batch_id]['active_count'] = max(0, old_active - 1)
             new_active = download_batches[batch_id]['active_count']
 
             logger.error(f"[Batch Manager] Task {task_id} completed ({'success' if success else 'failed/cancelled'}). Active workers: {old_active} → {new_active}/{download_batches[batch_id]['max_concurrent']}")
@@ -495,7 +509,11 @@ def on_download_completed(batch_id: str, task_id: str, success: bool, deps: Life
         # FIXED: Check if batch is truly complete (all tasks finished, not just workers freed)
         batch = download_batches[batch_id]
         all_tasks_started = batch['queue_index'] >= len(batch['queue'])
-        no_active_workers = batch['active_count'] == 0
+        # `<= 0`, not `== 0`. The clamp above should make them equivalent, but a
+        # completion gate is the wrong place to depend on that: this is the test
+        # that decides whether a batch is ever allowed to finish, and it should
+        # not be one arithmetic slip away from hanging forever.
+        no_active_workers = batch['active_count'] <= 0
 
         # Count actually finished tasks (completed, failed, or cancelled)
         # CRITICAL: Don't include 'post_processing' as finished - it's still in progress (unless stuck)!
@@ -739,7 +757,7 @@ def check_batch_completion_v2(batch_id: str, deps: LifecycleDeps) -> Optional[bo
 
             batch = download_batches[batch_id]
             all_tasks_started = batch['queue_index'] >= len(batch['queue'])
-            no_active_workers = batch['active_count'] == 0
+            no_active_workers = batch['active_count'] <= 0
 
             # Count actually finished tasks (completed, failed, or cancelled)
             finished_count = 0

@@ -118,6 +118,12 @@ class TrackResult(SearchResult):
     title: Optional[str] = None
     album: Optional[str] = None
     track_number: Optional[int] = None
+    # Whether this candidate is the explicit cut, when the source says so at all
+    # (Deezer's explicit_lyrics, HiFi's explicit). None = not reported, which is
+    # a different answer from False and must stay distinguishable: see
+    # core/downloads/explicit_preference.py. Soulseek, torrent and usenet
+    # results have no such flag and fall back to their release name.
+    explicit: Optional[bool] = None
     _source_metadata: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
