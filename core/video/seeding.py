@@ -40,17 +40,27 @@ def is_running() -> bool:
 
 
 def _completed_age_hours(dl: Dict[str, Any], now: Optional[datetime] = None) -> Optional[float]:
-    raw = dl.get("completed_at") or dl.get("updated_at")
+    """How long ago this download finished, in hours.
+
+    The two candidate columns have DIFFERENT time bases and have to be told
+    apart. ``completed_at`` is written by the app in local wall-clock;
+    ``updated_at`` is SQLite's own ``datetime('now')``, which is UTC. Reading
+    both as UTC — as this did — made every app-written value look a whole UTC
+    offset older than it was, and this function decides when a torrent may be
+    released. With ``seed_remove_data`` on, that is a deletion happening hours
+    early. An arithmetic bug that ends in an irreversible action is worth
+    naming the columns for."""
+    from core.video.timestamps import LOCAL, UTC, to_epoch
+    raw, naive_is = dl.get("completed_at"), LOCAL
+    if not raw:
+        raw, naive_is = dl.get("updated_at"), UTC      # SQLite datetime('now')
     if not raw:
         return None
-    try:
-        ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-    except ValueError:
+    epoch = to_epoch(raw, naive_is=naive_is)
+    if epoch is None:
         return None
     now = now or datetime.now(timezone.utc)
-    return max(0.0, (now - ts).total_seconds() / 3600.0)
+    return max(0.0, (now.timestamp() - epoch) / 3600.0)
 
 
 def goals_met(status: Any, dl: Dict[str, Any], cfg: Dict[str, Any],

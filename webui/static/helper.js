@@ -3491,6 +3491,14 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.2.1': [
+        { date: 'August 2026 · 2.2.1' },
+        { title: "Downloads that died seconds after they started", desc: "on any server not running in UTC, a download could be declared “stalled” almost immediately — in one case <strong>four seconds after its last progress reading, at 100%</strong>, fully downloaded and still being tidied up. The clock that decides whether something has stopped moving was written in your server's local time and read back as if it were UTC, so every download looked hours older than it was. Four hours older, on a US East Coast server." },
+        { title: "…and torrents deleted hours early", desc: "the same misread reached the seeding sweep, which decides when a finished torrent may be released. With “remove data” switched on, that is a <strong>deletion</strong> happening hours before the seeding goal was actually met. Both now read the clock the way it was written." },
+        { title: "Why times on the Downloads history page look the same as before", desc: "they should. The page prints these timestamps exactly as stored, so they were only ever right <em>because</em> they were local — moving the storage to UTC would have shifted every “Finished” time on that page instead. The readers were the half that was wrong, and nothing needs migrating. YouTube grabs, which used to show in UTC while everything beside them showed local, now match." },
+        { title: "A failed torrent stopped looking for a replacement on Soulseek", desc: "when a torrent or usenet grab failed, the retry searched <strong>Soulseek</strong> — for a release only an indexer had. It almost always found nothing and gave up with “no working release found”, having never once asked the indexers that served it in the first place. Retries now go back to the same source, keep the other releases that were ranked alongside the first choice, and honour the trackers your Library has selected." },
+        { title: "RSS sync can see a season pack now", desc: "the feed watcher matched every wanted episode individually, so a whole-season release sitting in the same feed could never match anything. It can now — and it no longer grabs an episode on its own while the season pack containing it is still downloading." },
+    ],
     '2.2.0': [
         { date: 'August 2026 · 2.2.0' },
         { title: "Grab a whole TV season in one go", desc: "when several episodes of a season are missing, Commissary can now fetch <strong>one season pack</strong> instead of hunting each episode separately. One search and one download rather than a dozen — and the whole season arrives from the same release at the same quality, then unpacks and imports episode by episode exactly as before." },
@@ -3956,6 +3964,22 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.2.1: the clock that killed downloads, and retries that asked the wrong network",
+        description: "A timestamp written in local time and read as UTC made every download look hours older than it was - killing them early and releasing torrents before their seeding goal. Plus torrent retries that searched Soulseek.",
+        features: [
+            "the stall clock is written in server-local time and was being read as UTC, so a download looked a whole UTC offset older than it was",
+            "on a UTC-4 server that is 14400 seconds against a 30-minute timeout - the first tick without progress killed it, one film at 100%",
+            "the same misread reached the seeding sweep, which releases finished torrents and can delete their data",
+            "storage stayed local because the history page prints these values verbatim - it was right BECAUSE they were local; the readers were wrong",
+            "YouTube grabs wrote a third, UTC format and showed the wrong time in the history list; all three writers now agree",
+            "a failed torrent/usenet grab retried against Soulseek: wrong network, and it discarded the other ranked releases at grab time",
+            "retries now use the row's own client, keep the runners-up, carry the grab URLs through, and respect the Library's tracker selection",
+            "RSS sync ranked every episode individually, so a season pack in the same feed matched nothing; it can now grab one",
+            "RSS also no longer grabs an episode singly while the season pack containing it is still downloading",
+        ],
+        usage_note: "Nothing to migrate: every timestamp already on disk parses correctly under the new rules, whichever writer produced it. If you had set TZ=UTC on the container as a workaround for the stall issue, you can remove it.",
+    },
     {
         title: "2.2.0: whole seasons in one grab",
         description: "TV seasons can be fetched as a single season pack instead of episode by episode - with a threshold, a wait-for-a-proper-pack mode, and a per-show override.",

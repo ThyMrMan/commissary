@@ -39,26 +39,22 @@ SEEDED = "seeded"        # no clock stored yet (new or migrated row) — start o
 
 
 def _ts(value: Any) -> Optional[float]:
-    """Parse a stored SQLite timestamp ('YYYY-MM-DD HH:MM:SS', UTC) to epoch
-    seconds. Returns None for anything unparseable, which the caller treats as
-    'no clock yet' rather than 'infinitely stalled' — a bad timestamp must never
-    mass-fail a queue."""
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip()
-    if not text:
-        return None
-    from datetime import datetime, timezone
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f",
-                "%Y-%m-%dT%H:%M:%S.%f"):
-        try:
-            return datetime.strptime(text.replace("Z", ""), fmt).replace(
-                tzinfo=timezone.utc).timestamp()
-        except ValueError:
-            continue
-    return None
+    """Parse a stored ``progress_at`` to epoch seconds.
+
+    This used to read the value as UTC. It is written by
+    ``download_monitor._now()`` in LOCAL wall-clock, and compared here against
+    ``time.time()`` — so on a UTC-4 host every download reported 14400 seconds
+    of idleness the moment it was written, against a 1800-second timeout. The
+    first tick without forward progress was therefore instantly STALLED, and
+    two films were killed four seconds after their last progress reading, one
+    of them at 100.0% while it was still being finalised.
+
+    See core/video/timestamps.py for why the storage stayed local rather than
+    the writer moving to UTC. None for anything unparseable, which the caller
+    treats as 'no clock yet' rather than 'infinitely stalled' — a bad timestamp
+    must never mass-fail a queue."""
+    from core.video.timestamps import LOCAL, to_epoch
+    return to_epoch(value, naive_is=LOCAL)
 
 
 def _pct(value: Any) -> float:

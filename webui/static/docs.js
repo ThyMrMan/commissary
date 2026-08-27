@@ -1984,6 +1984,7 @@ const DOCS_SECTIONS = [
                 <h3 class="docs-subsection-title">Season Packs</h3>
                 <p class="docs-text">A season with several missing episodes can be grabbed as <strong>one release</strong> instead of hunted episode by episode. One search and one download rather than a dozen, and the whole season arrives from the same release at the same quality &mdash; it is unpacked and imported per episode when it lands, exactly as if you had grabbed them individually.</p>
                 <p class="docs-text">Turn it on in <strong>Settings &rarr; Downloads &rarr; Grab whole seasons as one release</strong>. It is <strong>off by default</strong>: one pack can be tens of gigabytes and the wishlist drain runs unattended, so it is not something an update should start doing on your behalf.</p>
+                <p class="docs-text">Both acquisition paths use it: the hourly wishlist drain, which <em>searches</em> the indexers, and RSS sync, which watches what they have just <em>posted</em>. A pack appearing in the feed is picked up within minutes rather than waiting for the next drain tick.</p>
                 <h4>When a pack is used</h4>
                 <ul class="docs-list">
                     <li>The season must be missing at least <strong>N</strong> episodes &mdash; four by default, configurable. Below that a pack is usually more bytes than the episodes are worth, and packs are rarer than singles so the search often comes back empty anyway.</li>

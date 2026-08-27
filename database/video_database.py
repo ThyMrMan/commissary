@@ -3545,6 +3545,43 @@ class VideoDatabase:
         finally:
             conn.close()
 
+    def root_folder_for_path(self, path) -> dict | None:
+        """The Library a destination folder belongs to, or None.
+
+        A ``video_downloads`` row records ``target_dir`` — the Library folder the
+        grab was headed for — but not which Library row produced it. A retry
+        needs the Library back, because its ``category`` is what tells the
+        torrent client where to sort the download, and a grab into an Anime
+        Library that retried into the primary TV category would land somewhere
+        the importer is not looking.
+
+        Longest path wins, so a Library nested inside another resolves to the
+        inner one."""
+        target = str(path or "").strip().replace("\\", "/").rstrip("/")
+        if not target:
+            return None
+        conn = self._get_connection()
+        try:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT id, path, category, content_kind, label FROM root_folders "
+                "WHERE path IS NOT NULL AND path <> ''")]
+        except sqlite3.Error:
+            logger.exception("root_folder_for_path failed (%s)", path)
+            return None
+        finally:
+            conn.close()
+        best, best_len = None, -1
+        low = target.lower()
+        for r in rows:
+            p = str(r.get("path") or "").strip().replace("\\", "/").rstrip("/")
+            if not p:
+                continue
+            pl = p.lower()
+            if low == pl or low.startswith(pl + "/"):
+                if len(pl) > best_len:
+                    best, best_len = r, len(pl)
+        return best
+
     def primary_root_folder(self, server: str, kind: str) -> dict | None:
         """The 'primary' library for a kind (lowest sort_order) — the default
         destination for unattended grabs and the fallback Library-page tab."""

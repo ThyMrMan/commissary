@@ -35,8 +35,16 @@ from core.video import stall
 
 
 def _stamp(seconds_ago: float) -> str:
-    """A stored SQLite timestamp that many seconds in the past (UTC)."""
-    return (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).strftime(
+    """A stored ``progress_at`` that many seconds in the past.
+
+    Built the way the PRODUCTION WRITER builds it — ``download_monitor._now()``
+    is ``time.strftime(...)``, i.e. local wall-clock with no offset. This helper
+    used to build a UTC-naive string instead, which matched the reader's
+    (wrong) assumption rather than the writer, and is why the whole file passed
+    while every real download on a non-UTC host was killed four seconds after
+    its last progress reading. A fixture that models the reader instead of the
+    writer cannot catch a reader/writer disagreement."""
+    return (datetime.now() - timedelta(seconds=seconds_ago)).strftime(
         "%Y-%m-%d %H:%M:%S")
 
 

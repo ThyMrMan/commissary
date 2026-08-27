@@ -800,7 +800,13 @@ def run_youtube_download(dl_id: Any, db_provider: Callable) -> None:
     from datetime import datetime, timezone
 
     def _now():
-        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+        # Was an explicit-UTC ISO string, which made `completed_at` carry two
+        # different shapes depending on which downloader wrote it — and the
+        # history page, which prints the stored value verbatim, showed YouTube
+        # grabs in UTC while every row beside them was local. One format now;
+        # the reader still honours the offset on rows already written.
+        from core.video.timestamps import now_str
+        return now_str()
 
     def _progress(d):
         # yt-dlp progress hook → row progress %. Best-effort; never raises into yt-dlp.

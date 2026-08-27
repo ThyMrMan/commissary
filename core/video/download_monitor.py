@@ -298,15 +298,67 @@ _requerying: set = set()  # download ids with a requery thread in flight
 
 
 def _now():
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+    """The app's storage format — local wall-clock. See core/video/timestamps.py
+    for why it is local (the history page renders these verbatim) and what the
+    readers must therefore assume."""
+    from core.video.timestamps import now_str
+    return now_str()
 
 
 # ── auto-retry ────────────────────────────────────────────────────────────────
+def _retry_category(db, row):
+    """The torrent/usenet category the ORIGINAL grab used, recovered from the
+    row's destination folder.
+
+    The row does not record which Library it came from, only where it was
+    headed — so the Library is looked up by that path. Falling back to the
+    primary Library's category would be wrong on exactly the installs this fork
+    exists for: a grab into an Anime Library would retry into the TV category
+    and land where the importer is not looking. None means "no Library matched",
+    and the client adapter then uses its global default, which is the same thing
+    an install with no Libraries configured has always done."""
+    try:
+        rf = db.root_folder_for_path(row.get("target_dir"))
+        return (rf or {}).get("category") or None
+    except Exception:   # noqa: BLE001 - a category lookup must never block a retry
+        logger.debug("retry category lookup failed for download %s", row.get("id"),
+                     exc_info=True)
+        return None
+
+
+def _start_candidate(db, row, cand) -> dict:
+    """Hand the candidate to the client that matches the ROW'S SOURCE.
+
+    This used to call slskd unconditionally. For a torrent or usenet row that
+    meant retrying on the wrong network entirely: slskd was asked to start a
+    transfer for a release it had never heard of, and on the rare occasion a
+    same-named file did exist there, the row went on saying `source=torrent`
+    while a Soulseek transfer ran underneath it. Returns ``{ok, ref?, error?}``.
+    """
+    source = str(row.get("source") or "soulseek").lower()
+    if source in ("torrent", "usenet"):
+        url = cand.get("download_url") or cand.get("magnet_uri")
+        if not url:
+            # A pre-2.2.1 row, or a candidate that predates the carriers being
+            # kept. Nothing to grab from — say so rather than silently falling
+            # through to Soulseek.
+            return {"ok": False, "error": "candidate has no download URL"}
+        from core.video.client_grab import grab
+        return grab(source, cand.get("download_url"),
+                    category=_retry_category(db, row),
+                    fallback_magnet=cand.get("magnet_uri"))
+    return start_download(cand.get("username"), cand.get("filename"),
+                          cand.get("size_bytes") or 0)
+
+
 def _apply_candidate(db, dl_id, row, cand, rest) -> bool:
     """Start the next candidate download and flip the row back to 'downloading'.
-    Returns False if slskd refused to start it."""
-    started = start_download(cand.get("username"), cand.get("filename"), cand.get("size_bytes") or 0)
+    Returns False if the row's download client refused it."""
+    started = _start_candidate(db, row, cand)
     if not started.get("ok"):
+        logger.info("[Download] %r: candidate %r refused by %s (%s)",
+                    row.get("title") or "?", cand.get("filename") or "?",
+                    row.get("source") or "soulseek", started.get("error") or "no reason given")
         return False
     tried = []
     try:
@@ -314,13 +366,19 @@ def _apply_candidate(db, dl_id, row, cand, rest) -> bool:
     except (ValueError, TypeError):
         tried = []
     tried.append(cand.get("filename"))
-    db.update_video_download(
-        dl_id, status="downloading", progress=0, error=None, completed_at=None,
+    fields = dict(
+        status="downloading", progress=0, error=None, completed_at=None,
         username=cand.get("username"), filename=cand.get("filename"),
         release_title=cand.get("release_title") or cand.get("filename"),
         size_bytes=int(cand.get("size_bytes") or 0), quality_label=cand.get("quality_label"),
         candidates=json.dumps(rest), tried_files=json.dumps(tried),
         attempts=int(row.get("attempts") or 0) + 1)
+    # The client ref is how the monitor finds a torrent/usenet job at all. The
+    # retry started a NEW job, so the old ref would point at the one that just
+    # failed — and progress would be read from a download nobody is waiting for.
+    if started.get("ref"):
+        fields["client_ref"] = started["ref"]
+    db.update_video_download(dl_id, **fields)
     _misses.pop(dl_id, None)
     return True
 
@@ -751,6 +809,53 @@ def _search_for_retry(query, max_seconds=55):
         stop_search(sid)
 
 
+def _requery_hits(db, row, query, ctx) -> dict:
+    """Search again for a failed download, ON THE NETWORK IT CAME FROM.
+
+    The requery worker called the slskd search unconditionally. For a torrent or
+    usenet row that asked Soulseek for a release only an indexer had — so the
+    answer was almost always "nothing", and the row failed with "No working
+    release found after retries" having never once asked the indexers that
+    served it in the first place. Worse when it *did* match something by name:
+    the row went on saying `source=torrent` while a Soulseek transfer ran.
+
+    Returns the same ``{hits, started, error}`` shape either way so the caller
+    does not branch.
+    """
+    source = str(row.get("source") or "soulseek").lower()
+    if source not in ("torrent", "usenet"):
+        return _search_for_retry(query) or {}
+
+    from core.video.prowlarr_search import prowlarr_search
+    # Honour the Library's tracker selection, the same as the first search did.
+    # A retry that queried every indexer would quietly undo a deselection the
+    # user made — and "it still grabs from a tracker I unticked" is the exact
+    # complaint that selection exists to answer.
+    indexer_ids = set()
+    try:
+        rf = db.root_folder_for_path(row.get("target_dir")) or {}
+        raw_ids = rf.get("preferred_indexer_ids")
+        if raw_ids:
+            parsed = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+            indexer_ids = {int(i) for i in (parsed or []) if str(i).strip()}
+    except Exception:   # noqa: BLE001 - an unreadable selection means no restriction
+        logger.debug("retry indexer selection unreadable for download %s", row.get("id"),
+                     exc_info=True)
+        indexer_ids = set()
+
+    res = prowlarr_search(ctx.get("scope") or "movie", ctx.get("title"),
+                          year=ctx.get("year"), season=ctx.get("season"),
+                          episode=ctx.get("episode"), source=source,
+                          air_date=ctx.get("air_date"), absolute=ctx.get("absolute"),
+                          series_type=ctx.get("series_type"),
+                          indexer_ids=indexer_ids)
+    if not res.get("configured"):
+        return {"hits": [], "started": False, "error": "Prowlarr not configured"}
+    if res.get("error"):
+        return {"hits": [], "started": False, "error": res["error"]}
+    return {"hits": res.get("hits") or [], "started": True}
+
+
 def _requery_worker(dl_id) -> None:
     from core.video.quality_eval import evaluate_release
     from core.video.quality_profile import profile_by_id
@@ -784,7 +889,7 @@ def _requery_worker(dl_id) -> None:
             tq.append(query)
             db.update_video_download(dl_id, tried_queries=json.dumps(tq),
                                      attempts=int(row.get("attempts") or 0) + 1)
-            polled = _search_for_retry(query)
+            polled = _requery_hits(db, row, query, ctx)
             accepted = []
             blocked_users = db.blocked_usernames()
             from api.video.downloads import _parse_text
@@ -812,7 +917,16 @@ def _requery_worker(dl_id) -> None:
             fresh = merge_candidates(accepted, tried_files, blocked=_blocked_pairs(db), blocked_users=_blocked_users(db))
             if fresh and _apply_candidate(db, dl_id, row2, fresh[0], fresh[1:]):
                 return
-            # this query gave nothing usable → loop tries the next query (or fails)
+            # this query gave nothing usable → loop tries the next query (or fails).
+            #
+            # Except on the indexer sources. The loop advances by trying another
+            # FREE-TEXT query, which is how you coax more out of Soulseek's
+            # filename search. Prowlarr is asked a STRUCTURED question (scope +
+            # title + season/episode) that does not change between passes, so
+            # continuing here would repeat one identical search eight times and
+            # call the result eight attempts.
+            if str(row2.get("source") or "soulseek").lower() in ("torrent", "usenet"):
+                break
         # Exhausted every retry — fail for real, and (like _fail_or_retry) put it
         # back on the wishlist + archive it so it isn't silently lost.
         err = "No working release found after retries"

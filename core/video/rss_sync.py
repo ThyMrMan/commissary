@@ -173,8 +173,19 @@ def _rss_pass_inner(*, fetch, log) -> Dict[str, Any]:
         target = vpw._default_target_dir(media_type)
         if not target:
             continue
+        if media_type == "episode":
+            items, _pack_grabs = _season_pack_pass(
+                hits, items, target=target, active=active, log=log)
+            grabbed += _pack_grabs
         for item in items:
+            # A season pack already downloading — this pass's, an earlier RSS
+            # pass's, or the drain's — covers every episode in it. Only the
+            # per-item key was checked here, so RSS would happily grab episode 3
+            # on its own while the pack containing it was still landing, and the
+            # importer then had two claimants for one file.
             if vpw.item_key(item, media_type) in active:
+                continue
+            if media_type == "episode" and vpw.season_key(item, media_type) in active:
                 continue
             titles = [item.get("title") or item.get("show_title")]
             pool = _prescreen(hits, titles)
@@ -204,6 +215,68 @@ def _rss_pass_inner(*, fetch, log) -> Dict[str, Any]:
 
     return {"status": "completed", "grabbed": grabbed,
             "matched_items": matched, "releases": len(hits)}
+
+
+def _season_pack_pass(pool_hits, items, *, target, active, log) -> tuple:
+    """Match SEASON PACKS in the feed before falling to per-episode.
+
+    RSS ranked every wanted episode with ``scope='episode'``, so a
+    ``Show.S01.1080p`` pack sitting in the same feed could not match anything —
+    the one acquisition path that sees releases the moment they are posted was
+    structurally blind to the release shape that covers a whole season. The
+    drain learned about packs; this had not.
+
+    Returns ``(remaining per-episode items, grabs)``. Everything is the drain's
+    own seams — same grouping, same per-show mode, same ranker, same enqueue —
+    so the two paths cannot drift on what a pack is or which shows may have one.
+    """
+    from core.automation.handlers import video_process_wishlist as vpw
+    try:
+        settings = vpw._season_pack_settings()
+        mode_for = vpw._pack_mode_resolver(settings)
+        packs = vpw.season_pack_groups(
+            items, min_episodes=settings["season_pack_min_episodes"], mode_for=mode_for)
+    except Exception:       # noqa: BLE001 - never let this break the normal pass
+        logger.exception("RSS season pack grouping failed")
+        return items, 0
+
+    claimed, skipped, grabs = set(), set(), 0
+    for pack in packs:
+        label = "%s S%02d" % (pack.get("show_title") or "?",
+                              int(pack.get("season_number") or 0))
+        try:
+            titles = [pack.get("show_title")]
+            cands = _rank(_prescreen(pool_hits, titles), pack, "episode")
+            best = vpw.pick_best(cands) if cands else None
+            if best and vpw._default_enqueue(pack, best, cands, "episode",
+                                             vpw._item_target_dir(pack, target)):
+                claimed.update(pack.get("_pack_members") or [])
+                active.add(vpw.season_key(pack, "episode"))
+                grabs += 1
+                log("RSS grab: %s season pack — covers %d wanted episode(s)"
+                    % (label, pack.get("_pack_size") or 0))
+                continue
+            # No pack in THIS feed. That is not "no pack exists" — the feed is
+            # the last few hundred releases, not a search — so unlike the drain
+            # nothing is failed or retried here; the episodes simply fall
+            # through and the drain searches properly on its own tick.
+            #
+            # Except under 'only', where grabbing singles is the thing the user
+            # ruled out. Same airing guard as the drain, so the two agree: a
+            # season still going out weekly has no pack to wait for and its
+            # episodes are grabbed normally.
+            if pack.get("_pack_mode") == "only" and vpw._season_has_finished_airing(pack):
+                skipped.update(pack.get("_pack_members") or [])
+                log("RSS skip: %s — no season pack in the feed, and this show is "
+                    "set to season packs only" % label)
+        except Exception:   # noqa: BLE001 - one season must not stop the rest
+            logger.exception("RSS season pack attempt failed for %s", label)
+            continue
+
+    drop = claimed | skipped
+    if not drop:
+        return items, grabs
+    return [it for it in items if vpw.item_key(it, "episode") not in drop], grabs
 
 
 def _item_label(item: Dict[str, Any], media_type: str) -> str:

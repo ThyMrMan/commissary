@@ -487,10 +487,21 @@ def build_download_record(item: Dict[str, Any], best: Dict[str, Any], candidates
                 "filename": best.get("filename"), "candidates": json.dumps(rest),
                 "tried_queries": json.dumps([query] if query else []),
                 "tried_files": json.dumps([best.get("filename")])}
-    # torrent / usenet — tracked by the client ref the grab returned; no Soulseek requery pool.
+    # torrent / usenet — tracked by the client ref the grab returned. The ranked
+    # runners-up are KEPT, same as Soulseek's: they were being discarded here
+    # (`candidates: []`, "no Soulseek requery pool"), so a torrent that failed
+    # had nothing to fall back to and the monitor went looking on Soulseek
+    # instead — for a row whose source says torrent. Prowlarr hits are already
+    # slskd-shaped (username = indexer, filename = release title), so the
+    # existing retry planner works on them unchanged once the grab carriers ride
+    # along (see core/video/retry.merge_candidates).
+    _chosen = best.get("title") or best.get("filename")
+    rest = [c for c in (candidates or [])
+            if (c.get("title") or c.get("filename")) != _chosen]
     return {**common, "source": source, "username": best.get("username"),   # indexer (display)
-            "filename": best.get("title") or best.get("filename"), "client_ref": best.get("_client_ref"),
-            "candidates": json.dumps([]), "tried_queries": json.dumps([]), "tried_files": json.dumps([])}
+            "filename": _chosen, "client_ref": best.get("_client_ref"),
+            "candidates": json.dumps(rest), "tried_queries": json.dumps([query] if query else []),
+            "tried_files": json.dumps([_chosen] if _chosen else [])}
 
 
 # ── production seams ──────────────────────────────────────────────────────────

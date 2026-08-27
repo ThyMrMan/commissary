@@ -1419,9 +1419,9 @@ def register_routes(bp):
         if dl["status"] in ("completed", "failed", "cancelled"):
             return jsonify({"ok": True, "already": True})
         cancel_download(dl.get("username"), dl.get("filename"))   # best-effort; mark regardless
-        import time
+        from core.video.timestamps import now_str
         db.update_video_download(dl["id"], status="cancelled", error="Cancelled",
-                                 completed_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+                                 completed_at=now_str())
         return jsonify({"ok": True})
 
     @bp.route("/downloads/retry", methods=["POST"])

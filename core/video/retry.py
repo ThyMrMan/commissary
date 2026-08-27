@@ -111,8 +111,18 @@ def merge_candidates(new_accepted: Any, tried_files: Any, blocked=frozenset(),
                 or (r.get("username"), fn) in blocked:
             continue
         seen.add(fn)
-        out.append({"username": r.get("username"), "filename": fn, "size_bytes": r.get("size_bytes"),
-                    "quality_label": r.get("quality_label"), "release_title": r.get("title") or r.get("release_title")})
+        cand = {"username": r.get("username"), "filename": fn, "size_bytes": r.get("size_bytes"),
+                "quality_label": r.get("quality_label"),
+                "release_title": r.get("title") or r.get("release_title")}
+        # A Soulseek candidate is fully described by (username, filename) — the
+        # transfer is started from those two. A torrent/usenet one is not: the
+        # grab needs the URL carriers, and this projection dropped every one of
+        # them. A candidate that survived the merge could be ranked, chosen and
+        # then not grabbed, because by then nothing knew where to fetch it from.
+        for key in ("download_url", "magnet_uri", "protocol", "indexer_id", "guid", "source"):
+            if r.get(key) is not None:
+                cand[key] = r.get(key)
+        out.append(cand)
     return out
 
 
