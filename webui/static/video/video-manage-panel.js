@@ -188,6 +188,34 @@
     // the exception: it's stored against the TMDB id, precisely so it can be set
     // for something you don't own yet (which is when a release gets rejected as
     // a wrong title). Rendering just that beats a panel of dead controls.
+    // Per-show season-pack preference. Beats the global setting in BOTH
+    // directions, so a show can be packs-only while packs are off globally, or
+    // stay on singles while they are on. A subtractive-only override could not
+    // say "always get this one as packs", which is the reason to come here.
+    var SEASON_PACK_CHOICES = [
+        ['', 'Follow the global setting'],
+        ['prefer', 'Prefer season packs, fall back to episodes'],
+        ['only', 'Season packs only — wait rather than use episodes'],
+        ['never', 'Never use season packs for this show']
+    ];
+
+    function seasonPackField(d) {
+        if (d.kind !== 'show') return '';
+        var cur = d.season_pack_mode || '';
+        return '<div class="vmg-field"><label>Season packs</label>' +
+            '<select class="vmg-input" data-vmg-season-pack-mode>' +
+            SEASON_PACK_CHOICES.map(function (c) {
+                return '<option value="' + c[0] + '"' + (c[0] === cur ? ' selected' : '') + '>' +
+                    c[1] + '</option>';
+            }).join('') + '</select>' +
+            '<div class="vmg-hint">Whether a season with several missing episodes is ' +
+                'grabbed as one release instead of episode by episode. ' +
+                '&ldquo;Season packs only&rdquo; applies to seasons that have finished ' +
+                'airing &mdash; a season still going out weekly is grabbed normally, so ' +
+                'nothing stalls waiting for a pack that cannot exist yet.</div>' +
+          '</div>';
+    }
+
     function tmdbOnlyBodyHtml(d) {
         // Series type decides HOW episodes are hunted (SxxExx / air date /
         // absolute number), so it's needed while you're still acquiring the show.
@@ -205,7 +233,7 @@
                 }).join('') + '</select>' +
                 '<div class="vmg-hint">How episode releases are searched for. Anime and ' +
                     'daily shows are named differently from standard SxxExx releases.</div>' +
-              '</div>'
+              '</div>' + seasonPackField(d)
             : '';
         return (
             '<div class="vmg-sect">Matching</div>' + st +
@@ -307,7 +335,7 @@
                             t.charAt(0).toUpperCase() + t.slice(1) +
                             (t === 'daily' ? ' (releases by air date)' : t === 'anime' ? ' (absolute numbering)' : '') +
                             '</option>';
-                    }).join('') + '</select></div>' +
+                    }).join('') + '</select></div>' + seasonPackField(d) +
                   // Re-read the episode list from TMDB on demand. A show is
                   // cascaded once and then never revisited, so episodes TMDB
                   // gains later (a season still airing, a late-added batch)
@@ -990,6 +1018,21 @@
             .catch(function () { toast('Couldn’t update the series type', 'error'); });
     }
 
+    function setSeasonPackMode(sel) {
+        fetch('/api/video/detail/show/' + state.id + '/season-pack-mode', {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            // Not in the library → state.id is the tmdb id, stored as an override.
+            body: JSON.stringify({ season_pack_mode: sel.value,
+                                   source: state.tmdbOnly ? 'tmdb' : 'library' }) })
+            .then(function (r) {
+                if (!r.ok) throw new Error();
+                toast(sel.value
+                    ? 'Season pack preference saved for this show'
+                    : 'This show follows the global season pack setting again', 'success');
+            })
+            .catch(function () { toast('Couldn’t save the season pack preference', 'error'); });
+    }
+
     function saveAkaTitles(btn) {
         var box = document.querySelector('[data-vmg-aka]');
         if (!box) return;
@@ -1186,6 +1229,8 @@
             if (lk) { toggleImportLock(lk); return; }
             var st = e.target.closest('[data-vmg-series-type]');
             if (st) setSeriesType(st);
+            var spm = e.target.closest('[data-vmg-season-pack-mode]');
+            if (spm) setSeasonPackMode(spm);
             var lib = e.target.closest('[data-vmg-library]');
             if (lib) setLibrary(lib);
             var es = e.target.closest('[data-vmg-episode-source]');
@@ -1248,6 +1293,7 @@
                     _mount({ kind: opts.kind, id: opts.id, title: src.title || '',
                              aka_titles: (a && a.aka_titles) || opts.akaTitles || [],
                              series_type: (a && a.series_type) || src.series_type || 'standard',
+                             season_pack_mode: (a && a.season_pack_mode) || '',
                              _tmdbOnly: true }, true);
                 })
                 .catch(function () {

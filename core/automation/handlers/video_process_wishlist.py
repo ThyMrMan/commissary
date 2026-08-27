@@ -157,7 +157,8 @@ SEASON_PACK_MIN_EPISODES = 4      # video.season_pack_min_episodes
 
 
 def season_pack_groups(items: List[Dict[str, Any]], *,
-                       min_episodes: int = SEASON_PACK_MIN_EPISODES) -> List[Dict[str, Any]]:
+                       min_episodes: int = SEASON_PACK_MIN_EPISODES,
+                       mode_for=None) -> List[Dict[str, Any]]:
     """Seasons with enough wanted episodes to be worth one pack instead of N grabs.
 
     Returns pseudo-items flagged ``_season_pack``, each a copy of a REPRESENTATIVE
@@ -174,6 +175,11 @@ def season_pack_groups(items: List[Dict[str, Any]], *,
         pack is usually more bytes than the episodes are worth, and packs are
         rarer than singles so the search often comes back empty anyway.
       • season 0 (specials) never packs — 'S00' is not a thing releases ship.
+      • a show whose effective mode is 'never' is skipped entirely.
+
+    ``mode_for(item) -> 'prefer'|'only'|'never'`` supplies the per-show
+    decision. Passed IN rather than looked up here so this stays pure and
+    unit-testable; the caller owns the config and DB reads.
     """
     try:
         min_episodes = max(2, int(min_episodes))
@@ -189,6 +195,8 @@ def season_pack_groups(items: List[Dict[str, Any]], *,
             continue
         if season <= 0:
             continue
+        if mode_for is not None and mode_for(it) == "never":
+            continue
         groups.setdefault((str(it.get("show_tmdb_id")), season), []).append(it)
     out = []
     for (_show, _season), members in groups.items():
@@ -198,56 +206,103 @@ def season_pack_groups(items: List[Dict[str, Any]], *,
         rep["_season_pack"] = True
         rep["_pack_members"] = [item_key(m, "episode") for m in members]
         rep["_pack_size"] = len(members)
+        rep["_pack_mode"] = mode_for(rep) if mode_for is not None else "prefer"
         rep.pop("_min_rank", None)
         out.append(rep)
     return out
 
 
-def _season_packs_enabled() -> bool:
-    """Season packs are OFF by default. One pack can be tens of GB and the drain
+def _season_pack_settings() -> dict:
+    """The global season-pack settings, through the ONE normalizer that also
+    serves the settings page (core.video.download_config).
+
+    Season packs are OFF by default. One pack can be tens of GB and the drain
     runs unattended, so an existing install must not start spending disk on this
     because it updated — the operator turns it on."""
     try:
-        from config.settings import config_manager
-        return bool(config_manager.get("video.season_packs", False)) if config_manager else False
+        from core.video.download_config import season_pack_settings
+        return season_pack_settings()
     except Exception:      # noqa: BLE001 - unreadable config behaves like off
+        logger.debug("season pack settings unreadable; treating as off", exc_info=True)
+        return {"season_packs": False, "season_pack_min_episodes": SEASON_PACK_MIN_EPISODES,
+                "season_pack_mode": "prefer"}
+
+
+def _pack_mode_resolver(settings: Dict[str, Any]):
+    """``item -> 'prefer' | 'only' | 'never'``, memoised per show.
+
+    A per-show override BEATS the global in both directions: a show set to
+    'only' or 'prefer' packs even with the global switch off, and a show set to
+    'never' stays per-episode even with it on. Without that the override would
+    only ever subtract, and "always get this one as packs" — the case someone
+    actually opens the panel for — would be unexpressible.
+    """
+    default = settings["season_pack_mode"] if settings["season_packs"] else "never"
+    try:
+        from api.video import get_video_db
+        overrides = get_video_db().all_season_pack_overrides()
+    except Exception:       # noqa: BLE001 - no overrides readable → everyone follows the global
+        logger.debug("season pack overrides unreadable; using the global for every show",
+                     exc_info=True)
+        overrides = {}
+
+    def resolve(item):
+        try:
+            mode = overrides.get(int(item.get("show_tmdb_id")))
+        except (TypeError, ValueError):
+            mode = None
+        return mode if mode in ("prefer", "only", "never") else default
+
+    return resolve
+
+
+def _season_has_finished_airing(item) -> bool:
+    """Whether a complete pack for this season could exist yet.
+
+    'Packs only' is a preference, not a licence to stop acquiring a show. A
+    season still airing has no full pack to find, so holding its episodes back
+    pack-or-nothing would skip them week after week — the show would simply
+    stop arriving, with nothing in the UI saying why. Not-provably-finished
+    counts as still airing."""
+    try:
+        from api.video import get_video_db
+        return get_video_db().season_fully_aired(
+            item.get("show_tmdb_id"), item.get("season_number")) is True
+    except Exception:       # noqa: BLE001 - unknown → treat as still airing
+        logger.debug("season air state unreadable", exc_info=True)
         return False
 
 
-def _try_season_packs(todo, *, root, search, enqueue, deps, automation_id):
+def _try_season_packs(todo, *, root, search, enqueue, deps, automation_id,
+                      settings=None, mode_for=None):
     """Grab a pack per eligible season; return (remaining per-episode todo, grabs).
 
-    Never fatal and never destructive: a season whose pack search finds nothing —
-    the common case, packs are much rarer than singles — simply falls through to
-    the per-episode pass with its items untouched. Only a season we actually
-    enqueued a pack for is removed.
+    Never fatal: a season whose pack search finds nothing — the common case,
+    packs are much rarer than singles — falls through to the per-episode pass
+    with its items untouched, UNLESS that season is in 'only' mode and has
+    finished airing, in which case its episodes are held for a later tick
+    rather than assembled from a dozen unrelated releases.
     """
+    settings = settings or _season_pack_settings()
     try:
-        min_eps = SEASON_PACK_MIN_EPISODES
-        try:
-            from config.settings import config_manager
-            if config_manager:
-                min_eps = config_manager.get("video.season_pack_min_episodes",
-                                             SEASON_PACK_MIN_EPISODES)
-        except Exception:   # noqa: BLE001
-            pass
-        groups = season_pack_groups(todo, min_episodes=min_eps)
+        mode_for = mode_for or _pack_mode_resolver(settings)
+        groups = season_pack_groups(todo, min_episodes=settings["season_pack_min_episodes"],
+                                    mode_for=mode_for)
     except Exception:       # noqa: BLE001 - grouping must never break the normal drain
         logger.exception("season pack grouping failed")
         return todo, 0
     if not groups:
         return todo, 0
 
-    claimed, grabs = set(), 0
+    claimed, held, grabs = set(), set(), 0
     for pack in groups:
         name = "%s S%02d" % (pack.get("show_title") or "?", int(pack.get("season_number") or 0))
         try:
             found = search(pack, "episode")
             cands, _err = found if isinstance(found, tuple) else (found, None)
             best = pick_best(cands or [])
-            if not best:
-                continue
-            if enqueue(pack, best, cands or [], "episode", _item_target_dir(pack, root)):
+            if best and enqueue(pack, best, cands or [], "episode",
+                                _item_target_dir(pack, root)):
                 claimed.update(pack.get("_pack_members") or [])
                 grabs += 1
                 deps.update_progress(
@@ -255,12 +310,25 @@ def _try_season_packs(todo, *, root, search, enqueue, deps, automation_id):
                     log_line="Grabbed the %s season pack — covers %d wanted episode(s)"
                              % (name, pack.get("_pack_size") or 0),
                     log_type='success')
+                continue
+            # No pack (or the grab was refused). In 'only' mode a FINISHED
+            # season waits for one instead of being built out of singles; a
+            # season still airing falls through, because pack-or-nothing on
+            # something that cannot have a pack yet is just "never download".
+            if pack.get("_pack_mode") == "only" and _season_has_finished_airing(pack):
+                held.update(pack.get("_pack_members") or [])
+                deps.update_progress(
+                    automation_id,
+                    log_line="No %s season pack yet — holding %d episode(s); this show is "
+                             "set to season packs only" % (name, pack.get("_pack_size") or 0),
+                    log_type='info')
         except Exception:   # noqa: BLE001 - one season failing must not stop the rest
             logger.exception("season pack attempt failed for %s", name)
             continue
-    if not claimed:
+    skip = claimed | held
+    if not skip:
         return todo, grabs
-    return [it for it in todo if item_key(it, "episode") not in claimed], grabs
+    return [it for it in todo if item_key(it, "episode") not in skip], grabs
 
 
 def _acceptable_titles(primary: Any, kind: str, tmdb_id: Any) -> List[str]:
@@ -811,12 +879,17 @@ def auto_video_process_wishlist(
         # Season packs (opt-in): try ONE grab for a season with several holes
         # before falling back to per-episode. Runs first so a successful pack
         # removes its episodes from this tick's per-episode work.
-        if media_type == "episode" and _season_packs_enabled():
-            todo, pack_grabs = _try_season_packs(
-                todo, root=root, search=search, enqueue=enqueue, deps=deps,
-                automation_id=automation_id)
-        else:
-            pack_grabs = 0
+        pack_grabs = 0
+        if media_type == "episode":
+            _sp = _season_pack_settings()
+            # The global switch is not the only way in: a show with its OWN
+            # 'prefer'/'only' override packs even while the global is off, so
+            # the pass runs whenever ANY show in this tick opts in.
+            _mode_for = _pack_mode_resolver(_sp)
+            if any(_mode_for(it) != "never" for it in todo):
+                todo, pack_grabs = _try_season_packs(
+                    todo, root=root, search=search, enqueue=enqueue, deps=deps,
+                    automation_id=automation_id, settings=_sp, mode_for=_mode_for)
         if not todo:
             # A season pack can claim every remaining episode, emptying todo — that
             # is a fully successful run, not "nothing to grab", so the pack count

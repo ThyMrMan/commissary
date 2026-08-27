@@ -62,7 +62,9 @@ def register_routes(bp):
         return jsonify({"ok": True,
                         "aka_titles": db.aka_titles_for_tmdb(kind, tmdb_id),
                         "series_type": (db.series_type_for_tmdb(tmdb_id)
-                                        if kind == "show" else None)})
+                                        if kind == "show" else None),
+                        "season_pack_mode": (db.season_pack_mode_for_tmdb(tmdb_id)
+                                             if kind == "show" else None)})
 
     @bp.route("/detail/show/<int:show_id>/rescan-episodes", methods=["POST"])
     def video_rescan_episodes(show_id):

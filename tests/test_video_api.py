@@ -746,7 +746,11 @@ def test_downloads_config_save_load(tmp_path, monkeypatch):
             "download_mode": "soulseek", "hybrid_order": ["soulseek"],
             # seeding lifecycle (arr-parity P5) rides the same config payload
             "seed_ratio_goal": 0.0, "seed_time_goal_hours": 0, "seed_remove_data": True,
-            "seed_mode": "soulsync"}
+            "seed_mode": "soulsync",
+            # season packs ride it too — one read for the settings page and the
+            # drain, rather than a second place to look the same keys up
+            "season_packs": False, "season_pack_min_episodes": 4,
+            "season_pack_mode": "prefer"}
         # Round-trips: libraries → video.db, the INPUT folder → the SHARED music key.
         client.post("/api/video/downloads/config",
                     json={"download_path": " /mnt/v/dl ", "movies_path": "/media/movies",
@@ -757,7 +761,9 @@ def test_downloads_config_save_load(tmp_path, monkeypatch):
             "tv_path": "/media/tv", "youtube_path": "/media/yt",
             "download_mode": "hybrid", "hybrid_order": ["torrent", "usenet"],
             "seed_ratio_goal": 0.0, "seed_time_goal_hours": 0, "seed_remove_data": True,
-            "seed_mode": "soulsync"}
+            "seed_mode": "soulsync",
+            "season_packs": False, "season_pack_min_episodes": 4,
+            "season_pack_mode": "prefer"}
         # The input folder is the SHARED soulseek.download_path (so music sees it too);
         # it is NOT stored in video.db.
         assert fake.get("soulseek.download_path") == "/mnt/v/dl"

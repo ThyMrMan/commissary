@@ -3491,6 +3491,14 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.2.0': [
+        { date: 'August 2026 · 2.2.0' },
+        { title: "Grab a whole TV season in one go", desc: "when several episodes of a season are missing, Commissary can now fetch <strong>one season pack</strong> instead of hunting each episode separately. One search and one download rather than a dozen — and the whole season arrives from the same release at the same quality, then unpacks and imports episode by episode exactly as before." },
+        { title: "The switch it never had", desc: "the awkward part: all of that machinery was already built. What was missing was any way to turn it on — it read two settings that <strong>nothing in the app ever wrote</strong>. No checkbox, no default, no way in short of hand-editing config. It now lives in <em>Settings → Downloads</em>, along with how many missing episodes a season needs before a pack is worth it." },
+        { title: "Or wait for a proper pack instead of stitching one together", desc: "when no pack exists you can either fall back to grabbing episodes, or <strong>wait</strong> — rather than assembling a season out of a dozen unrelated releases at different qualities. Waiting only ever applies to a season that has <em>finished airing</em>: a show still going out weekly has no complete pack to find, so its episodes are grabbed normally instead of being held back for something that cannot exist yet." },
+        { title: "And a say per show", desc: "each show's <strong>Manage</strong> panel now has its own season-pack setting, and it beats the global one in both directions. A box-set-style show can be packs-only even with the feature switched off everywhere else; a show you want week by week can stay on single episodes with it switched on. You can set it on a show you don't own yet, which is exactly when it matters — it decides how the show gets acquired in the first place." },
+        { title: "Off by default", desc: "one pack can be tens of gigabytes and the wishlist drain runs unattended, so nothing starts happening because you updated. Turn it on when you want it." },
+    ],
     '2.1.2': [
         { date: 'August 2026 · 2.1.2' },
         { title: "Rearranging your download sources actually saves now", desc: "you could reorder the sources, add one, or remove one, hit Save — and find the old arrangement back the moment you left the page and returned. The save was reaching the server; the server was then <em>undoing</em> it, which is why nothing about it looked broken." },
@@ -3948,6 +3956,20 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.2.0: whole seasons in one grab",
+        description: "TV seasons can be fetched as a single season pack instead of episode by episode - with a threshold, a wait-for-a-proper-pack mode, and a per-show override.",
+        features: [
+            "a season missing several episodes can be grabbed as ONE release, then unpacked and imported per episode",
+            "the grouping, search, grab and import fan-out were already built - what was missing was any way to switch them on",
+            "the two settings behind it were read by the downloader and written by nothing: no checkbox, no default, no route",
+            "Settings - Downloads now has the toggle, and how many missing episodes a season needs before a pack is worth it",
+            "when no pack exists: fall back to episodes, or wait rather than assemble a season from a dozen unrelated releases",
+            "waiting only binds on a season that has FINISHED airing, so a currently-airing show can never stall waiting for a pack that cannot exist",
+            "each show's Manage panel can override the global setting in both directions, including on shows you do not own yet",
+        ],
+        usage_note: "Off by default - one pack can be tens of GB and the drain runs unattended. Upgrades never trigger a pack (wanting a better copy of two episodes will not pull a whole season), specials never pack, and a pack already downloading claims its whole season so those episodes are not also grabbed one by one.",
+    },
     {
         title: "2.1.2: the download source order that saved itself back",
         description: "Rearranging your download sources, adding one, or switching to a single source appeared to save and then reverted. The save was fine; the step that ran after it wrote the old arrangement back on top.",

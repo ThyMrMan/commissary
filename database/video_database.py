@@ -434,6 +434,10 @@ _COLUMN_MIGRATIONS = [
     # translation of the original title has no automatic bridge to its TMDB name.
     # Never pushed to Plex/Jellyfin; this is Commissary-local.
     ("shows", "aka_titles", "TEXT"),
+    # Per-show season-pack override (prefer | only | never). Lives on the
+    # OVERRIDES table, not `shows`, because the setting matters most while
+    # you are still acquiring a show — exactly when no shows row exists.
+    ("video_title_overrides", "season_pack_mode", "TEXT"),
     ("movies", "aka_titles", "TEXT"),
     ("video_watchlist", "approved", "INTEGER NOT NULL DEFAULT 1"),
     ("video_watchlist", "requested_by", "INTEGER"),
@@ -1388,6 +1392,112 @@ class VideoDatabase:
                 "WHERE kind='show' AND tmdb_id=?", (int(tmdb_id),)).fetchone()
             return (row["series_type"] or None) if row else None
         except (sqlite3.Error, TypeError, ValueError):
+            return None
+        finally:
+            conn.close()
+
+    def set_season_pack_mode_override(self, tmdb_id, mode) -> str | None:
+        """Per-show season-pack preference, keyed by tmdb id.
+
+        ``prefer``  try a pack, fall back to per-episode when there is none
+        ``only``    a pack or nothing — never assemble a season from singles
+        ``never``   always per-episode, even with packs enabled globally
+        ``''``      clear the override and follow the global setting
+
+        Keyed by tmdb id rather than a ``shows`` column for the same reason
+        ``series_type`` is: this decides how a show is HUNTED, which matters
+        while you are still trying to acquire it and have no library row.
+
+        Returns the stored value, or None when the input was rejected."""
+        m = str(mode or "").strip().lower()
+        if m not in ("prefer", "only", "never", ""):
+            return None
+        try:
+            tid = int(tmdb_id)
+        except (TypeError, ValueError):
+            return None
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO video_title_overrides (kind, tmdb_id, season_pack_mode, updated_at) "
+                "VALUES ('show',?,?,CURRENT_TIMESTAMP) "
+                "ON CONFLICT(kind, tmdb_id) DO UPDATE SET "
+                "  season_pack_mode=excluded.season_pack_mode, updated_at=CURRENT_TIMESTAMP",
+                (tid, m or None))
+            conn.commit()
+            return m
+        except sqlite3.Error:
+            logger.exception("set_season_pack_mode_override failed (%s)", tmdb_id)
+            return None
+        finally:
+            conn.close()
+
+    def season_pack_mode_for_tmdb(self, tmdb_id) -> str | None:
+        """A show's season-pack override, or None when it follows the global."""
+        if tmdb_id is None:
+            return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT season_pack_mode FROM video_title_overrides "
+                "WHERE kind='show' AND tmdb_id=?", (int(tmdb_id),)).fetchone()
+            return (row["season_pack_mode"] or None) if row else None
+        except (sqlite3.Error, TypeError, ValueError):
+            return None
+        finally:
+            conn.close()
+
+    def all_season_pack_overrides(self) -> dict:
+        """{tmdb_id: mode} for every show with a season-pack override.
+
+        One query instead of one per show. The drain resolves a mode for every
+        wishlisted episode on every tick, and with the global switch OFF that
+        walk only ends when it finds an opt-in — so a per-show lookup would open
+        and close a connection for each of potentially hundreds of shows just to
+        learn that nobody had set anything. This table only holds rows someone
+        deliberately created, so it is small by construction."""
+        conn = self._get_connection()
+        try:
+            return {int(r["tmdb_id"]): r["season_pack_mode"] for r in conn.execute(
+                "SELECT tmdb_id, season_pack_mode FROM video_title_overrides "
+                "WHERE kind='show' AND season_pack_mode IS NOT NULL AND season_pack_mode <> ''")}
+        except (sqlite3.Error, TypeError, ValueError):
+            logger.exception("all_season_pack_overrides failed")
+            return {}
+        finally:
+            conn.close()
+
+    def season_fully_aired(self, tmdb_id, season_number) -> bool | None:
+        """Has every episode of this season aired? None when we cannot tell.
+
+        This is what makes "packs only" safe. A season still airing has no
+        complete pack to find, so enforcing pack-or-nothing on it would hold
+        every episode back week after week and quietly stop acquiring the show
+        — a setting that looks like a preference behaving like an outage.
+
+        None (no episode rows, or no air dates on them) deliberately does NOT
+        mean "finished": the caller treats not-provably-finished as still
+        airing, so an unknown season falls back to per-episode rather than
+        stalling."""
+        try:
+            tid, season = int(tmdb_id), int(season_number)
+        except (TypeError, ValueError):
+            return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total, "
+                "       SUM(CASE WHEN e.air_date IS NULL OR e.air_date = '' THEN 1 ELSE 0 END) AS undated, "
+                "       SUM(CASE WHEN e.air_date > date('now') THEN 1 ELSE 0 END) AS future "
+                "FROM episodes e JOIN shows s ON e.show_id = s.id "
+                "WHERE s.tmdb_id = ? AND e.season_number = ?", (tid, season)).fetchone()
+            if not row or not row["total"]:
+                return None                      # season unknown to us
+            if row["undated"]:
+                return None                      # can't prove it has finished
+            return not row["future"]
+        except sqlite3.Error:
+            logger.exception("season_fully_aired failed (%s S%s)", tmdb_id, season_number)
             return None
         finally:
             conn.close()
@@ -5528,6 +5638,10 @@ class VideoDatabase:
             "sort_title": show["sort_title"],
             "quality_profile_id": show["quality_profile_id"] or 0,
             "series_type": show["series_type"] or "standard",
+            # Per-show season-pack override. Keyed by tmdb id (it has to work
+            # before a show is in the library), so it is a lookup rather than a
+            # column on this row. None = follow the global setting.
+            "season_pack_mode": self.season_pack_mode_for_tmdb(show["tmdb_id"]),
             # NULL = 'auto' (detect from the season structure). See
             # core/video/episode_numbering.
             "episode_source": show["episode_source"] or "auto",

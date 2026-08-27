@@ -7190,6 +7190,53 @@
                                      share limits at it. There is now one set, in the data-shared
                                      Torrent Client section below (#shared-seed-*), which is visible on
                                      both sides. -->
+                                <!-- Season packs (TV). The grouping, grab, and per-episode
+                                     import fan-out have existed since pack support landed; the
+                                     settings were read from two config keys nothing ever wrote,
+                                     so the feature could not be switched on. -->
+                                <div class="form-group" id="video-season-packs-group">
+                                    <label class="checkbox-label">
+                                        <input type="checkbox" id="video-season-packs">
+                                        Grab whole seasons as one release
+                                    </label>
+                                    <div class="setting-help-text">
+                                        For a TV season with several missing episodes, search for a single
+                                        season pack instead of hunting each episode separately. One search
+                                        and one download instead of a dozen, and the whole season comes from
+                                        the same release at the same quality &mdash; it is unpacked and
+                                        imported per episode when it lands. <strong>Off by default:</strong>
+                                        one pack can be tens of gigabytes and the drain runs unattended.
+                                    </div>
+                                    <div id="video-season-pack-opts" style="display:none; margin-left:26px; margin-top:10px;">
+                                        <div class="form-group">
+                                            <label>Only pack a season missing at least:</label>
+                                            <input type="number" id="video-season-pack-min" min="2" max="200" step="1" style="max-width:120px;">
+                                            <div class="setting-help-text">
+                                                Episodes. Below this, a pack is usually more bytes than the
+                                                episodes are worth &mdash; and packs are rarer than singles,
+                                                so the search often comes back empty anyway. Upgrades never
+                                                count: wanting a better copy of two episodes will not pull a
+                                                whole season.
+                                            </div>
+                                        </div>
+                                        <div class="form-group">
+                                            <label>When no season pack exists:</label>
+                                            <select id="video-season-pack-mode" class="form-select" style="max-width:340px;">
+                                                <option value="prefer">Fall back to grabbing episodes</option>
+                                                <option value="only">Wait for a pack &mdash; never assemble from singles</option>
+                                            </select>
+                                            <div class="setting-help-text">
+                                                Waiting keeps a season internally consistent instead of
+                                                stitching it together from a dozen unrelated releases.
+                                                It only applies to a season that has <strong>finished
+                                                airing</strong> &mdash; a season still going out weekly has no
+                                                complete pack to find, so its episodes are grabbed
+                                                normally rather than held back forever.
+                                                Individual shows can override this in their Manage panel.
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
                                 <!-- Import lists (arr-parity P6) -->
                                 <div class="form-group" id="video-import-lists">
                                     <label>Import lists:</label>

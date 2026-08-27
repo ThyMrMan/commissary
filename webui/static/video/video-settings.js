@@ -634,6 +634,13 @@
                 setP('video-movies-path', d.movies_path);
                 setP('video-tv-path', d.tv_path);
                 setP('video-youtube-path', d.youtube_path);
+                var sp = document.getElementById('video-season-packs');
+                if (sp && d.season_packs != null) sp.checked = !!d.season_packs;
+                var spMin = document.getElementById('video-season-pack-min');
+                if (spMin && d.season_pack_min_episodes != null) spMin.value = d.season_pack_min_episodes;
+                var spMode = document.getElementById('video-season-pack-mode');
+                if (spMode && d.season_pack_mode) spMode.value = d.season_pack_mode;
+                updateSeasonPackUI();
                 _videoMode = d.download_mode || 'soulseek';
                 _videoHybrid = (d.hybrid_order && d.hybrid_order.length) ? d.hybrid_order : ['soulseek'];
                 var ms = document.getElementById('video-download-mode');
@@ -658,6 +665,16 @@
                 youtube_path: val('video-youtube-path'),
                 download_mode: _videoMode,
                 hybrid_order: _videoHybrid,
+                season_packs: !!(document.getElementById('video-season-packs') || {}).checked,
+                // Blank/NaN keeps the stored value rather than posting a 0 the
+                // normalizer would floor to 2 — an empty box is "didn't say",
+                // not "every season, however few episodes are missing".
+                season_pack_min_episodes: (function () {
+                    var el = document.getElementById('video-season-pack-min');
+                    var n = el ? parseInt(el.value, 10) : NaN;
+                    return Number.isFinite(n) ? n : undefined;
+                })(),
+                season_pack_mode: (document.getElementById('video-season-pack-mode') || {}).value || 'prefer',
                 // seed_* deliberately omitted — shared with music, saved by the
                 // data-shared Torrent Client section via /api/settings.
             })
@@ -955,6 +972,15 @@
         if (sc) sc.style.display = soulseekActive() ? 'block' : 'none';
     }
 
+    // The threshold and fallback-mode controls only mean anything while packs
+    // are on, so they stay hidden until they do — same pattern as the hybrid
+    // chain above.
+    function updateSeasonPackUI() {
+        var on = !!(document.getElementById('video-season-packs') || {}).checked;
+        var opts = document.getElementById('video-season-pack-opts');
+        if (opts) opts.style.display = on ? '' : 'none';
+    }
+
     // ── Shared slskd connection (writes the app-wide soulseek.* — affects Music too) ──
     function _byId(id) { return document.getElementById(id); }
     function loadSlskd() {
@@ -1010,6 +1036,13 @@
     }
 
     function wireDownloads() {
+        ['video-season-packs', 'video-season-pack-min', 'video-season-pack-mode'].forEach(function (id) {
+            var el = document.getElementById(id);
+            if (el && !el._vdWired) {
+                el._vdWired = true;
+                el.addEventListener('change', function () { updateSeasonPackUI(); saveDownloads(true); });
+            }
+        });
         var ms = document.getElementById('video-download-mode');
         if (ms && !ms._vdWired) {
             ms._vdWired = true;

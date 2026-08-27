@@ -1963,6 +1963,7 @@ const DOCS_SECTIONS = [
         children: [
             { id: 'vdl-queue', title: 'The Download Queue' },
             { id: 'vdl-quality', title: 'Quality Profiles & Formats' },
+            { id: 'vdl-season-packs', title: 'Season Packs' },
             { id: 'vdl-lists', title: 'Import Lists' },
             { id: 'vdl-blocklist', title: 'Blocklist & Recycle Bin' },
             { id: 'vdl-history', title: 'History' },
@@ -1978,6 +1979,33 @@ const DOCS_SECTIONS = [
                 <h3 class="docs-subsection-title">Quality Profiles &amp; Formats</h3>
                 <p class="docs-text">A <strong>quality profile</strong> is a Radarr-class ladder: an ordered list of allowed qualities, a <strong>cutoff</strong> (stop upgrading once you reach it), rejects, and preferences. <strong>Custom formats</strong> are scored release matchers that nudge the ranker toward (or away from) specific releases &mdash; release groups, HDR flavors, audio, and so on. YouTube grabs get their own quality selector.</p>
                 <div class="docs-callout info"><span class="docs-callout-icon">&#x1F512;</span><div>Profiles, custom formats, server/indexer/client config, and the slskd credentials are <strong>admin-only</strong> &mdash; their reads can expose tokens, so both GET and write are gated to admins. The download modal's read-only meta lookups stay open so any allowed profile can queue a grab.</div></div>
+            </div>
+            <div class="docs-subsection" id="vdl-season-packs">
+                <h3 class="docs-subsection-title">Season Packs</h3>
+                <p class="docs-text">A season with several missing episodes can be grabbed as <strong>one release</strong> instead of hunted episode by episode. One search and one download rather than a dozen, and the whole season arrives from the same release at the same quality &mdash; it is unpacked and imported per episode when it lands, exactly as if you had grabbed them individually.</p>
+                <p class="docs-text">Turn it on in <strong>Settings &rarr; Downloads &rarr; Grab whole seasons as one release</strong>. It is <strong>off by default</strong>: one pack can be tens of gigabytes and the wishlist drain runs unattended, so it is not something an update should start doing on your behalf.</p>
+                <h4>When a pack is used</h4>
+                <ul class="docs-list">
+                    <li>The season must be missing at least <strong>N</strong> episodes &mdash; four by default, configurable. Below that a pack is usually more bytes than the episodes are worth, and packs are rarer than singles so the search often comes back empty anyway.</li>
+                    <li><strong>Upgrades never count.</strong> Wanting a better copy of two episodes will not pull a whole season.</li>
+                    <li>Specials (season 0) never pack &mdash; releases do not ship an "S00".</li>
+                    <li>A pack already downloading claims its whole season, so those episodes are not also grabbed one by one while it lands.</li>
+                </ul>
+                <h4>When no pack exists</h4>
+                <p class="docs-text">Two choices, under the same setting:</p>
+                <ul class="docs-list">
+                    <li><strong>Fall back to grabbing episodes</strong> (default) &mdash; the season is assembled from whatever single releases are available.</li>
+                    <li><strong>Wait for a pack</strong> &mdash; the episodes are left on the wishlist and tried again later, rather than stitching a season together from a dozen unrelated releases at different qualities.</li>
+                </ul>
+                <div class="docs-callout tip"><span class="docs-callout-icon">&#x1F4A1;</span><div><strong>Waiting only applies to a season that has finished airing.</strong> A season still going out weekly has no complete pack to find, so its episodes are grabbed normally &mdash; the setting cannot leave a currently-airing show stuck waiting for something that does not exist yet.</div></div>
+                <h4>Per-show overrides</h4>
+                <p class="docs-text">A show's <strong>Manage</strong> panel has its own <em>Season packs</em> setting, and it beats the global one in both directions:</p>
+                <ul class="docs-list">
+                    <li><strong>Follow the global setting</strong> &mdash; the default.</li>
+                    <li><strong>Prefer season packs</strong> / <strong>Season packs only</strong> &mdash; applies to this show <em>even when packs are switched off globally</em>. Use it for a box-set-style show you always want whole.</li>
+                    <li><strong>Never use season packs</strong> &mdash; keeps this show on individual episodes even with packs switched on.</li>
+                </ul>
+                <p class="docs-text">The choice is stored against the show itself, so you can set it on a show you do not own yet &mdash; which is when it matters most, since it decides how the show gets acquired in the first place.</p>
             </div>
             <div class="docs-subsection" id="vdl-lists">
                 <h3 class="docs-subsection-title">Import Lists</h3>

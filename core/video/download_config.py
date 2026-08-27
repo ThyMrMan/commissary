@@ -51,6 +51,61 @@ def normalize_hybrid_order(value: Any) -> list:
     return out or ["soulseek"]
 
 
+# ── Season packs (TV only) ──────────────────────────────────────────────────
+#
+# One grab for a whole season instead of N grabs for N episodes. The machinery
+# has existed since season-pack support landed; what it never had was a way to
+# turn on, because `video.season_packs` and `video.season_pack_min_episodes`
+# were the only two `video.*` config keys in the tree and nothing wrote them.
+#
+# They stay in the APP-WIDE config rather than moving into video.db, because
+# that is where the drain has always READ them from. Moving the store while
+# leaving the reader alone is precisely the 2.1.2 download-source bug (see
+# core/downloads/source_chain.py): one setting, two stores, and a save that
+# looks like it worked.
+SEASON_PACK_MODES = ("prefer", "only")
+SEASON_PACK_MIN_EPISODES = 4
+
+_SEASON_KEYS = {
+    "season_packs": ("video.season_packs", False),
+    "season_pack_min_episodes": ("video.season_pack_min_episodes", SEASON_PACK_MIN_EPISODES),
+    "season_pack_mode": ("video.season_pack_mode", "prefer"),
+}
+
+
+def normalize_season_pack_mode(value: Any) -> str:
+    """``prefer`` (pack if there is one, else per-episode) or ``only`` (pack or
+    wait). Anything unrecognised reads as ``prefer`` — the mode that still
+    acquires the episodes."""
+    v = str(value or "").strip().lower()
+    return v if v in SEASON_PACK_MODES else "prefer"
+
+
+def normalize_min_episodes(value: Any) -> int:
+    """How many genuinely-missing episodes a season needs before one pack beats
+    N singles. Floored at 2: a 'pack' covering a single episode is an episode,
+    and season_pack_groups already refuses that."""
+    try:
+        return max(2, min(200, int(value)))
+    except (TypeError, ValueError):
+        return SEASON_PACK_MIN_EPISODES
+
+
+def season_pack_settings(config_get=None) -> dict:
+    """The three season-pack settings, normalized. ONE reader, so the drain and
+    the settings page cannot disagree about what is configured."""
+    if config_get is None:
+        from config.settings import config_manager
+        config_get = config_manager.get
+    return {
+        "season_packs": bool(config_get(*_SEASON_KEYS["season_packs"])),
+        "season_pack_min_episodes": normalize_min_episodes(
+            config_get(*_SEASON_KEYS["season_pack_min_episodes"])),
+        "season_pack_mode": normalize_season_pack_mode(
+            config_get(*_SEASON_KEYS["season_pack_mode"])),
+    }
+
+
 def _norm_ratio(value: Any) -> float:
     try:
         return max(0.0, min(100.0, float(value)))
@@ -169,6 +224,7 @@ def load(db) -> dict:
         "seed_time_goal_hours": _norm_hours(config_manager.get(*_SEED_KEYS["seed_time_goal_hours"])),
         "seed_remove_data": bool(config_manager.get(*_SEED_KEYS["seed_remove_data"])),
         "seed_mode": _norm_seed_mode(config_manager.get(*_SEED_KEYS["seed_mode"])),
+        **season_pack_settings(config_manager.get),
     }
 
 
@@ -190,7 +246,17 @@ def save(db, body: Any) -> dict:
         config_manager.set(_SEED_KEYS["seed_remove_data"][0], bool(body.get("seed_remove_data")))
     if "seed_mode" in body:
         config_manager.set(_SEED_KEYS["seed_mode"][0], _norm_seed_mode(body.get("seed_mode")))
+    if "season_packs" in body:
+        config_manager.set(_SEASON_KEYS["season_packs"][0], bool(body.get("season_packs")))
+    if "season_pack_min_episodes" in body:
+        config_manager.set(_SEASON_KEYS["season_pack_min_episodes"][0],
+                           normalize_min_episodes(body.get("season_pack_min_episodes")))
+    if "season_pack_mode" in body:
+        config_manager.set(_SEASON_KEYS["season_pack_mode"][0],
+                           normalize_season_pack_mode(body.get("season_pack_mode")))
     return load(db)
 
 
-__all__ = ["SOURCES", "MODES", "normalize_mode", "normalize_hybrid_order", "load", "save"]
+__all__ = ["SOURCES", "MODES", "SEASON_PACK_MODES", "SEASON_PACK_MIN_EPISODES",
+           "normalize_mode", "normalize_hybrid_order", "normalize_season_pack_mode",
+           "normalize_min_episodes", "season_pack_settings", "load", "save"]

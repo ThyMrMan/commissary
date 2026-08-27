@@ -926,6 +926,7 @@ CREATE TABLE IF NOT EXISTS video_title_overrides (
     tmdb_id     INTEGER NOT NULL,
     aka_titles  TEXT,                    -- newline-separated "also known as" names
     series_type TEXT,                    -- shows: standard | daily | anime
+    season_pack_mode TEXT,               -- shows: prefer | only | never (NULL = follow the global)
     updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (kind, tmdb_id)
 );

@@ -952,6 +952,39 @@ def register_routes(bp):
             return jsonify({"success": False, "error": "Show not found."}), 404
         return jsonify({"success": True})
 
+    @bp.route("/detail/show/<int:library_id>/season-pack-mode", methods=["PUT"])
+    def video_show_season_pack_mode(library_id):
+        """Set how this show is acquired: as season packs, or episode by episode.
+
+        Body ``{"season_pack_mode": "prefer"|"only"|"never"|""}``; ``""`` clears
+        the override and hands the show back to the global setting.
+
+        A show-level choice BEATS the global in both directions — 'only' packs a
+        show even with season packs switched off globally, 'never' keeps a show
+        on singles with them switched on. A subtractive-only override could not
+        express "always get this one as packs", which is the reason to open this
+        panel at all.
+
+        Like ``series-type``, ``source: 'tmdb'`` addresses a show that is not in
+        the library yet: this decides how a show is HUNTED, so it matters most
+        before you own it."""
+        from . import get_video_db
+        body = request.get_json(silent=True) or {}
+        mode = str(body.get("season_pack_mode") or "").strip().lower()
+        if mode not in ("prefer", "only", "never", ""):
+            return jsonify({"success": False,
+                            "error": "season_pack_mode must be prefer|only|never (or empty to clear)"}), 400
+        db = get_video_db()
+        tmdb_id = library_id
+        if str(body.get("source") or "").lower() != "tmdb":
+            tmdb_id = db.tmdb_id_for_library_row("show", library_id)
+            if not tmdb_id:
+                return jsonify({"success": False,
+                                "error": "This show isn't matched to TMDB yet."}), 404
+        if db.set_season_pack_mode_override(tmdb_id, mode) is None:
+            return jsonify({"success": False, "error": "Could not save."}), 400
+        return jsonify({"success": True, "season_pack_mode": mode or None})
+
     @bp.route("/organization", methods=["GET"])
     def video_organization():
         """The library-organisation settings: naming templates + post-process toggles."""

@@ -238,9 +238,14 @@ def test_a_single_episode_in_flight_still_claims_only_itself():
 
 def test_season_packs_are_off_by_default():
     """One pack can be tens of GB and the drain is unattended — an existing
-    install must not start spending disk because it updated."""
-    from core.automation.handlers.video_process_wishlist import _season_packs_enabled
-    assert _season_packs_enabled() is False
+    install must not start spending disk because it updated.
+
+    Now read through core.video.download_config, which is also what the settings
+    page reads and writes: the drain used to look the key up itself, and a
+    setting whose reader and writer disagree is exactly how the download-source
+    order came to save and then revert (2.1.2)."""
+    from core.automation.handlers.video_process_wishlist import _season_pack_settings
+    assert _season_pack_settings()["season_packs"] is False
 
 
 def test_a_pack_grabbed_from_the_ui_also_claims_its_season():
