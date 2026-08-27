@@ -33,7 +33,7 @@ const DOCS_SECTIONS = [
     {
         id: 'getting-started',
         title: 'Getting Started',
-        icon: '/static/dashboard.jpg',
+        icon: '/static/dashboard.png',
         children: [
             { id: 'gs-overview', title: 'Overview' },
             { id: 'gs-first-setup', title: 'First-Time Setup' },
@@ -45,10 +45,10 @@ const DOCS_SECTIONS = [
         content: () => `
             <div class="docs-subsection" id="gs-overview">
                 <h3 class="docs-subsection-title">Overview</h3>
-                <p class="docs-text">Commissary is a self-hosted music download, sync, and library management platform. It connects to <strong>Spotify</strong>, <strong>Apple Music/iTunes</strong>, <strong>Deezer</strong>, <strong>Discogs</strong>, <strong>Tidal</strong>, <strong>Qobuz</strong>, <strong>YouTube</strong>, and <strong>Beatport</strong> for metadata, and downloads from <strong>Soulseek</strong>, <strong>YouTube</strong>, <strong>Tidal</strong>, <strong>Qobuz</strong>, <strong>HiFi</strong>, and <strong>Deezer</strong>. Your library is served through <strong>Plex</strong>, <strong>Jellyfin/Emby</strong>, or <strong>Navidrome</strong>.</p>
+                <p class="docs-text">Commissary is a self-hosted music download, sync, and library management platform. It connects to <strong>Spotify</strong>, <strong>Apple Music/iTunes</strong>, <strong>Deezer</strong>, <strong>Discogs</strong>, <strong>Tidal</strong>, <strong>Qobuz</strong>, <strong>YouTube</strong>, and <strong>Beatport</strong> for metadata, and downloads from eleven sources &mdash; <strong>Soulseek</strong>, <strong>YouTube</strong>, <strong>Tidal</strong>, <strong>Qobuz</strong>, <strong>HiFi</strong>, <strong>Deezer</strong>, <strong>Amazon Music</strong>, <strong>SoundCloud</strong>, <strong>Lidarr</strong>, and <strong>torrent</strong>/<strong>usenet</strong> via Prowlarr. Your library is served through <strong>Plex</strong>, <strong>Jellyfin/Emby</strong>, or <strong>Navidrome</strong>.</p>
                 ${docsImg('gs-overview.jpg', 'Commissary dashboard overview')}
                 <div class="docs-features">
-                    <div class="docs-feature-card"><h4>&#x1F3B5; Download Music</h4><p>Search and download tracks in FLAC, MP3, and more from 6 sources (Soulseek, YouTube, Tidal, Qobuz, HiFi, Deezer), with automatic metadata tagging and file organization.</p></div>
+                    <div class="docs-feature-card"><h4>&#x1F3B5; Download Music</h4><p>Search and download tracks in FLAC, MP3, and more from eleven sources &mdash; or search them all at once and pick the copy you want &mdash; with automatic metadata tagging and file organization.</p></div>
                     <div class="docs-feature-card"><h4>&#x1F504; Playlist Sync</h4><p>Mirror playlists from Spotify, YouTube, Tidal, and Beatport. Discover official metadata and sync to your media server.</p></div>
                     <div class="docs-feature-card"><h4>&#x1F4DA; Library Management</h4><p>Browse, edit, and enrich your music library with metadata from 9 services. Write tags directly to audio files.</p></div>
                     <div class="docs-feature-card"><h4>&#x1F916; Automations</h4><p>Schedule tasks, chain workflows with signals, and get notified via Discord, Pushbullet, or Telegram.</p></div>
@@ -60,10 +60,10 @@ const DOCS_SECTIONS = [
                 <h3 class="docs-subsection-title">First-Time Setup</h3>
                 <p class="docs-text">After launching Commissary, head to the <strong>Settings</strong> page to configure your services. At minimum you need:</p>
                 <ol class="docs-steps">
-                    <li><strong>Download Source</strong> &mdash; Connect at least one download source: Soulseek (slskd), YouTube, Tidal, Qobuz, HiFi, or Deezer. Soulseek offers the best quality selection; the others work as alternatives or fallbacks in Hybrid mode.</li>
+                    <li><strong>Download Source</strong> &mdash; Connect at least one: Soulseek (slskd), YouTube, Tidal, Qobuz, HiFi, Deezer, Amazon Music, SoundCloud, Lidarr, or torrent/usenet via Prowlarr. Soulseek offers the best quality selection; connect several and drag them into the order you want tried, and the rest act as fallbacks.</li>
                     <li><strong>Media Server</strong> &mdash; Connect Plex, Jellyfin, or Navidrome so Commissary knows where your library lives and can trigger scans.</li>
                     <li><strong>Spotify (Recommended)</strong> &mdash; Connect Spotify for the richest metadata. Create an app at <strong>developer.spotify.com</strong>, enter your Client ID and Secret, then click Authenticate.</li>
-                    <li><strong>Input Path</strong> &mdash; Set your input and output paths in the Download Settings section. The output path should point to your media server's monitored folder.</li>
+                    <li><strong>Paths</strong> &mdash; Set your input folder and at least one Music Library in the Downloads section. The library path should point to your media server's monitored folder.</li>
                 </ol>
                 ${docsImg('gs-first-setup.jpg', 'Settings page first-time setup')}
                 <div class="docs-callout tip"><span class="docs-callout-icon">&#x1F4A1;</span><div>You can start using Commissary with just one download source. Spotify and other services add metadata enrichment but aren't strictly required &mdash; iTunes/Apple Music and Deezer are always available as free fallbacks.</div></div>
@@ -323,7 +323,7 @@ const DOCS_SECTIONS = [
     {
         id: 'workflows',
         title: 'Quick Start Workflows',
-        icon: '/static/help.jpg',
+        icon: '/static/help.png',
         children: [
             { id: 'wf-first', title: 'What Should I Do First?' },
             { id: 'wf-download', title: 'How to: Download an Album' },
@@ -457,7 +457,7 @@ const DOCS_SECTIONS = [
     {
         id: 'dashboard',
         title: 'Dashboard',
-        icon: '/static/dashboard.jpg',
+        icon: '/static/dashboard.png',
         children: [
             { id: 'dash-overview', title: 'Overview & Stats' },
             { id: 'dash-history', title: 'Download History' },
@@ -605,7 +605,7 @@ const DOCS_SECTIONS = [
     {
         id: 'sync',
         title: 'Playlist Sync',
-        icon: '/static/sync.jpg',
+        icon: '/static/sync.png',
         children: [
             { id: 'sync-overview', title: 'Overview' },
             { id: 'sync-spotify', title: 'Spotify Playlists' },
@@ -769,11 +769,12 @@ const DOCS_SECTIONS = [
     {
         id: 'search',
         title: 'Music Downloads',
-        icon: '/static/search.jpg',
+        icon: '/static/search.png',
         children: [
             { id: 'search-enhanced', title: 'Enhanced Search' },
             { id: 'search-basic', title: 'Basic Search' },
             { id: 'search-sources', title: 'Download Sources' },
+            { id: 'search-picker', title: 'Picking a Source Yourself' },
             { id: 'search-downloading', title: 'Downloading Music' },
             { id: 'search-postprocess', title: 'Post-Processing Pipeline' },
             { id: 'search-quality', title: 'Quality Profiles' },
@@ -800,7 +801,7 @@ const DOCS_SECTIONS = [
             </div>
             <div class="docs-subsection" id="search-sources">
                 <h3 class="docs-subsection-title">Download Sources</h3>
-                <p class="docs-text">Commissary supports multiple download sources, configurable in <strong>Settings &rarr; Download Settings</strong>:</p>
+                <p class="docs-text">Commissary can download from eleven sources, configured in <strong>Settings &rarr; Downloads</strong>:</p>
                 <table class="docs-table">
                     <thead><tr><th>Source</th><th>Description</th><th>Best For</th></tr></thead>
                     <tbody>
@@ -810,11 +811,36 @@ const DOCS_SECTIONS = [
                         <tr><td><strong>Qobuz</strong></td><td>Qobuz Hi-Res streaming rip (requires auth)</td><td>Audiophile quality, up to 24-bit/192kHz</td></tr>
                         <tr><td><strong>HiFi</strong></td><td>Free lossless downloads via community-run API instances</td><td>No account needed, good FLAC availability</td></tr>
                         <tr><td><strong>Deezer</strong></td><td>Deezer streaming rip via ARL token (FLAC/MP3)</td><td>Large catalog, easy setup, FLAC with HiFi sub</td></tr>
-                        <tr><td><strong>Hybrid</strong></td><td>Tries your primary source first, then automatically falls back to alternates</td><td>Best overall success rate</td></tr>
+                        <tr><td><strong>Amazon Music</strong></td><td>Amazon Music rip (requires auth)</td><td>Official releases, wide catalog</td></tr>
+                        <tr><td><strong>SoundCloud</strong></td><td>Anonymous SoundCloud downloads &mdash; no account</td><td>Remixes, bootlegs, independent artists</td></tr>
+                        <tr><td><strong>Lidarr</strong></td><td>Hands the request to an existing Lidarr install</td><td>Reusing an indexer setup you already run</td></tr>
+                        <tr><td><strong>Torrent</strong></td><td>Prowlarr indexers, handed to your torrent client</td><td>Whole albums, box sets, out-of-print releases</td></tr>
+                        <tr><td><strong>Usenet</strong></td><td>Prowlarr indexers, handed to your usenet client</td><td>Fast, retention-backed album grabs</td></tr>
                     </tbody>
                 </table>
-                <div class="docs-callout tip"><span class="docs-callout-icon">&#x1F4A1;</span><div><strong>Hybrid mode</strong> is recommended for most users. It tries your primary source first, then falls back through your configured priority order. All six sources (Soulseek, YouTube, Tidal, Qobuz, HiFi, Deezer) can be ordered via drag-and-drop in Settings.</div></div>
+                <div class="docs-callout tip"><span class="docs-callout-icon">&#x1F4A1;</span><div><strong>Torrent and Usenet search whole releases, not tracks.</strong> They return one result per album, so picking one downloads the entire release and keeps the track that matches what you asked for. The other nine search track by track.</div></div>
+                <h4>The source order</h4>
+                <p class="docs-text">The sources you enable form one <strong>ordered chain</strong>, dragged into the priority you want in Settings &rarr; Downloads. Automatic downloads &mdash; the wishlist drain, watchlist grabs, anything unattended &mdash; walk that chain from the top and stop at the first source that delivers. A chain of one source is simply single-source mode; there is no separate setting for it.</p>
+                <p class="docs-text">The order is a preference for <em>unattended</em> grabs only. It never limits what you can search by hand: every source you have configured is searchable from the picker regardless of whether it is in the chain or where it sits.</p>
+                <div class="docs-callout tip"><span class="docs-callout-icon">&#x1F4A1;</span><div>You can also reorder the chain from the <strong>quick-switch</strong> in the sidebar without opening Settings. Both places write the same setting.</div></div>
                 <p class="docs-text"><strong>YouTube settings</strong> include cookies browser selection (for bot detection bypass), download delay (seconds between requests), and minimum confidence threshold for title matching.</p>
+            </div>
+            <div class="docs-subsection" id="search-picker">
+                <h3 class="docs-subsection-title">Picking a Source Yourself</h3>
+                <p class="docs-text">Every search result gives you two ways to get it:</p>
+                <ul class="docs-list">
+                    <li><strong>&#x1F50D; Sources</strong> &mdash; searches <em>every</em> source you have configured and shows you what each one found, so you choose the copy you want. This is the default action.</li>
+                    <li><strong>&#x2B07; Auto</strong> &mdash; the older behaviour: take the first source in your chain that has it, without asking.</li>
+                </ul>
+                <p class="docs-text">The picker is reachable from the Search page, from album track rows (missing <em>and</em> already-owned, for replacing a bad copy), from wishlist rows, and from the download-missing modal.</p>
+                <h4>Reading the results</h4>
+                <p class="docs-text">Results stream in and are grouped by source as each one finishes, so a fast source is usable while a slow one is still working. A source that fails says so in its own group rather than silently returning nothing &mdash; if Prowlarr is down you see that, instead of wondering where the torrent results went.</p>
+                <div class="docs-callout tip"><span class="docs-callout-icon">&#x1F4A1;</span><div><strong>Every configured source is searched, not just the ones in your chain.</strong> The chain order is a preference for unattended downloads. A source you connected but left out of it still works here &mdash; it used to be invisible, which was the bug, not the design.</div></div>
+                <h4>Full releases</h4>
+                <p class="docs-text">Torrent and Usenet results appear in a separate <strong>Full releases</strong> group at the bottom, because they index whole albums rather than single tracks. Picking one downloads the entire release and keeps only the track you asked for. If the release turns out not to contain that track, the download <em>fails</em> rather than importing the wrong file.</p>
+                <h4>Choosing a release for a whole album</h4>
+                <p class="docs-text">In the album download modal, <strong>&#x1F4BF; Choose Release</strong> searches every source that indexes complete albums and lets you pick one. The whole album is then downloaded as a set instead of track by track, which keeps an album consistent &mdash; same rip, same mastering, same tags &mdash; rather than assembling it from whichever source happened to win each individual track.</p>
+                <p class="docs-text">Your pick travels as an opaque token, not a download URL, so indexer API keys never reach the browser.</p>
             </div>
             <div class="docs-subsection" id="search-downloading">
                 <h3 class="docs-subsection-title">Downloading Music</h3>
@@ -867,7 +893,7 @@ const DOCS_SECTIONS = [
     {
         id: 'discover',
         title: 'Discover Artists',
-        icon: '/static/discover.jpg',
+        icon: '/static/discover.png',
         children: [
             { id: 'disc-hero', title: 'Featured Artists' },
             { id: 'disc-playlists', title: 'Discovery Playlists' },
@@ -957,7 +983,7 @@ const DOCS_SECTIONS = [
     {
         id: 'artists',
         title: 'Artists & Watchlist',
-        icon: '/static/artists.jpg',
+        icon: '/static/artists.png',
         children: [
             { id: 'art-search', title: 'Artist Search' },
             { id: 'art-detail', title: 'Artist Detail & Discography' },
@@ -1032,7 +1058,7 @@ const DOCS_SECTIONS = [
     {
         id: 'automations',
         title: 'Automations',
-        icon: '/static/automation.jpg',
+        icon: '/static/automation.png',
         children: [
             { id: 'auto-overview', title: 'Overview' },
             { id: 'auto-builder', title: 'Builder' },
@@ -1164,7 +1190,7 @@ const DOCS_SECTIONS = [
     {
         id: 'library',
         title: 'Music Library',
-        icon: '/static/library.jpg',
+        icon: '/static/library.png',
         children: [
             { id: 'lib-standard', title: 'Standard View' },
             { id: 'lib-enhanced', title: 'Enhanced Library Manager' },
@@ -1263,9 +1289,51 @@ const DOCS_SECTIONS = [
         `
     },
     {
+        id: 'purchased',
+        title: 'Purchased',
+        icon: '/static/library.png',
+        children: [
+            { id: 'pur-why', title: 'What It Is For' },
+            { id: 'pur-shopping-list', title: 'The To Be Purchased List' },
+            { id: 'pur-marking', title: 'Marking Something Purchased' },
+            { id: 'pur-page', title: 'The Purchased Page' },
+            { id: 'pur-unmark', title: 'Unmarking (Admin Only)' }
+        ],
+        content: () => `
+            <div class="docs-subsection" id="pur-why">
+                <h3 class="docs-subsection-title">What It Is For</h3>
+                <p class="docs-text">Commissary keeps a permanent record of the music you have actually <strong>bought</strong>, separate from what you have merely downloaded. If you use downloads to audition music and then buy the albums you keep, this is the ledger that tells you which is which &mdash; months later, when you no longer remember.</p>
+                <p class="docs-text">Nothing about it changes how downloading works. It records a fact about a track; it does not move, re-tag or delete files.</p>
+            </div>
+            <div class="docs-subsection" id="pur-shopping-list">
+                <h3 class="docs-subsection-title">The To Be Purchased List</h3>
+                <p class="docs-text">Every track you download is flagged <strong>to be purchased</strong> automatically. Open the list with the <strong>To Be Purchased</strong> button on the Library page &mdash; it is a flat, cross-artist shopping list of everything you have downloaded and not yet bought, searchable and paged.</p>
+                <p class="docs-text">You never have to add anything to it by hand. It fills itself as you download.</p>
+            </div>
+            <div class="docs-subsection" id="pur-marking">
+                <h3 class="docs-subsection-title">Marking Something Purchased</h3>
+                <ul class="docs-list">
+                    <li><strong>Mark Purchased</strong> on a single track</li>
+                    <li><strong>Mark Album Purchased</strong> to do every track on an album at once</li>
+                </ul>
+                <p class="docs-text">Either one clears the to-be-purchased flag and stamps a permanent purchase date, moving the track off the shopping list and onto the Purchased page.</p>
+                <div class="docs-callout tip"><span class="docs-callout-icon">&#x1F4A1;</span><div>Recording a purchase is open to <strong>every</strong> profile, not just admins. Anyone in the household who buys something can say so.</div></div>
+            </div>
+            <div class="docs-subsection" id="pur-page">
+                <h3 class="docs-subsection-title">The Purchased Page</h3>
+                <p class="docs-text">Its own entry in the sidebar: everything you have marked as bought, grouped into collapsible albums with a running album count, and filterable by title, artist or album.</p>
+            </div>
+            <div class="docs-subsection" id="pur-unmark">
+                <h3 class="docs-subsection-title">Unmarking (Admin Only)</h3>
+                <p class="docs-text"><strong>Unmark</strong> removes the purchase record. Unlike marking, it is restricted to admin profiles and enforced on the server, not just hidden in the UI &mdash; a purchase date is history that nothing else can reconstruct, so anyone can add one and only an admin can erase one.</p>
+                <div class="docs-callout warning"><span class="docs-callout-icon">&#x26A0;</span><div>Unmarking clears the purchase date but does <strong>not</strong> put the track back on the To Be Purchased list. If you unmark by mistake, the track is in neither place until you mark it purchased again.</div></div>
+            </div>
+        `
+    },
+    {
         id: 'import',
         title: 'Import Music',
-        icon: '/static/import.jpg',
+        icon: '/static/import.png',
         children: [
             { id: 'imp-setup', title: 'Staging Setup' },
             { id: 'imp-workflow', title: 'Import Workflow' },
@@ -1323,7 +1391,7 @@ const DOCS_SECTIONS = [
     {
         id: 'player',
         title: 'Media Player',
-        icon: '/static/library.jpg',
+        icon: '/static/library.png',
         children: [
             { id: 'player-controls', title: 'Playback Controls' },
             { id: 'player-streaming', title: 'Streaming & Sources' },
@@ -1376,7 +1444,7 @@ const DOCS_SECTIONS = [
     {
         id: 'settings',
         title: 'Settings',
-        icon: '/static/settings.jpg',
+        icon: '/static/settings.png',
         children: [
             { id: 'set-services', title: 'Service Credentials' },
             { id: 'set-media', title: 'Media Server Setup' },
@@ -1422,13 +1490,14 @@ const DOCS_SECTIONS = [
             <div class="docs-subsection" id="set-download">
                 <h3 class="docs-subsection-title">Download Settings</h3>
                 <ul class="docs-list">
-                    <li><strong>Download Source Mode</strong> &mdash; Soulseek, YouTube, Tidal, Qobuz, HiFi, Deezer, or Hybrid. Hybrid tries your primary source first, then falls back to alternates with configurable priority via drag-and-drop. Each streaming source has its own quality dropdown and an <strong>Allow quality fallback</strong> toggle. See <em>Download Sources</em> and <em>Quality Profiles</em> in the Music Downloads section for details.</li>
+                    <li><strong>Download sources</strong> &mdash; enable the ones you want and drag them into the order you want them tried: Soulseek, YouTube, Tidal, Qobuz, HiFi, Deezer, Amazon Music, SoundCloud, Lidarr, Torrent and Usenet. Automatic downloads walk that order from the top; enabling exactly one is single-source mode. The order does not limit manual searching &mdash; every configured source is searchable from the picker whatever the order says. Each streaming source has its own quality dropdown and an <strong>Allow quality fallback</strong> toggle. See <em>Download Sources</em>, <em>Picking a Source Yourself</em> and <em>Quality Profiles</em> in the Music Downloads section.</li>
                     <li><strong>Input Path</strong> &mdash; The folder where files are initially downloaded. This <strong>must match</strong> the folder your download source (slskd) writes to. In Docker, this is the container-side mount point (e.g., <code>/app/downloads</code>), not the host path. Commissary monitors this folder for completed downloads to begin post-processing.</li>
-                    <li><strong>Output Path</strong> &mdash; The final destination for processed music files. After tagging, renaming, and organizing, files are moved here. This <strong>must</strong> point to your media server's monitored music folder (the folder Plex/Jellyfin/Navidrome watches for new content). In Docker, use the container-side path (e.g., <code>/app/Transfer</code>).</li>
+                    <li><strong>Music Libraries</strong> &mdash; where processed files end up, after tagging, renaming and organizing. This is a <em>list</em>, not a single folder: each entry has a label, a destination path, and optional overrides for the naming template and quality profile used by files filed into it. Reorder with the arrows &mdash; <strong>the first library is the default</strong>. Each path <strong>must</strong> be a folder your media server watches (Plex/Jellyfin/Navidrome); in Docker, the container-side path (e.g. <code>/app/Transfer</code>).
+                        <br><br>If you have never touched this setting you already have exactly one library, seeded from the folder you were using before, and everything files there as it always did. Add more only if you actually want music split across destinations &mdash; say a lossless archive and a phone-sync copy with a simpler naming scheme.</li>
                     <li><strong>Import Path</strong> &mdash; Folder for the Import feature (files placed here appear on the Import page). Separate from the input/output pipeline.</li>
                     <li><strong>iTunes Country</strong> &mdash; Storefront region for iTunes/Apple Music lookups (US, GB, FR, JP, etc.). Changes apply immediately to all searches without restarting. ID-based lookups automatically try up to 10 regional storefronts as fallback when the primary country returns no results.</li>
                     <li><strong>Lossy Copy</strong> &mdash; When enabled, creates a lower-bitrate MP3 copy of every downloaded file. Configure the output bitrate (default 320kbps) and output folder. Optionally delete the original lossless file after creating the lossy copy. Useful for syncing to mobile devices or streaming servers with bandwidth constraints.</li>
-                    <li><strong>Content Filtering</strong> &mdash; Toggle explicit content filtering to control whether explicit tracks appear in search results and downloads.</li>
+                    <li><strong>Content Filtering</strong> &mdash; <strong>Allow explicit content in downloads</strong> controls whether tracks marked explicit are downloaded at all; turning it off skips them during matched downloads. Underneath it, <strong>Prefer explicit versions when matching</strong> (off by default, and ignored entirely while the parent is off) ranks a candidate lower when it disagrees with a track you asked for that is <em>itself</em> explicit &mdash; so a censored cut loses to the uncensored one. It only re-orders and never filters: if the clean version is all that exists, it still downloads.</li>
                 </ul>
                 ${docsImg('settings-downloads.jpg', 'Download settings')}
                 <div class="docs-callout warning"><span class="docs-callout-icon">&#x26A0;&#xFE0F;</span><div><strong>Docker users:</strong> Always use container-side paths in these settings (e.g., <code>/app/downloads</code>, <code>/app/Transfer</code>). Never use host paths like <code>/mnt/music</code> &mdash; the container can't access those. Your docker-compose <code>volumes</code> section is where host paths are mapped to container paths. See <strong>Getting Started &rarr; Folder Setup</strong> for a complete walkthrough.</div></div>
@@ -1482,7 +1551,7 @@ const DOCS_SECTIONS = [
     {
         id: 'profiles',
         title: 'Multi-Profile',
-        icon: '/static/settings.jpg',
+        icon: '/static/settings.png',
         children: [
             { id: 'prof-overview', title: 'How Profiles Work' },
             { id: 'prof-manage', title: 'Managing Profiles' },
@@ -1546,7 +1615,7 @@ const DOCS_SECTIONS = [
     {
         id: 'troubleshooting',
         title: 'Troubleshooting',
-        icon: '/static/settings.jpg',
+        icon: '/static/settings.png',
         children: [
             { id: 'ts-logs', title: 'Understanding Logs' },
             { id: 'ts-debug', title: 'Copy Debug Info' },
@@ -1640,7 +1709,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-overview',
         title: 'Video: Overview',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/dashboard.png',
         children: [
             { id: 'vid-what', title: 'What the Video Side Is' },
             { id: 'vid-switch', title: 'Switching Sides' },
@@ -1693,7 +1762,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-dashboard',
         title: 'Video: Dashboard',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/dashboard.png',
         children: [
             { id: 'vdash-overview', title: 'Overview & Health' },
             { id: 'vdash-continue', title: 'Continue Watching' },
@@ -1718,7 +1787,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-search',
         title: 'Video: Search & Studios',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/search.png',
         children: [
             { id: 'vsearch-search', title: 'Searching' },
             { id: 'vsearch-trending', title: 'Trending' },
@@ -1743,7 +1812,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-discover',
         title: 'Video: Discover',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/discover.png',
         children: [
             { id: 'vdisc-hero', title: 'Cinematic Hero' },
             { id: 'vdisc-foryou', title: 'For You & Taste' },
@@ -1778,7 +1847,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-library',
         title: 'Video: Library',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/library.png',
         children: [
             { id: 'vlib-browse', title: 'Browsing & Filters' },
             { id: 'vlib-manage', title: 'Manage Panel' },
@@ -1804,7 +1873,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-detail',
         title: 'Video: Detail Pages',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/library.png',
         children: [
             { id: 'vdet-layout', title: 'Movie & Show Pages' },
             { id: 'vdet-watch', title: 'Watch State & History' },
@@ -1840,7 +1909,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-watchlist',
         title: 'Video: Watchlist',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/artists.png',
         children: [
             { id: 'vwatch-follow', title: 'Following People & Studios' },
             { id: 'vwatch-settings', title: 'Per-Follow Settings' },
@@ -1865,7 +1934,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-wishlist',
         title: 'Video: Wishlist',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/artists.png',
         children: [
             { id: 'vwish-wanted', title: 'Wanted & Cutoff-Unmet' },
             { id: 'vwish-search', title: 'Search Now & Status' },
@@ -1890,7 +1959,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-downloads',
         title: 'Video: Downloads',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/search.png',
         children: [
             { id: 'vdl-queue', title: 'The Download Queue' },
             { id: 'vdl-quality', title: 'Quality Profiles & Formats' },
@@ -1931,7 +2000,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-requests',
         title: 'Video: Requests',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/settings.png',
         children: [
             { id: 'vreq-flow', title: 'Request → Approve → Wishlist' }
         ],
@@ -1947,7 +2016,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-calendar',
         title: 'Video: Calendar',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/discover.png',
         children: [
             { id: 'vcal-grid', title: 'Week Grid & Air Times' },
             { id: 'vcal-movie', title: 'Movie Lane' },
@@ -1972,7 +2041,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-automations',
         title: 'Video: Automations',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/automation.png',
         children: [
             { id: 'vauto-shared', title: 'Shared System Automations' },
             { id: 'vauto-events', title: 'Event Triggers' }
@@ -1992,7 +2061,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-youtube',
         title: 'Video: YouTube Channels',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/search.png',
         children: [
             { id: 'vyt-follow', title: 'Following Channels' },
             { id: 'vyt-import', title: 'Import Subscriptions' },
@@ -2017,7 +2086,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-tools',
         title: 'Video: Tools',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/settings.png',
         children: [
             { id: 'vtool-overlays', title: 'Overlay Studio' },
             { id: 'vtool-collections', title: 'Collection Manager' },
@@ -2060,7 +2129,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-import',
         title: 'Video: Import',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/import.png',
         children: [
             { id: 'vimp-failed', title: 'Failed Imports' }
         ],
@@ -2075,7 +2144,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-settings',
         title: 'Video: Settings & Side Access',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/settings.png',
         children: [
             { id: 'vset-server', title: 'Server & Libraries' },
             { id: 'vset-services', title: 'Enrichment Services & Keys' },
@@ -2105,7 +2174,7 @@ const DOCS_SECTIONS = [
     {
         id: 'video-api',
         title: 'Video: API Reference',
-        icon: '/static/video/video-nav.jpg',
+        icon: '/static/settings.png',
         children: [
             { id: 'vapi-auth', title: 'Auth Model' },
             { id: 'vapi-content', title: 'Library, Detail & Discover' },
@@ -2238,7 +2307,7 @@ const DOCS_SECTIONS = [
     {
         id: 'api',
         title: 'REST API',
-        icon: '/static/settings.jpg',
+        icon: '/static/settings.png',
         children: [
             { id: 'api-auth', title: 'Authentication' },
             { id: 'api-system', title: 'System' },
@@ -2595,7 +2664,7 @@ const DOCS_SECTIONS = [
                         E('DELETE', '/api-keys/{key_id}', 'Revoke an API key by its UUID', [], null, {
                             response: '{\n  "success": true,\n  "data": { "message": "API key revoked." }\n}'
                         }),
-                        E('POST', '/api-keys/bootstrap', 'Generate the first API key when none exist (NO AUTH REQUIRED)', [], [
+                        E('POST', '/api-keys/bootstrap', 'Generate the first API key when none exist. Requires login mode, a signed-in admin session, and no existing keys', [], [
                             P('label', 'string', false, 'Label for the key', '"Default"')
                         ], {
                             request: '{\n  "label": "My First Key"\n}',
@@ -2760,7 +2829,8 @@ const DOCS_SECTIONS = [
             // Auth section (not a group)
             sectionsHTML += '<div class="docs-subsection" id="api-auth">';
             sectionsHTML += '<h3 class="docs-subsection-title">Authentication</h3>';
-            sectionsHTML += '<p class="docs-text">All API v1 endpoints require an API key (except <code>POST /api-keys/bootstrap</code>). Generate keys in <strong>Settings &rarr; API Keys</strong> or via the bootstrap endpoint.</p>';
+            sectionsHTML += '<p class="docs-text">Every API v1 endpoint requires an API key. Generate one in <strong>Settings &rarr; API Keys</strong> &mdash; that is the way to create your first. The one exception, <code>POST /api-keys/bootstrap</code>, is not an anonymous shortcut: it needs login mode on, a signed-in <em>admin</em> session, and no existing keys. It used to need none of that, which made it a way to obtain a credential without one.</p>';
+            sectionsHTML += '<p class="docs-text"><strong>CSRF does not apply to API v1.</strong> These routes authenticate with a header rather than a cookie, so scripted clients need send no CSRF header and no Origin.</p>';
             sectionsHTML += '<div class="api-detail-label">Two authentication methods</div>';
             sectionsHTML += '<table class="api-params-table"><thead><tr><th>Method</th><th>Format</th><th>Example</th></tr></thead><tbody>';
             sectionsHTML += '<tr><td>Header</td><td>Authorization: Bearer {key}</td><td><code>Authorization: Bearer sk_AbCd…</code></td></tr>';

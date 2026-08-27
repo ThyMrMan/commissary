@@ -1,8 +1,18 @@
 # Commissary API Response Shapes
 
-Reference for the expected response shapes from `SpotifyClient` (which delegates to iTunes when Spotify is not authenticated).
+Reference for the expected response shapes from `SpotifyClient`, and from whichever
+provider it delegates to when Spotify is not authenticated.
 
-Both `core/spotify_client.py` and `core/itunes_client.py` define identical dataclasses (`Track`, `Artist`, `Album`, `Playlist`). The Spotify client returns Spotify-module versions; iTunes fallback returns iTunes-module versions with the same field names and types.
+**The fallback is configurable, and iTunes is not the default.** `SpotifyClient._fallback_source`
+reads `metadata.fallback_source` (Settings → Metadata), which defaults to **Deezer**; iTunes,
+Discogs and the opt-in experimental providers are the other choices. This document was written
+when iTunes was the only fallback, so read "iTunes" below as "the configured fallback".
+
+`core/spotify_client.py`, `core/itunes_client.py` and `core/deezer_client.py` each define the same
+four dataclasses (`Track`, `Artist`, `Album`, `Playlist`); `core/discogs_client.py` defines three
+(no `Playlist`). Each client returns its own module's versions, with the same field names and
+types — that structural identity is the contract this file describes, and it is what lets a
+consumer treat any provider's result the same way.
 
 ---
 

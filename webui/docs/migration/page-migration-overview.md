@@ -1,11 +1,19 @@
 # WebUI Page Migration Overview
 
-Snapshot date: 2026-05-15
+Snapshot date: 2026-08-26
+
+This is a **snapshot**, not a live index. The manifest itself
+(`_DEEPLINK_VALID_PAGES` in `webui/static/init.js`) and the contents of
+`webui/src/routes/` are the source of truth; check them before trusting the
+counts below.
 
 ## Summary
-- The shell route manifest now has 18 page ids.
-- `issues`, `stats`, and `import` are now React-owned routes.
-- Since the last snapshot, the biggest changes are:
+- The shell route manifest now has 19 page ids.
+- React-owned routes: `issues`, `stats`, `import`, `artist-detail` and
+  `label-detail`. The rest are still the legacy vanilla-JS shell.
+- Since the 2026-05-15 snapshot: `purchased` joined the manifest as a full
+  sidebar page, and `artist-detail` and `label-detail` moved to React.
+- Changes from the snapshot before that:
   - `downloads` was renamed into `search`.
   - The live queue became `active-downloads`.
   - `watchlist` and `wishlist` became full sidebar pages.
@@ -29,11 +37,15 @@ Snapshot date: 2026-05-15
 - `webui/static/core.js` now holds a lot of the shared global state that used to live in the old monolith.
 - `webui/static/init.js` still owns page activation, permission gating, nav highlighting, legacy routing, and the `window.SoulSyncWebRouter` bridge.
 - `webui/static/shell-bridge.js` and the TanStack Router adapter still decide whether a route is handled by the React host or handed back to the legacy shell.
-- `issues` remains the reference pattern for interactive React-owned pages, while `stats` now complements it as the reference for data-heavy read-only routes with route-local charts and explicit shell handoffs.
+- `issues` remains the reference pattern for interactive React-owned pages, while `stats` now complements it as the reference for data-heavy read-only routes with route-local charts and explicit shell handoffs. `artist-detail` and `label-detail` are the reference for a React route reached *from* legacy pages, which is the seam most likely to bite.
+
+  `import` is the one to read before touching import UI: it is route-local state
+  in `-import.store.ts` plus queries in `-import.api.ts`, with vitest alongside
+  (`-route.test.tsx`).
 - The legacy shell is now spread across feature modules rather than one giant coordinator file, which makes the migration seams a little clearer than they were a month ago.
 
 ### Route and Compatibility Notes
-- Manifest page ids: `dashboard`, `sync`, `search`, `discover`, `playlist-explorer`, `watchlist`, `wishlist`, `automations`, `active-downloads`, `library`, `tools`, `artist-detail`, `stats`, `import`, `settings`, `issues`, `help`, `hydrabase`.
+- Manifest page ids: `dashboard`, `sync`, `search`, `discover`, `playlist-explorer`, `watchlist`, `wishlist`, `purchased`, `automations`, `active-downloads`, `library`, `tools`, `artist-detail`, `stats`, `import`, `settings`, `issues`, `help`, `hydrabase`.
 - `downloads` and `artists` are no longer manifest ids.
 - HTML `.page` containers exist for every legacy page plus `webui-react-root` for React.
 - `watchlist`, `wishlist`, and `active-downloads` are now standalone route targets instead of dashboard overlays.

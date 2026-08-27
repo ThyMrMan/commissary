@@ -1,5 +1,18 @@
 # Download Engine Refactor Plan
 
+> **Status: shipped.** This is kept as the design rationale, not as work outstanding.
+> The engine lives in [`core/download_engine/`](../core/download_engine/) —
+> `engine.py` (`DownloadEngine`: unified download-record state, the shared lock, and
+> `search_all_sources`), `rate_limit.py` (one rate-limit policy resolved per plugin)
+> and `worker.py` (the single background download worker that replaced the per-client
+> copies). The plugin contract is in
+> [`core/download_plugins/base.py`](../core/download_plugins/base.py) and the source
+> registry in [`registry.py`](../core/download_plugins/registry.py).
+>
+> Read the code for what it does now; read this for *why* it is shaped that way. Some
+> names below were sketches and differ from what was built — the table of
+> "what moves into the engine" is the accurate part.
+
 ## Goal
 
 Mirror Cin's "metadata engine" architecture for the download dispatcher. Move shared logic OUT of the per-source clients (currently 1600+ LOC of duplicated thread workers, search retry ladders, rate-limiters, state machines) and INTO a central `DownloadEngine`. Clients become dumb: make raw API requests + manage their own auth state. Everything else is the engine.

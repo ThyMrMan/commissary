@@ -1,45 +1,59 @@
-# Documentation Page — Images Needed
+# Documentation Screenshots
 
-Place all images in: `webui/static/docs/`
+The in-app **Help** page (`webui/static/docs.js`) shows a screenshot wherever it
+calls `docsImg('<file>', '<alt text>')`. Every image lives in
+**`webui/static/docs/`** and is referenced by bare filename.
 
-## Required Images
+Missing images are not an error — `docsImg` renders an `onerror` handler that
+hides the element — so the docs page works with none of them. They just make it
+much easier to follow.
 
-### Page Icon (Required)
-- `help.png` — Sidebar nav icon for the Help & Docs page (512x512 PNG, same style as other sidebar icons)
+## Conventions
 
-### Screenshots (Optional but Recommended)
-These are optional — the docs page works without them, but screenshots make it much more professional. Capture at ~1200px wide, PNG format.
+- **Location:** `webui/static/docs/` (flat, no subfolders)
+- **Format:** `.jpg` for screenshots, `.gif` for the short workflow recordings
+- **Width:** roughly 1200px; the page scales them down
+- **Naming:** the file must match the name in the `docsImg(...)` call exactly
 
-| Filename | What to Capture |
-|----------|----------------|
-| `dashboard-overview.png` | Full dashboard page showing tool cards, stats, activity feed |
-| `dashboard-workers.png` | Close-up of enrichment worker tooltips in the header |
-| `sync-spotify.png` | Sync page with Spotify playlists loaded |
-| `sync-youtube.png` | YouTube tab with URL input and parsed playlist |
-| `sync-mirrored.png` | Mirrored playlists tab with cards |
-| `search-enhanced.png` | Enhanced search dropdown showing artists/albums/tracks |
-| `search-basic.png` | Basic search with filters expanded and results |
-| `search-download-modal.png` | Album download modal with track list |
-| `search-download-manager.png` | Download manager sidebar with active downloads |
-| `discover-hero.png` | Discover page hero slider with featured artist |
-| `discover-playlists.png` | Build playlist section or discovery pool playlists |
-| `artists-search.png` | Artists page search with results |
-| `artists-watchlist.png` | Watchlist scan in progress with live activity |
-| `artists-settings.png` | Per-artist or global watchlist settings modal |
-| `automations-list.png` | Automations page with cards showing triggers/actions |
-| `automations-builder.png` | Automation builder with WHEN/DO/THEN filled in |
-| `library-cards.png` | Library page with artist cards and badges |
-| `library-detail.png` | Artist detail page with discography |
-| `library-enhanced.png` | Enhanced library manager with track table |
-| `library-tags.png` | Write Tags preview modal showing diff |
-| `import-matching.png` | Import page with album/track matching |
-| `settings-services.png` | Settings page showing service credentials |
-| `settings-download.png` | Settings page download/quality section |
-| `player-sidebar.png` | Sidebar media player in playing state |
-| `player-modal.png` | Now Playing modal with queue visible |
-| `profiles-picker.png` | Profile picker overlay |
+## Still missing
 
-### Setup Instructions
-1. Create the folder: `webui/static/docs/`
-2. Place `help.png` (required) and any screenshots you want
-3. The docs page will gracefully handle missing screenshots — they just won't show
+22 of the 74 images the docs reference are not present yet. All of them are on
+the video side or are workflow recordings; the music side is fully illustrated.
+
+| File | Docs section | What to capture |
+|------|--------------|-----------------|
+| `video-automations.jpg` | Video: Automations | Video automations |
+| `video-calendar.jpg` | Video: Calendar | Video calendar week grid |
+| `video-collections.jpg` | Video: Tools | Collection Manager |
+| `video-dashboard.jpg` | Video: Dashboard | Video dashboard overview |
+| `video-detail.jpg` | Video: Detail Pages | Video show detail page |
+| `video-discover.jpg` | Video: Discover | Video discover hero billboard |
+| `video-downloads.jpg` | Video: Downloads | Video downloads queue |
+| `video-library.jpg` | Video: Library | Video library poster grid |
+| `video-overlay-studio.jpg` | Video: Tools | Overlay Studio editor |
+| `video-repair.jpg` | Video: Tools | Library Maintenance jobs and findings |
+| `video-requests.jpg` | Video: Requests | Video requests queue |
+| `video-search.jpg` | Video: Search & Studios | Video search results |
+| `video-settings.jpg` | Video: Settings & Side Access | Video settings |
+| `video-side-switch.jpg` | Video: Overview | Switching between the Music and Video sides |
+| `video-watchlist.jpg` | Video: Watchlist | Video watchlist tabs |
+| `video-wishlist.jpg` | Video: Wishlist | Video wishlist |
+| `video-youtube.jpg` | Video: YouTube Channels | YouTube channels tab |
+| `wf-auto-downloads.gif` | Quick Start Workflows | Setting up auto-downloads |
+| `wf-download-album.gif` | Quick Start Workflows | Downloading an album |
+| `wf-import-music.gif` | Quick Start Workflows | Importing music |
+| `wf-media-server.gif` | Quick Start Workflows | Connecting media server |
+| `wf-sync-playlist.gif` | Quick Start Workflows | Syncing a Spotify playlist |
+
+## Adding one
+
+Drop the file into `webui/static/docs/` under the exact name above. Nothing else
+to change — the call site already exists. **Restart the server afterwards:** the
+static cache-buster is generated once per run, so a browser reload alone will not
+pick up a newly added asset.
+
+## Regenerating this list
+
+This section is derived from `docs.js`, so it goes stale as screenshots land.
+To rebuild it, list every `docsImg(...)` filename that is not in
+`webui/static/docs/`.

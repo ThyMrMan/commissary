@@ -1,5 +1,16 @@
 # Media Server Engine Refactor Plan
 
+> **Status: shipped, with a tail left over.** Kept as design rationale.
+> [`core/media_server/engine.py`](../core/media_server/engine.py) has
+> `MediaServerEngine` — `client()`, `active_server()`, `active_client()`,
+> `is_connected()`, `configured_clients()`, `reload_config()` — and it is what
+> `web_server.py` calls.
+>
+> The goal of removing every `if active_server == ...` branch was **not** finished:
+> around two dozen remain in `web_server.py`. They work; they are simply the sites
+> that were never migrated. If you are adding a fifth media server, that is the
+> list to work through, and this document is the argument for doing so.
+
 ## Goal
 
 Same playbook as the download engine refactor, applied to media servers. Replace 33 `if active_server == 'plex' / 'jellyfin' / 'navidrome' / 'soulsync'` dispatch sites in web_server.py with a central `MediaServerEngine` that owns server selection + cross-server query dispatch. Each per-server client stays as-is for its protocol-specific work (Plex API SDK, Jellyfin REST, Navidrome OpenSubsonic, Commissary filesystem walk).

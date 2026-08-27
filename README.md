@@ -22,7 +22,7 @@ Commissary began as a private customization of SoulSync 3.1.5 and has diverged s
 |---|---|
 | **Upstream** | [Nezreka/SoulSync](https://github.com/Nezreka/SoulSync) — the original project, its Discord, and its `ssync.net` site. All of the credit for the foundation, and none of the blame for anything below. |
 | **This fork** | [ThyMrMan/commissary](https://github.com/ThyMrMan/commissary), published as `ghcr.io/thymrman/commissary`. |
-| **Versioning** | Independent. Commissary reset to `1.0.0` at the fork point and is now **2.0.0** — the release that took the name. Upstream's numbering (3.x) is unrelated, and the in-app update check points here, not there. |
+| **Versioning** | Independent. Commissary reset to `1.0.0` at the fork point, took the name at **2.0.0**, and is now **2.1.2**. Upstream's numbering (3.x) is unrelated, and the in-app update check points here, not there. |
 | **Upstream fixes** | Pulled in selectively. Everything through SoulSync **3.1.8** was cherry-picked (released here as 1.6.0), and individually-triaged fixes from **3.2.0** landed in 1.9.19 and 1.9.22. |
 | **Upstream features** | Not automatically adopted. SoulSync 3.2.0 is largely a React rewrite that deletes the vanilla-JS pages this fork has customized most heavily, so it is deliberately not followed. |
 | **Where to report** | Bugs you see in Commissary belong **here**. Upstream cannot reproduce changes made in this fork, and several subsystems now behave differently on purpose. |
@@ -33,7 +33,7 @@ Under the hood the app still identifies itself as `soulsync` in a few places tha
 
 ## What's Different in This Fork
 
-Roughly 130 commits of changes since the fork point. The themes:
+Roughly 145 commits of changes since the fork point. The themes:
 
 ### Shared, multi-user installs
 
@@ -52,6 +52,7 @@ The single biggest divergence. Upstream assumes one operator; Commissary assumes
 - **Music Libraries** — music had exactly one output folder since its Soulseek-era design. It now has a table of labelled destinations, each able to override the naming template and quality profile, resolved per file (explicit choice → the item's own library → the library containing the file → the default → the legacy `transfer_path`). Seeded from your existing folder, so an install that never opens the setting writes files exactly where it always did.
 - **Video Libraries everywhere** — the root-folders registry now drives health checks, the recycle bin, path resolution and the naming-conformance job, not just download destinations. Wishlist, watchlist, download history, enrichment priority and the library tab bar are all per-Library, with per-Library trackers and categories.
 - **Anime stops leaking into TV.** A show you don't own yet had no Library, fell back to the primary, imported there, and the next scan made the mistake permanent. Intent can now be recorded on the watchlist *before* the first grab, and all nine wishlist-creating paths resolve a Library instead of nine of them meaning "primary".
+- **A quality profile for a whole Library, not one title at a time.** Setting the same profile on every show in a Library meant opening every show. A Library now carries a default that anything inside it inherits, with a per-title override that still wins — and the per-title dropdown names the inherited profile rather than saying "Default" and leaving you to guess.
 - **Writability probes** on both music and video destinations — an unwritable folder is marked *NOT WRITABLE* with the reason, instead of every track reporting a successful import while nothing moved.
 
 ### Acquisition you can drive by hand
@@ -60,6 +61,8 @@ The single biggest divergence. Upstream assumes one operator; Commissary assumes
 - **Album release picker** — choose the actual release for a whole album, including Prowlarr-backed torrent/usenet releases, with the pick travelling as an opaque token rather than a download URL.
 - **Manual import that doesn't require a failed download first**, with a folder browser instead of typing absolute paths, season-folder imports, and placement moved to a worker thread so a slow SMB copy stops reporting itself as a failure.
 - **Season packs import.** Grabbing a pack used to download it and then leave it sitting; members are now fanned out and handed to the single-episode importer, inheriting per-episode upgrade decisions.
+- **Explicit and clean versions told apart on the sources that know.** "Prefer explicit versions" only ever read the marker out of a *filename*, so it did nothing on Deezer, Tidal, Qobuz or HiFi — which report the answer directly and were having it discarded. It now compares against the track you asked for, only asks the question when that track is itself explicit, and only re-orders: a clean cut still downloads when it is all there is.
+- **Rar'd releases are recognised before they wedge.** A torrent that turns out to be a set of `.rar` parts used to download and then sit there forever, since nothing on the video side extracts archives. The file list is now read before and after the grab, and a packed release says so instead of stalling silently.
 - **Trackers you deselect are actually not searched** — the per-Library selection was a +25 scoring nudge while Prowlarr was still asked to search everything.
 
 ### Naming and organization
@@ -92,6 +95,14 @@ Audited and found clean: SQL injection, command injection, unsafe deserializatio
 
 Fixes found by reading real 12-hour logs rather than from reproductions: Deezer silently dying on an expired CSRF token and never recovering while still reporting itself healthy; HiFi re-dialling instances it already knew were down (4,094 errors in one log, now cooled down per instance); episodes filed under the wrong show entirely because a name search accepted `results[0]`; a leaked worker slot hanging an entire album; batch healing that counted *completed* tracks as orphans; downloaded songs never reaching the playlist that requested them.
 
+More of the same, from later logs:
+
+- **A batch that could never finish counting its own workers.** Two lists of "still working" statuses disagreed, and the one the watchdog used omitted `pending` — the status every task is *created* with. So a worker it had just started was invisible to it: it freed a slot still in use, started a replacement that was equally invisible, and repeated every few seconds. The miscounts drove the count below zero and the completion test asked for exactly zero. There is one shared definition now, the count cannot go negative, and the completion test no longer depends on it landing exactly.
+- **Say where a video file went, and why a grab was refused.** Both used to be silent; a refused grab now names its reason and an import names its destination.
+- **A duplicate add is not a failure.** Handing a torrent client something it already had was being treated as a refusal; it now adopts the existing torrent.
+- **Two modules that decided whether a batch completes were logging to the console only** — outside the namespace the log file listens on, so 2.7 MB of a real log contained not one line from them while five batches hung. Diagnosing that took a source read where it should have taken a log read.
+- **Download source settings that saved and then reverted.** Rearranging your sources appeared to save and came back the way it was on the next page load. The save was fine; the step that ran after it re-read the stored list and wrote the old arrangement back on top. The sidebar quick-switch had the same cause and was inert for downloads entirely.
+
 ### Distribution
 
 Published to **GitHub Container Registry** as `ghcr.io/thymrman/commissary`, manual-dispatch only — publishing is a release decision, not something every push to `main` does. There is no Docker Hub image and no nightly channel.
@@ -111,7 +122,7 @@ docker-compose up -d
 The compose file pulls `ghcr.io/thymrman/commissary:latest`. To pin a release, change the `image:` line to a version tag:
 
 ```bash
-docker pull ghcr.io/thymrman/commissary:2.0.0
+docker pull ghcr.io/thymrman/commissary:2.1.2
 ```
 
 `:latest` and `:<version>` are the only tags. Images are built for `linux/amd64` and `linux/arm64`.
@@ -255,7 +266,7 @@ CSRF protection is on by default, but three things are configuration rather than
 
 ### Downloads
 
-**7 sources**: Soulseek, Deezer, Tidal, Qobuz, HiFi, Amazon Music, YouTube — configured as one ordered chain with automatic fallback. Every *configured* source is searchable by hand regardless of chain order.
+**11 sources**: Soulseek, Deezer, Tidal, Qobuz, HiFi, Amazon Music, YouTube, SoundCloud, Lidarr, and torrent + usenet via Prowlarr — configured as one ordered chain with automatic fallback. Every *configured* source is searchable by hand regardless of chain order.
 
 - **Deezer** — ARL token auth, FLAC / MP3 320 / MP3 128 with quality fallback and Blowfish decryption
 - **Tidal** — device-flow OAuth, AAC 96kbps through FLAC 24-bit/96kHz Hi-Res
@@ -263,7 +274,10 @@ CSRF protection is on by default, but three things are configuration rather than
 - **HiFi** — free lossless via public instances, no account, with per-instance failure cooldowns
 - **Soulseek** — FLAC priority, quality profiles, peer scoring, source reuse for album consistency
 - **YouTube** — audio extraction with cookie-based bot-detection bypass
-- **Torrent / usenet** — via Prowlarr, with the tracker that served each result named and linked
+- **SoundCloud** — anonymous, no account, good for remixes and independent artists
+- **Amazon Music** — account-based; the one source that cannot take part in explicit/clean preference, since it publishes no such flag
+- **Lidarr** — hands the request to an existing Lidarr install rather than fetching directly
+- **Torrent / usenet** — via Prowlarr, with the tracker that served each result named and linked. Both index whole releases rather than tracks, so they are grouped separately in the picker
 
 **Playlist sources**: Spotify, Tidal, YouTube, Deezer, Qobuz, Beatport charts, ListenBrainz, Spotify/Deezer link paste (no API needed), CSV/TSV/M3U import. Discovery results can be filtered by match quality (Perfect / Low confidence / Wing It / Not found / Error).
 
@@ -373,7 +387,7 @@ A fully isolated video side: its own database, dashboard, search, calendar and d
 | Cache-powered discovery (zero API) | ✓ | ✗ | ✗ | ✗ |
 | Listening stats dashboard | ✓ | ✗ | ✗ | ✗ |
 | Last.fm / ListenBrainz scrobbling | ✓ | ✗ | ✗ | ✗ |
-| 7 download sources | ✓ | ✗ | ✗ | ✗ |
+| 11 download sources | ✓ | ✗ | ✗ | ✗ |
 | Deezer / Tidal / Qobuz downloads | ✓ | ✗ | ✗ | ✗ |
 | Soulseek downloads | ✓ | ✗ | ✗ | ✗ |
 | Beatport integration | ✓ | ✗ | ✗ | ✗ |
@@ -403,6 +417,30 @@ Ruff config lives in `pyproject.toml`; the ruleset is intentionally lenient — 
 ### A release touches four places
 
 `web_server._SOULSYNC_BASE_VERSION` is the one the UI, update check and backup metadata actually read. `database/__init__.__version__`, the `version_tag` default in `docker-publish.yml` and the changelog in `helper.js` must agree with it — `tests/test_version_consistency.py` enforces that, because a stale constant silently hides the release notes for every version after it.
+
+---
+
+## Documentation
+
+In-app: the **Help** page (sidebar) is the full user manual — every page of both sides. The music sections are illustrated; the video ones are not yet (see `webui/static/docs-images-needed.md`).
+
+In this repo:
+
+| Guide | What it covers |
+|---|---|
+| [Support/API.md](Support/API.md) | The `/api/v1/` REST API — auth, every endpoint, field filtering, pagination |
+| [Support/AUTOMATIONS.md](Support/AUTOMATIONS.md) | The automation engine: triggers, actions, signal chains, pipelines |
+| [Support/README-Docker.md](Support/README-Docker.md) | Release channels, compose deployment, volume mounts |
+| [Support/DOCKER.md](Support/DOCKER.md) | Docker install walkthrough: paths, service URLs, persistence, common commands |
+| [Support/DOCKER_PERMISSIONS.md](Support/DOCKER_PERMISSIONS.md) | PUID/PGID and file-ownership problems |
+| [Support/DOCKER-TRANSFER-GUIDE.md](Support/DOCKER-TRANSFER-GUIDE.md) | Moving an install between hosts |
+| [Support/DOCKER-OAUTH-FIX.md](Support/DOCKER-OAUTH-FIX.md) | Spotify OAuth redirect from inside a container |
+| [Support/REVERSE-PROXY.md](Support/REVERSE-PROXY.md) | TLS, `trust_reverse_proxy`, and exposing the app safely |
+| [Support/UNRAID.md](Support/UNRAID.md) | The Unraid template, start to finish |
+| [Support/IMPORT-STAGING-GUIDE.md](Support/IMPORT-STAGING-GUIDE.md) | Importing music you already own |
+| [Support/METADATA-FALLBACK-IMPLEMENTATION.md](Support/METADATA-FALLBACK-IMPLEMENTATION.md) | Deep dive on the metadata fallback chain |
+
+For contributors, `docs/` holds architecture notes and `webui/docs/migration/` tracks the React migration.
 
 ---
 

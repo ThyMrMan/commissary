@@ -5,7 +5,7 @@
 Commissary publishes **one** image, to the GitHub Container Registry:
 
 - **`ghcr.io/thymrman/commissary:latest`** — the current release. The default in `docker-compose.yml`.
-- **`ghcr.io/thymrman/commissary:<version>`** — e.g. `:2.0.0`, a permanent tag for pinning.
+- **`ghcr.io/thymrman/commissary:<version>`** — e.g. `:2.1.2`, a permanent tag for pinning.
 
 There is no nightly or `:dev` track. Publishing is manual: the workflow only runs
 on `workflow_dispatch`, so an image appears when a release is cut, not on every

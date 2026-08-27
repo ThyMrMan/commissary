@@ -8,13 +8,7 @@ Commissary includes a full REST API at `/api/v1/` that lets you control everythi
 
 Go to **Settings** in the Commissary web UI and find the **Commissary API** section. Click **Generate API Key**, give it a label, and copy the key immediately — it's only shown once.
 
-Alternatively, if no keys exist yet, use the bootstrap endpoint:
-
-```bash
-curl -X POST http://localhost:8008/api/v1/api-keys/bootstrap \
-  -H "Content-Type: application/json" \
-  -d '{"label": "My First Key"}'
-```
+This is the way to create your first key. There is a `/api/v1/api-keys/bootstrap` endpoint as well, but it is **not** an anonymous shortcut — see [Bootstrapping the first key](#bootstrapping-the-first-key) for what it requires and why.
 
 ### 2. Make Requests
 
@@ -77,7 +71,7 @@ Paginated responses include:
 
 ## Authentication
 
-All `/api/v1/` endpoints require an API key (except the bootstrap endpoint).
+Every `/api/v1/` endpoint requires an API key. The one exception, `/api/v1/api-keys/bootstrap`, is authenticated by *session* instead — it is not open.
 
 | Method | Details |
 |--------|---------|
@@ -85,6 +79,23 @@ All `/api/v1/` endpoints require an API key (except the bootstrap endpoint).
 | Query  | `?api_key=sk_...` |
 
 Keys are generated as `sk_` followed by a random token. Only the SHA-256 hash is stored — the raw key is shown once at creation.
+
+**CSRF does not apply here.** Commissary validates `Origin`/`Referer` on state-changing routes, but `/api/v1/` authenticates with a header rather than a cookie, so a malicious page cannot make an authenticated call to it. Scripted clients need send no CSRF header and no `Origin`. The single exception is `/api/v1/api-keys-internal/*`, which the Settings page uses over a session and which stays protected.
+
+### Bootstrapping the first key
+
+`POST /api/v1/api-keys/bootstrap` creates the first key when none exist, and it requires **all** of:
+
+1. Login mode on (`security.require_login`) — otherwise `403 LOGIN_REQUIRED`
+2. A signed-in session — otherwise `401 AUTH_REQUIRED`
+3. That session being an admin — otherwise `403 FORBIDDEN`
+4. No keys existing yet — otherwise `403 FORBIDDEN`
+
+It used to require none of that, which made it a login bypass: `/api/v1/` is deliberately exempt from the login gate because it carries its own keys, so a route here that minted one *without* a key handed any anonymous caller a credential — and `PATCH /api/v1/settings` could then turn `security.require_login` back off. Two sound decisions with a hole between them.
+
+Requiring login mode is the actual gate rather than belt-and-braces: with login off, every request resolves to profile 1 and therefore counts as admin, so an admin check alone would still have authorised anonymous callers.
+
+In practice you will not need this endpoint. Use **Settings → Commissary API → Generate API Key**, which goes through `/api/v1/api-keys-internal/generate` and works whether or not login mode is on.
 
 ### Error Codes
 
@@ -2164,13 +2175,20 @@ Revoke an API key by its UUID.
 
 #### `POST /api/v1/api-keys/bootstrap`
 
-Generate the first API key when none exist. **No authentication required.** Returns `403` if keys already exist.
+Generate the first API key when none exist. **Requires login mode, a signed-in admin session, and an empty key list** — see [Bootstrapping the first key](#bootstrapping-the-first-key). Prefer Settings → Commissary API → Generate API Key.
 
 ```json
 {
   "label": "My First Key"
 }
 ```
+
+| Status | Code | Meaning |
+|--------|------|---------|
+| 201 | — | Key created; the raw `key` is in the response and is never shown again |
+| 401 | `AUTH_REQUIRED` | Not signed in |
+| 403 | `LOGIN_REQUIRED` | Login mode is off |
+| 403 | `FORBIDDEN` | Not an admin, or keys already exist |
 
 ---
 
@@ -2433,4 +2451,4 @@ curl -H "Authorization: Bearer sk_..." \
 | GET | `/api-keys` | List API keys |
 | POST | `/api-keys` | Generate new key |
 | DELETE | `/api-keys/<id>` | Revoke key |
-| POST | `/api-keys/bootstrap` | Bootstrap first key (no auth) |
+| POST | `/api-keys/bootstrap` | Bootstrap first key (admin session + login mode) |

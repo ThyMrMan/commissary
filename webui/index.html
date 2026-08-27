@@ -9805,9 +9805,17 @@
                                     <span class="info-icon" role="button" tabindex="0" title="What's this?" onclick="toggleSettingHelp(this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSettingHelp(this);}">i</span>
                                 </div>
                                 <div class="help-text setting-help-body" style="margin-left: 26px;" hidden>
-                                    When picking between Soulseek results, files marked Explicit/Uncensored
-                                    rank higher and Clean/Censored/Radio-Edit files rank lower. Nothing is
-                                    ever skipped &mdash; if only a clean version exists, it still downloads.
+                                    When a track you asked for is itself explicit, candidates that disagree
+                                    rank lower and matching ones rank higher. Deezer, Tidal, Qobuz and HiFi
+                                    report this directly; Soulseek, torrent, usenet and YouTube fall back to
+                                    reading Clean/Censored/Radio-Edit out of the filename or release name.
+                                    Amazon cannot take part &mdash; it publishes no such flag and strips the
+                                    marker from titles.
+                                    <br><br>
+                                    Nothing is ever skipped: this only re-orders candidates, so if only a
+                                    clean version exists it still downloads. A track that simply has no
+                                    explicit content is not penalised &mdash; the question asked is "does this
+                                    disagree with what I asked for?", never "is this explicit?".
                                     Requires explicit content to be allowed.
                                 </div>
 

@@ -1,5 +1,10 @@
 # Typed Metadata Migration Plan
 
+> **Status: shipped.** Kept as design rationale, not as work outstanding.
+> The dataclasses live in [`core/metadata/types.py`](../core/metadata/types.py)
+> (`Album`, `Track`, `Artist`), and the provider registry that produces them is in
+> [`core/metadata/registry.py`](../core/metadata/registry.py).
+
 ## Why
 
 Right now the metadata pipeline has no real contract about the shape
