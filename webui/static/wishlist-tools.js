@@ -1453,14 +1453,17 @@ async function openAlbumReleasePickerForModal(playlistId) {
         showToast('The release picker is unavailable on this page', 'error');
         return;
     }
-    await window.openAlbumSourcePicker(albumName, artistName, (pin) => {
-        window.setPendingAlbumPin(playlistId, pin);
+    await window.openAlbumSourcePicker(albumName, artistName, (pin, opts) => {
+        // `opts.replace` is the answer to the picker's "you already own this"
+        // prompt; it has to reach the pin store or the confirmation grabs nothing.
+        window.setPendingAlbumPin(playlistId, pin, opts);
         // Choosing a release IS the instruction to download it — leaving the user
         // to press Begin Analysis afterwards would make the pick look like it did
         // nothing. "Let Commissary choose" lands here with a null pin and starts
         // the ordinary run, which is exactly what Begin Analysis would have done.
+        const _replacing = !!(opts && opts.replace);
         showToast(pin
-            ? `Downloading that release of “${albumName}”`
+            ? `${_replacing ? 'Replacing' : 'Downloading'} that release of “${albumName}”`
             : `Choosing a release automatically for “${albumName}”`, 'info');
         startMissingTracksProcess(playlistId);
     });

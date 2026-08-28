@@ -52,7 +52,7 @@ logger = setup_logging(_log_level, _log_path)
 # the published image moved (ghcr.io/thymrman/commissary) even though nothing
 # about the data changed — see tests/test_branding.py for what deliberately
 # kept its old `soulsync` name.
-_SOULSYNC_BASE_VERSION = "2.2.1"
+_SOULSYNC_BASE_VERSION = "2.2.2"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -9168,6 +9168,51 @@ def _serialize_album_candidate(album, source: str):
     return entry
 
 
+def _album_ownership_summary(artist: str, album: str) -> dict:
+    """What the library already holds for this album, for the picker's warning.
+
+    The picker asks "which release do you want?", and that is a materially
+    different question once you already own the album — the release can then
+    only REPLACE what is on disk, and the ownership analysis will otherwise end
+    the batch before the pinned release is ever grabbed. Answering it here costs
+    one DB read on a request already fanning out eight network searches, and it
+    puts the warning on screen before the first result lands.
+
+    Deliberately the SAME 0.7 threshold the batch analysis uses
+    (``core/downloads/master.py``) so the picker's warning and the behaviour it
+    is warning about cannot disagree. It is still only advisory: the batch
+    matches per-track titles as well, so the counts can differ by an edition.
+
+    Never raises — a failed lookup degrades to "owns nothing", i.e. today's
+    silent behaviour, rather than blocking the picker.
+    """
+    empty = {"owned": 0, "expected": 0, "complete": False, "formats": []}
+    if not (album or "").strip():
+        return empty
+    try:
+        db = get_database()
+        found, confidence, owned, expected, complete, formats = (
+            db.check_album_exists_with_completeness(
+                album, artist,
+                confidence_threshold=0.7,
+                server_source=config_manager.get_active_media_server(),
+            )
+        )
+        if not found or confidence < 0.7:
+            return empty
+        return {
+            "owned": int(owned or 0),
+            "expected": int(expected or 0),
+            "complete": bool(complete),
+            "formats": [str(f).upper() for f in (formats or []) if f][:4],
+            "album_title": str(getattr(found, "title", "") or ""),
+            "confidence": round(float(confidence or 0.0), 3),
+        }
+    except Exception as exc:   # noqa: BLE001 - advisory only, never fatal
+        logger.debug("[Album Sources] ownership lookup failed for %r: %s", album, exc)
+        return empty
+
+
 @app.route('/api/downloads/album/sources', methods=['POST'])
 def album_source_candidates():
     """Search every configured source for a whole ALBUM and stream what each
@@ -9199,6 +9244,19 @@ def album_source_candidates():
             return jsonify({"error": "An album name is required."}), 400
 
         query = f"{artist} {album}".strip()
+        # Before the sources, because the answer changes what picking one MEANS.
+        #
+        # Read from owned_* when the client sends them. The picker lets the user
+        # retype the search terms to find a release an indexer files under some
+        # other name, but the ownership question is about the album the DOWNLOAD
+        # is for, which does not change when the query does. Binding the warning
+        # to the query instead would let an edited search silently suppress the
+        # replace prompt. Absent (any other caller) they fall back to the query
+        # terms, which is what this did before.
+        ownership = _album_ownership_summary(
+            str(data.get('owned_artist') or artist),
+            str(data.get('owned_album') or album),
+        )
         download_mode, available_sources = _list_available_download_sources()
         source = str(data.get('source') or 'all').strip().lower()
         valid_ids = {s['id'] for s in available_sources}
@@ -9234,6 +9292,7 @@ def album_source_candidates():
                 "download_mode": download_mode,
                 "available_sources": available_sources,
                 "sources_queried": sources_to_query,
+                "ownership": ownership,
             }) + "\n"
 
             if not sources_to_query:

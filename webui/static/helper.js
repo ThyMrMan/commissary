@@ -3491,6 +3491,13 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.2.2': [
+        { date: 'August 2026 · 2.2.2' },
+        { title: "Choosing a release for an album you already own downloaded nothing", desc: "you could open <strong>Choose Release</strong>, search every source, pick the exact torrent you wanted and press go — and the batch would finish having grabbed <strong>nothing at all</strong>. The ownership check runs first, and when every track is already in your library it ends the run <em>before</em> your choice is ever read. The log said only “no missing tracks”, and never once mentioned the release you had picked." },
+        { title: "…so the picker now asks whether to replace what you have", desc: "picking a release for an album already on disk is a different act from picking one for an album you don't have: the only thing it <em>can</em> do is overwrite. The picker now tells you how many tracks you already own and in which format, and when you pick a release it asks whether to take just the missing tracks or <strong>replace</strong> the ones you have. Replacing deletes the current files and imports the ones from that release, so it is never the default — and if a pick still ends up with nothing to do, the log now names the release and says why instead of going quiet." },
+        { title: "A release you picked could be lost before it was ever used", desc: "the choice was spent the moment the request was <em>assembled</em> rather than when the server accepted it. A rate limit, a blocklisted album or a dropped connection therefore ate it silently, and the obvious retry then ran with <strong>no release pinned at all</strong> — while looking exactly like it had worked. It is now released only once the batch actually exists." },
+        { title: "You can change what the release picker searches for", desc: "indexers file the same record under names no metadata provider ever uses. The artist and album are still filled in for you, but both boxes are now editable and re-searchable — and emptying the artist lets you paste a whole release name like <em>Artist-Album-2012-FLAC</em> straight in. This changes only what is <em>searched for</em>: whichever release you pick is still imported as the album you opened the picker from, and the “you already own this” warning stays bound to that album rather than to whatever you typed." },
+    ],
     '2.2.1': [
         { date: 'August 2026 · 2.2.1' },
         { title: "Downloads that died seconds after they started", desc: "on any server not running in UTC, a download could be declared “stalled” almost immediately — in one case <strong>four seconds after its last progress reading, at 100%</strong>, fully downloaded and still being tidied up. The clock that decides whether something has stopped moving was written in your server's local time and read back as if it were UTC, so every download looked hours older than it was. Four hours older, on a US East Coast server." },
@@ -3964,6 +3971,24 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.2.2: a release you chose that was never downloaded",
+        description: "Picking an exact release for an album you already own grabbed nothing and said nothing. The picker now warns up front, asks whether to replace, survives a failed request, and lets you edit what it searches for.",
+        features: [
+            "the pinned release is read at the download-phase transition, which the 'nothing is missing' branch returns long before reaching",
+            "so a picked torrent was dropped in silence - the log said 'no missing tracks' and never named the release the user chose",
+            "the picker now reports what you already own, at the SAME 0.7 confidence the batch analysis uses, so warning and behaviour cannot disagree",
+            "picking on an owned album now asks: take only the missing tracks, or replace the ones you have",
+            "'replace' rides force_download_all, which is what makes the server set force_replace and actually overwrite",
+            "without that the import protection discards the download as a duplicate - a grab that runs and changes nothing",
+            "a pin that still cannot be honoured logs at WARNING naming the release and source, and is recorded on the batch",
+            "the pick is spent when the server accepts the batch, not when the request is built, so a 429 or a blocklist 409 no longer eats it",
+            "the picker's artist and album are editable and re-searchable; empty the artist to paste a whole release name",
+            "the ownership warning stays bound to the album being downloaded rather than the edited query - otherwise retyping the search would silently suppress the prompt",
+            "staging the release from the all-owned branch would have been WORSE: the per-track workers that import staged files are exactly the ones that do not run when nothing is missing",
+        ],
+        usage_note: "Nothing to migrate. To replace an album you already have in a bad rip: open Choose Release, pick the release you want, and answer Replace when asked. That is now the supported path and it overwrites, where before it either did nothing or kept the files you already had.",
+    },
     {
         title: "2.2.1: the clock that killed downloads, and retries that asked the wrong network",
         description: "A timestamp written in local time and read as UTC made every download look hours older than it was - killing them early and releasing torrents before their seeding goal. Plus torrent retries that searched Soulseek.",

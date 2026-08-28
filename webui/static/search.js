@@ -806,8 +806,12 @@ function initializeSearchModeToggle() {
         const label = btn ? btn.innerHTML : null;
         if (btn) { btn.disabled = true; btn.innerHTML = '…'; }
         try {
-            await openAlbumSourcePicker(album.name, album.artist, (pin) => {
-                setPendingAlbumPin(virtualPlaylistId, pin);
+            await openAlbumSourcePicker(album.name, album.artist, (pin, opts) => {
+                // `opts` carries the answer to the picker's own "you already own
+                // this — replace it?" prompt. Dropping it here would send the
+                // user's yes into the void and grab nothing, which is the exact
+                // failure the prompt exists to end.
+                setPendingAlbumPin(virtualPlaylistId, pin, opts);
                 handleEnhancedSearchAlbumClick(album);
             });
         } catch (err) {

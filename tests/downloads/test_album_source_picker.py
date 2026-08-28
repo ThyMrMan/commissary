@@ -235,10 +235,15 @@ def test_the_picker_exists_and_is_global():
 
 def test_the_pin_is_consumed_once():
     """Left in place it would silently re-pin a stale release the next time the
-    same album is downloaded."""
-    block = _DOWNLOADS_JS.split("if (_pendingAlbumPins[playlistId]) {", 1)[1][:400]
-    assert "requestBody.pinned_release" in block
-    assert "delete _pendingAlbumPins[playlistId]" in block
+    same album is downloaded.
+
+    Consumed once, but on ACCEPTANCE rather than on send — spending it while the
+    request was still being built meant a 429 or a dropped connection ate the
+    choice. WHEN it is spent is pinned in test_album_pick_on_owned_album.py;
+    this only holds that it reaches the request and is released exactly once."""
+    block = _DOWNLOADS_JS.split("const _pendingPick = _pendingAlbumPins[playlistId];", 1)[1][:900]
+    assert "requestBody.pinned_release = _pendingPick.pin;" in block
+    assert _DOWNLOADS_JS.count("delete _pendingAlbumPins[_pendingPinKey];") == 1
 
 
 def test_choosing_automatically_is_still_offered():
@@ -247,7 +252,9 @@ def test_choosing_automatically_is_still_offered():
     body = _DOWNLOADS_JS.split("async function openAlbumSourcePicker(", 1)[1]
     body = body[:body.index("\nwindow.openAlbumSourcePicker")]
     assert "album-sources-auto" in body
-    assert "onPicked(null)" in body
+    # The second argument is the answer to the "you already own this" prompt;
+    # null is still "choose automatically".
+    assert "onPicked(null, {replace: replace})" in body
 
 
 def test_an_unpinnable_source_does_not_pretend_to_pin_a_release():
@@ -321,7 +328,7 @@ def test_the_pick_rides_the_existing_download_path():
     """No second download route: stash the pin against the playlist id and run
     the ordinary flow, exactly as the search page already does."""
     body = _WISHLIST_JS.split("async function openAlbumReleasePickerForModal(", 1)[1]
-    assert "window.setPendingAlbumPin(playlistId, pin)" in body
+    assert "window.setPendingAlbumPin(playlistId, pin, opts)" in body
     assert "startMissingTracksProcess(playlistId)" in body
 
 

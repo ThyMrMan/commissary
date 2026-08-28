@@ -446,6 +446,11 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
         batch_album_context = None
         batch_artist_context = None
         batch_is_album = False
+        # Read up here, not at the download-phase transition where the
+        # dispatch consumes it: the 'nothing missing' branch returns long
+        # before that point, and it has to be able to say that a release
+        # the user personally chose is being dropped on the floor.
+        batch_pinned_release = None
         batch_profile_id = 1
         batch_source = 'spotify'
         batch_playlist_folder_mode = False
@@ -465,6 +470,7 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                 ignore_manual_matches = download_batches[batch_id].get('ignore_manual_matches', False)
                 batch_is_album = download_batches[batch_id].get('is_album_download', False)
                 batch_album_context = download_batches[batch_id].get('album_context')
+                batch_pinned_release = download_batches[batch_id].get('pinned_release')
                 batch_artist_context = download_batches[batch_id].get('artist_context')
                 batch_profile_id = download_batches[batch_id].get('profile_id', 1) or 1
                 batch_source = download_batches[batch_id].get('batch_source', 'spotify') or 'spotify'
@@ -793,6 +799,29 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
         if not missing_tracks:
             logger.warning(f"Analysis for batch {batch_id} complete. No missing tracks.")
 
+            # A user-picked release dies here, and used to die in silence.
+            # The pin is only read at the download-phase transition below,
+            # which this return never reaches — so someone who opened the
+            # album source picker, chose a specific torrent and pressed go
+            # saw a batch complete having grabbed nothing, with nothing in
+            # the log naming their choice. Staging the release here instead
+            # would be worse: the per-track workers that import staged files
+            # are the ones that never run when nothing is missing, so it
+            # would download a whole release and then abandon it. The honest
+            # outcome is to say why, and to point at the answer — replacing
+            # what is already on disk is what the picker asks about, and
+            # what the Force Download All toggle does.
+            if batch_pinned_release:
+                _pin_desc = (batch_pinned_release.get("title") or "").strip() or "(untitled)"
+                logger.warning(
+                    "[Album Bundle] Batch %s carried a user-picked %s release (%s) that "
+                    "was NOT grabbed: every track is already in the library, so the batch "
+                    "ended before the release could be claimed. Choose 'Replace' in the "
+                    "release picker (or tick Force Download All) to download over the "
+                    "existing files.",
+                    batch_id, batch_pinned_release.get("source") or "?", _pin_desc,
+                )
+
             # Record sync history — all tracks found, nothing to download
             tracks_found = sum(1 for r in analysis_results if r.get('found'))
             try:
@@ -836,6 +865,13 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                     is_auto_batch = download_batches[batch_id].get('auto_initiated', False)
                     download_batches[batch_id]['phase'] = 'complete'
                     download_batches[batch_id]['completion_time'] = time.time()  # Track for auto-cleanup
+                    if batch_pinned_release:
+                        download_batches[batch_id]['pinned_release_skipped'] = True
+                        download_batches[batch_id]['pinned_release_skipped_reason'] = (
+                            'Every track is already in your library, so the release you picked '
+                            'was not downloaded. Pick it again and choose Replace to download '
+                            'over the files you have.'
+                        )
 
                     # Update YouTube playlist phase to 'download_complete' if this is a YouTube playlist
                     if playlist_id.startswith('youtube_'):

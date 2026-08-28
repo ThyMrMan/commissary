@@ -2785,6 +2785,9 @@ async function startMissingTracksProcess(playlistId) {
         if (selectAllCb) selectAllCb.disabled = true;
 
         // Prepare request body - add album/artist context for artist album downloads
+        // Set when this request carried a picker choice, so it can be released
+        // once — and only once — the server confirms the batch exists.
+        let _pendingPinKey = null;
         const wingItState = youtubePlaylistStates[playlistId] || {};
         const isWingIt = wingItState.wing_it || false;
         const requestBody = {
@@ -2806,12 +2809,27 @@ async function startMissingTracksProcess(playlistId) {
             requestBody.album_context = process.album;   // Full Spotify album object
             requestBody.artist_context = process.artist; // Full Spotify artist object
             // A release the user chose in the album source picker, if any.
-            // Consumed once — leaving it set would silently re-pin a stale
-            // release on the next download of the same album.
-            if (_pendingAlbumPins[playlistId]) {
-                requestBody.pinned_release = _pendingAlbumPins[playlistId];
-                delete _pendingAlbumPins[playlistId];
-                console.log(`📌 [Album] Pinned release from ${requestBody.pinned_release.source}`);
+            // NOT dropped here — only once the server has accepted the batch
+            // (below). Spending it at build time meant a 429, a blocklist 409 or
+            // a dead connection silently ate the choice, and the natural retry
+            // then ran with no pin at all while looking like it had worked.
+            const _pendingPick = _pendingAlbumPins[playlistId];
+            if (_pendingPick) {
+                _pendingPinKey = playlistId;
+                if (_pendingPick.pin) {
+                    requestBody.pinned_release = _pendingPick.pin;
+                    console.log(`📌 [Album] Pinned release from ${_pendingPick.pin.source}`);
+                }
+                if (_pendingPick.replace) {
+                    // The picker asked and the user chose "replace what I have".
+                    // That is the same intent as the modal's Force toggle, so it
+                    // rides the same two flags — which is what makes the server
+                    // set force_replace and actually overwrite, instead of the
+                    // import protection discarding the download as a duplicate.
+                    requestBody.force_download_all = true;
+                    requestBody.ignore_manual_matches = true;
+                    console.log('📌 [Album] Picker confirmed replace — forcing re-download over the existing files');
+                }
             }
             console.log(`🎵 [${_isAlbumContext ? 'Album' : 'Single Track'}] Sending context: ${process.album?.name} by ${process.artist?.name}`);
         } else {
@@ -2854,6 +2872,13 @@ async function startMissingTracksProcess(playlistId) {
         }
 
         process.batchId = data.batch_id;
+
+        // The batch exists, so the pick is now spent. Left in place it would
+        // silently re-pin a stale release the next time this album downloads.
+        if (_pendingPinKey) {
+            delete _pendingAlbumPins[_pendingPinKey];
+            _pendingPinKey = null;
+        }
 
         // Update Beatport backend state with download_process_id now that we have the batchId
         if (playlistId.startsWith('beatport_')) {
@@ -3356,14 +3381,93 @@ async function openManualSearchFor(track, btnEl) {
 }
 window.openManualSearchFor = openManualSearchFor;
 
+// ── "you already have this album" ───────────────────────────────────────────
+// Picking a release for an album you already own is a DIFFERENT act from
+// picking one you don't. The batch's ownership analysis ends the run before the
+// pinned release is ever grabbed, so without an explicit replace-intent the
+// pick quietly does nothing — the failure the user sees is "I chose a torrent
+// and no download started". Say it before the pick, and ask at the pick.
+//
+// The answer rides the pin (see setPendingAlbumPin) rather than the modal's
+// Force toggle: the toggle lives in a modal that opens AFTER this one closes,
+// so steering it from here would be a race, and silently ticking a box the user
+// never saw is the wrong way to obtain consent for overwriting their files.
+function _ownedAlbumSummary(o) {
+    if (!o || !o.owned) return '';
+    const fmt = (o.formats && o.formats.length)
+        ? ` as ${o.formats.map(f => escapeHtml(String(f))).join(' + ')}` : '';
+    if (o.expected && o.owned < o.expected) {
+        return `You already have <strong>${o.owned} of ${o.expected}</strong> tracks from this album${fmt}.`;
+    }
+    return `You already have <strong>all ${o.owned} track${o.owned !== 1 ? 's' : ''}</strong> of this album${fmt}.`;
+}
+
+// Resolves to 'replace', 'fill', or null for cancelled. Never throws — a
+// cancelled prompt leaves the picker open so another release can be chosen.
+function _confirmOwnedAlbumPick(ownership, releaseTitle) {
+    return new Promise(resolve => {
+        const complete = !ownership.expected || ownership.owned >= ownership.expected;
+        const missing = complete ? 0 : (ownership.expected - ownership.owned);
+        const overlay = document.createElement('div');
+        overlay.className = 'candidates-modal-overlay album-owned-overlay';
+        overlay.innerHTML = `
+            <div class="candidates-modal album-owned-modal">
+                <div class="candidates-modal-header">
+                    <h2 class="candidates-modal-title">You already have this album</h2>
+                </div>
+                <div class="candidates-modal-body">
+                    <div class="album-owned-summary">${_ownedAlbumSummary(ownership)}</div>
+                    <div class="album-owned-release">Chosen release: ${escapeHtml(releaseTitle || '(untitled)')}</div>
+                    <div class="album-owned-note">
+                        ${complete
+                            ? `Nothing is missing, so this release can only <strong>replace</strong> what you have.
+                               Replacing deletes the current files and imports the ones from this release.`
+                            : `You can take just the ${missing} missing track${missing !== 1 ? 's' : ''} from this
+                               release, or <strong>replace</strong> all ${ownership.owned} you already have.
+                               Replacing deletes the current files and imports the ones from this release.`}
+                    </div>
+                    <div class="album-owned-actions">
+                        ${complete ? '' : `<button class="candidates-manual-search-btn" id="album-owned-fill">
+                            Get the ${missing} missing track${missing !== 1 ? 's' : ''}
+                        </button>`}
+                        <button class="candidates-manual-search-btn album-owned-replace" id="album-owned-replace">
+                            Replace all ${ownership.owned} with this release
+                        </button>
+                        <button class="candidates-manual-search-btn album-owned-cancel" id="album-owned-cancel">
+                            Cancel
+                        </button>
+                    </div>
+                </div>
+            </div>`;
+        document.body.appendChild(overlay);
+        const reveal = () => overlay.classList.add('visible');
+        requestAnimationFrame(reveal);
+        setTimeout(reveal, 50);
+
+        let settled = false;
+        const finish = (answer) => {
+            if (settled) return;
+            settled = true;
+            overlay.remove();
+            resolve(answer);
+        };
+        overlay.onclick = (e) => { if (e.target === overlay) finish(null); };
+        overlay.querySelector('#album-owned-cancel').addEventListener('click', () => finish(null));
+        overlay.querySelector('#album-owned-replace').addEventListener('click', () => finish('replace'));
+        const fillBtn = overlay.querySelector('#album-owned-fill');
+        if (fillBtn) fillBtn.addEventListener('click', () => finish('fill'));
+    });
+}
+
 // ── Album source picker ─────────────────────────────────────────────────────
 // The track picker can't serve albums: picking a track-level candidate for an
 // album would import ONE file named after the album. So albums get their own
 // picker over the AlbumResult lists the plugins already return, and the choice
 // is carried as `pinned_release` into the batch the normal album flow starts.
 //
-// `onPicked(pin)` receives the pin (or null for "choose automatically") and is
-// what actually kicks off the download — this function only chooses.
+// `onPicked(pin, opts)` receives the pin (or null for "choose automatically")
+// plus `{replace}` — the answer to the owned-album prompt below — and is what
+// actually kicks off the download. This function only chooses.
 async function openAlbumSourcePicker(album, artist, onPicked) {
     const existing = document.getElementById('album-sources-overlay');
     if (existing) existing.remove();
@@ -3387,6 +3491,24 @@ async function openAlbumSourcePicker(album, artist, onPicked) {
                     <strong>that exact release</strong> instead of letting Commissary guess, then the
                     normal per-track matching imports the tracks you're missing from it.
                 </div>
+                <div class="album-sources-query">
+                    <label class="album-sources-query-field">
+                        <span>Artist</span>
+                        <input type="text" id="album-sources-artist" autocomplete="off" spellcheck="false">
+                    </label>
+                    <label class="album-sources-query-field album-sources-query-album">
+                        <span>Album or release name</span>
+                        <input type="text" id="album-sources-album" autocomplete="off" spellcheck="false">
+                    </label>
+                    <button class="candidates-manual-search-btn" id="album-sources-go">Search</button>
+                </div>
+                <div class="album-sources-query-hint">
+                    Both boxes are joined into one query, so you can empty the artist and put a
+                    whole release name in the second box. This only changes what is
+                    <em>searched for</em> — whichever release you pick is still imported as
+                    the album you opened this from.
+                </div>
+                <div class="album-sources-owned" id="album-sources-owned" style="display: none;"></div>
                 <div class="candidates-manual-search-status" id="album-sources-status">Searching…</div>
                 <div id="album-sources-groups"></div>
                 <div class="album-sources-footer">
@@ -3404,16 +3526,39 @@ async function openAlbumSourcePicker(album, artist, onPicked) {
     setTimeout(reveal, 50);
 
     const close = () => overlay.remove();
-    overlay.querySelector('#album-sources-close').addEventListener('click', close);
-    overlay.querySelector('#album-sources-auto').addEventListener('click', () => {
-        close();
-        onPicked(null);
-    });
-
     const groupsHost = overlay.querySelector('#album-sources-groups');
     const statusEl = overlay.querySelector('#album-sources-status');
+    const ownedEl = overlay.querySelector('#album-sources-owned');
     const sourceMeta = {};
+    // What the library already holds, from the header event. Null until it
+    // arrives, and null forever if the lookup failed — in which case picking
+    // behaves exactly as it did before, rather than being blocked on a warning
+    // we could not compute. Declared here, above the handlers that close over
+    // it, so the reading order matches the dependency order.
+    let ownership = null;
     let found = 0;
+
+    const albumInput = overlay.querySelector('#album-sources-album');
+    const artistInput = overlay.querySelector('#album-sources-artist');
+    const goBtn = overlay.querySelector('#album-sources-go');
+    // Property, not attribute — see the note on the markup above.
+    albumInput.value = album || '';
+    artistInput.value = artist || '';
+
+    overlay.querySelector('#album-sources-close').addEventListener('click', close);
+    overlay.querySelector('#album-sources-auto').addEventListener('click', async () => {
+        // Choosing automatically on an album you own hits the SAME dead end as a
+        // pinned pick would — analysis finds nothing missing and the batch ends.
+        // So it asks the same question; there is just no release to pin with it.
+        let replace = false;
+        if (ownership && ownership.owned > 0) {
+            const answer = await _confirmOwnedAlbumPick(ownership, 'whichever release Commissary picks');
+            if (!answer) return;
+            replace = (answer === 'replace');
+        }
+        close();
+        onPicked(null, {replace: replace});
+    });
 
     const groupFor = (sourceId, label) => {
         const domId = 'album-src-' + String(sourceId).replace(/[^a-zA-Z0-9_-]/g, '');
@@ -3459,15 +3604,22 @@ async function openAlbumSourcePicker(album, artist, onPicked) {
                     <div class="album-source-row-meta">${bits.join(' • ')}</div>
                 </div>
                 <button class="album-source-pick-btn">${c.pinnable ? 'Use this' : 'Use this source'}</button>`;
-            row.querySelector('.album-source-pick-btn').addEventListener('click', () => {
-                close();
+            row.querySelector('.album-source-pick-btn').addEventListener('click', async () => {
                 // An unpinnable source has no download_album_to_staging, so the
                 // most we can honestly promise is "get it from here" — say so
                 // rather than implying we pinned a release we can't pin.
-                onPicked(c.pinnable
+                const pin = c.pinnable
                     ? {source: c.source, token: c.token, title: c.title,
                        username: c.username, folder_path: c.folder_path}
-                    : null);
+                    : null;
+                let replace = false;
+                if (ownership && ownership.owned > 0) {
+                    const answer = await _confirmOwnedAlbumPick(ownership, c.title);
+                    if (!answer) return;      // cancelled — keep the picker open
+                    replace = (answer === 'replace');
+                }
+                close();
+                onPicked(pin, {replace: replace});
             });
             list.appendChild(row);
         });
@@ -3477,54 +3629,100 @@ async function openAlbumSourcePicker(album, artist, onPicked) {
         statusEl.textContent = `${found} release${found !== 1 ? 's' : ''} so far…`;
     };
 
-    try {
-        const resp = await fetch('/api/downloads/album/sources', {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({album: album, artist: artist}),
-        });
-        if (!resp.ok) {
-            let msg = 'Search failed';
-            try { const p = await resp.json(); if (p && p.error) msg = p.error; } catch (_) {}
-            statusEl.textContent = msg;
+    // One search, re-runnable. `searchGen` exists because the streams are long
+    // and a second Search can be pressed while the first is still arriving: the
+    // stale reader would otherwise keep appending rows into a list the new
+    // search had already cleared, so results from two different queries would
+    // interleave with nothing saying so.
+    let searchGen = 0;
+
+    async function runSearch() {
+        const myGen = ++searchGen;
+        const qAlbum = (albumInput.value || '').trim();
+        const qArtist = (artistInput.value || '').trim();
+        if (qAlbum.length < 2) {
+            statusEl.textContent = 'Enter an album or release name to search for.';
+            albumInput.focus();
             return;
         }
-        const reader = resp.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        while (true) {
-            const {value, done} = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, {stream: true});
-            let end;
-            while ((end = buffer.indexOf('\n')) >= 0) {
-                const line = buffer.slice(0, end).trim();
-                buffer = buffer.slice(end + 1);
-                if (!line) continue;
-                let msg;
-                try { msg = JSON.parse(line); } catch (_) { continue; }
-                if (msg.type === 'header') {
-                    (msg.available_sources || []).forEach(s => { sourceMeta[s.id] = s; });
-                } else if (msg.type === 'source_results') {
-                    if (msg.candidates && msg.candidates.length) {
-                        addRows(msg.source, msg.candidates);
-                    } else {
+        found = 0;
+        groupsHost.innerHTML = '';
+        statusEl.textContent = 'Searching…';
+        goBtn.disabled = true;
+        try {
+            const resp = await fetch('/api/downloads/album/sources', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    album: qAlbum, artist: qArtist,
+                    // The ownership warning must stay bound to the album this
+                    // download is FOR, not to whatever was typed to find a
+                    // release for it. Without this, editing the search text
+                    // would quietly suppress the replace prompt and bring back
+                    // the silent no-op it exists to prevent.
+                    owned_album: album, owned_artist: artist,
+                }),
+            });
+            if (myGen !== searchGen) return;
+            if (!resp.ok) {
+                let msg = 'Search failed';
+                try { const p = await resp.json(); if (p && p.error) msg = p.error; } catch (_) {}
+                statusEl.textContent = msg;
+                return;
+            }
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            while (true) {
+                const {value, done} = await reader.read();
+                if (done) break;
+                if (myGen !== searchGen) { try { await reader.cancel(); } catch (_) {} return; }
+                buffer += decoder.decode(value, {stream: true});
+                let end;
+                while ((end = buffer.indexOf('\n')) >= 0) {
+                    const line = buffer.slice(0, end).trim();
+                    buffer = buffer.slice(end + 1);
+                    if (!line) continue;
+                    let msg;
+                    try { msg = JSON.parse(line); } catch (_) { continue; }
+                    if (msg.type === 'header') {
+                        (msg.available_sources || []).forEach(s => { sourceMeta[s.id] = s; });
+                        ownership = msg.ownership || null;
+                        if (ownership && ownership.owned > 0 && ownedEl) {
+                            ownedEl.innerHTML = _ownedAlbumSummary(ownership)
+                                + ' Picking a release here will ask whether to replace them.';
+                            ownedEl.style.display = '';
+                        }
+                    } else if (msg.type === 'source_results') {
+                        if (msg.candidates && msg.candidates.length) {
+                            addRows(msg.source, msg.candidates);
+                        } else {
+                            setCount(groupFor(msg.source, (sourceMeta[msg.source] || {}).label),
+                                     'no releases', false);
+                        }
+                    } else if (msg.type === 'source_error') {
                         setCount(groupFor(msg.source, (sourceMeta[msg.source] || {}).label),
-                                 'no releases', false);
+                                 'failed', true);
+                    } else if (msg.type === 'done') {
+                        statusEl.textContent = found === 0
+                            ? 'No source has this album as a single release — try a different name above, or "Let Commissary choose" to download it track by track.'
+                            : `${found} release${found !== 1 ? 's' : ''}`;
                     }
-                } else if (msg.type === 'source_error') {
-                    setCount(groupFor(msg.source, (sourceMeta[msg.source] || {}).label),
-                             'failed', true);
-                } else if (msg.type === 'done') {
-                    statusEl.textContent = found === 0
-                        ? 'No source has this album as a single release — "Let Commissary choose" still downloads it track by track.'
-                        : `${found} release${found !== 1 ? 's' : ''}`;
                 }
             }
+        } catch (err) {
+            console.error('Album source search failed:', err);
+            if (myGen === searchGen) statusEl.textContent = 'Search request failed';
+        } finally {
+            if (myGen === searchGen) goBtn.disabled = false;
         }
-    } catch (err) {
-        console.error('Album source search failed:', err);
-        statusEl.textContent = 'Search request failed';
     }
+
+    goBtn.addEventListener('click', () => { runSearch(); });
+    [albumInput, artistInput].forEach(el => el.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); runSearch(); }
+    }));
+
+    await runSearch();
 }
 window.openAlbumSourcePicker = openAlbumSourcePicker;
 
@@ -3549,9 +3747,17 @@ function isAlbumContextPlaylistId(playlistId) {
 window.isAlbumContextPlaylistId = isAlbumContextPlaylistId;
 
 const _pendingAlbumPins = {};
-function setPendingAlbumPin(virtualPlaylistId, pin) {
-    if (pin) _pendingAlbumPins[virtualPlaylistId] = pin;
-    else delete _pendingAlbumPins[virtualPlaylistId];
+// Replace-intent travels WITH the pin rather than beside it. They are one
+// decision, taken in one dialog, and they have to expire together: split across
+// two maps, clearing the pin would leave a live "overwrite my files" flag
+// attached to the next download of the same album.
+function setPendingAlbumPin(virtualPlaylistId, pin, opts) {
+    const replace = !!(opts && opts.replace);
+    if (pin || replace) {
+        _pendingAlbumPins[virtualPlaylistId] = {pin: pin || null, replace: replace};
+    } else {
+        delete _pendingAlbumPins[virtualPlaylistId];
+    }
 }
 window.setPendingAlbumPin = setPendingAlbumPin;
 

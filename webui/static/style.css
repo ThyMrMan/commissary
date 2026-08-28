@@ -45274,6 +45274,146 @@ div.artist-hero-badge {
     text-align: center;
 }
 
+
+/* ── the picker's editable search terms ──────────────────────────────────────
+   Indexers file the same record under names the metadata provider never uses,
+   so the query that was auto-filled from the album is a starting point, not the
+   only thing that can be asked. The two boxes are joined into one query, which
+   is why emptying the artist and pasting a whole release name into the second
+   works. */
+.album-sources-query {
+    display: flex;
+    gap: 8px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+}
+.album-sources-query-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    flex: 1 1 130px;
+    min-width: 0;
+}
+/* The album box is the one people actually retype. */
+.album-sources-query-album {
+    flex: 2 1 220px;
+}
+.album-sources-query-field span {
+    color: rgba(255, 255, 255, 0.45);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}
+.album-sources-query-field input {
+    width: 100%;
+    min-width: 0;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    color: rgba(255, 255, 255, 0.92);
+    font-size: 13px;
+    padding: 7px 10px;
+}
+.album-sources-query-field input:focus {
+    outline: none;
+    background: rgba(255, 255, 255, 0.09);
+    border-color: rgba(var(--accent-rgb), 0.6);
+}
+#album-sources-go {
+    flex: 0 0 auto;
+}
+.album-sources-query-hint {
+    color: rgba(255, 255, 255, 0.4);
+    font-size: 11px;
+    font-style: italic;
+    line-height: 1.5;
+    margin-bottom: 10px;
+}
+
+/* ── "you already have this album" ───────────────────────────────────────────
+   The picker's premise changes once the album is owned: a release can then only
+   REPLACE what is on disk, and picking one without saying so grabs nothing at
+   all. The banner states it while results stream in; the prompt asks at the
+   moment of the pick, because overwriting files needs an answer, not a default. */
+.album-sources-owned {
+    color: rgba(255, 200, 130, 0.9);
+    font-size: 12px;
+    line-height: 1.5;
+    background: rgba(255, 180, 80, 0.1);
+    border: 1px solid rgba(255, 180, 80, 0.3);
+    border-radius: 6px;
+    padding: 9px 11px;
+    margin-bottom: 10px;
+}
+.album-sources-owned strong {
+    color: rgba(255, 215, 160, 1);
+}
+
+/* Sits above the picker it was opened from. */
+.album-owned-overlay {
+    z-index: 100002;
+}
+.album-owned-modal {
+    max-width: 520px;
+}
+.album-owned-summary {
+    color: rgba(255, 255, 255, 0.92);
+    font-size: 14px;
+    line-height: 1.5;
+    margin-bottom: 10px;
+}
+.album-owned-summary strong {
+    color: rgb(var(--accent-rgb));
+}
+.album-owned-release {
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 12px;
+    line-height: 1.5;
+    word-break: break-word;
+    margin-bottom: 12px;
+}
+.album-owned-note {
+    color: rgba(255, 200, 130, 0.85);
+    font-size: 12px;
+    line-height: 1.6;
+    background: rgba(255, 180, 80, 0.07);
+    border: 1px solid rgba(255, 180, 80, 0.2);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 16px;
+}
+.album-owned-note strong {
+    color: rgba(255, 215, 160, 1);
+}
+.album-owned-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: flex-end;
+}
+/* Deleting the user's files is the destructive answer, so it reads as one
+   rather than as the confident default. */
+.album-owned-replace {
+    background: rgba(220, 80, 80, 0.2);
+    border-color: rgba(220, 80, 80, 0.45);
+    color: rgba(255, 170, 170, 0.95);
+}
+.album-owned-replace:hover:not(:disabled) {
+    background: rgba(220, 80, 80, 0.35);
+    border-color: rgba(220, 80, 80, 0.8);
+}
+.album-owned-cancel {
+    background: rgba(255, 255, 255, 0.07);
+    border-color: rgba(255, 255, 255, 0.18);
+    color: rgba(255, 255, 255, 0.7);
+}
+.album-owned-cancel:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.14);
+    border-color: rgba(255, 255, 255, 0.3);
+}
+
 .candidates-source-badge {
     display: inline-block;
     background: rgba(255, 255, 255, 0.08);
