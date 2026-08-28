@@ -348,9 +348,11 @@
     function openResolve(item) {
         state.resolve = {
             item: item,
-            // 'season' = a whole FOLDER. It searches shows like an episode does,
-            // but asks for no season/episode: every file carries its own, and the
-            // dialog's numbers are deliberately not applied (see run_season_import).
+            // 'season' = a whole FOLDER. It searches shows like an episode
+            // does, and asks for no EPISODE number: every file carries its own.
+            // The SEASON is a fact about the pack rather than its members, so it
+            // is offered and honoured (see run_season_import) — a folder whose
+            // filenames say S08 can be imported as season 7.
             kind: item.scope === 'season' ? 'season'
                 : ((item.scope === 'episode' || item.kind === 'show') ? 'episode' : 'movie'),
             pack: item.scope === 'season' ? { count: null, items: [] } : null,
@@ -455,18 +457,55 @@
         if (p.error) return '<div class="vimp-pack-msg">' + esc(p.error) + '</div>';
         if (p.count == null) return '<div class="vimp-pack-msg">Reading folder…</div>';
         if (!p.count) return '<div class="vimp-pack-msg">No numbered episodes in this folder.</div>';
+        // One season is the only case a single number can describe. A pack
+        // spanning several cannot be reassigned — one number applied to all of
+        // them would file their episodes at the same paths.
+        var one = p.seasons && p.seasons.length === 1;
         var rows = (p.items || []).map(function (i) {
             return '<div class="vimp-pack-row"><span class="vimp-pack-se">S' + pad2(i.season) +
-                'E' + pad2(i.episode) + '</span><span class="vimp-pack-name">' +
+                'E' + pad2(i.episode) + '<span class="vimp-pack-moved" data-vimp-pack-to="' +
+                esc(i.episode) + '"></span></span><span class="vimp-pack-name">' +
                 esc(i.name) + '</span></div>';
         }).join('');
+        var ctl = one
+            ? '<div class="vimp-pack-season">' +
+                  '<label class="vimp-ep-field">Import as season ' +
+                      '<input type="number" min="0" data-vimp-pack-season></label>' +
+                  '<span class="vimp-pack-note" data-vimp-pack-note></span>' +
+              '</div>'
+            : (p.seasons && p.seasons.length > 1
+                ? '<div class="vimp-pack-msg">This folder spans seasons ' + esc(p.seasons.join(', ')) +
+                  ', so it cannot be given a single season number. Each file keeps its own.</div>'
+                : '');
         return '<div class="vimp-pack-head">' + p.count + ' episode' + (p.count === 1 ? '' : 's') +
-            ' will be imported' + (p.seasons && p.seasons.length === 1
-                ? ' (season ' + p.seasons[0] + ')'
-                : (p.seasons && p.seasons.length > 1 ? ' (seasons ' + p.seasons.join(', ') + ')' : '')) +
-            '. Each file keeps its own episode number.</div>' +
+            ' will be imported' + (one ? ' (season ' + esc(p.seasons[0]) + ')' : '') +
+            '. Each file keeps its own episode number.</div>' + ctl +
             '<div class="vimp-pack-list">' + rows + '</div>' +
             (p.truncated ? '<div class="vimp-pack-msg">…and more.</div>' : '');
+    }
+
+    // Rewrites ONLY the "→ SxxEyy" spans and the note. Re-rendering the whole
+    // panel on each keystroke would blow away the input the user is typing into.
+    function updatePackArrows() {
+        var r = state.resolve;
+        if (!r || r.kind !== 'season') return;
+        var p = r.pack || {};
+        var one = p.seasons && p.seasons.length === 1;
+        var target = parseInt(r.season, 10);
+        var moved = !!one && !isNaN(target) && target !== p.seasons[0];
+        var spans = document.querySelectorAll('[data-vimp-pack-to]');
+        for (var i = 0; i < spans.length; i++) {
+            spans[i].textContent = moved
+                ? ' → S' + pad2(target) + 'E' + pad2(spans[i].getAttribute('data-vimp-pack-to'))
+                : '';
+        }
+        var note = $('[data-vimp-pack-note]');
+        if (note) {
+            note.textContent = moved
+                ? 'Every file will be filed under season ' + target + '.'
+                : (one ? 'Detected from the filenames.' : '');
+            note.classList.toggle('vimp-pack-note--moved', moved);
+        }
     }
 
     function loadPack(r) {
@@ -501,7 +540,19 @@
         var pk = $('[data-vimp-pack]');
         if (pk) {
             pk.hidden = r.kind !== 'season';
-            if (r.kind === 'season') pk.innerHTML = packHTML(r);
+            if (r.kind === 'season') {
+                pk.innerHTML = packHTML(r);
+                // Pre-fill from the pack once the preview has told us what the
+                // filenames say; the value is set as a PROPERTY so no title or
+                // number is ever interpolated into an attribute.
+                var ps = $('[data-vimp-pack-season]');
+                if (ps) {
+                    if (r.season === '' && (r.pack || {}).seasons && r.pack.seasons.length === 1)
+                        r.season = r.pack.seasons[0];
+                    ps.value = r.season === '' ? '' : r.season;
+                }
+                updatePackArrows();
+            }
         }
         var ep = $('[data-vimp-ep]');
         if (ep) ep.hidden = !(r.kind === 'episode' && r.picked);
@@ -534,7 +585,9 @@
         var btn = $('[data-vimp-confirm]');
         var r = state.resolve;
         if (!btn || !r) return;
-        var ok = !!r.picked && (r.kind === 'movie' || r.kind === 'season' ||
+        var packSeasonOk = r.kind !== 'season' || r.season === '' ||
+            (!isNaN(parseInt(r.season, 10)) && parseInt(r.season, 10) >= 0);
+        var ok = !!r.picked && (r.kind === 'movie' || (r.kind === 'season' && packSeasonOk) ||
             (r.kind === 'episode' && r.season !== '' && r.episode !== ''));
         btn.disabled = !ok;
         var n = (r.pack || {}).count;
@@ -601,6 +654,11 @@
             body.season = parseInt(r.season, 10);
             body.episode = parseInt(r.episode, 10);
             var t = $('[data-vimp-eptitle]'); if (t && t.value.trim()) body.episode_title = t.value.trim();
+        } else if (r.kind === 'season' && r.season !== '' && !isNaN(parseInt(r.season, 10))) {
+            // A whole-folder placement CAN reassign the season: it describes the
+            // pack, not its members. The episode still comes from each file, so
+            // this renumbers without collapsing them onto one another.
+            body.season = parseInt(r.season, 10);
         }
         var btn = $('[data-vimp-confirm]'); if (btn) { btn.disabled = true; btn.textContent = 'Placing…'; }
         var id = r.item.id;
@@ -733,6 +791,12 @@
             clearTimeout(searchTimer); searchTimer = setTimeout(runSearch, 300); return;
         }
         if (e.target.matches('[data-vimp-season]')) { r.season = e.target.value; updateConfirm(); return; }
+        if (e.target.matches('[data-vimp-pack-season]')) {
+            r.season = e.target.value;
+            updatePackArrows();     // NOT renderModal — that would drop the caret
+            updateConfirm();
+            return;
+        }
         if (e.target.matches('[data-vimp-episode]')) { r.episode = e.target.value; updateConfirm(); return; }
         if (e.target.matches('[data-vimp-lib]')) { r.rootFolderId = e.target.value || ''; return; }
     }

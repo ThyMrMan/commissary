@@ -3491,6 +3491,14 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.2.3': [
+        { date: 'August 2026 · 2.2.3' },
+        { title: "A season folder ignored the season you gave it", desc: "placing a whole folder by hand filed every episode under the season its <em>filenames</em> claimed, whatever you asked for. A folder called Season 8, imported as season 7, landed as season 8 — the number you assigned was replaced by the very number you were correcting. Worse, the Place dialog had no season box for a folder at all, so there was no way to say it and no sign it had been ignored." },
+        { title: "The dialog now asks, and shows you the answer first", desc: "a whole-folder placement gets an <strong>Import as season</strong> box, filled in from what the filenames say, and every row in the file list previews where it will actually land — <em>S08E01 → S07E01</em> — before a single file is copied. A wrong season here is unpicked one file at a time, so it is worth seeing beforehand." },
+        { title: "Why the episode number is still taken from each file", desc: "because it has to be. The season describes the whole pack, so one number does describe it; the episode numbers are what make its members <em>different</em>, and stamping one across all of them would file the entire season on top of itself. That distinction had been lost, and the rule that correctly protects the episode number was being applied to the season too." },
+        { title: "A folder holding several seasons says so instead of guessing", desc: "one number cannot describe two seasons. Applying it anyway would file S07E01 and S08E01 at the same path, the second quietly overwriting the first — so a mixed folder is refused before anything is copied, and the dialog names the seasons it found rather than offering a box that could only do harm." },
+        { title: "Double episodes keep their span through a renumber", desc: "a file named <em>S08E01-E02</em> would have been filed as a plain <em>S07E01</em>, losing the second episode from the name your media server reads. The check that spots a double episode requires the filename's season to agree with the one being filed — and disagreeing is precisely what a renumber is." },
+    ],
     '2.2.2': [
         { date: 'August 2026 · 2.2.2' },
         { title: "Choosing a release for an album you already own downloaded nothing", desc: "you could open <strong>Choose Release</strong>, search every source, pick the exact torrent you wanted and press go — and the batch would finish having grabbed <strong>nothing at all</strong>. The ownership check runs first, and when every track is already in your library it ends the run <em>before</em> your choice is ever read. The log said only “no missing tracks”, and never once mentioned the release you had picked." },
@@ -3971,6 +3979,22 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.2.3: the season number a folder import threw away",
+        description: "Placing a season folder by hand filed it under whatever its filenames said, discarding the number you assigned - and the dialog never offered one to begin with.",
+        features: [
+            "run_season_import overwrote the placement's season with the one parsed from each filename",
+            "so a Season 8 folder imported as season 7 landed as season 8, replaced by the number being corrected",
+            "the Place dialog had no season field for a folder, and never sent one - the pack panel was a read-only list",
+            "EPISODE numbers still come from each file: one number stamped across a pack files the whole season on top of itself",
+            "SEASON is a property of the pack rather than its members, so one number does describe it - that distinction had been lost",
+            "the dialog now offers 'Import as season', prefilled from the filenames, with a per-row S08E01 -> S07E01 preview",
+            "a pack spanning several seasons refuses the renumber before copying anything, and names the seasons it found",
+            "a double episode keeps its span: the parsed-season guard treats a renumber as a reason to distrust the parse",
+            "single-FILE placement always honoured the override - the fault was confined to the whole-folder path",
+        ],
+        usage_note: "Nothing to migrate, and nothing already in your library moves. To refile a folder: open Place, pick the show, set 'Import as season', and check the arrows in the file list before confirming. Anything already imported under the wrong season still has to be moved by hand.",
+    },
     {
         title: "2.2.2: a release you chose that was never downloaded",
         description: "Picking an exact release for an album you already own grabbed nothing and said nothing. The picker now warns up front, asks whether to replace, survives a failed request, and lets you edit what it searches for.",

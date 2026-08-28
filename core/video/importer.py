@@ -295,7 +295,20 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
     # A multi-episode file is NAMED by its full span (S01E01-E02, the Sonarr/Plex
     # convention) even though the download row's identity is one episode of it.
     ep, ep_end = ctx.get("episode"), None
-    if scope == "episode" and parsed.get("episode_end") \
+    _ov_end = override.get("episode_end") if force else None
+    if _ov_end is not None:
+        # A pack member's span, supplied by the caller that already parsed it.
+        # Re-deriving it below fails under a season renumber, because the guard
+        # there requires the parsed season to agree with the one being filed —
+        # and disagreeing is the entire point of a renumber. Without this a
+        # renumbered S08E01-E02 would be filed as a single S07E01.
+        try:
+            _end = int(_ov_end)
+        except (TypeError, ValueError):
+            _end = None
+        if _end is not None and _end != ctx.get("episode"):
+            ep_end = _end
+    elif scope == "episode" and parsed.get("episode_end") \
             and parsed.get("season") == ctx.get("season"):
         ep, ep_end = parsed.get("episode"), parsed.get("episode_end")
     fields = {
@@ -576,11 +589,22 @@ def run_season_import(dl: dict, src_dir: str, *, fs: Any, lister: Callable,
     failed import.
 
     ``force``/``override`` drive a MANUAL placement of a whole folder: the user
-    has chosen the show, so every member is placed against that identity. The
-    season/episode numbers still come from each FILE, never from the override —
-    the whole point of a pack is that its members differ, and stamping one
-    episode number across all of them would file the entire season on top of
-    itself.
+    has chosen the show, so every member is placed against that identity.
+
+    EPISODE numbers always come from each FILE. The whole point of a pack is
+    that its members differ, and stamping one episode number across all of them
+    would file the entire season on top of itself.
+
+    SEASON is not the same kind of fact. It is a property of the PACK, not of
+    its members, so an override renumbers the lot — which is what makes a folder
+    whose filenames say S08 importable as season 7. Release groups numbering
+    differently from TMDB make that routine, and it used to be impossible: the
+    number was silently replaced by the one parsed out of each filename, so the
+    placement landed exactly where the user had just said it should not.
+
+    A renumber is REFUSED across a pack spanning several seasons. One number
+    cannot describe them, and applying it anyway would file S07E01 and S08E01 at
+    the same path — the second overwriting the first.
     """
     settings = organization.normalize(settings)
     members = pack_members(src_dir, lister, size_of=size_of)
@@ -588,13 +612,39 @@ def run_season_import(dl: dict, src_dir: str, *, fs: Any, lister: Callable,
         return {"status": "import_failed", "progress": 100.0, "dest_path": src_dir,
                 "error": "No episode files found in this pack"}
 
+    # The user's season, if they gave one. Resolved before the loop because it
+    # is a fact about the pack: the multi-season refusal has to be answered from
+    # ALL the members, not discovered halfway through copying them.
+    renumber = None
+    if override and override.get("season") is not None:
+        try:
+            renumber = int(override["season"])
+        except (TypeError, ValueError):
+            renumber = None
+    if renumber is not None:
+        _seasons = sorted({m["season"] for m in members})
+        if len(_seasons) > 1:
+            return {"status": "import_failed", "progress": 100.0, "dest_path": src_dir,
+                    "error": "This folder holds seasons %s. A season number can only be "
+                             "reassigned to a pack that is all one season — applying one "
+                             "number to several would file their episodes on top of each "
+                             "other." % ", ".join("%d" % s for s in _seasons)}
+
     imported, upgraded, failed, dests = 0, 0, [], []
     for m in members:
         member_override = None
         if override:
             member_override = dict(override)
-            member_override.update({"scope": "episode", "season": m["season"],
-                                    "episode": m["episode"]})
+            member_override.update({
+                "scope": "episode",
+                "season": m["season"] if renumber is None else renumber,
+                "episode": m["episode"],
+                # The member's own span, handed over rather than re-parsed. Under
+                # a renumber the filename's season and the one being filed under
+                # deliberately disagree, which is exactly what the span check in
+                # plan_import treats as a reason to distrust the parse.
+                "episode_end": m.get("episode_end"),
+            })
             # The chosen show supplies the title; only the pack itself knows the
             # per-episode title, and a stale one from the dialog would be worse
             # than none (it names the file).

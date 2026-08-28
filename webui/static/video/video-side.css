@@ -5110,6 +5110,20 @@ a.vdl-r-title--link:hover { color: rgb(var(--accent-light-rgb, 30, 215, 96));
 .vimp-pack-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     color: rgba(255, 255, 255, 0.62); }
 
+/* Reassigning the pack's season. Offered only for a single-season folder — one
+   number cannot describe a pack spanning several, and applying it anyway would
+   file their episodes at the same paths. The arrow in each row shows the result
+   before anything is copied, because a wrong season here is unpicked one file
+   at a time. */
+.vimp-pack-season { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap;
+    margin-bottom: 8px; }
+.vimp-pack-note { font-size: 11.5px; color: rgba(255, 255, 255, 0.42); padding-bottom: 9px; }
+.vimp-pack-note--moved { color: rgb(var(--accent-light-rgb, 30, 215, 96)); font-weight: 600; }
+.vimp-pack-moved { color: rgb(var(--accent-light-rgb, 30, 215, 96)); }
+.vimp-pack-row:has(.vimp-pack-moved:not(:empty)) .vimp-pack-se { color: rgba(255, 255, 255, 0.34);
+    text-decoration: line-through; }
+.vimp-pack-row .vimp-pack-moved { text-decoration: none; }
+
 .vimp-ep { display: flex; gap: 10px; flex-wrap: wrap; padding: 12px 20px 4px; }
 .vimp-ep-field { font-size: 12px; font-weight: 600; color: rgba(255, 255, 255, 0.6); display: flex; flex-direction: column; gap: 4px; }
 .vimp-ep-field--wide { flex: 1; min-width: 140px; }

@@ -6,10 +6,17 @@ other way — moved in by hand, grabbed outside Commissary, or left behind by a
 failed auto-import — had to be placed twelve times, answering "which show is
 this?" on every one.
 
-A folder becomes ONE queued row and ONE identity choice. The season and episode
-numbers still come from each FILE: stamping the dialog's numbers across every
-member would file the whole season on top of itself, which is the one mistake
-that would be worse than doing it by hand.
+A folder becomes ONE queued row and ONE identity choice. EPISODE numbers still
+come from each FILE: stamping the dialog's episode number across every member
+would file the whole season on top of itself, which is the one mistake that
+would be worse than doing it by hand.
+
+SEASON is not the same kind of fact and used to be treated as though it were.
+It describes the PACK rather than its members, so one number does describe it —
+and a folder whose filenames say S08 has to be importable as season 7, because
+release groups numbering differently from TMDB make that routine. Overriding it
+was silently discarded until then; see tests/test_video_manual_season_renumber.py
+for that fix and the multi-season case it refuses.
 """
 
 from __future__ import annotations
@@ -163,8 +170,31 @@ def test_every_member_keeps_its_own_episode_number(monkeypatch, env):
                               "season": 9, "episode": 9, "episode_title": "wrong"})
     assert patch["status"] == "completed"
     assert sorted(s[2] for s in seen) == [1, 2, 3, 4]      # from the FILES
-    assert {s[1] for s in seen} == {1}
     assert {s[3] for s in seen} == {"Chosen Show"}         # from the DIALOG
+    # The SEASON is the dialog's — it describes the pack, not its members, so
+    # one number does describe it. This line used to assert {1} (the files'),
+    # which is precisely the reported bug: a folder placed as season 7 landed
+    # as season 8 because the number was replaced by the parsed one.
+    assert {s[1] for s in seen} == {9}
+
+
+def test_the_season_still_comes_from_the_files_when_none_was_chosen(monkeypatch, env):
+    """The half that must not change. Only an explicit season renumbers; every
+    other placement — and the whole automated path — still files by what each
+    filename says."""
+    from core.video import importer
+
+    seen = []
+    monkeypatch.setattr(importer, "run_import",
+                        lambda dl, p, **kw: (seen.append(kw.get("override") or {}),
+                                             {"status": "completed", "dest_path": p})[1])
+    importer.run_season_import(
+        {"search_ctx": json.dumps({"scope": "season"}), "release_title": "Show.S01"},
+        str(env["pack"]), fs=None,
+        lister=lambda root: [os.path.join(b, n) for b, _d, ns in os.walk(root) for n in ns],
+        force=True, override={"scope": "season", "title": "Chosen Show", "media_id": 42})
+    assert {o.get("season") for o in seen} == {1}
+    assert sorted(o.get("episode") for o in seen) == [1, 2, 3, 4]
 
 
 def test_a_stale_episode_title_is_not_stamped_on_every_member(monkeypatch, env):
