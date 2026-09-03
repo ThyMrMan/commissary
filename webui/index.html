@@ -8139,6 +8139,28 @@
                                 <div class="form-group">
                                     <div class="setting-row">
                                         <label class="checkbox-label">
+                                            <input type="checkbox" id="import-user-download-replaces">
+                                            A download you asked for always replaces what's there
+                                        </label>
+                                        <span class="info-icon" role="button" tabindex="0" title="What's this?"
+                                            onclick="toggleSettingHelp(this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSettingHelp(this);}">i</span>
+                                    </div>
+                                    <div class="setting-help-body" hidden>
+                                        When you pick a file yourself — from the manual search, the release picker, or by
+                                        re-downloading a track you already own — the new file replaces the copy in your
+                                        library, even if the existing one is the same or better quality.
+                                        <br><br>
+                                        With this off, that download is compared against what you already have and
+                                        discarded if the library copy wins, which is why a track you deliberately
+                                        re-downloaded could appear to do nothing.
+                                        <br><br>
+                                        <strong>Only applies to downloads you chose.</strong> The wishlist, auto-import and
+                                        retries are never allowed to overwrite a library file this way.
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <div class="setting-row">
+                                        <label class="checkbox-label">
                                             <input type="checkbox" id="import-replace-lower-quality">
                                             Replace lower quality files on import
                                         </label>

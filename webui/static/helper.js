@@ -3491,6 +3491,13 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.2.4': [
+        { date: 'September 2026 · 2.2.4' },
+        { title: "Downloads that finished but never left “Downloading”", desc: "a download could complete, import correctly, appear in your library — and sit in Active for ever anyway. The step that marks a download finished required it to belong to a <em>batch</em>, and a track you pick yourself from the manual search has no batch. In one instance's logs that meant <strong>836 successful imports and not a single completed task</strong>. The file was always fine; the row just never caught up." },
+        { title: "…and the ones that quietly re-downloaded every night", desc: "six of the places post-processing can stop early mean “your library already has this” — a success. None of them told the task, so it stayed Active and whatever queued it queued it again. One track was fetched, moved, compared against the copy on disk and deleted <strong>64 times across three days</strong>. Every one of those endings now settles the download and says which it was, rather than stopping in silence." },
+        { title: "A download you asked for now replaces what's already there", desc: "picking a file yourself — from the manual search, the release picker, or by re-downloading a track you own — used to be compared against your existing copy and <em>discarded</em> if the old one won. Deliberately re-downloading something therefore looked like it did nothing. A download you chose now wins, because a person pressing download is a clearer statement of intent than a quality comparison. <strong>Only downloads you chose</strong>: the wishlist, auto-import and retries can still never overwrite a library file this way. There's an off switch beside “Replace lower quality files on import”." },
+        { title: "Torrents that downloaded perfectly while Commissary called them refused", desc: "newer qBittorrent builds answer an add with JSON instead of the old <code>Ok.</code>, and anything that wasn't exactly <code>Ok.</code> was read as a rejection. But <code>{\"failure_count\": 0, \"pending_count\": 1}</code> means the opposite — accepted, and still fetching the .torrent from the URL. So the client downloaded the release happily while the app reported <strong>“Torrent client refused the URL”</strong> and never polled it again. A reply that genuinely reports a failure is still treated as one." },
+    ],
     '2.2.3': [
         { date: 'August 2026 · 2.2.3' },
         { title: "A season folder ignored the season you gave it", desc: "placing a whole folder by hand filed every episode under the season its <em>filenames</em> claimed, whatever you asked for. A folder called Season 8, imported as season 7, landed as season 8 — the number you assigned was replaced by the very number you were correcting. Worse, the Place dialog had no season box for a folder at all, so there was no way to say it and no sign it had been ignored." },
@@ -3979,6 +3986,24 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.2.4: downloads that finished without ever saying so",
+        description: "A completed download could import correctly and still sit in Active for ever - and six 'your library already has this' outcomes silently re-queued themselves nightly. Plus torrent adds reported as refused while the client downloaded them.",
+        features: [
+            "the completion step was gated on `task_id AND batch_id`, and a manual pick has a task but no batch",
+            "one instance logged 836 'Post-processing complete' lines and zero task completions across ten days",
+            "six early returns between 'the file is on disk' and the completion callback settled nothing at all",
+            "so the task stayed Active and whatever queued it re-queued it: 64 downloads of one track in three days",
+            "every terminal outcome now settles the task and names itself - 'the library copy is the same or better quality'",
+            "only the batch NOTIFY still needs a batch id; without one there is simply no queue slot to release",
+            "the short-replacement guard still reports FAILED - a truncated file is not a success to be ticked off",
+            "a user-picked download now replaces the existing copy: import.user_download_always_replaces, default on",
+            "keyed on the manual-pick flag, so the wishlist drain, auto-import and retries can never overwrite through it",
+            "qBittorrent's newer JSON add reply was read as a refusal; failure_count 0 with pending_count 1 is an acceptance",
+            "an unrecognised reply body is still refused - handing back a download nothing can track is the same bug inverted",
+        ],
+        usage_note: "Nothing to migrate. Downloads already stuck in Active are in-memory and clear on restart - check your library first, since some of them have very likely already imported. After updating, the new '[Post-Process] Task ... settled as ...' log line is what to grep for if a download ever hangs again: its absence means post-processing never reached the end, which is a different fault from these.",
+    },
     {
         title: "2.2.3: the season number a folder import threw away",
         description: "Placing a season folder by hand filed it under whatever its filenames said, discarding the number you assigned - and the dialog never offered one to begin with.",

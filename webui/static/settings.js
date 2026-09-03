@@ -1730,6 +1730,10 @@ async function loadSettingsData() {
 
         // Populate Import settings
         document.getElementById('import-replace-lower-quality').checked = settings.import?.replace_lower_quality === true;
+        // Defaults ON — `!== false` so an install that has never saved this
+        // setting gets the new behaviour rather than an unticked box.
+        const _udr = document.getElementById('import-user-download-replaces');
+        if (_udr) _udr.checked = settings.import?.user_download_always_replaces !== false;
         // Default ON (legacy Artist/Album staging behavior) when the key is absent.
         const _folderArtistEl = document.getElementById('import-folder-artist-override');
         if (_folderArtistEl) _folderArtistEl.checked = settings.import?.folder_artist_override !== false;
@@ -5147,6 +5151,8 @@ async function saveSettings(quiet = false) {
         },
         import: {
             replace_lower_quality: document.getElementById('import-replace-lower-quality').checked,
+            user_download_always_replaces:
+                document.getElementById('import-user-download-replaces')?.checked !== false,
             folder_artist_override: document.getElementById('import-folder-artist-override')?.checked !== false,
             transfer_is_permanent: document.getElementById('import-transfer-permanent')?.checked === true,
             staging_path: document.getElementById('staging-path').value || './Staging'

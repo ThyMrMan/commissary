@@ -245,6 +245,34 @@ def _resolve_replace_target(final_path: str, source_path: str, track_number=None
     return _existing_library_copy(final_path, track_number, quality_profile)
 
 
+def _user_download_replaces(context: dict) -> bool:
+    """True when the user personally asked for THIS file and the install lets a
+    user's choice outrank the copy already on disk.
+
+    ``force_replace`` covers the modal's Force toggle, but that is a box most
+    people never find. Everything else — picking a candidate in the manual
+    search, choosing a release, re-downloading a track you already own — was
+    treated as an unattended import and silently discarded whenever the library
+    already held something "same or better". The file was fetched, moved,
+    compared and deleted; the user got their old copy back with no explanation.
+
+    Deliberately keyed on ``_user_manual_pick``, which is set only where a
+    person chose the exact file (see core/downloads/candidates.py). The wishlist
+    drain, the auto-import sweep and the retry monitor never set it, so nothing
+    unattended can overwrite a library file through this door.
+
+    Defaults ON: a person pressing download is a clearer statement of intent
+    than a quality comparison. ``import.user_download_always_replaces`` turns it
+    off for installs that would rather keep what they have.
+    """
+    if not (context or {}).get('_user_manual_pick'):
+        return False
+    try:
+        return bool(config_manager.get('import.user_download_always_replaces', True))
+    except Exception:   # noqa: BLE001 - a config read must never block an import
+        return True
+
+
 def _batch_force_replace(context: dict) -> bool:
     """True when the USER explicitly forced this download (the 'Force
     download' toggle on the download modal). An explicit re-download of a
@@ -563,6 +591,44 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
     def _notify_download_completed(batch_id, task_id, success=True):
         if on_download_completed:
             on_download_completed(batch_id, task_id, success=success)
+
+    def _settle_task(*, success: bool, outcome: str, final_path=None):
+        """Bring this download's TASK to a terminal state, whatever the outcome.
+
+        Every ``return`` out of this function ends the work for that task, and
+        several of them mean "the library already has this" — a success from the
+        user's side, not a reason to stay silent. Those returned without touching
+        the task at all, so the row sat at "Downloading" indefinitely and whatever
+        queued it queued it again: one track was re-downloaded 64 times across
+        three days and skipped identically every time.
+
+        Deliberately NOT gated on ``batch_id``. A manual pick from the search
+        modal has a task and no batch, and requiring both is why 836 successful
+        imports in one instance's logs marked exactly zero tasks completed. The
+        batch NOTIFY still needs one — without a batch there is no queue slot to
+        release — but a task's own status never did.
+        """
+        task_id = context.get('task_id')
+        if not task_id:
+            return
+        batch_id = context.get('batch_id')
+        with tasks_lock:
+            task = download_tasks.get(task_id)
+            if isinstance(task, dict):
+                if success:
+                    _mark_task_completed(task_id, context.get('track_info'))
+                    if final_path:
+                        task['final_file_path'] = final_path
+                else:
+                    task['status'] = 'failed'
+                    task['stream_processed'] = True
+                    task['status_change_time'] = time.time()
+                    if outcome:
+                        task['error_message'] = outcome
+                logger.info("[Post-Process] Task %s settled as %s — %s",
+                            task_id, task.get('status'), outcome)
+        if batch_id:
+            _notify_download_completed(batch_id, task_id, success=success)
 
     with post_process_locks_lock:
         if context_key not in post_process_locks:
@@ -1230,7 +1296,7 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
         # something they already own, so the metadata-protection skip must not
         # discard it (#1045). Rides the same replace path as enhance — the
         # short-file replacement guard above still applies.
-        force_replace = _batch_force_replace(context)
+        force_replace = _batch_force_replace(context) or _user_download_replaces(context)
 
         logger.info(f"Moving '{os.path.basename(file_path)}' to '{final_path}'")
         # The library's existing copy of this track, which is NOT necessarily at
@@ -1246,6 +1312,8 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
             if not os.path.exists(file_path):
                 # Only reachable with existing_path == final_path; see above.
                 logger.info(f"[Protection] Destination exists and source already gone - file already transferred: {os.path.basename(final_path)}")
+                _settle_task(success=True, outcome='already in the library',
+                             final_path=final_path)
                 return
             # THE backstop for sella's incident: an upgrade/replace must NEVER
             # swap a good library file for a materially shorter one. Every path
@@ -1268,17 +1336,9 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                 except Exception as _qe:   # noqa: BLE001
                     logger.error("[Protection] Could not quarantine the short replacement "
                                  "(leaving in place, NOT replacing): %s", _qe)
-                task_id = context.get('task_id')
-                batch_id = context.get('batch_id')
-                if task_id:
-                    with tasks_lock:
-                        if task_id in download_tasks:
-                            download_tasks[task_id]['status'] = 'failed'
-                            download_tasks[task_id]['error_message'] = (
-                                "Replacement rejected: incoming file is far shorter "
-                                "than the existing library file")
-                    if batch_id:
-                        _notify_download_completed(batch_id, task_id, success=False)
+                _settle_task(success=False, outcome=(
+                    "Replacement rejected: incoming file is far shorter "
+                    "than the existing library file"))
                 with matched_context_lock:
                     if context_key in matched_downloads_context:
                         del matched_downloads_context[context_key]
@@ -1311,6 +1371,9 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                                 pass
                             except Exception as e:
                                 logger.error(f"[Protection] Error removing redundant file: {e}")
+                            _settle_task(success=True, outcome=(
+                                'the library copy is the same or better quality'),
+                                final_path=existing_path)
                             return
                     elif existing_path != final_path:
                         # The existing copy is a DIFFERENT container or naming, and
@@ -1336,6 +1399,9 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                             logger.error(f"[Protection] Could not remove redundant file (already gone): {file_path}")
                         except Exception as e:
                             logger.error(f"[Protection] Error removing redundant file: {e}")
+                        _settle_task(success=True, outcome=(
+                            'the library copy already has enhanced metadata'),
+                            final_path=existing_path)
                         return
                 elif is_enhance_download or force_replace:
                     if is_enhance_download:
@@ -1365,6 +1431,8 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                 logger.info(f"[Pre-Move] Source already gone and destination exists - another thread completed transfer: {os.path.basename(final_path)}")
                 download_cover_art(album_info, os.path.dirname(final_path), context)
                 generate_lrc_file(final_path, context, artist_context, album_info)
+                _settle_task(success=True, outcome='another thread completed the transfer',
+                             final_path=final_path)
                 return
             expected_dir = os.path.dirname(final_path)
             expected_stem = os.path.splitext(os.path.basename(final_path))[0]
@@ -1389,6 +1457,8 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                 context['_final_processed_path'] = found_variant
                 download_cover_art(album_info, expected_dir, context)
                 generate_lrc_file(found_variant, context, artist_context, album_info)
+                _settle_task(success=True, outcome='the stream processor already placed it',
+                             final_path=found_variant)
                 return
             logger.warning(f"[Pre-Move] Source file gone and no matching file in destination: {os.path.basename(file_path)}")
             raise FileNotFoundError(f"Source file vanished before move and destination does not exist: {file_path}")
@@ -1491,20 +1561,11 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
         except Exception as wishlist_error:
             logger.error(f"[Post-Process] Error checking wishlist removal: {wishlist_error}")
 
-        task_id = context.get('task_id')
-        batch_id = context.get('batch_id')
-        if task_id and batch_id:
-            logger.info(f"[Post-Process] Calling completion callback for task {task_id} in batch {batch_id}")
-            with tasks_lock:
-                if task_id in download_tasks:
-                    download_tasks[task_id]['stream_processed'] = True
-                    download_tasks[task_id]['status'] = 'completed'
-                    # Additive: record where the imported file landed so downstream
-                    # (playlist materialization) knows the real path of a freshly
-                    # downloaded track without re-resolving it.
-                    download_tasks[task_id]['final_file_path'] = context.get('_final_processed_path')
-                    logger.info(f"[Post-Process] Marked task {task_id} as completed")
-            _notify_download_completed(batch_id, task_id, success=True)
+        # `final_file_path` is additive: it records where the imported file
+        # landed so downstream (playlist materialization) knows the real path of
+        # a freshly downloaded track without re-resolving it.
+        _settle_task(success=True, outcome='imported',
+                     final_path=context.get('_final_processed_path', final_path))
 
     except Exception as e:
         import traceback

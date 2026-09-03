@@ -12,6 +12,7 @@ Reference: https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-(qBittorren
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from typing import List, Optional
 
@@ -59,6 +60,50 @@ _QBIT_STATE_MAP = {
 
 def _map_state(qbit_state: str) -> str:
     return _QBIT_STATE_MAP.get(qbit_state, "error")
+
+
+def _parse_add_response(body: str):
+    """Read qBittorrent's ``/torrents/add`` reply. Returns ``(accepted, hash)``.
+
+    WebAPI <= 2.10 answers with the bare string ``Ok.``. Newer builds answer
+    with JSON::
+
+        {"added_torrent_ids": [], "failure_count": 0,
+         "pending_count": 1, "success_count": 0}
+
+    and this module treated any body that was not exactly ``Ok.`` as a refusal.
+    It is not one. ``failure_count: 0`` says nothing failed, and
+    ``pending_count: 1`` says qBit accepted the URL and is still fetching the
+    .torrent from it — ``added_torrent_ids`` is empty only because the hash is
+    not known yet, not because the add was rejected.
+
+    Reading that as failure turned perfectly good grabs into "Torrent client
+    refused the URL": the client downloaded the release happily while the app
+    never polled it, so the download sat at "Downloading" for ever.
+
+    An unrecognised body is still refused. Guessing "probably fine" about a
+    shape we do not understand would hand back a download nothing can track.
+    """
+    try:
+        payload = json.loads(body)
+    except Exception:       # noqa: BLE001 - not JSON at all
+        return False, None
+    if not isinstance(payload, dict):
+        return False, None
+    failed = payload.get('failure_count')
+    if isinstance(failed, int) and failed > 0:
+        return False, None
+    ids = payload.get('added_torrent_ids')
+    if isinstance(ids, list) and ids:
+        first = str(ids[0] or '').strip().lower()
+        if first:
+            return True, first
+    # Accepted but not yet resolved: the hash is discovered by confirm/poll,
+    # which is the same path an http .torrent URL has always taken.
+    if isinstance(payload.get('success_count'), int) or isinstance(failed, int) \
+            or isinstance(payload.get('pending_count'), int):
+        return True, None
+    return False, None
 
 
 class QBittorrentAdapter:
@@ -203,9 +248,17 @@ class QBittorrentAdapter:
                            resp.status_code if resp else 'no-response',
                            (resp.text[:200] if resp else ''))
             return None
-        if resp.text and resp.text.strip() and resp.text.strip() != 'Ok.':
-            logger.warning("qBittorrent /torrents/add unexpected body: %r", resp.text[:200])
-            return None
+        _body = (resp.text or '').strip()
+        if _body and _body != 'Ok.':
+            _accepted, _direct = _parse_add_response(_body)
+            if not _accepted:
+                logger.warning("qBittorrent /torrents/add refused the request: %r", _body[:200])
+                return None
+            if _direct:
+                # The reply named the torrent outright; no discovery needed.
+                logger.info("qBittorrent accepted the add and returned %s", _direct)
+                return _direct
+            logger.info("qBittorrent accepted the add (still resolving the URL): %r", _body[:120])
         # A magnet CARRIES its info-hash, so there is nothing to discover: confirm
         # it landed and return it. The before/after diff below is a race — qBit
         # needs longer than the poll whenever it is resolving magnet metadata or
