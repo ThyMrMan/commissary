@@ -52,7 +52,7 @@ logger = setup_logging(_log_level, _log_path)
 # the published image moved (ghcr.io/thymrman/commissary) even though nothing
 # about the data changed — see tests/test_branding.py for what deliberately
 # kept its old `soulsync` name.
-_SOULSYNC_BASE_VERSION = "2.3.0"
+_SOULSYNC_BASE_VERSION = "2.3.1"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -34106,24 +34106,81 @@ def get_hidden_gems_playlist():
 
 @app.route('/api/discover/personalized/daily-mixes', methods=['GET'])
 def get_daily_mixes():
-    """Get all Daily Mix playlists (hybrid library + discovery)"""
+    """Daily Mixes — taste-clustered blends of owned + discovery tracks.
+
+    Rebuilt on core/personalized/daily_mixes.py, ported from upstream SoulSync
+    3.3.1. The legacy builder promised "50% your library + 50% discovery" and
+    could never deliver the first half: `tracks` carries no source ids, so
+    library rows cannot flow through the sync/wishlist pipeline discovery rows
+    use, and `_get_library_tracks_by_category` returns nothing by design (its
+    own docstring says so). Every mix was therefore a relabelled genre playlist
+    built purely from the discovery pool.
+
+    The replacement clusters from `listening_history` — what you actually
+    played, wherever it was played — and resolves the result against owned
+    files, so a mix is mostly music you have and can press play on. Regenerated
+    daily on a TTL; `?refresh=1` forces a rebuild.
+    """
     try:
-        from core.personalized_playlists import get_personalized_playlists_service
-
-        database = get_database()
-        service = get_personalized_playlists_service(database, spotify_client)
-
-        mixes = service.get_all_daily_mixes(max_mixes=4)
-
+        from core.personalized.daily_mixes import get_or_build_daily_mixes
+        force = request.args.get('refresh') in ('1', 'true')
+        payload = get_or_build_daily_mixes(
+            get_database(), get_current_profile_id(), force=force)
+        mixes = payload.get("mixes", [])
+        # `description` for this fork's Discover page, which reads that key and
+        # falls back to a flat "Daily Mix" without it. Upstream renames it
+        # `subtitle` in its React rewrite; aliasing here means the shelf shows
+        # "Eminem, Linkin Park, YOASOBI and more" instead of the placeholder,
+        # with no change to a 12k-line vanilla page. Both keys ship, so adopting
+        # upstream's frontend later needs nothing undone here.
+        for _m in mixes:
+            if isinstance(_m, dict) and "description" not in _m:
+                _m["description"] = _m.get("subtitle") or ""
         return jsonify({
             "success": True,
-            "mixes": mixes
+            "mixes": mixes,
+            "generated_at": payload.get("generated_at"),
         })
 
     except Exception as e:
         logger.error(f"Error getting daily mixes: {e}")
         import traceback
         traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/discover/stations', methods=['GET'])
+def get_recommended_stations():
+    """Recommended Stations — your heaviest recent artists as one-click artist
+    radio. Ported from upstream SoulSync 3.3.1."""
+    try:
+        from core.discovery.stations import build_stations
+        stations = build_stations(get_database(), get_current_profile_id())
+        return jsonify({"success": True, "stations": stations})
+    except Exception as e:
+        logger.error(f"[Discover] stations failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/discover/resolve-playable', methods=['POST'])
+def resolve_playable_endpoint():
+    """Match an artist/title list against owned tracks so a mix can be played
+    from the library rather than only downloaded. Ported from upstream 3.3.1.
+
+    This is what makes the rebuilt Daily Mixes press-play-able: the mix names
+    tracks, this resolves the ones already on disk to their file paths, and the
+    remainder stays with the download button."""
+    try:
+        from core.discovery.playable import resolve_playable_tracks
+        payload = request.get_json(silent=True) or {}
+        wanted = payload.get('tracks')
+        if not isinstance(wanted, list):
+            return jsonify({"success": False, "error": "tracks list required"}), 400
+        result = resolve_playable_tracks(get_database(), wanted)
+        result["success"] = "error" not in result
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"[Discover] resolve-playable failed: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/api/discover/personalized/discovery-shuffle', methods=['GET'])

@@ -3491,6 +3491,13 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.3.1': [
+        { date: 'September 2026 · 2.3.1' },
+        { title: "Daily Mixes are real mixes now", desc: "the old ones promised “half your library, half discovery” and could never deliver the first half — library tracks carry no source ids, so they cannot travel the pipeline discovery tracks use, and the builder simply left them out. Every “mix” was a genre playlist from the discovery pool wearing a different name. The replacement, ported from upstream SoulSync 3.3.1, clusters what you have <em>actually played</em>: a mix comes out as <strong>Eminem, Linkin Park, YOASOBI and more</strong> — mostly music you already own, so it is something you can press play on rather than a download list." },
+        { title: "…and every track in them was nearly two days long", desc: "it would have been, anyway. Upstream reads the library's track length as <em>seconds</em>; Commissary stores <em>milliseconds</em>, so the ported code multiplied by a thousand and a three-minute song became forty-eight hours. Caught before release by running the new mixes against a real library rather than trusting that a shared schema stayed shared." },
+        { title: "Recommended Stations", desc: "your heaviest recent artists as one-click radio, each listed with the artists it sits nearest — <em>Eminem, with 2Pac, Dr. Dre and 50 Cent</em>. Only artists you own become stations, since radio has to start from tracks that exist. <strong>This one has no page yet</strong>: it is served at <code>/api/discover/stations</code> and nothing on the Discover page draws it, so it is groundwork rather than something you will see." },
+        { title: "What deliberately did not come across", desc: "the same upstream range also carried a shared naming normaliser, a watchlist-scanner change and the “Wing It” feature. None of them are this feature, each is woven into code Commissary has changed on its own terms, and taking a whole diff because part of it was wanted is how a port breaks things quietly. They are left for their own assessment, and a test now fails if they appear without one." },
+    ],
     '2.3.0': [
         { date: 'September 2026 · 2.3.0' },
         { title: "Your Last.fm scrobbles can come in now", desc: "ported from upstream SoulSync 3.3.0. Commissary already recorded what you played through Plex or Jellyfin; it had no way to bring in the years of history sitting in your Last.fm account. The importer pages through your scrobbles and writes them into the <strong>same listening history</strong> the media-server path fills — one source of truth, so Stats, discovery and Year in Listening all read it without knowing where a play came from." },
@@ -3993,6 +4000,25 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.3.1: Daily Mixes that mean something, ported from upstream",
+        description: "The old Daily Mixes were genre playlists in disguise - the library half never worked by design. The replacement clusters what you actually played. Plus Recommended Stations, backend-only for now.",
+        features: [
+            "ported from upstream SoulSync 3.3.1: daily_mixes.py, stations.py and playable.py, taken verbatim",
+            "upstream's own 18 tests pass here unchanged - the evidence the modules behave the same in this fork",
+            "the legacy builder's library half returned nothing BY DESIGN (its own docstring said so): tracks carry no source ids",
+            "so every mix was the discovery pool relabelled; the replacement clusters listening_history instead",
+            "which is the same table the Last.fm importer in 2.3.0 fills, so the two releases compound",
+            "THE port bug: upstream reads tracks.duration as SECONDS, this fork stores MILLISECONDS",
+            "unfixed, every mix track rendered as ~48 hours - and upstream's tests never touch duration, so nothing would have caught it",
+            "found by running the ported modules against a copy of a real library before wiring anything",
+            "no frontend change needed: this fork's _normalizeTrack already accepted upstream's Spotify-shaped tracks",
+            "the one shape change (subtitle vs description) is aliased server-side, so both keys ship and a later React adoption needs nothing undone",
+            "stations and resolve-playable are endpoints only - nothing on the vanilla Discover page renders them yet",
+            "canonical.py, curated_full.py and wing_it.py were deliberately NOT ported; a test fails if they appear unassessed",
+        ],
+        usage_note: "Daily Mixes improve as soon as there is listening history to cluster - media-server plays already count, and the Last.fm importer deepens it. Stations (/api/discover/stations) and resolve-playable are groundwork with no UI yet.",
+    },
     {
         title: "2.3.0: Last.fm listening history, ported from upstream",
         description: "Bring years of Last.fm scrobbles into the same listening history the media-server path fills, on an hourly automation that resumes, retries, and never runs twice.",
