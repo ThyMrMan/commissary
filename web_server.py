@@ -52,7 +52,7 @@ logger = setup_logging(_log_level, _log_path)
 # the published image moved (ghcr.io/thymrman/commissary) even though nothing
 # about the data changed — see tests/test_branding.py for what deliberately
 # kept its old `soulsync` name.
-_SOULSYNC_BASE_VERSION = "2.2.4"
+_SOULSYNC_BASE_VERSION = "2.3.0"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -18413,6 +18413,7 @@ def _enhance_file_metadata(file_path: str, context: dict, artist: dict, album_in
             tidal_client=tidal_client,
             qobuz_enrichment_worker=qobuz_enrichment_worker,
             lastfm_worker=lastfm_worker,
+            lastfm_import_worker=lastfm_import_worker,
             genius_worker=genius_worker,
             bandcamp_worker=bandcamp_worker,
             spotify_enrichment_worker=spotify_enrichment_worker,
@@ -18520,6 +18521,7 @@ def _post_process_matched_download_with_verification(context_key, context, file_
             tidal_client=tidal_client,
             qobuz_enrichment_worker=qobuz_enrichment_worker,
             lastfm_worker=lastfm_worker,
+            lastfm_import_worker=lastfm_import_worker,
             genius_worker=genius_worker,
             bandcamp_worker=bandcamp_worker,
             spotify_enrichment_worker=spotify_enrichment_worker,
@@ -18646,6 +18648,7 @@ def _post_process_matched_download(context_key, context, file_path):
             tidal_client=tidal_client,
             qobuz_enrichment_worker=qobuz_enrichment_worker,
             lastfm_worker=lastfm_worker,
+            lastfm_import_worker=lastfm_import_worker,
             genius_worker=genius_worker,
             bandcamp_worker=bandcamp_worker,
             spotify_enrichment_worker=spotify_enrichment_worker,
@@ -40469,6 +40472,106 @@ try:
 except Exception as e:
     logger.error(f"Listening stats worker initialization failed: {e}")
     listening_stats_worker = None
+
+# ===================================================================
+# Last.fm Listening Import Worker — pulls scrobbles into listening_history
+# ===================================================================
+# Ported from upstream SoulSync 3.3.0. Deliberately AFTER the listening stats
+# worker: the importer hands it `_build_stats_cache` so a finished backfill
+# refreshes the Stats page rather than leaving it reading a stale cache.
+#
+# This is account-history INGESTION, not metadata enrichment — it shares the
+# Last.fm client and config with the enrichment worker above but writes
+# canonical rows into `listening_history`, the same table the media-server
+# scrobble path fills, so Stats and discovery keep one source of truth.
+lastfm_import_worker = None
+try:
+    from core.listening_import.lastfm import LastFMListeningImportWorker
+    from database.music_database import MusicDatabase
+
+    def _emit_lastfm_import_progress(state):
+        try:
+            socketio.emit('lastfm:import-progress', state or {})
+        except Exception as e:
+            logger.debug("lastfm import progress emit failed: %s", e)
+
+    lastfm_import_db = MusicDatabase()
+    lastfm_import_worker = LastFMListeningImportWorker(
+        database=lastfm_import_db,
+        config_manager=config_manager,
+        cache_builder=(listening_stats_worker._build_stats_cache
+                       if listening_stats_worker else None),
+        progress_callback=_emit_lastfm_import_progress,
+    )
+    logger.info("Last.fm listening import worker initialized")
+except Exception as e:
+    logger.error(f"Last.fm listening import worker initialization failed: {e}")
+    lastfm_import_worker = None
+
+
+@app.route('/api/lastfm/listening-import/status', methods=['GET'])
+def lastfm_listening_import_status():
+    """Get Last.fm listening-history import status."""
+    try:
+        if not lastfm_import_worker:
+            return jsonify({'success': False, 'enabled': False,
+                            'error': 'Last.fm importer unavailable'})
+        status = lastfm_import_worker.status()
+        next_run = (automation_engine.get_system_automation_next_run_seconds('import_lastfm_listening')
+                    if automation_engine else 0)
+        username = config_manager.get('lastfm.username', '') or status.get('username') or ''
+        # A blank username is workable ONLY when the account is authorized —
+        # the importer can then ask Last.fm who we are. Without that the caller
+        # has to supply one, so say which case they are in.
+        can_use_auth_user = bool(
+            config_manager.get('lastfm.api_key', '')
+            and config_manager.get('lastfm.api_secret', '')
+            and config_manager.get('lastfm.session_key', '')
+        )
+        return jsonify({
+            'success': True,
+            'enabled': bool(config_manager.get('lastfm.listening_sync_enabled', False)),
+            'api_key_configured': bool(config_manager.get('lastfm.api_key', '')),
+            'authenticated_user_available': can_use_auth_user,
+            'username': username,
+            'next_run_in_seconds': next_run,
+            **status,
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/lastfm/listening-import/run', methods=['POST'])
+def lastfm_listening_import_run():
+    """Start or update the Last.fm listening-history import."""
+    try:
+        if not lastfm_import_worker:
+            return jsonify({'success': False, 'error': 'Last.fm importer unavailable'}), 400
+        body = request.get_json(silent=True) or {}
+        username = str(body.get('username') or config_manager.get('lastfm.username', '') or '').strip()
+        if username:
+            config_manager.set('lastfm.username', username)
+        if 'enabled' in body:
+            config_manager.set('lastfm.listening_sync_enabled', bool(body.get('enabled')))
+        result = lastfm_import_worker.start_import(username=username or None,
+                                                   full=bool(body.get('full')))
+        ok = result.get('status') not in ('error',)
+        return jsonify({'success': ok, **result}), 200 if ok else 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/lastfm/listening-import/cancel', methods=['POST'])
+def lastfm_listening_import_cancel():
+    """Cancel the active Last.fm listening-history import."""
+    try:
+        if not lastfm_import_worker:
+            return jsonify({'success': False, 'error': 'Last.fm importer unavailable'}), 400
+        lastfm_import_worker.cancel()
+        return jsonify({'success': True, **lastfm_import_worker.status()})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 # --- Stats API Endpoints ---
 # Logic lives in core/stats/queries.py — these routes are thin handlers.

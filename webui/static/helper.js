@@ -3491,6 +3491,13 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.3.0': [
+        { date: 'September 2026 · 2.3.0' },
+        { title: "Your Last.fm scrobbles can come in now", desc: "ported from upstream SoulSync 3.3.0. Commissary already recorded what you played through Plex or Jellyfin; it had no way to bring in the years of history sitting in your Last.fm account. The importer pages through your scrobbles and writes them into the <strong>same listening history</strong> the media-server path fills — one source of truth, so Stats, discovery and Year in Listening all read it without knowing where a play came from." },
+        { title: "It runs itself, and it can be interrupted", desc: "an hourly automation keeps it current once the first backfill is done, and there's an <em>Import Last.fm Listening</em> block if you'd rather drive it from your own automation. A long backfill resumes where it stopped rather than starting over, a transient network failure retries before giving up, and it never runs twice at once. Imported plays are tagged <code>lastfm</code> so they can be told apart from — or removed without touching — what your media server recorded." },
+        { title: "Nothing starts importing on its own", desc: "the hourly job stays skipped until you turn the sync on; running it by hand <em>is</em> turning it on. Set your Last.fm username in the importer, or leave it blank if your account is already authorized and it will ask Last.fm who you are." },
+        { title: "No button in the UI yet", desc: "upstream drives this from a page Commissary hasn't adopted, so for now it runs on the schedule, from the automation block, or by POSTing to <code>/api/lastfm/listening-import/run</code>. The status endpoint tells you whether an import is running and when the next one is due." },
+    ],
     '2.2.4': [
         { date: 'September 2026 · 2.2.4' },
         { title: "Downloads that finished but never left “Downloading”", desc: "a download could complete, import correctly, appear in your library — and sit in Active for ever anyway. The step that marks a download finished required it to belong to a <em>batch</em>, and a track you pick yourself from the manual search has no batch. In one instance's logs that meant <strong>836 successful imports and not a single completed task</strong>. The file was always fine; the row just never caught up." },
@@ -3986,6 +3993,24 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.3.0: Last.fm listening history, ported from upstream",
+        description: "Bring years of Last.fm scrobbles into the same listening history the media-server path fills, on an hourly automation that resumes, retries, and never runs twice.",
+        features: [
+            "ported from upstream SoulSync 3.3.0 - core/listening_import/ plus an automation handler, taken verbatim",
+            "upstream's own 9 tests pass here unchanged, which is the evidence the port is faithful rather than approximate",
+            "writes into listening_history using only columns this fork already had - no migration",
+            "rows carry server_source='lastfm', so an import can be unpicked without touching media-server plays",
+            "single-flight: a second start while a crawl runs is skipped, not queued behind it",
+            "a long backfill resumes at its interrupted page instead of restarting the whole crawl",
+            "a transient page failure retries with backoff before failing, and keeps the resume point when it does",
+            "hourly system automation, plus an 'Import Last.fm Listening' block for user automations",
+            "the schedule stays skipped until the sync is enabled; a manual run is what enables it",
+            "deliberately did NOT port upstream's api/stats.py refactor - the three routes went in inline instead",
+            "the client gained ONE method; this fork's own removal of get_tag_top_artists and its branding are pinned by tests",
+        ],
+        usage_note: "No UI button yet - upstream drives this from a page this fork has not adopted. Run it from the automation block, or POST to /api/lastfm/listening-import/run. Set lastfm.username first, or leave it blank if your account is authorized. The first run is a full backfill and will take a while; it resumes if interrupted.",
+    },
     {
         title: "2.2.4: downloads that finished without ever saying so",
         description: "A completed download could import correctly and still sit in Active for ever - and six 'your library already has this' outcomes silently re-queued themselves nightly. Plus torrent adds reported as refused while the client downloaded them.",

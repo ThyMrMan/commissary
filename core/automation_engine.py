@@ -143,6 +143,13 @@ SYSTEM_AUTOMATIONS = [
         'initial_delay': 1080,
     },
     {
+        'name': 'Last.fm Listening Sync',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 1, 'unit': 'hours'},
+        'action_type': 'import_lastfm_listening',
+        'initial_delay': 1200,
+    },
+    {
         'name': 'Auto-Deep Scan Library',
         'trigger_type': 'schedule',
         'trigger_config': {'interval': 7, 'unit': 'days'},

@@ -155,6 +155,12 @@ class AutomationDeps:
     # no caching needed yet).
     build_personalized_manager: Callable[[], Any]
 
+    # --- Listening-history importers ---
+    # Optional: the importer is legitimately None when its boot failed or
+    # Last.fm is not configured, and the handler answers for that rather
+    # than the registration refusing to build.
+    lastfm_import_worker: Optional[Any] = None
+
     # --- Unified PlaylistSource registry ---
     # Optional so test fixtures that don't exercise refresh_mirrored
     # can keep their existing scaffolding. Production wiring in
