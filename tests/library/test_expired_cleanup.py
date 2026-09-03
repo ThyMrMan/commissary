@@ -87,5 +87,11 @@ def test_select_expired_filters():
         _entry(eid=3, days_old=70, protected=True),          # mirrored → keep
         _entry(eid=4, days_old=10),                          # too new → keep
     ]
-    out = select_expired(entries, watchlist_retention="off", playlist_retention="2mo")
+    # `now=NOW` is load-bearing. Without it select_expired reads the wall
+    # clock while the entries are dated from the frozen NOW, so entry 4 —
+    # written as "10 days old, too new to expire" — silently became 98 days
+    # old and started being selected for DELETION on 2026-07-27. The test
+    # then sat red in the known-failures list, which is exactly where a real
+    # regression in a file-deleting path would have hidden. (Upstream 3.3.1.)
+    out = select_expired(entries, watchlist_retention="off", playlist_retention="2mo", now=NOW)
     assert [e["id"] for e in out] == [1]

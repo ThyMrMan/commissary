@@ -721,6 +721,87 @@ def test_start_sync_allows_resync_phases():
         assert code == 200, phase
 
 
+def test_start_sync_refuses_while_a_sync_is_in_flight():
+    """The discovery modal's "Sync This Playlist" scheduled a second sync over a
+    running one and overwrote the worker handle. An un-done future for the same
+    sync id must 409 and leave everything untouched. (Upstream 3.3.1.)"""
+    from core.discovery.endpoints import start_sync
+
+    class _Running:
+        def done(self):
+            return False
+
+    infra = _cancel_infra()
+    kw, submitted, calls = _start_kwargs(infra)
+    states = {'k': {'phase': 'discovered', 'discovery_results': [], 'last_accessed': 0}}
+    running = _Running()
+    infra['active_sync_workers']['tidal_k'] = running
+    body, code = start_sync(states, 'k', **kw)
+    assert code == 409
+    assert 'already in progress' in body['error']
+    assert submitted == []
+    assert calls == []
+    # the in-flight handle is NOT overwritten and the phase is untouched
+    assert infra['active_sync_workers']['tidal_k'] is running
+    assert states['k']['phase'] == 'discovered'
+
+
+def test_start_sync_proceeds_when_the_previous_sync_finished():
+    from core.discovery.endpoints import start_sync
+
+    class _Done:
+        def done(self):
+            return True
+
+    infra = _cancel_infra()
+    kw, submitted, _ = _start_kwargs(infra)
+    states = {'k': {'phase': 'discovered', 'discovery_results': [], 'last_accessed': 0}}
+    infra['active_sync_workers']['tidal_k'] = _Done()
+    body, code = start_sync(states, 'k', **kw)
+    assert code == 200 and body['success'] is True
+    assert len(submitted) == 1
+
+
+def test_start_sync_tolerates_a_handle_that_cannot_say_whether_it_is_done():
+    """`getattr(existing, 'done', lambda: True)` rather than `.done()`. A stale
+    key holding something that is not a Future must not raise — that would turn
+    a leftover dict entry into a 500 on every subsequent sync. Treating it as
+    finished is also the pre-guard behaviour, so nothing regresses."""
+    from core.discovery.endpoints import start_sync
+
+    infra = _cancel_infra()
+    kw, submitted, _ = _start_kwargs(infra)
+    states = {'k': {'phase': 'discovered', 'discovery_results': [], 'last_accessed': 0}}
+    infra['active_sync_workers']['tidal_k'] = object()      # no .done at all
+    body, code = start_sync(states, 'k', **kw)
+    assert code == 200, body
+    assert len(submitted) == 1
+
+
+def test_start_sync_leaves_no_activity_trace_for_a_refused_duplicate():
+    """The guard sits BEFORE the activity item and the phase mutation. Logging
+    "Sync Started" for a request that is about to 409 would be a second, quieter
+    wrong thing."""
+    from core.discovery.endpoints import start_sync
+
+    class _Running:
+        def done(self):
+            return False
+
+    infra = _cancel_infra()
+    kw, _submitted, calls = _start_kwargs(infra)
+    states = {'k': {'phase': 'discovered', 'discovery_results': [], 'last_accessed': 0,
+                    'sync_progress': {'kept': True}}}
+    infra['active_sync_workers']['tidal_k'] = _Running()
+    before_states = dict(infra['sync_states'])
+    body, code = start_sync(states, 'k', **kw)
+    assert code == 409
+    assert calls == [], "no activity item may be recorded for a refused duplicate"
+    assert 'sync_playlist_id' not in states['k']
+    assert states['k']['sync_progress'] == {'kept': True}
+    assert infra['sync_states'] == before_states
+
+
 def test_start_sync_exception_returns_500():
     from core.discovery.endpoints import start_sync
     infra = _cancel_infra()

@@ -3491,6 +3491,14 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.3.2': [
+        { date: 'September 2026 · 2.3.2' },
+        { title: "A big cover could leave a FLAC with no artwork <em>and</em> no tags", desc: "a FLAC stores each metadata block with a 24-bit length, so nothing over about 16MB can be written into one — and the tagging library only discovers that at the moment it saves. Some services hand back genuinely enormous originals. The log would say “Album art successfully embedded”, the save would fail, and the track was left with neither the art nor the tags it already had. Oversized covers are now re-encoded down to fit, or the tags are written without art, which is a far better outcome than losing both." },
+        { title: "…and the retry that finished the job", desc: "the safe half of the save works on a copy, so the failure above left your file untouched — and then the fallback ran <strong>the same impossible write against the real file</strong>. That fallback exists for disk and permission problems, which retrying genuinely can fix; a set of tags that cannot be encoded is not one of those, and is now refused with the original left alone. Ported from upstream SoulSync 3.3.1." },
+        { title: "Two tag writers on one file no longer knock each other onto the unsafe path", desc: "the temporary file used during a safe save had a fixed name, so a bulk fix and a scan's own auto-fix touching the same track at the same moment collided — and the one that lost fell through to the in-place write the safe path exists to avoid. The name is now unique per writer." },
+        { title: "A test guarding file deletion had been quietly red since July", desc: "the Expired Download Cleaner's test pinned a fixed “now” for the files it built but let the code read the real clock, so an entry written as “too new to delete” aged past the retention window on <strong>27 July</strong> and the test had been failing ever since. Nothing was wrong with the cleaner — but a red test on a path that <em>deletes your files</em> is a blind spot exactly the size of what it covers." },
+        { title: "Syncing a discovery playlist twice", desc: "the discovery modal's “Sync This Playlist” had no guard against a second click while one was running, unlike the playlist cards, so it started a second sync and overwrote the handle to the first — which is what the finished-check later asks. It now refuses politely, before anything is logged or changed." },
+    ],
     '2.3.1': [
         { date: 'September 2026 · 2.3.1' },
         { title: "Daily Mixes are real mixes now", desc: "the old ones promised “half your library, half discovery” and could never deliver the first half — library tracks carry no source ids, so they cannot travel the pipeline discovery tracks use, and the builder simply left them out. Every “mix” was a genre playlist from the discovery pool wearing a different name. The replacement, ported from upstream SoulSync 3.3.1, clusters what you have <em>actually played</em>: a mix comes out as <strong>Eminem, Linkin Park, YOASOBI and more</strong> — mostly music you already own, so it is something you can press play on rather than a download list." },
@@ -4000,6 +4008,23 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.3.2: a cover too big to write, and the retry that made it worse",
+        description: "An oversized FLAC cover failed the whole tag write, then the fallback repeated it against the real file. Plus a file-deleting path whose test had been red since July, and a discovery sync that could start twice.",
+        features: [
+            "a FLAC metadata block carries a 24-bit length, so >16MB art can never be written - mutagen only raises at SAVE",
+            "the log said 'Album art successfully embedded' immediately before the write that lost both art and tags",
+            "oversized covers are re-encoded (quality first, then dimensions) or dropped; tags without art beats neither",
+            "the atomic save works on a COPY, so the failure was safe - the in-place fallback then repeated it on the original",
+            "a tag-encoding error is now refused outright; disk and permission errors still fall back, which is what that path is for",
+            "third bug in the same hunk, unmentioned upstream: the atomic temp file had a FIXED name",
+            "two writers on one track collided and the loser dropped to the non-atomic save the function exists to replace",
+            "NOT ported from the same hunk: upstream's `from core.settings` - that module does not exist here and the import is swallowed",
+            "expired-cleanup test pinned NOW for its fixtures but let the code read the wall clock; red since 2026-07-27",
+            "the discovery sync path gained the re-entrancy guard the card-level path always had",
+        ],
+        usage_note: "Nothing to migrate. If a FLAC in your library has lost its tags, re-running metadata enhancement on it will now succeed where it previously failed - the file itself was never damaged, only left un-tagged. The expired-cleanup fix is a TEST fix: the cleaner was behaving correctly, but its coverage had silently stopped working.",
+    },
     {
         title: "2.3.1: Daily Mixes that mean something, ported from upstream",
         description: "The old Daily Mixes were genre playlists in disguise - the library half never worked by design. The replacement clusters what you actually played. Plus Recommended Stations, backend-only for now.",
