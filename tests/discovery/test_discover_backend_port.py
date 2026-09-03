@@ -157,14 +157,21 @@ def _discover_js() -> str:
 
 
 def test_the_existing_page_can_already_read_the_new_track_shape():
-    """Why no frontend change shipped with this port. Upstream's mix tracks are
+    """Why no frontend change shipped with this port: upstream's mix tracks are
     Spotify-shaped — {name, artists[], album{name,images[]}, duration_ms} — and
-    this fork's `_normalizeTrack` was already written to accept exactly that
-    alongside the flat form."""
-    body = _discover_js().split("function _normalizeTrack(", 1)[1][:1200]
-    assert "td.artists && td.artists[0]" in body
-    assert "td.album && td.album.name" in body
-    assert "td.duration_ms" in body
+    this fork's `_normalizeTrack` already accepted exactly that.
+
+    That claim originally shipped here as three substring assertions, which
+    could not tell whether the function RETURNED the right thing. It is now
+    proven by running the real body — see tests/js/discover_vanilla_harness.mjs,
+    driven from tests/test_discover_vanilla_harness.py. All that is left here is
+    the coupling itself: the page must still define the function this port
+    relies on, and the harness must still be the thing that checks it."""
+    assert "function _normalizeTrack(" in _discover_js()
+    harness = (_ROOT / "tests" / "js" / "discover_vanilla_harness.mjs").read_text(encoding="utf-8")
+    assert "_normalizeTrack" in harness, (
+        "the behavioural coverage this test defers to has gone; either restore "
+        "it or put real assertions back here")
 
 
 def test_the_subtitle_is_aliased_so_the_shelf_is_not_blank():
