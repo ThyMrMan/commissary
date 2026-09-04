@@ -1078,6 +1078,43 @@ def _inert_video_enrichment_engine():
     yield engine
 
 
+def _keep_the_video_download_monitor_inert():
+    """Neutralise the video download monitor for the whole pytest process.
+
+    Called at conftest IMPORT, deliberately not from a fixture. web_server.py
+    calls ensure_started(_get_video_db) at module scope, and
+    tests/blocklist/test_blocklist_api.py imports web_server at module scope
+    via importorskip -- so the real daemon launches during COLLECTION, before
+    the first fixture runs. The session fixture below was consequently setting
+    a flag the real launcher had already set itself, on a thread already in
+    the air.
+
+    That thread then lives for the rest of the run, and its loop calls the LIVE
+    db_provider -- get_video_db() -- which resolves to whichever per-test
+    database is installed at that moment: it re-queues orphans, pumps youtube
+    workers and mutates rows inside other tests' databases. It ticks on its own
+    schedule, so which test it lands in is pure timing; that is the whole of the
+    video suite's order-dependence. Caught by the self-describing assert in
+    test_youtube_episode_parity, where its recovery pass called that test's
+    stubbed start_next_queued three extra times (_MAX_CONCURRENT).
+
+    Replacing the launcher instead of only pre-setting the flag also closes the
+    window test_video_health opens when it clears _started to assert the
+    "monitor is not running" health warning. Production is untouched: this runs
+    only inside pytest.
+    """
+    import core.video.download_monitor as monitor
+
+    def _inert_ensure_started(db_provider=None):
+        return None
+
+    monitor.ensure_started = _inert_ensure_started
+    with monitor._lock:
+        monitor._started = True
+
+
+_keep_the_video_download_monitor_inert()
+
 @pytest.fixture(autouse=True, scope='session')
 def _inert_video_download_monitor():
     """Pre-mark the video download monitor as started so no test can spawn it.

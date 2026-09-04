@@ -84,7 +84,13 @@ def build_query(scope: str, title: Any, *, year: Any = None, season: Any = None,
         ad = str(air_date or "")[:10]
         if st == "daily" and len(ad) == 10:
             return "%s %s" % (t, ad.replace("-", "."))
-        if st == "anime" and absolute:
+        # Anime, or a show nobody has typed yet. series_type is never derived
+        # automatically -- it is set by hand per show, or by a Library's
+        # default_series_type -- so requiring 'anime' here made the absolute
+        # query depend on a tag most shows simply do not carry, and an untyped
+        # anime was asked for as SxxExx only. A show explicitly marked standard
+        # or daily is believed and keeps SxxExx.
+        if absolute and st not in ("standard", "daily"):
             return "%s %s" % (t, absolute)
     if scope == "episode" and s_i is not None and e_i is not None:
         return "%s S%02dE%02d" % (t, s_i, e_i)

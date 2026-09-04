@@ -3491,6 +3491,13 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.3.3': [
+        { date: 'September 2026 · 2.3.3' },
+        { title: "A tracker listing an episode as EP81 now matches a search for S04E15", desc: "anime and other long-running shows are numbered by <em>absolute</em> episode on most trackers — <code>Show - 81</code>, not <code>S04E15</code>. Manual search already worked the absolute number out, and already used it to <em>rank</em> what came back — it just never put it in the query it sent. So the tracker was asked for <code>S04E15</code>, returned nothing for it, and the absolute-aware ranking sat there with no candidate to accept. The capability was present and unreachable. The number now goes out <strong>with</strong> the search, and the plain <code>SxxExx</code> query still runs beside it, so indexers that do number by season stay reachable." },
+        { title: "…and it no longer waits on a tag almost nothing carries", desc: "the absolute-number query used to require the show be tagged <strong>Anime</strong> — and nothing applies that tag automatically. It is set by hand, per show, or from a Library's default. Measured on the library this was built for: <strong>565 of 571 shows in a Library called “Anime” had no type at all</strong>, and every one of them was being hunted as standard <code>SxxExx</code>. An untyped show now gets the absolute query too. A show you have explicitly marked <em>standard</em> or <em>daily</em> is believed, and keeps its SxxExx or air-date search." },
+        { title: "What automatic grabs still refuse to guess", desc: "the unattended drain deliberately did not change. For a show nobody has typed it still will not derive a <em>later</em> season's absolute number: wanting S02E01 with absolute 4, a release called <code>Show - 04</code> is far more likely season <strong>one's</strong> episode 4 — and there is nobody watching an automatic grab to catch that. To get absolute numbering on the automatic side as well, set the Library's <strong>Default series type</strong> to Anime; it applies to every show filed there that has no type of its own." },
+        { title: "A timing race that could fail almost any video test", desc: "internal, but it had been costing real time. Importing the web server starts the video download monitor — which is correct at boot, so in-flight downloads resume — and one test file imports the web server, so the monitor's daemon thread was already running before the first test began. It then ran for the rest of the suite against whichever test's database happened to be installed at that moment, and whichever test it happened to interrupt was the one that failed. Nothing was wrong with the application; the suite simply could not hold still." },
+    ],
     '2.3.2': [
         { date: 'September 2026 · 2.3.2' },
         { title: "A big cover could leave a FLAC with no artwork <em>and</em> no tags", desc: "a FLAC stores each metadata block with a 24-bit length, so nothing over about 16MB can be written into one — and the tagging library only discovers that at the moment it saves. Some services hand back genuinely enormous originals. The log would say “Album art successfully embedded”, the save would fail, and the track was left with neither the art nor the tags it already had. Oversized covers are now re-encoded down to fit, or the tags are written without art, which is a far better outcome than losing both." },
@@ -4008,6 +4015,23 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.3.3: an episode numbered 81 that no search would ask for",
+        description: "Manual search worked out the absolute episode number, used it to rank the results, and then left it out of the query — so the tracker was asked for S04E15 and had nothing to return.",
+        features: [
+            "trackers number anime and long-running shows by ABSOLUTE episode: 'Show - 81', not S04E15",
+            "the endpoints computed that number and handed it to the RANKER, never to the query builder",
+            "present and unreachable: _evaluate_hits accepted the hint, build_query was never given it",
+            "the absolute query is ADDITIVE - the plain SxxExx query still goes out beside it",
+            "second gate: the absolute form required series_type=='anime', a tag nothing derives automatically",
+            "measured on the library this was built for: 565 of 571 shows in a Library named 'Anime' had no type",
+            "untyped shows now get the absolute query; an explicit 'standard' or 'daily' is believed and keeps SxxExx",
+            "the UNATTENDED drain is unchanged on purpose - it still will not guess a later season's absolute number",
+            "series type now resolves through the shows row as well as the tmdb override, so a Library default counts",
+            "separately: video tests raced a real download-monitor thread that importing web_server had started",
+        ],
+        usage_note: "Manual search needs nothing from you. For AUTOMATIC grabs to use absolute numbering, set the Library's Default series type to Anime - it applies to every show filed there that has no type of its own. A show you have explicitly marked standard or daily is never searched by absolute number, on either path.",
+    },
     {
         title: "2.3.2: a cover too big to write, and the retry that made it worse",
         description: "An oversized FLAC cover failed the whole tag write, then the fallback repeated it against the real file. Plus a file-deleting path whose test had been red since July, and a discovery sync that could start twice.",

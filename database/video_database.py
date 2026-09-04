@@ -1396,6 +1396,32 @@ class VideoDatabase:
         finally:
             conn.close()
 
+    def effective_series_type(self, tmdb_id) -> str | None:
+        """A show's series type as a SEARCH should see it, or None when untyped.
+
+        The per-show override first (what the show's own Series Type control
+        writes, and the only place an explicit 'standard' is recorded -- the
+        shows column stores standard as NULL), then the library row, which is
+        also where a Library's ``default_series_type`` lands. None means nobody
+        has typed this show, which is the ordinary case: nothing derives the
+        type automatically.
+        """
+        st = self.series_type_for_tmdb(tmdb_id)
+        if st:
+            return st
+        if tmdb_id is None:
+            return None
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT series_type FROM shows WHERE tmdb_id=? ORDER BY id LIMIT 1",
+                (int(tmdb_id),)).fetchone()
+            return (row["series_type"] or None) if row else None
+        except (sqlite3.Error, TypeError, ValueError):
+            return None
+        finally:
+            conn.close()
+
     def set_season_pack_mode_override(self, tmdb_id, mode) -> str | None:
         """Per-show season-pack preference, keyed by tmdb id.
 

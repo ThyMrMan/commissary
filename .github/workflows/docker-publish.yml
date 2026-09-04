@@ -17,9 +17,9 @@ on:
   workflow_dispatch:
     inputs:
       version_tag:
-        description: 'Version tag (e.g. 2.3.2). Also published as :latest.'
+        description: 'Version tag (e.g. 2.3.3). Also published as :latest.'
         required: true
-        default: '2.3.2'
+        default: '2.3.3'
 
 jobs:
   build-and-push:

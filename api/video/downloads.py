@@ -241,6 +241,26 @@ def _episode_hints(db, body, season=None, episode=None):
     return want_date, want_absolute
 
 
+def _series_type_for(db, body):
+    """The show's series type for a search payload, or None when untyped.
+
+    Shapes the QUERY only — anime is hunted by absolute number, dailies by air
+    date. It deliberately does NOT gate whether the hints are computed;
+    _episode_hints explains why making a match depend on a hand-applied tag was
+    the wrong lever, and the same reasoning is why an unknown type here still
+    gets the absolute query (build_query suppresses it only for a show
+    explicitly marked standard or daily).
+    """
+    tmdb_id = _tmdb_id_from(db, body)
+    if not tmdb_id:
+        return None
+    try:
+        return db.effective_series_type(tmdb_id)
+    except Exception:   # noqa: BLE001 - a query hint must never break a search
+        logger.debug("series-type hint failed for %s", tmdb_id, exc_info=True)
+        return None
+
+
 def _parse_text(hit) -> str:
     """What the release parser should read for a hit. Soulseek hits are grouped by
     FOLDER — the folder title carries the show/release name, but on library-style
@@ -1065,11 +1085,18 @@ def register_routes(bp):
         source = str(body.get("source") or "").lower()
         want_season, want_episode, season_end = _search_ints(body)
         profile, _pid = _profile_for_request(get_video_db(), body)
+        # Before the search, not after: these shape the QUERY as well as the
+        # ranking. Computing them below the fetch meant an anime episode was
+        # only ever asked for as SxxExx.
+        _ep_hints = _episode_hints(get_video_db(), body, want_season, want_episode)
+        _stype = _series_type_for(get_video_db(), body)
         live = False
         if source == "soulseek":
             from core.video.slskd_search import build_query, slskd_search
             sres = slskd_search(build_query(scope, title, year=body.get("year"),
-                                            season=want_season, episode=want_episode))
+                                            season=want_season, episode=want_episode,
+                                            air_date=_ep_hints[0], absolute=_ep_hints[1],
+                                            series_type=_stype))
             if not sres.get("configured"):
                 return jsonify({"scope": scope, "results": [], "error": "slskd isn't configured — set its URL on Settings → Downloads."})
             if sres.get("error"):
@@ -1084,7 +1111,8 @@ def register_routes(bp):
                 get_video_db(), _root_folder_id_for_grab(get_video_db(), body))
             pres = prowlarr_search(scope, title, year=body.get("year"),
                                    season=want_season, episode=want_episode, source=source,
-                                   indexer_ids=restrict)
+                                   air_date=_ep_hints[0], absolute=_ep_hints[1],
+                                   series_type=_stype, indexer_ids=restrict)
             if not pres.get("configured"):
                 return jsonify({"scope": scope, "results": [],
                                 "error": "Prowlarr isn't configured — set its URL + key on Settings → Downloads."})
@@ -1094,7 +1122,6 @@ def register_routes(bp):
         else:
             raw = mock_search(scope, title, year=body.get("year"), season=want_season,
                               episode=want_episode, season_end=season_end, source=source)
-        _ep_hints = _episode_hints(get_video_db(), body, want_season, want_episode)
         return jsonify({"scope": scope, "live": live,
                         "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=_want_titles(get_video_db(), body),
                                                  want_date=_ep_hints[0], want_absolute=_ep_hints[1])})
@@ -1113,12 +1140,15 @@ def register_routes(bp):
         want_season, want_episode, season_end = _search_ints(body)
         # Air date / absolute number, for releases that carry no SxxExx.
         _ep_hints = _episode_hints(get_video_db(), body, want_season, want_episode)
+        _stype = _series_type_for(get_video_db(), body)
 
         if source == "soulseek":
             from core.video.slskd_search import (
                 _INTERACTIVE_MAX_WAIT_SECONDS, build_query, search_timeout_ms, start_search)
             res = start_search(build_query(scope, title, year=body.get("year"),
-                                           season=want_season, episode=want_episode),
+                                           season=want_season, episode=want_episode,
+                                           air_date=_ep_hints[0], absolute=_ep_hints[1],
+                                           series_type=_stype),
                                max_throttle_wait=_INTERACTIVE_MAX_WAIT_SECONDS)
             if not res.get("configured"):
                 return jsonify({"error": "slskd isn't configured — set its URL on Settings → Downloads."})
@@ -1136,7 +1166,8 @@ def register_routes(bp):
                 get_video_db(), _root_folder_id_for_grab(get_video_db(), body))
             pres = prowlarr_search(scope, title, year=body.get("year"),
                                    season=want_season, episode=want_episode, source=source,
-                                   indexer_ids=restrict)
+                                   air_date=_ep_hints[0], absolute=_ep_hints[1],
+                                   series_type=_stype, indexer_ids=restrict)
             if not pres.get("configured"):
                 return jsonify({"error": "Prowlarr isn't configured — set its URL + key on Settings → Downloads."})
             if pres.get("error"):
