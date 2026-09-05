@@ -3491,6 +3491,14 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.3.4': [
+        { date: 'September 2026 · 2.3.4' },
+        { title: "The Last.fm importer's automation could never have run", desc: "a wiring mistake in 2.3.0 attached the importer's handle to three calls that build the <em>metadata enrichment</em> runtime, rather than to the automation dependencies where the field actually lives. Two things followed. Those three calls raised <code>TypeError</code> — which is what the log shows as metadata enrichment failing on auto-imported tracks — and the automation's own guard, which asks the dependencies whether the importer exists, was told <strong>“no”</strong> every single time. The hourly job was being skipped for reasons that had nothing to do with how you had configured it." },
+        { title: "…and the test written to catch that counted the mistake as a pass", desc: "the guard asserted that one particular line of text appeared three times in <code>web_server.py</code>. It did — in the three <em>wrong</em> places. Counting text cannot tell a correct call from an incorrect one. The argument list is now checked against the function's real signature instead, so any argument the builder does not accept fails the test rather than satisfying it." },
+        { title: "Two repair routines undoing each other every thirty seconds", desc: "<strong>2,491 warnings — 91% of a 21-hour log — from one batch.</strong> Batch healing counted its active downloads as 3 and corrected the number; the worker validator counted the same batch as 21 and corrected it straight back; thirty seconds later both did it again. <strong>4,992 corrections against 4,982</strong>, neither ever winning, for the batch's entire life. The two were reading separate hand-written lists of what counts as “active”, and one of them omitted <code>pending</code> — the status every download starts in. Both now ask the same shared function, which exists for precisely this reason and which one of them had simply never been moved onto." },
+        { title: "Dates were a timezone out, so the calendar could show tomorrow", desc: "the container sets a timezone, but the image carried no timezone <em>database</em> to resolve it against — and that combination fails silently: the setting is accepted and everything quietly stays on UTC. If you are behind UTC, every date the server rendered rolled over early. The calendar highlighted the next day from early evening onward, and log timestamps ran hours ahead of the clock on the wall. <strong>This one needs a rebuilt image; a restart alone will not pick it up.</strong>" },
+        { title: "Two shutdown saves racing for one temporary file", desc: "the API-call history is written through a temporary file, and shutting down saves it twice — once from the shutdown sequence, once from the exit handler that follows it. Both used the same fixed temporary name, so the second failed with a permission error, and the failure handler then deleted the file the <em>other</em> save was still writing. Each save now uses a name of its own. Same fix, and the same cause, as the tag writer in 2.3.2." },
+    ],
     '2.3.3': [
         { date: 'September 2026 · 2.3.3' },
         { title: "A tracker listing an episode as EP81 now matches a search for S04E15", desc: "anime and other long-running shows are numbered by <em>absolute</em> episode on most trackers — <code>Show - 81</code>, not <code>S04E15</code>. Manual search already worked the absolute number out, and already used it to <em>rank</em> what came back — it just never put it in the query it sent. So the tracker was asked for <code>S04E15</code>, returned nothing for it, and the absolute-aware ranking sat there with no candidate to accept. The capability was present and unreachable. The number now goes out <strong>with</strong> the search, and the plain <code>SxxExx</code> query still runs beside it, so indexers that do number by season stay reachable." },
@@ -4015,6 +4023,24 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.3.4: what one app.log was hiding",
+        description: "A wiring mistake from 2.3.0 that kept the Last.fm automation from ever running, two repair routines that spent 21 hours undoing each other, and dates that were a whole timezone out.",
+        features: [
+            "lastfm_import_worker was passed to _build_metadata_enrichment_runtime, which does not accept it",
+            "all three of those calls raised TypeError - the log shows enrichment failing on auto-imported tracks",
+            "AutomationDeps, where the field lives, never received it: the handler's guard always answered 'unavailable'",
+            "the wiring test asserted a STRING COUNT of three, and the mistake satisfied it exactly",
+            "replaced with an AST check against the real signature, plus proof the builder rejects the argument",
+            "batch healing and the worker validator corrected each other's active count every 30s: 4,992 vs 4,982",
+            "two hand-written 'active' lists; web_server's omitted 'pending', the status every task is created with",
+            "task_is_active() was introduced to stop exactly this drift - the healer had never been migrated to it",
+            "TZ was set in docker-compose, but python:3.11-slim ships no tzdata, so the setting silently did nothing",
+            "the calendar sends the SERVER's date.today() as its 'today' marker, so a UTC container rolled it over early",
+            "the api-call history's fixed .tmp name collided between the shutdown save and the atexit save",
+        ],
+        usage_note: "The timezone fix requires a REBUILT image - restarting the existing one will not pick it up. To confirm it applied: `docker exec <container> date` should agree with your wall clock. Everything else takes effect on restart. If your Last.fm import automation looked configured but never ran, this is why.",
+    },
     {
         title: "2.3.3: an episode numbered 81 that no search would ask for",
         description: "Manual search worked out the absolute episode number, used it to rank the results, and then left it out of the query — so the tracker was asked for S04E15 and had nothing to return.",

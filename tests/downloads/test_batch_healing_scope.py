@@ -47,8 +47,34 @@ def test_finished_tasks_are_no_longer_called_orphans():
 
 def test_a_terminal_status_counts_as_finished_not_missing():
     block = _healer()
-    terminal = block.split("elif task_status in ['failed', 'completed', 'cancelled', 'not_found']", 1)[1][:120]
+    terminal = block.split("elif task_status in TERMINAL_TASK_STATUSES", 1)[1][:120]
     assert "finished_tasks.append" in terminal
+
+
+def test_the_healer_shares_one_definition_of_active_with_the_validator():
+    """The healer and core/downloads/monitor.py's _validate_worker_counts each
+    recompute a batch's active count on their own 30-second tick. While the
+    healer enumerated its own live states it omitted 'pending' -- the status
+    every task is created with -- so it counted 3 where the validator counted
+    21, and the two spent a whole run overwriting each other:
+
+        [Batch Healing]     fixing active count 21 -> 3
+        [Worker Validation] reported=3, actual=21 ... Fixed active count: 3 -> 21
+
+    4,992 heals against 4,982 validations in one 21-hour log. task_is_active
+    derives from the terminal set so a second copy cannot drift; the point of
+    this test is that the healer keeps USING it rather than growing a list back.
+    """
+    block = _healer()
+    assert "task_is_active(task_status)" in block
+    assert "'searching', 'downloading', 'queued', 'post_processing'" not in block
+
+
+def test_the_shared_helper_counts_a_pending_task_as_active():
+    """The specific omission that caused the oscillation."""
+    from core.runtime_state import task_is_active
+    assert task_is_active('pending') is True
+    assert task_is_active('completed') is False
 
 
 def test_a_task_absent_from_the_task_table_is_the_real_fault():

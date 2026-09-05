@@ -65,6 +65,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     flac \
     libchromaprint-tools \
     unzip \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Deno — JavaScript runtime for yt-dlp. YouTube gates its downloadable formats

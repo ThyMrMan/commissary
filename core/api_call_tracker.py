@@ -10,6 +10,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from collections import deque, defaultdict
 
 from utils.logging_config import get_logger
@@ -279,6 +280,7 @@ class ApiCallTracker:
         a SIGINT/SIGTERM/crash mid-write can't leave the JSON file truncated.
         Without this, an interrupted shutdown corrupts the history file and
         the next startup loses 24h of metrics."""
+        tmp_path = None
         try:
             now = time.time()
             cutoff = now - 86400
@@ -296,7 +298,14 @@ class ApiCallTracker:
                 events = [dict(e) for e in self._events if e['ts'] >= cutoff]
 
             payload = {'ts': now, 'history': data, 'events': events}
-            tmp_path = _PERSIST_PATH + '.tmp'
+            # Unique per process/thread/call. Shutdown saves twice -- the
+            # runtime-component shutdown calls save(), then sys.exit(0) fires the
+            # atexit handler which calls it again -- and a fixed '.tmp' name made
+            # the second open fail on Windows while the first still held the
+            # handle: "[Errno 13] Permission denied: api_call_history.json.tmp".
+            tmp_path = "%s.%d.%d.%s.tmp" % (_PERSIST_PATH, os.getpid(),
+                                            threading.get_ident(),
+                                            uuid.uuid4().hex[:8])
             with open(tmp_path, 'w') as f:
                 json.dump(payload, f)
                 f.flush()
@@ -304,10 +313,12 @@ class ApiCallTracker:
             os.replace(tmp_path, _PERSIST_PATH)
         except Exception as e:
             logger.error(f"[ApiCallTracker] Failed to save history: {e}")
-            # Best-effort cleanup of stale tmp file from a failed write.
+            # Best-effort cleanup of THIS call's tmp file. It used to remove
+            # the shared fixed name, which meant a save that failed could delete
+            # a concurrent save's file and take that one down with it.
             try:
-                if os.path.exists(_PERSIST_PATH + '.tmp'):
-                    os.remove(_PERSIST_PATH + '.tmp')
+                if tmp_path and os.path.exists(tmp_path):
+                    os.remove(tmp_path)
             except Exception as e:
                 logger.debug("remove stale tmp file failed: %s", e)
 

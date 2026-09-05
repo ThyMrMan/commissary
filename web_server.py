@@ -52,7 +52,7 @@ logger = setup_logging(_log_level, _log_path)
 # the published image moved (ghcr.io/thymrman/commissary) even though nothing
 # about the data changed — see tests/test_branding.py for what deliberately
 # kept its old `soulsync` name.
-_SOULSYNC_BASE_VERSION = "2.3.3"
+_SOULSYNC_BASE_VERSION = "2.3.4"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -212,6 +212,7 @@ from core.metadata.source import (
     normalize_album_cache_key,
 )
 from core.runtime_state import (
+    TERMINAL_TASK_STATUSES,
     activity_feed,
     activity_feed_lock,
     add_activity_item,
@@ -223,6 +224,7 @@ from core.runtime_state import (
     mark_task_completed,
     processed_download_ids,
     set_activity_toast_emitter,
+    task_is_active,
     tasks_lock,
 )
 from core.metadata import enrichment as metadata_enrichment
@@ -1777,6 +1779,12 @@ def _register_automation_handlers():
         init_automation_progress=_init_automation_progress,
         record_progress_history=_auto_progress.record_history,
         build_personalized_manager=_build_personalized_manager,
+        # Read at CALL time, not at def time: _register_automation_handlers is
+        # defined near the top of this module but invoked at the very end, after
+        # the importer's own module-level init has run. None is a legitimate
+        # value -- Last.fm unconfigured, or its boot failed -- and the handler's
+        # guard answers for that rather than the registration refusing to build.
+        lastfm_import_worker=lastfm_import_worker,
     )
     _register_extracted_handlers(_automation_deps)
 
@@ -2160,10 +2168,21 @@ def validate_and_heal_batch_states():
                 for task_id in queue:
                     if task_id in download_tasks:
                         task_status = download_tasks[task_id]['status']
-                        if task_status in ['searching', 'downloading', 'queued', 'post_processing']:
+                        # ONE definition of active, shared with the worker-count
+                        # validator in core/downloads/monitor.py. Both used to
+                        # enumerate their own list. This one omitted 'pending' --
+                        # the status every task is created with -- so it counted 3
+                        # where the validator counted 21, and each "fixed" the
+                        # other's answer on its own 30-second tick: 4,992 heals
+                        # against 4,982 validations in a single 21-hour log, one
+                        # batch oscillating 21 <-> 3 for its entire life without
+                        # ever converging. task_is_active DERIVES from the terminal
+                        # set for exactly this reason -- a second enumerated copy
+                        # drifts the moment a status is added.
+                        if task_is_active(task_status):
                             if task_id not in completed_task_ids:
                                 actually_active += 1
-                        elif task_status in ['failed', 'completed', 'cancelled', 'not_found']:
+                        elif task_status in TERMINAL_TASK_STATUSES:
                             finished_tasks.append(task_id)
                     else:
                         # Task in queue but not in download_tasks dict
@@ -18413,7 +18432,6 @@ def _enhance_file_metadata(file_path: str, context: dict, artist: dict, album_in
             tidal_client=tidal_client,
             qobuz_enrichment_worker=qobuz_enrichment_worker,
             lastfm_worker=lastfm_worker,
-            lastfm_import_worker=lastfm_import_worker,
             genius_worker=genius_worker,
             bandcamp_worker=bandcamp_worker,
             spotify_enrichment_worker=spotify_enrichment_worker,
@@ -18521,7 +18539,6 @@ def _post_process_matched_download_with_verification(context_key, context, file_
             tidal_client=tidal_client,
             qobuz_enrichment_worker=qobuz_enrichment_worker,
             lastfm_worker=lastfm_worker,
-            lastfm_import_worker=lastfm_import_worker,
             genius_worker=genius_worker,
             bandcamp_worker=bandcamp_worker,
             spotify_enrichment_worker=spotify_enrichment_worker,
@@ -18648,7 +18665,6 @@ def _post_process_matched_download(context_key, context, file_path):
             tidal_client=tidal_client,
             qobuz_enrichment_worker=qobuz_enrichment_worker,
             lastfm_worker=lastfm_worker,
-            lastfm_import_worker=lastfm_import_worker,
             genius_worker=genius_worker,
             bandcamp_worker=bandcamp_worker,
             spotify_enrichment_worker=spotify_enrichment_worker,

@@ -22,7 +22,7 @@ Commissary began as a private customization of SoulSync 3.1.5 and has diverged s
 |---|---|
 | **Upstream** | [Nezreka/SoulSync](https://github.com/Nezreka/SoulSync) — the original project, its Discord, and its `ssync.net` site. All of the credit for the foundation, and none of the blame for anything below. |
 | **This fork** | [ThyMrMan/commissary](https://github.com/ThyMrMan/commissary), published as `ghcr.io/thymrman/commissary`. |
-| **Versioning** | Independent. Commissary reset to `1.0.0` at the fork point, took the name at **2.0.0**, and is now **2.3.3**. Upstream's numbering (3.x) is unrelated, and the in-app update check points here, not there. |
+| **Versioning** | Independent. Commissary reset to `1.0.0` at the fork point, took the name at **2.0.0**, and is now **2.3.4**. Upstream's numbering (3.x) is unrelated, and the in-app update check points here, not there. |
 | **Upstream fixes** | Pulled in selectively. Everything through SoulSync **3.1.8** was cherry-picked (released here as 1.6.0), and individually-triaged fixes from **3.2.0** landed in 1.9.19 and 1.9.22. |
 | **Upstream features** | Not automatically adopted. SoulSync 3.2.0 is largely a React rewrite that deletes the vanilla-JS pages this fork has customized most heavily, so it is deliberately not followed. |
 | **Where to report** | Bugs you see in Commissary belong **here**. Upstream cannot reproduce changes made in this fork, and several subsystems now behave differently on purpose. |
@@ -122,7 +122,7 @@ docker-compose up -d
 The compose file pulls `ghcr.io/thymrman/commissary:latest`. To pin a release, change the `image:` line to a version tag:
 
 ```bash
-docker pull ghcr.io/thymrman/commissary:2.3.3
+docker pull ghcr.io/thymrman/commissary:2.3.4
 ```
 
 `:latest` and `:<version>` are the only tags. Images are built for `linux/amd64` and `linux/arm64`.

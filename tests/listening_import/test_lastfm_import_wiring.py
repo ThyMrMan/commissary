@@ -74,14 +74,65 @@ def test_the_handler_is_registered_and_guarded_on_its_own_run_flag():
     assert "is_pipeline_running" not in guard.split(")")[0]
 
 
-def test_all_three_deps_build_sites_pass_the_worker():
-    """The guard reads deps.lastfm_import_worker, so a build site that missed it
-    would register a handler that always reports the importer unavailable."""
+def _web_server_tree():
+    import ast
     import pathlib
     root = pathlib.Path(__file__).resolve().parents[2]
-    src = (root / "web_server.py").read_text(encoding="utf-8")
-    assert src.count("lastfm_worker=lastfm_worker,") == 3
-    assert src.count("lastfm_import_worker=lastfm_import_worker,") == 3
+    return ast.parse((root / "web_server.py").read_text(encoding="utf-8"))
+
+
+def _calls_named(tree, name):
+    import ast
+    return [n for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and (
+                getattr(n.func, "id", None) == name
+                or getattr(n.func, "attr", None) == name)]
+
+
+def test_the_deps_build_site_passes_the_worker():
+    """ONE build site, not three. The guard reads deps.lastfm_import_worker, so
+    a construction that misses it registers a handler which always reports the
+    importer unavailable -- which is exactly what 2.3.0 shipped: the worker was
+    added to three OTHER calls and never to this one, so the automation could
+    never run no matter how it was configured."""
+    calls = _calls_named(_web_server_tree(), "AutomationDeps")
+    assert len(calls) == 1, "expected a single AutomationDeps construction"
+    passed = {kw.arg for kw in calls[0].keywords}
+    assert "lastfm_import_worker" in passed
+
+
+def test_every_enrichment_runtime_kwarg_is_one_the_builder_accepts():
+    """The bug this test replaces. Its predecessor asserted that the string
+    "lastfm_import_worker=lastfm_import_worker," appeared three times in
+    web_server.py -- and the mistake satisfied that perfectly, because the three
+    places it landed were _build_metadata_enrichment_runtime() calls, which do
+    not accept the argument at all. Every one raised TypeError at runtime and
+    the user's log filled with failed metadata enrichment.
+
+    Counting text cannot tell a right call from a wrong one. Check the keywords
+    against the real signature instead, which catches the next such mistake too.
+    """
+    import inspect
+
+    from core.metadata.enrichment import build_metadata_enrichment_runtime
+    accepted = set(inspect.signature(build_metadata_enrichment_runtime).parameters)
+    calls = _calls_named(_web_server_tree(), "_build_metadata_enrichment_runtime")
+    assert calls, "no _build_metadata_enrichment_runtime call sites found"
+    for call in calls:
+        for kw in call.keywords:
+            assert kw.arg in accepted, (
+                "_build_metadata_enrichment_runtime() is called with %r, which "
+                "it does not accept -- this raises TypeError at runtime" % kw.arg)
+
+
+def test_the_enrichment_builder_really_rejects_it():
+    """The other half: proof the signature check above is testing something. If
+    the builder ever grows this argument the assertion would pass vacuously."""
+    import pytest as _pytest
+
+    from core.metadata.enrichment import build_metadata_enrichment_runtime
+    with _pytest.raises(TypeError):
+        build_metadata_enrichment_runtime(lastfm_import_worker=None)
 
 
 def test_it_is_offered_as_an_automation_block():
