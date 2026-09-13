@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from core.imports.album_matching import DISC_FOLDER_RE
 from core.imports.folder_artist import resolve_folder_artist
 from utils.logging_config import get_logger
 
@@ -47,7 +48,6 @@ logger = get_logger("auto_import")
 DEFAULT_CONFIDENCE_THRESHOLD = 0.45
 
 AUDIO_EXTENSIONS = {'.mp3', '.flac', '.ogg', '.opus', '.m4a', '.aac', '.wav', '.wma', '.aiff', '.aif', '.ape'}
-DISC_FOLDER_RE = re.compile(r'^(?:disc|cd|disk)\s*(\d+)$', re.IGNORECASE)
 
 
 @dataclass

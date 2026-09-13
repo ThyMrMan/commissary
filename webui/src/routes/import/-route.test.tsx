@@ -10,7 +10,7 @@ import { createShellBridge } from '@/test/shell-bridge';
 import type { ImportStagingFile } from './-import.types';
 
 import { autoImportResultsQueryOptions, autoImportStatusQueryOptions } from './-import.api';
-import { resetImportWorkflowStore } from './-import.store';
+import { resetImportWorkflowStore, useImportWorkflowStore } from './-import.store';
 
 function renderImportRoute(initialEntries = ['/import']) {
   const queryClient = createTestQueryClient();
@@ -325,6 +325,85 @@ describe('import route', () => {
       album_name: 'Album A',
       album_artist: 'Artist A',
     });
+  });
+
+  it('sends the folder on screen with the album match', async () => {
+    // Without it the server matched against the configured Import folder, which
+    // is not the folder the page shows after "Import from a different folder".
+    const matchUrls: string[] = [];
+    server.use(
+      http.post('/api/import/album/match', ({ request }) => {
+        matchUrls.push(request.url);
+        return HttpResponse.json({
+          success: true,
+          album: { id: 'album-1', name: 'Album A', artist: 'Artist A', source: 'deezer' },
+          matches: [],
+        });
+      }),
+    );
+    useImportWorkflowStore.getState().setScanPath('/music/Downloads');
+    renderImportRoute();
+
+    const albumButtons = await screen.findAllByRole('button', { name: /Album A/ });
+    fireEvent.click(albumButtons[albumButtons.length - 1]);
+
+    await waitFor(() => expect(matchUrls).toHaveLength(1));
+    expect(new URL(matchUrls[0]).searchParams.get('path')).toBe('/music/Downloads');
+  });
+
+  it('keeps an auto-detected album scoped after going back to its results', async () => {
+    // "Back to Search" used to wipe the query, the results and the group's file
+    // list, so the next pick was matched against every file in the folder.
+    renderImportRoute();
+
+    const groupCard = (await screen.findAllByRole('button', { name: /Album A/ }))[0];
+    fireEvent.click(groupCard);
+    await waitFor(() => expect(screen.queryByText('Auto-Detected Albums')).not.toBeInTheDocument());
+
+    fireEvent.click((await screen.findAllByRole('button', { name: /Album A/ }))[0]);
+    await waitFor(() => expect(screen.getByText('Track Matching')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back to Search' }));
+    expect(screen.getByDisplayValue('Artist A Album A')).toBeInTheDocument();
+
+    fireEvent.click((await screen.findAllByRole('button', { name: /Album A/ }))[0]);
+    await waitFor(() => expect(albumMatchBodies).toHaveLength(2));
+
+    const groupFiles = ['/music/Staging/Album/01-track.flac'];
+    expect(albumMatchBodies[0].file_paths).toEqual(groupFiles);
+    expect(albumMatchBodies[1].file_paths).toEqual(groupFiles);
+  });
+
+  it('says which files the match drew from and offers only those', async () => {
+    server.use(
+      http.post('/api/import/album/match', () =>
+        HttpResponse.json({
+          success: true,
+          album: { id: 'album-1', name: 'Album A', artist: 'Artist A', source: 'deezer' },
+          matches: [],
+          match_scope: {
+            mode: 'folder',
+            folder_label: 'Artist A - Album A',
+            folders_considered: 12,
+            file_count: 1,
+          },
+          candidate_paths: ['/music/Staging/Album/01-track.flac'],
+        }),
+      ),
+    );
+    renderImportRoute();
+
+    const albumButtons = await screen.findAllByRole('button', { name: /Album A/ });
+    fireEvent.click(albumButtons[albumButtons.length - 1]);
+
+    expect(
+      await screen.findByText(/Matched against the 1 file in "Artist A - Album A"/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/of 12 folders/)).toBeInTheDocument();
+    // The other file in the scanned folder is not part of this match.
+    const pool = document.getElementById('import-page-pool-chips');
+    expect(pool?.textContent).toContain('01-track.flac');
+    expect(pool?.textContent).not.toContain('02-track.flac');
   });
 
   it('surfaces the served source when album search falls back', async () => {

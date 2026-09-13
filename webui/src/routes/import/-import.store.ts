@@ -149,7 +149,19 @@ export const useImportWorkflowStore = create(
     setAlbumMatch: (albumMatch: ImportAlbumMatchPayload | null) => set({ albumMatch }),
     setAlbumMatchError: (albumMatchError: string | null) => set({ albumMatchError }),
     setAlbumMatchLoading: (albumMatchLoading: boolean) => set({ albumMatchLoading }),
-    clearAutoGroupFilePaths: () => set({ autoGroupFilePaths: null }),
+    // Leave a match and return to the SAME result list: the query, the results
+    // and the Auto-Detected album's file list all survive, so picking a different
+    // result is still scoped to that album's files. "Back to Search" used to wipe
+    // all of it, and the next pick was matched against every file in the folder.
+    backToAlbumResults: () => {
+      set({
+        selectedAlbum: null,
+        albumMatch: null,
+        albumMatchError: null,
+        albumMatchLoading: false,
+        matchOverrides: {},
+      });
+    },
     setMatchOverrides: (updater: StateUpdater<Record<number, number>>) => {
       set((state) => ({ matchOverrides: resolveState(state.matchOverrides, updater) }));
     },
@@ -271,7 +283,7 @@ export function useAlbumImportWorkflow() {
       albumSearchLookupSource: state.albumSearchLookupSource,
       albumSearchSourceOverride: state.albumSearchSourceOverride,
       autoGroupFilePaths: state.autoGroupFilePaths,
-      clearAutoGroupFilePaths: state.clearAutoGroupFilePaths,
+      backToAlbumResults: state.backToAlbumResults,
       matchOverrides: state.matchOverrides,
       resetAlbumWorkflow: state.resetAlbumSearch,
       selectedAlbum: state.selectedAlbum,

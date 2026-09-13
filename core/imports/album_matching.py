@@ -572,12 +572,14 @@ def _track_duration_ms(track: Dict[str, Any]) -> int:
 
     Decision order:
     1. If the track carries a source name + that source is in the
-       seconds-only list, treat raw value as seconds and × 1000.
+       seconds-only list, treat a bare ``duration`` as seconds and × 1000.
+       A value under ``duration_ms`` is milliseconds for EVERY source.
     2. If source is ms-only, take the value as-is.
     3. If source unknown / missing (e.g. mocked test data), fall back
        to a magnitude heuristic — values < 30000 treated as seconds.
        This is the legacy behavior, kept as the safety net.
     """
+    from_ms_key = bool(track.get('duration_ms'))
     raw = track.get('duration_ms') or track.get('duration') or 0
     try:
         value = int(raw)
@@ -589,6 +591,19 @@ def _track_duration_ms(track: Dict[str, Any]) -> int:
     source = (track.get('source') or track.get('_source') or track.get('provider') or '').strip().lower()
 
     if source in _SECONDS_DURATION_SOURCES:
+        # Only a bare ``duration`` is seconds. A value that arrived under
+        # ``duration_ms`` is already milliseconds: the Discogs client turns
+        # "3:25" into 205000 before returning, and MusicBrainz ``length`` IS
+        # milliseconds. Multiplying those by 1000 made a Discogs or MusicBrainz
+        # track "last" roughly 57 hours. It stayed latent: only a track tagged
+        # with its source reaches this branch, and tagged tracks come from
+        # _normalize_match_track -- the Import page and the album Re-identify
+        # preview -- neither of which compared against a real length until
+        # 2.3.5. The auto-import worker matches raw get_album tracks, which
+        # carry no tag and take the magnitude heuristic below (only Discogs'
+        # get_album_tracks fallback tags them, when get_album returns nothing).
+        if from_ms_key:
+            return value
         return value * 1000
     if source in _MS_DURATION_SOURCES:
         return value
@@ -610,6 +625,7 @@ def match_files_to_tracks(
     target_album: str,
     quality_rank: QualityRankFn,
     similarity: Optional[SimilarityFn] = None,
+    log_diagnostics: bool = True,
 ) -> Dict[str, Any]:
     """Match staging files to album tracks.
 
@@ -688,7 +704,7 @@ def match_files_to_tracks(
                 # unit mismatch (seconds vs ms), genuine drift, or some
                 # third thing. Logging every rejection would spam the
                 # log on a 21-file × 19-track album (399 lines).
-                if not sample_rejection_logged:
+                if log_diagnostics and not sample_rejection_logged:
                     sample_rejection_logged = True
                     raw_dur_ms = track.get('duration_ms')
                     raw_dur = track.get('duration')
@@ -728,7 +744,7 @@ def match_files_to_tracks(
     # strict, title agreement too low, or wrong tracks list passed in.
     # Log a one-line summary at INFO so users grep'ing app.log for
     # "no matches" cases see WHY without needing to bump log level.
-    if not matches and (audio_files or tracks):
+    if log_diagnostics and not matches and (audio_files or tracks):
         logger.info(
             "[Album Matching] No matches: %d files, %d tracks, "
             "%d duration-rejected pairs, %d tracks below threshold. "
@@ -744,6 +760,108 @@ def match_files_to_tracks(
         'matches': matches,
         'unmatched_files': [f for f in audio_files if f not in used_files],
     }
+
+
+# ---------------------------------------------------------------------------
+# Folder affinity (the Import page's unscoped match)
+# ---------------------------------------------------------------------------
+# A download folder holds many albums side by side. Matching a tracklist
+# against every file in it lets each track take its best-scoring file from ANY
+# folder, so an "Intro", an interlude or a same-numbered track from another
+# album wins a slot -- and the position dedup can even discard the album's own
+# copy first, because it keeps one file per (disc, track) across all folders.
+# An album almost always lives in one folder, so match each on its own.
+
+# One rule for multi-disc layouts ("CD1", "Disc 2"). The auto-import worker
+# imports this rather than keeping a copy that could drift from it.
+DISC_FOLDER_RE = re.compile(r'^(?:disc|cd|disk)\s*(\d+)$', re.IGNORECASE)
+
+
+def album_folder_of(path: str) -> str:
+    """The folder an audio file's ALBUM lives in.
+
+    Its parent directory, except that a disc subfolder ("CD1", "Disc 2")
+    belongs to the folder above it -- otherwise a two-disc album would be split
+    into two folders and only one disc could ever be matched."""
+    parent = os.path.dirname(path)
+    if DISC_FOLDER_RE.match(os.path.basename(parent)):
+        return os.path.dirname(parent)
+    return parent
+
+
+def match_files_to_tracks_by_folder(
+    audio_files: List[str],
+    file_tags: Dict[str, Dict[str, Any]],
+    tracks: List[Dict[str, Any]],
+    *,
+    target_album: str,
+    quality_rank: QualityRankFn,
+    similarity: Optional[SimilarityFn] = None,
+) -> Dict[str, Any]:
+    """``match_files_to_tracks``, confined to the one album folder that fits best.
+
+    Each album folder is matched in isolation, so a file elsewhere can never
+    take a slot from -- or be deduped against -- the album's own files. The
+    winner is the folder with the most matched tracks, then the highest total
+    confidence; ties go to the first folder in path order, so the pick is
+    deterministic.
+
+    Returns the winning folder's result, plus:
+
+    - ``folder``: the folder the matches were drawn from (``None`` on fallback)
+    - ``folders_considered``: how many album folders the files spanned
+    - ``candidate_files``: the files that were eligible to match
+
+    When NO folder matches anything, falls back to matching across every file,
+    which is exactly the behaviour before folders were considered -- so an
+    album spread unusually across folders is never worse off than it was.
+    """
+    by_folder: Dict[str, List[str]] = {}
+    for f in audio_files:
+        by_folder.setdefault(album_folder_of(f), []).append(f)
+
+    if len(by_folder) <= 1:
+        result = match_files_to_tracks(
+            audio_files, file_tags, tracks,
+            target_album=target_album, quality_rank=quality_rank, similarity=similarity,
+        )
+        result['folder'] = next(iter(by_folder), None)
+        result['folders_considered'] = len(by_folder)
+        result['candidate_files'] = list(audio_files)
+        return result
+
+    best_folder: Optional[str] = None
+    best_result: Optional[Dict[str, Any]] = None
+    best_key: Optional[Tuple[int, float]] = None
+    for folder in sorted(by_folder):
+        result = match_files_to_tracks(
+            by_folder[folder], file_tags, tracks,
+            target_album=target_album, quality_rank=quality_rank, similarity=similarity,
+            log_diagnostics=False,
+        )
+        key = (len(result['matches']), sum(m['confidence'] for m in result['matches']))
+        if best_key is None or key > best_key:
+            best_folder, best_result, best_key = folder, result, key
+
+    if best_result is None or not best_result['matches']:
+        result = match_files_to_tracks(
+            audio_files, file_tags, tracks,
+            target_album=target_album, quality_rank=quality_rank, similarity=similarity,
+        )
+        result['folder'] = None
+        result['folders_considered'] = len(by_folder)
+        result['candidate_files'] = list(audio_files)
+        return result
+
+    logger.info(
+        "[Album Matching] '%s': matched %d/%d tracks from %r (best of %d folders)",
+        target_album, len(best_result['matches']), len(tracks),
+        best_folder, len(by_folder),
+    )
+    best_result['folder'] = best_folder
+    best_result['folders_considered'] = len(by_folder)
+    best_result['candidate_files'] = list(by_folder[best_folder])
+    return best_result
 
 
 # ---------------------------------------------------------------------------

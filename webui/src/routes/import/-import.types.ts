@@ -179,10 +179,25 @@ export interface ImportAlbumMatch {
   confidence: number;
 }
 
+/** Which files the album matcher was allowed to draw from. */
+export interface ImportAlbumMatchScope {
+  /** 'files' = the Auto-Detected album's own files; 'folder' = the one album
+   * folder that best fit the tracklist; 'all' = nothing fit any single folder,
+   * so every file was considered. */
+  mode: 'files' | 'folder' | 'all';
+  folder?: string | null;
+  folder_label?: string | null;
+  folders_considered?: number;
+  file_count?: number;
+}
+
 export interface ImportAlbumMatchPayload {
   success: boolean;
   album?: ImportAlbum;
   matches?: ImportAlbumMatch[];
+  match_scope?: ImportAlbumMatchScope;
+  /** Full paths the match drew from. The manual-assign pool offers only these. */
+  candidate_paths?: string[] | null;
   error?: string;
 }
 

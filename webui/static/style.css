@@ -71974,3 +71974,56 @@ button:focus-visible,
     outline: 2px solid rgb(var(--accent-rgb));
     outline-offset: -2px;
 }
+
+/* ── Re-identify album ─────────────────────────────────────────────────── */
+.enhanced-album-reidentify-btn {
+    margin-left: 6px; flex: 0 0 auto;
+    background: none; border: 1px solid transparent; border-radius: 8px;
+    color: rgba(255,255,255,0.35); font-size: 15px; line-height: 1;
+    padding: 6px 8px; cursor: pointer;
+    transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+}
+.enhanced-album-reidentify-btn:hover,
+.enhanced-album-reidentify-btn:focus-visible {
+    color: rgb(var(--accent-light-rgb)); background: rgba(var(--accent-rgb),0.1);
+    border-color: rgba(var(--accent-rgb),0.25); outline: none;
+}
+#reida-modal-overlay { backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+.reida-summary {
+    display: flex; flex-direction: column; gap: 4px; padding: 10px 4px 12px;
+    color: rgba(255,255,255,0.85); font-size: 14px;
+}
+.reida-summary span { color: rgba(255,255,255,0.5); font-size: 12.5px; }
+.reida-pairs { display: flex; flex-direction: column; gap: 4px; }
+.reida-pair {
+    display: grid; grid-template-columns: 22px 34px minmax(0, 1fr) auto 18px;
+    align-items: center; gap: 10px; padding: 9px 12px; border-radius: 12px; cursor: pointer;
+    background: rgba(255,255,255,0.025); border: 1px solid transparent;
+    transition: background 0.15s ease, opacity 0.15s ease, border-color 0.15s ease;
+}
+.reida-pair:hover { background: rgba(255,255,255,0.05); }
+.reida-pair input { accent-color: rgb(var(--accent-rgb)); width: 16px; height: 16px; cursor: pointer; }
+.reida-pair.unpaired { cursor: default; opacity: 0.55; }
+.reida-pair.skipped { opacity: 0.45; }
+.reida-pair.done { border-color: rgba(80, 200, 120, 0.35); }
+.reida-pair.failed { border-color: rgba(255, 107, 107, 0.4); }
+.reida-num {
+    color: rgba(255,255,255,0.4); font-variant-numeric: tabular-nums;
+    font-size: 12.5px; text-align: right;
+}
+.reida-names { display: flex; flex-direction: column; min-width: 0; }
+.reida-release-name, .reida-library-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.reida-release-name { color: rgba(255,255,255,0.9); font-size: 13.5px; }
+.reida-library-name { color: rgba(255,255,255,0.45); font-size: 12px; }
+.reida-conf {
+    font-size: 11.5px; font-variant-numeric: tabular-nums; padding: 2px 8px; border-radius: 999px;
+    color: rgb(var(--accent-light-rgb)); background: rgba(var(--accent-rgb),0.12);
+}
+.reida-conf.low { color: #ffb86b; background: rgba(255,184,107,0.12); }
+.reida-status { font-size: 13px; text-align: center; }
+.reida-pair.done .reida-status { color: #50c878; }
+.reida-pair.failed .reida-status { color: #ff6b6b; }
+.reida-unmatched { margin: 12px 4px 4px; color: rgba(255,255,255,0.45); font-size: 12.5px; line-height: 1.5; }
+@media (max-width: 560px) {
+    .reida-pair { grid-template-columns: 22px 28px minmax(0, 1fr) auto 16px; gap: 8px; padding: 8px 10px; }
+}

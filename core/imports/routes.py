@@ -474,6 +474,9 @@ def album_match(runtime: ImportRouteRuntime, data: Dict[str, Any]) -> tuple[Dict
             album_artist=album_artist,
             file_paths=filter_file_paths,
             source=source or None,
+            # The folder this request is scanning -- the same one the page's
+            # file list and Auto-Detected Albums were built from.
+            staging_path=runtime.get_staging_path(),
         )
         return payload, 200
     except Exception as exc:

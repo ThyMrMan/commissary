@@ -91,9 +91,14 @@ export async function matchImportAlbum(input: {
   albumName?: string | null;
   albumArtist?: string | null;
   filePaths?: string[] | null;
+  /** The folder the page is showing. Without it the server matched against the
+   * configured Import folder, which is not the folder on screen after "Import
+   * from a different folder". */
+  scanPath?: string;
 }): Promise<ImportAlbumMatchPayload> {
   return readJson<ImportAlbumMatchPayload>(
     apiClient.post('import/album/match', {
+      ...scanParams(input.scanPath),
       json: {
         album_id: input.albumId,
         source: input.source || '',

@@ -3491,6 +3491,14 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.3.5': [
+        { date: 'September 2026 · 2.3.5' },
+        { title: "Choosing an album on the Import page matches <em>that</em> album's files", desc: "given no file list, the matcher was handed every audio file in the folder, and each track took its best-scoring file from anywhere in it — so in a downloads folder holding dozens of albums, an “Intro”, an interlude or a same-numbered track from some other album could take the slot. One step made it worse: the pass that keeps a single file per track position ran across the whole folder <em>before</em> any scoring, so an album's own <code>01 Intro.mp3</code> could be thrown out in favour of another album's <code>01 Intro.flac</code>. Each album folder is now matched on its own and the one that best fits the tracklist wins, with <code>CD1</code> and <code>Disc 2</code> subfolders counted as part of their album. If no single folder fits, every file is considered, exactly as before." },
+        { title: "…from the folder on screen, for every result you try", desc: "three separate slips pulled the match away from what you were looking at. After <em>Import from a different folder</em>, the file list came from the folder you chose while the match quietly read your configured Import folder. An Auto-Detected album's own files were forgotten after the first result you picked, so a second pick matched against the whole folder. And <strong>Back to Search</strong> threw away the search and its results. The match now reads the folder on screen, the album's files stay attached to every pick, Back to Search returns to the same results, and the <strong>x</strong> in the search box is how to start over. A line under Track Matching says what was searched — <em>Matched against the 12 files in “Artist - Album”, the folder that best fits this tracklist (of 37 folders)</em> — and the pool of unmatched files offers only those, not the entire folder." },
+        { title: "The length check and exact-ID matching finally run on this page", desc: "the album matcher can refuse a file whose length is nowhere near the track's, and can pair files by ISRC or MusicBrainz ID before any fuzzy scoring. The Import page never told it a file's length or IDs, so neither ever fired, and matching came down to titles and track numbers alone. Both now apply. Turning the length check on also exposed a unit mistake: Discogs and MusicBrainz lengths, already in milliseconds, were multiplied by a thousand, which would have made every file look some 57 hours out and rejected it. Auto-import reads those lengths differently and was never affected; this page is fixed before it could trip over it." },
+        { title: "Re-identify a whole album", desc: "album rows that have files in your library now carry a <strong>⇄</strong> button for admins, in the artist page's Enhanced view. Choose the release the album should be filed under, and before anything moves you see how your tracks pair with its tracklist: a confidence for each pairing with the low ones highlighted, release tracks with no file of yours that can't be ticked, and your tracks that aren't on the release listed as left alone. Untick anything you want kept as it is, then confirm. Each track is re-imported through the path the Import page uses, one at a time, marked ✓ or ✕ as it goes." },
+        { title: "…and no original is deleted until its replacement has landed", desc: "with <em>Replace the original files</em> on (the default), each original is removed only after its re-filed copy has imported and Commissary can say where it went — and never when the copy landed on the original's own path. A track the AcoustID, integrity or silence checks reject keeps its original, and its row says why. If the media server disconnects partway, the run stops rather than failing every remaining track the same way. <strong>Worth knowing:</strong> this is tested against Commissary's real database layout but has not yet been run against a live media server, so try it first on an album you don't mind." },
+    ],
     '2.3.4': [
         { date: 'September 2026 · 2.3.4' },
         { title: "The Last.fm importer's automation could never have run", desc: "a wiring mistake in 2.3.0 attached the importer's handle to three calls that build the <em>metadata enrichment</em> runtime, rather than to the automation dependencies where the field actually lives. Two things followed. Those three calls raised <code>TypeError</code> — which is what the log shows as metadata enrichment failing on auto-imported tracks — and the automation's own guard, which asks the dependencies whether the importer exists, was told <strong>“no”</strong> every single time. The hourly job was being skipped for reasons that had nothing to do with how you had configured it." },
@@ -4023,6 +4031,25 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.3.5: importing the album you picked, and re-filing one you already have",
+        description: "The Import page matched a chosen album against every file in the folder, could read a folder that wasn't on screen, and never gave its safety checks a file's length. Plus Re-identify for a whole library album, and a unit bug caught before the new length check could trip over it.",
+        features: [
+            "an unscoped match gave match_files_to_tracks EVERY file in the folder; each track took its best file from anywhere",
+            "dedupe_files_by_position ran across all folders, so another album's 01 Intro.flac could evict this album's 01 Intro.mp3",
+            "match_files_to_tracks_by_folder matches each album folder alone and keeps the best fit; CD1 / Disc 2 stay with their album",
+            "nothing fits a single folder -> every file is considered, which is exactly the old behaviour",
+            "the match route ignored ?path=, so after 'Import from a different folder' it read the configured Import folder",
+            "an Auto-Detected album's file list was cleared after the FIRST pick; Back to Search wiped the query and results",
+            "file_tags never carried duration_ms / isrc / mbid: duration_sanity_ok passed everything and the exact-ID phase never ran",
+            "latent: Discogs/MusicBrainz duration_ms x1000 on source-tagged tracks - never live on auto-import, whose get_album tracks carry no tag",
+            "a scope notice names what was matched; the manual pool offers only candidate_paths, compared by full path",
+            "Re-identify album: a preview pairs library tracks to a release using the library's own durations, ISRCs and MBIDs",
+            "one apply per track: a temp copy is imported, and the original goes only once the import reports where it landed",
+            "library ids are TEXT in a migrated DB - no int() on the album id, no numeric gate on the button (Jellyfin/Navidrome ids)",
+        ],
+        usage_note: "Nothing to migrate. Re-identify album is the ⇄ button on album rows with files, for admins, in the artist page's Enhanced view. It is tested against the real database schema but has not yet been run against a live media server, so try it on an album you don't mind first. Leave 'Replace the original files' on unless you want the old copies kept.",
+    },
     {
         title: "2.3.4: what one app.log was hiding",
         description: "A wiring mistake from 2.3.0 that kept the Last.fm automation from ever running, two repair routines that spent 21 hours undoing each other, and dates that were a whole timezone out.",

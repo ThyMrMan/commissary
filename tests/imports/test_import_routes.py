@@ -420,6 +420,10 @@ def test_album_match_warns_without_source_and_passes_file_filter():
                 "album_artist": "Artist",
                 "file_paths": {"a.flac", "b.flac"},
                 "source": None,
+                # The folder this request scans. Omitting it made the builder
+                # read the configured Import folder even when the page showed
+                # a different one.
+                "staging_path": runtime.get_staging_path(),
             },
         )
     ]

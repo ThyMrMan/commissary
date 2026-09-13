@@ -98,6 +98,12 @@ def test_read_staging_file_metadata_reads_tags(monkeypatch, tmp_path):
         "album": "Album One",
         "track_number": 3,
         "disc_number": 2,
+        # The album matcher gates on duration and pairs on ISRC / MusicBrainz ID,
+        # so these are always present. The stub has no audio info and no
+        # identifier tags, so they read as empty rather than being absent.
+        "duration_ms": 0,
+        "isrc": "",
+        "mbid": "",
     }
 
 
@@ -168,6 +174,12 @@ def test_read_staging_file_metadata_uses_filename_fallbacks_when_tags_are_invali
         "album": "Album One",
         "track_number": 2,
         "disc_number": 1,
+        # The album matcher gates on duration and pairs on ISRC / MusicBrainz ID,
+        # so these are always present. The stub has no audio info and no
+        # identifier tags, so they read as empty rather than being absent.
+        "duration_ms": 0,
+        "isrc": "",
+        "mbid": "",
     }
 
 

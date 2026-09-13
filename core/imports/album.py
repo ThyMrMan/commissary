@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Iterable, List, Optional
 
 from core.imports.context import normalize_import_context
-from core.imports.staging import collect_staging_files
+from core.imports.staging import collect_staging_files, get_staging_path
 from utils.logging_config import get_logger
 
 
@@ -310,6 +311,23 @@ def build_album_import_context(
     return normalized_context
 
 
+def _scope_folder_label(folder: Optional[str], root: Optional[str]) -> Optional[str]:
+    """How the page names the folder a match was confined to: relative to the
+    folder being browsed, which is the frame the user is looking at."""
+    if not folder:
+        return None
+    try:
+        if root:
+            rel = os.path.relpath(folder, root)
+            if rel == ".":
+                return os.path.basename(os.path.normpath(root)) or root
+            if not rel.startswith(".."):
+                return rel
+    except ValueError:      # a different drive on Windows
+        pass
+    return os.path.basename(os.path.normpath(folder)) or folder
+
+
 def build_album_import_match_payload(
     album_id: str,
     *,
@@ -317,6 +335,7 @@ def build_album_import_match_payload(
     album_artist: str = "",
     file_paths: Optional[Iterable[str]] = None,
     source: Optional[str] = None,
+    staging_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build the album import match payload using provider-priority metadata lookup."""
     album_response = get_artist_album_tracks(
@@ -356,13 +375,19 @@ def build_album_import_match_payload(
             "resolved_album_id": album_response.get("resolved_album_id") or album_id,
         }
 
-    staging_files = collect_staging_files(file_paths)
+    explicit_files = bool(file_paths)
+    staging_root = staging_path or get_staging_path()
+    staging_files = collect_staging_files(file_paths, staging_path=staging_path)
     album_name_for_match = album.get("name") or album_name or ""
     normalized_tracks = [
         _normalize_match_track(track, source, album) for track in tracks
     ]
 
-    from core.imports.album_matching import default_quality_rank, match_files_to_tracks
+    from core.imports.album_matching import (
+        default_quality_rank,
+        match_files_to_tracks,
+        match_files_to_tracks_by_folder,
+    )
 
     audio_files = [sf["full_path"] for sf in staging_files]
     staging_by_path = {sf["full_path"]: sf for sf in staging_files}
@@ -373,17 +398,44 @@ def build_album_import_match_payload(
             "album": sf.get("album") or "",
             "track_number": sf.get("track_number") or 0,
             "disc_number": sf.get("disc_number") or 1,
+            # Without these the matcher's two safety nets were inert on this
+            # page: duration_sanity_ok passes any file whose duration is 0, and
+            # the MBID / ISRC exact phase had nothing to compare. Matching fell
+            # to title and track-position similarity alone.
+            "duration_ms": sf.get("duration_ms") or 0,
+            "isrc": sf.get("isrc") or "",
+            "mbid": sf.get("mbid") or "",
         }
         for sf in staging_files
     }
 
-    match_result = match_files_to_tracks(
-        audio_files,
-        file_tags,
-        normalized_tracks,
-        target_album=album_name_for_match,
-        quality_rank=default_quality_rank,
-    )
+    if explicit_files:
+        # The user picked these files (an Auto-Detected Albums card): match
+        # exactly them. There is no folder to guess.
+        match_result = match_files_to_tracks(
+            audio_files,
+            file_tags,
+            normalized_tracks,
+            target_album=album_name_for_match,
+            quality_rank=default_quality_rank,
+        )
+        scope_mode, scope_folder, folders_considered = "files", None, 0
+        candidate_paths = list(audio_files)
+    else:
+        # No file list means "everything in this folder" -- for a download
+        # folder, many albums side by side. Confine the match to the single
+        # album folder that fits this tracklist best.
+        match_result = match_files_to_tracks_by_folder(
+            audio_files,
+            file_tags,
+            normalized_tracks,
+            target_album=album_name_for_match,
+            quality_rank=default_quality_rank,
+        )
+        scope_folder = match_result.get("folder")
+        folders_considered = match_result.get("folders_considered", 0)
+        scope_mode = "folder" if scope_folder is not None else "all"
+        candidate_paths = list(match_result.get("candidate_files") or audio_files)
     # Re-map matches back to tracks by object identity, NOT track["id"]. match_files_to_tracks stores
     # the same track object on each match (both the exact-id and fuzzy phases), so identity is exact +
     # unique. Keying on track["id"] collided when a source omitted track ids — every id-less track
@@ -414,4 +466,14 @@ def build_album_import_match_payload(
         "source": source,
         "source_priority": album_response.get("source_priority", []),
         "resolved_album_id": album_response.get("resolved_album_id") or album_id,
+        # What the matcher drew from, so the page can SAY it -- and offer only
+        # these files for manual assignment instead of the whole folder.
+        "match_scope": {
+            "mode": scope_mode,                 # 'files' | 'folder' | 'all'
+            "folder": scope_folder,
+            "folder_label": _scope_folder_label(scope_folder, staging_root),
+            "folders_considered": folders_considered,
+            "file_count": len(candidate_paths),
+        },
+        "candidate_paths": candidate_paths,
     }

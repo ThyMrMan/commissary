@@ -134,10 +134,12 @@ export function getDisplayedMatchFile(
     return { file: null, confidence: match.confidence, isOverride: false };
   }
 
-  const autoFileName = match.staging_file.filename;
+  const autoFileKey = getStagingFileKey(match.staging_file);
   const reassigned = Object.entries(overrides).some(([trackIndex, stagingFileIndex]) => {
     const file = stagingFiles[stagingFileIndex];
-    return file && file.filename === autoFileName && Number(trackIndex) !== index;
+    // By full path: a download folder holds many "01 - Intro.flac"s, and a
+    // same-named file from another album is not this one.
+    return file && getStagingFileKey(file) === autoFileKey && Number(trackIndex) !== index;
   });
 
   return {
@@ -151,13 +153,20 @@ export function getUnmatchedStagingFiles(
   matches: ImportAlbumMatch[],
   stagingFiles: ImportStagingFile[],
   overrides: Record<number, number>,
+  candidatePaths?: string[] | null,
 ): Array<{ file: ImportStagingFile; index: number }> {
+  // Offer only the files the match drew from. The pool used to offer every file
+  // in the scanned folder -- in a download folder, hundreds of chips from other
+  // albums. Indices stay positions in `stagingFiles`, which is what overrides hold.
+  const candidates = candidatePaths ? new Set(candidatePaths) : null;
   return stagingFiles.flatMap((file, index) => {
+    if (candidates && !candidates.has(getStagingFileKey(file))) return [];
     if (Object.values(overrides).includes(index)) return [];
 
+    const fileKey = getStagingFileKey(file);
     const autoUsed = matches.some((match, matchIndex) => {
       if (Object.hasOwn(overrides, matchIndex)) return false;
-      return match.staging_file?.filename === file.filename;
+      return match.staging_file ? getStagingFileKey(match.staging_file) === fileKey : false;
     });
 
     return autoUsed ? [] : [{ file, index }];

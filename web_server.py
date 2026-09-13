@@ -52,7 +52,7 @@ logger = setup_logging(_log_level, _log_path)
 # the published image moved (ghcr.io/thymrman/commissary) even though nothing
 # about the data changed — see tests/test_branding.py for what deliberately
 # kept its old `soulsync` name.
-_SOULSYNC_BASE_VERSION = "2.3.4"
+_SOULSYNC_BASE_VERSION = "2.3.5"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -12995,6 +12995,127 @@ def reidentify_apply():
         return jsonify({"success": False, "error": f"Source file not found: {e}"}), 404
     except Exception as e:
         logger.error(f"Re-identify apply error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+def _reidentify_admin_error():
+    """The Re-identify gate: an ADMIN profile, the check reidentify_apply makes
+    inline. Returns an error response, or None when the caller may proceed.
+
+    Deliberately not @admin_only, which admits only profile 1 -- the Re-identify
+    buttons are shown to every admin profile, so the routes behind them must
+    accept every admin profile too."""
+    database = get_database()
+    pid = get_current_profile_id()
+    prof = database.get_profile(pid) if pid else None
+    if not prof or not prof.get('is_admin'):
+        return jsonify({"success": False, "error": "Admin only"}), 403
+    return None
+
+
+def _reidentify_album_inputs(data):
+    """``(library_album, release, error_response)`` for the album Re-identify
+    routes. Everything is re-read server-side on every request: the browser
+    supplies ids, never track metadata."""
+    from core.imports.album_reidentify import fetch_release, load_library_album
+    library_album = load_library_album(get_database(), data.get('library_album_id'))
+    if library_album is None:
+        return None, None, (jsonify({"success": False, "error": "Album not found in the library"}), 404)
+    source = str(data.get('source') or '').strip()
+    release_id = data.get('release_album_id')
+    if not source or not release_id:
+        return None, None, (jsonify({"success": False,
+                                     "error": "source and release_album_id are required"}), 400)
+    release = fetch_release(release_id, source=source,
+                            album_name=data.get('release_album_name') or '',
+                            album_artist=data.get('release_album_artist') or '')
+    if not release.get('success'):
+        return None, None, (jsonify({"success": False,
+                                     "error": release.get('error') or 'Release not found'}), 404)
+    return library_album, release, None
+
+
+@app.route('/api/reidentify/album/search', methods=['GET'])
+def reidentify_album_search():
+    """Search one metadata source for RELEASES to re-file an album under.
+
+    The Import page's album search, behind the Re-identify gate. Query params:
+    ``q``, ``source`` (omitted = the primary source), ``limit``."""
+    denied = _reidentify_admin_error()
+    if denied:
+        return denied
+    try:
+        from core.imports.staging import search_import_albums
+        query = (request.args.get('q') or '').strip()
+        if not query:
+            return jsonify({"success": True, "albums": []})
+        source = (request.args.get('source') or '').strip().lower() or None
+        try:
+            limit = max(1, min(30, int(request.args.get('limit', 20))))
+        except (TypeError, ValueError):
+            limit = 20
+        albums = search_import_albums(query, limit=limit, source_override=source)
+        return jsonify({"success": True, "albums": albums})
+    except Exception as e:
+        logger.error(f"Re-identify album search error: {e}")
+        return jsonify({"success": False, "error": str(e), "albums": []}), 500
+
+
+@app.route('/api/reidentify/album/preview', methods=['POST'])
+def reidentify_album_preview():
+    """Pair a library album's tracks with a chosen release's tracklist.
+
+    Body: ``{library_album_id, source, release_album_id, release_album_name?,
+    release_album_artist?}``. Changes nothing -- this is what the user confirms
+    before any file moves."""
+    denied = _reidentify_admin_error()
+    if denied:
+        return denied
+    try:
+        from core.imports.album_reidentify import build_preview
+        library_album, release, err = _reidentify_album_inputs(request.get_json(silent=True) or {})
+        if err:
+            return err
+        return jsonify(build_preview(library_album, release))
+    except Exception as e:
+        logger.error(f"Re-identify album preview error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/reidentify/album/apply-track', methods=['POST'])
+def reidentify_album_apply_track():
+    """Re-file ONE confirmed track of a library album under the chosen release.
+
+    Body: ``{library_album_id, library_track_id, release_track_key, source,
+    release_album_id, replace, release_album_name?, release_album_artist?}``.
+
+    One request per track, so the page shows progress and every track succeeds
+    or fails on its own. The original is removed only after its copy's import
+    has landed; a rejected import leaves it untouched."""
+    denied = _reidentify_admin_error()
+    if denied:
+        return denied
+    try:
+        from core.imports.album_reidentify import apply_track
+        from core.imports.side_effects import is_active_media_server_ready
+        data = request.get_json(silent=True) or {}
+        library_album, release, err = _reidentify_album_inputs(data)
+        if err:
+            return err
+        payload, status = apply_track(
+            database=get_database(),
+            library_album=library_album,
+            release=release,
+            library_track_id=data.get('library_track_id'),
+            release_key=data.get('release_track_key'),
+            replace=bool(data.get('replace', True)),
+            resolve_file=_resolve_library_file_path,
+            post_process=_post_process_matched_download,
+            is_media_server_ready=is_active_media_server_ready,
+        )
+        return jsonify(payload), status
+    except Exception as e:
+        logger.error(f"Re-identify album apply error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 
@@ -41710,7 +41831,14 @@ def import_search_sources_route():
 @app.route('/api/import/album/match', methods=['POST'])
 @admin_only
 def import_album_match():
-    payload, status = _import_album_match(_build_import_route_runtime(), request.get_json() or {})
+    # ?path= names the folder the page is showing, validated exactly as the
+    # staging GETs validate it. Without it the match read the configured Import
+    # folder, so after "Import from a different folder" a match drew its files
+    # from a folder that wasn't on screen.
+    runtime, err = _scan_runtime_or_error()
+    if err:
+        return err
+    payload, status = _import_album_match(runtime, request.get_json() or {})
     return jsonify(payload), status
 
 

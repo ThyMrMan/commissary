@@ -173,6 +173,20 @@ def read_staging_file_metadata(file_path: str, filename: Optional[str] = None) -
     except (TypeError, ValueError):
         pass
 
+    # Audio length and exact identifiers, in the auto-import worker's
+    # conventions (_read_file_tags). The album matcher gates on duration and
+    # pairs on ISRC / MusicBrainz ID before any fuzzy scoring -- and it can do
+    # neither for a file whose dict never carried them. The length comes off
+    # the already-parsed file, so this costs no extra read.
+    duration_ms = 0
+    try:
+        length_s = getattr(getattr(tags, "info", None), "length", 0) or 0
+        duration_ms = int(round(float(length_s) * 1000))
+    except (TypeError, ValueError):
+        duration_ms = 0
+    isrc = _first_tag("isrc").upper()
+    mbid = _first_tag("musicbrainz_trackid").lower()
+
     return {
         "title": title,
         "artist": artist,
@@ -180,6 +194,9 @@ def read_staging_file_metadata(file_path: str, filename: Optional[str] = None) -
         "album": album,
         "track_number": track_number,
         "disc_number": disc_number,
+        "duration_ms": duration_ms,
+        "isrc": isrc,
+        "mbid": mbid,
     }
 
 
@@ -602,9 +619,19 @@ def refresh_import_suggestions_cache():
     start_import_suggestions_cache()
 
 
-def collect_staging_files(file_paths: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:
-    """Collect audio files from the staging area with normalized metadata."""
-    staging_path = get_staging_path()
+def collect_staging_files(
+    file_paths: Optional[Iterable[str]] = None,
+    staging_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Collect audio files from a staging folder with normalized metadata.
+
+    ``staging_path`` is the folder the Import page is actually showing; omitted,
+    it is the configured Import folder. It used to be read from the config
+    unconditionally, so a match started after "Import from a different folder"
+    drew its files from a folder that was not on screen -- and an Auto-Detected
+    album's own files, which live in the browsed folder, were never found.
+    """
+    staging_path = staging_path or get_staging_path()
     file_filter: Optional[set[str]] = set(file_paths) if file_paths else None
     staging_files: List[Dict[str, Any]] = []
 
@@ -632,6 +659,9 @@ def collect_staging_files(file_paths: Optional[Iterable[str]] = None) -> List[Di
                     "albumartist": meta.get("albumartist") or meta.get("artist") or "",
                     "track_number": meta.get("track_number", 1),
                     "disc_number": meta.get("disc_number", 1),
+                    "duration_ms": meta.get("duration_ms", 0),
+                    "isrc": meta.get("isrc", ""),
+                    "mbid": meta.get("mbid", ""),
                 }
             )
 

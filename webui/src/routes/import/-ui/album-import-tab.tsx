@@ -5,7 +5,7 @@ import { type DragEvent, type KeyboardEvent, useState } from 'react';
 import { Button, Select, TextInput } from '@/components/form/form';
 import { Notice } from '@/components/primitives';
 
-import type { ImportAlbumResult } from '../-import.types';
+import type { ImportAlbumMatchScope, ImportAlbumResult } from '../-import.types';
 
 import {
   importSearchSourcesQueryOptions,
@@ -60,7 +60,7 @@ function useAlbumImportViewModel() {
     albumSearchLookupSource,
     albumSearchSourceOverride,
     autoGroupFilePaths,
-    clearAutoGroupFilePaths,
+    backToAlbumResults,
     matchOverrides,
     resetAlbumWorkflow,
     selectedAlbum,
@@ -83,6 +83,14 @@ function useAlbumImportViewModel() {
     setTapSelectedChip(null);
     resetAlbumWorkflow();
     void refreshStaging();
+  };
+
+  // Back to the same result list, not a blank page: the query, the results and
+  // the Auto-Detected album's files all stay, so the next pick is scoped too.
+  const backToResults = () => {
+    setDragOverTrack(null);
+    setTapSelectedChip(null);
+    backToAlbumResults();
   };
 
   const runAlbumSearch = async (query: string, filePaths: string[] | null = null) => {
@@ -117,6 +125,7 @@ function useAlbumImportViewModel() {
         albumName: album.name,
         albumArtist: album.artist,
         filePaths: autoGroupFilePaths,
+        scanPath,
       });
       setAlbumMatch(payload);
       setMatchOverrides({});
@@ -125,7 +134,9 @@ function useAlbumImportViewModel() {
     } catch (error) {
       setAlbumMatchError(getErrorMessage(error));
     } finally {
-      clearAutoGroupFilePaths();
+      // The Auto-Detected album's file list is deliberately KEPT: it scopes every
+      // pick from this result list, not only the first. Clearing it here sent the
+      // next pick with no files, and the server matched against everything.
       setAlbumMatchLoading(false);
     }
   };
@@ -195,7 +206,8 @@ function useAlbumImportViewModel() {
       setTapSelectedChip(null);
       setDragOverTrack(null);
     },
-    onBackToSearch: resetAlbumSearch,
+    onBackToSearch: backToResults,
+    onClearSearch: resetAlbumSearch,
     onDragOverTrack: setDragOverTrack,
     onProcessAlbum: processAlbum,
     onRunGroupSearch: (group: {
@@ -259,7 +271,7 @@ function AlbumImportPanelContent({ viewModel }: { viewModel: AlbumImportViewMode
     groups,
     onAlbumQueryChange,
     onAlbumSearchSourceChange,
-    onBackToSearch,
+    onClearSearch,
     onRunGroupSearch,
     onRunSearch,
     onSelectAlbum,
@@ -369,7 +381,7 @@ function AlbumImportPanelContent({ viewModel }: { viewModel: AlbumImportViewMode
             className={clsx({ [styles.hidden]: albumResults === null })}
             id="import-page-album-clear-btn"
             title="Clear search"
-            onClick={onBackToSearch}
+            onClick={onClearSearch}
           >
             x
           </Button>
@@ -490,7 +502,9 @@ function AlbumMatchPanel({ viewModel }: { viewModel: AlbumImportViewModel }) {
     albumMatch?.matches ?? [],
     stagingFiles,
     matchOverrides,
+    albumMatch?.candidate_paths,
   );
+  const scopeText = describeMatchScope(albumMatch?.match_scope);
   const matchedCount = effectiveMatches.length;
   const heroMetaParts = albumMatch?.album ? getAlbumMetaParts(albumMatch.album) : [];
 
@@ -527,6 +541,8 @@ function AlbumMatchPanel({ viewModel }: { viewModel: AlbumImportViewModel }) {
           </Button>
         </div>
       </div>
+
+      {scopeText ? <Notice id="import-page-match-scope">{scopeText}</Notice> : null}
 
       <div className={styles.importPageMatchList} id="import-page-match-list">
         {(albumMatch.matches ?? []).map((match, index) => {
@@ -682,4 +698,23 @@ function getAlbumMetaParts(album: AlbumMetaFields) {
 
 function getAlbumDetailParts(album: AlbumMetaFields) {
   return [album.status || '', album.label || ''].filter(Boolean);
+}
+
+// Says which files the matcher drew from. Without it, a match that reached into
+// another album's folder looked like the page simply being wrong.
+function describeMatchScope(scope: ImportAlbumMatchScope | null | undefined): string | null {
+  if (!scope) return null;
+  const count = scope.file_count ?? 0;
+  const files = `${count} file${count === 1 ? '' : 's'}`;
+  if (scope.mode === 'files') {
+    return `Matched against the ${files} in the album you picked.`;
+  }
+  if (scope.mode === 'folder') {
+    const where = scope.folder_label ? `"${scope.folder_label}"` : 'one folder';
+    const considered = scope.folders_considered ?? 0;
+    return considered > 1
+      ? `Matched against the ${files} in ${where}, the folder that best fits this tracklist (of ${considered} folders).`
+      : `Matched against the ${files} in ${where}.`;
+  }
+  return `No single folder fit this tracklist, so all ${files} here were considered.`;
 }

@@ -3848,6 +3848,26 @@ function renderAlbumRow(album, type) {
         row.appendChild(fmtBadge);
     }
 
+    // Re-identify the whole album (admin): choose the release once, confirm each
+    // pairing, and every track is re-filed together. Offered only where the
+    // library holds files -- a discography placeholder has nothing to move.
+    // Album ids are opaque (Jellyfin and Navidrome use strings), so the gate is
+    // "has an id and owns files", never "looks like a number".
+    if (isEnhancedAdmin() && album.id != null && album.id !== ''
+            && (album.tracks || []).some(t => t && t.file_path)) {
+        const reidBtn = document.createElement('button');
+        reidBtn.type = 'button';
+        reidBtn.className = 'enhanced-album-reidentify-btn';
+        reidBtn.title = 'Re-identify album — file every track under a different release';
+        reidBtn.setAttribute('aria-label', 'Re-identify album');
+        reidBtn.innerHTML = '&#8644;';
+        reidBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            openReidentifyAlbumModal(album);
+        });
+        row.appendChild(reidBtn);
+    }
+
     row.addEventListener('click', () => toggleAlbumExpand(album.id));
 
     return row;
@@ -10508,5 +10528,365 @@ async function confirmReidentify() {
         showToast(e.message || 'Re-identify failed', 'error');
         btn.disabled = false;
         btn.textContent = prev;
+    }
+}
+
+
+// ==================== Re-identify Album Modal ====================
+// Re-files every track of a library album under ONE chosen release. The
+// per-track modal above cannot simply be run once per track: the auto-import
+// worker groups copies from the same album into a single candidate and ignores
+// their hints. So this goes through the Import page's album path instead -- a
+// preview the user confirms, then one track at a time, each original removed
+// only after its copy has landed (core/imports/album_reidentify.py).
+
+const reidaState = {
+    album: null, source: null, sources: [], releases: [], release: null,
+    preview: null, excluded: new Set(), stage: 'search', running: false,
+};
+
+// Which confirmed pairings to apply: rows that paired a library track and were
+// not unticked. Pure, so tests/js/album_reidentify_harness.mjs can run it.
+function _reidaPlan(pairs, excludedKeys) {
+    return (pairs || [])
+        .filter(p => p && p.library_track && p.release_track
+            && !(excludedKeys && excludedKeys.has(p.release_track.key)))
+        .map(p => ({ library_track_id: p.library_track.id, release_track_key: p.release_track.key }));
+}
+
+// One line once every track has been tried. Pure, like _reidaPlan.
+function _reidaSummary(results) {
+    const list = results || [];
+    const ok = list.filter(r => r && r.success).length;
+    const failed = list.length - ok;
+    const replaced = list.filter(r => r && r.success && r.removed_original).length;
+    let msg = `Re-filed ${ok} of ${list.length} track${list.length === 1 ? '' : 's'}`;
+    if (replaced) msg += ` · replaced ${replaced} original${replaced === 1 ? '' : 's'}`;
+    if (failed) msg += ` · ${failed} left as ${failed === 1 ? 'it was' : 'they were'}`;
+    return msg;
+}
+
+function openReidentifyAlbumModal(album) {
+    const overlay = document.getElementById('reida-modal-overlay');
+    if (!overlay || !album) return;
+    Object.assign(reidaState, {
+        album, source: null, releases: [], release: null, preview: null,
+        excluded: new Set(), stage: 'search', running: false,
+    });
+
+    const artistName = artistDetailPageState.currentArtistName || '';
+    const owned = (album.tracks || []).filter(t => t && t.file_path).length;
+    document.getElementById('reida-hero-title').textContent = album.title || 'Album';
+    document.getElementById('reida-hero-sub').textContent =
+        [artistName, `${owned} track${owned === 1 ? '' : 's'} in your library`].filter(Boolean).join(' · ');
+    const imageUrl = album.thumb_url || album.image_url || '';
+    const art = document.getElementById('reida-hero-art');
+    const bg = document.getElementById('reida-hero-bg');
+    art.style.backgroundImage = imageUrl ? `url('${imageUrl}')` : '';
+    art.classList.toggle('empty', !imageUrl);
+    bg.style.backgroundImage = imageUrl ? `url('${imageUrl}')` : '';
+
+    document.getElementById('reida-search-input').value = `${album.title || ''} ${artistName}`.trim();
+    document.getElementById('reida-replace').checked = true;
+    _reidaSetStage('search');
+    _reidaRenderState('idle');
+
+    overlay.classList.remove('hidden');
+    _reidaLoadTabs();
+}
+
+function closeReidentifyAlbumModal() {
+    // A run in progress keeps going track by track; closing mid-run would hide
+    // its progress, not stop it.
+    if (reidaState.running) return;
+    const overlay = document.getElementById('reida-modal-overlay');
+    if (overlay) overlay.classList.add('hidden');
+}
+
+function _reidaSetStage(stage) {
+    reidaState.stage = stage;
+    const searching = stage === 'search';
+    document.getElementById('reida-tabs').style.display = searching ? '' : 'none';
+    document.getElementById('reida-search-row').style.display = searching ? '' : 'none';
+    document.getElementById('reida-back-btn').style.display = searching ? 'none' : '';
+    document.getElementById('reida-hero-eyebrow').textContent = searching
+        ? 'Re-identify album' : 'Re-identify album · confirm the pairings';
+    _reidaUpdateConfirm();
+}
+
+function reidentifyAlbumBack() {
+    if (reidaState.running) return;
+    reidaState.release = null;
+    reidaState.preview = null;
+    reidaState.excluded = new Set();
+    _reidaSetStage('search');
+    if (reidaState.releases.length) _reidaRenderReleases();
+    else _reidaRenderState('idle');
+}
+
+function _reidaUpdateConfirm() {
+    const btn = document.getElementById('reida-confirm-btn');
+    if (!btn || reidaState.running) return;
+    const plan = reidaState.preview ? _reidaPlan(reidaState.preview.pairs, reidaState.excluded) : [];
+    btn.disabled = reidaState.stage !== 'preview' || plan.length === 0;
+    btn.textContent = plan.length
+        ? `Re-identify ${plan.length} track${plan.length === 1 ? '' : 's'}`
+        : 'Re-identify album';
+}
+
+async function _reidaLoadTabs() {
+    const tabsEl = document.getElementById('reida-tabs');
+    tabsEl.innerHTML = '';
+    try {
+        const resp = await fetch('/api/reidentify/sources');
+        const data = await resp.json();
+        reidaState.sources = (data && data.sources) || [];
+    } catch (_) {
+        reidaState.sources = [];
+    }
+    if (!reidaState.sources.length) {
+        tabsEl.innerHTML = '<span class="reid-tab active">No metadata sources available</span>';
+        _reidaRenderState('empty', 'No configured metadata source to search.');
+        return;
+    }
+    const active = reidaState.sources.find(s => s.active) || reidaState.sources[0];
+    reidaState.source = active.source;
+    reidaState.sources.forEach(s => {
+        const tab = document.createElement('div');
+        tab.className = 'reid-tab' + (s.source === reidaState.source ? ' active' : '');
+        tab.textContent = s.label || s.source;
+        tab.dataset.source = s.source;
+        tab.onclick = () => _reidaSelectTab(s.source);
+        tabsEl.appendChild(tab);
+    });
+    runReidentifyAlbumSearch();   // search the active source on open
+}
+
+function _reidaSelectTab(source) {
+    if (source === reidaState.source || reidaState.running) return;
+    reidaState.source = source;
+    document.querySelectorAll('#reida-tabs .reid-tab').forEach(t => {
+        t.classList.toggle('active', t.dataset.source === source);
+    });
+    runReidentifyAlbumSearch();
+}
+
+async function runReidentifyAlbumSearch() {
+    const query = (document.getElementById('reida-search-input').value || '').trim();
+    if (!query || !reidaState.source) return;
+    _reidaRenderState('loading', 'Searching…');
+    try {
+        const url = `/api/reidentify/album/search?source=${encodeURIComponent(reidaState.source)}&q=${encodeURIComponent(query)}`;
+        const resp = await fetch(url);
+        const data = await resp.json();
+        if (!resp.ok || !data.success) throw new Error(data.error || 'Search failed');
+        reidaState.releases = data.albums || [];
+        _reidaRenderReleases();
+    } catch (e) {
+        _reidaRenderState('empty', 'Search failed. Try another source.');
+    }
+}
+
+function _reidaRenderReleases() {
+    const el = document.getElementById('reida-results');
+    if (!reidaState.releases.length) {
+        _reidaRenderState('empty', 'No releases found. Try refining the search or another source tab.');
+        return;
+    }
+    el.innerHTML = '';
+    reidaState.releases.forEach((r, n) => {
+        const bits = [];
+        if (r.release_date) bits.push(String(r.release_date).slice(0, 4));
+        if (r.total_tracks) bits.push(`${r.total_tracks} track${r.total_tracks === 1 ? '' : 's'}`);
+        if (r.disambiguation) bits.push(r.disambiguation);
+        const row = document.createElement('div');
+        row.className = 'reid-result';
+        row.style.animationDelay = `${Math.min(n * 0.03, 0.3)}s`;
+        row.onclick = () => _reidaSelectRelease(r);
+        row.innerHTML = `
+            <div class="reid-result-art" ${r.image_url ? `style="background-image:url('${encodeURI(r.image_url)}')"` : ''}>
+                ${r.image_url ? '' : '<span>♪</span>'}
+            </div>
+            <div class="reid-result-info">
+                <div class="reid-result-title">${escapeHtml(r.name || 'Unknown release')}</div>
+                <div class="reid-result-release">${escapeHtml(r.artist || '')}</div>
+            </div>
+            <div class="reid-result-meta">
+                ${bits.length ? `<span class="reid-result-detail">${escapeHtml(bits.join(' · '))}</span>` : ''}
+            </div>`;
+        el.appendChild(row);
+    });
+}
+
+function _reidaRequestBody(extra) {
+    const release = reidaState.release || {};
+    return Object.assign({
+        library_album_id: reidaState.album && reidaState.album.id,
+        source: release.source || reidaState.source,
+        release_album_id: release.id,
+        release_album_name: release.name || '',
+        release_album_artist: release.artist || '',
+    }, extra || {});
+}
+
+async function _reidaSelectRelease(release) {
+    if (reidaState.running) return;
+    reidaState.release = release;
+    reidaState.preview = null;
+    reidaState.excluded = new Set();
+    _reidaSetStage('preview');
+    _reidaRenderState('loading', 'Pairing your tracks with this release…');
+    try {
+        const resp = await fetch('/api/reidentify/album/preview', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(_reidaRequestBody()),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.success) throw new Error(data.error || 'Could not load that release');
+        if (reidaState.release !== release) return;   // went back while it loaded
+        reidaState.preview = data;
+        _reidaRenderPreview();
+    } catch (e) {
+        if (reidaState.release === release) {
+            _reidaRenderState('empty', e.message || 'Could not load that release.');
+        }
+    }
+    _reidaUpdateConfirm();
+}
+
+function _reidaTrackNo(t) {
+    if (!t) return '';
+    return (Number(t.disc_number) > 1 ? `${t.disc_number}·` : '') + (t.track_number || '');
+}
+
+function _reidaRenderPreview() {
+    const el = document.getElementById('reida-results');
+    const preview = reidaState.preview;
+    if (!el || !preview) return;
+    const pairs = preview.pairs || [];
+    const paired = pairs.filter(p => p.library_track).length;
+    const release = preview.release || {};
+
+    let html = `<div class="reida-summary">
+        <strong>${escapeHtml(release.name || 'Release')}${release.artist ? ' · ' + escapeHtml(release.artist) : ''}</strong>
+        <span>${paired} of ${pairs.length} release track${pairs.length === 1 ? '' : 's'} paired with your files. Untick any you want left as they are.</span>
+    </div><div class="reida-pairs">`;
+    pairs.forEach(pair => {
+        const rt = pair.release_track || {};
+        const lt = pair.library_track;
+        const pct = Math.round((pair.confidence || 0) * 100);
+        html += `<label class="reida-pair${lt ? '' : ' unpaired'}" data-key="${escapeHtml(String(rt.key || ''))}">
+            <input type="checkbox" ${lt ? 'checked' : 'disabled'}>
+            <span class="reida-num">${escapeHtml(String(_reidaTrackNo(rt)))}</span>
+            <span class="reida-names">
+                <span class="reida-release-name">${escapeHtml(rt.name || '')}</span>
+                <span class="reida-library-name">${lt ? 'your file: ' + escapeHtml(lt.title || '') : 'no matching file in your library'}</span>
+            </span>
+            ${lt ? `<span class="reida-conf${pct < 70 ? ' low' : ''}" title="How closely your track fits this release track">${pct}%</span>` : '<span></span>'}
+            <span class="reida-status"></span>
+        </label>`;
+    });
+    html += '</div>';
+    const leftOver = preview.unmatched_library_tracks || [];
+    if (leftOver.length) {
+        html += `<div class="reida-unmatched">Not on this release, so left as they are: ${leftOver.map(t => escapeHtml(t.title || '')).join(', ')}</div>`;
+    }
+    el.innerHTML = html;
+    el.querySelectorAll('.reida-pair').forEach(row => {
+        const input = row.querySelector('input');
+        if (!input || input.disabled) return;
+        input.addEventListener('change', () => _reidaToggle(row.dataset.key, input.checked, row));
+    });
+}
+
+function _reidaToggle(key, checked, row) {
+    if (checked) reidaState.excluded.delete(key);
+    else reidaState.excluded.add(key);
+    if (row) row.classList.toggle('skipped', !checked);
+    _reidaUpdateConfirm();
+}
+
+function _reidaMarkRow(key, result) {
+    const row = Array.from(document.querySelectorAll('#reida-results .reida-pair'))
+        .find(r => r.dataset.key === key);
+    if (!row) return;
+    const ok = !!(result && result.success);
+    row.classList.remove('done', 'failed');
+    row.classList.add(ok ? 'done' : 'failed');
+    const status = row.querySelector('.reida-status');
+    if (status) {
+        status.textContent = ok ? '✓' : '✕';
+        status.title = ok ? 'Re-filed' : ((result && result.error) || 'Failed');
+    }
+}
+
+async function confirmReidentifyAlbum() {
+    if (reidaState.running || !reidaState.preview || !reidaState.release) return;
+    const plan = _reidaPlan(reidaState.preview.pairs, reidaState.excluded);
+    if (!plan.length) return;
+    const replace = document.getElementById('reida-replace').checked;
+    const btn = document.getElementById('reida-confirm-btn');
+    reidaState.running = true;
+    btn.disabled = true;
+    document.getElementById('reida-back-btn').disabled = true;
+    document.querySelectorAll('#reida-results .reida-pair input').forEach(i => { i.disabled = true; });
+
+    const results = [];
+    for (let i = 0; i < plan.length; i++) {
+        btn.textContent = `Re-filing ${i + 1} of ${plan.length}…`;
+        let result;
+        let status = 0;
+        try {
+            const resp = await fetch('/api/reidentify/album/apply-track', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(_reidaRequestBody({
+                    library_track_id: plan[i].library_track_id,
+                    release_track_key: plan[i].release_track_key,
+                    replace,
+                })),
+            });
+            status = resp.status;
+            result = await resp.json();
+        } catch (e) {
+            result = { success: false, error: e.message || 'Request failed' };
+        }
+        results.push(result);
+        _reidaMarkRow(plan[i].release_track_key, result);
+        // A disconnected media server fails every remaining track the same way;
+        // stop instead of repeating that error for the rest of the album.
+        if (status === 503) break;
+    }
+
+    reidaState.running = false;
+    document.getElementById('reida-back-btn').disabled = false;
+    const allOk = results.length === plan.length && results.every(r => r && r.success);
+    const anyOk = results.some(r => r && r.success);
+    const summary = _reidaSummary(results);
+    const firstError = (results.find(r => r && !r.success) || {}).error;
+    showToast(firstError ? `${summary} — ${firstError}` : summary, anyOk ? 'success' : 'error');
+    if (anyOk && artistDetailPageState.currentArtistId) {
+        loadEnhancedViewData(artistDetailPageState.currentArtistId);
+    }
+    if (allOk) {
+        closeReidentifyAlbumModal();
+    } else {
+        btn.textContent = 'Done';
+        btn.disabled = true;
+    }
+}
+
+function _reidaRenderState(kind, msg) {
+    const el = document.getElementById('reida-results');
+    if (!el) return;
+    if (kind === 'loading') {
+        el.innerHTML = `<div class="reid-state"><div class="reid-spinner"></div><p>${escapeHtml(msg || 'Loading…')}</p></div>`
+            + '<div class="reid-skel"></div><div class="reid-skel"></div><div class="reid-skel"></div>';
+    } else if (kind === 'empty') {
+        el.innerHTML = `<div class="reid-state"><div class="reid-state-icon">🔍</div><p>${escapeHtml(msg || 'No results.')}</p></div>`;
+    } else {
+        el.innerHTML = '<div class="reid-state"><div class="reid-state-icon">💿</div>'
+            + '<p>Pick the release this album should be filed under. You confirm which of your tracks goes where before anything moves.</p></div>';
     }
 }

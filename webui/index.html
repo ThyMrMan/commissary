@@ -11477,6 +11477,51 @@
         </div>
     </div>
 
+    <!-- Re-identify Album Modal -->
+    <div class="modal-overlay hidden" id="reida-modal-overlay" onclick="if(event.target===this)closeReidentifyAlbumModal()">
+        <div class="reid-modal reida-modal" role="dialog" aria-modal="true" aria-label="Re-identify album" id="reida-modal">
+            <div class="reid-hero">
+                <div class="reid-hero-decor">
+                    <div class="reid-hero-bg" id="reida-hero-bg"></div>
+                    <div class="reid-hero-overlay"></div>
+                </div>
+                <span class="reid-close" onclick="closeReidentifyAlbumModal()">&times;</span>
+                <div class="reid-hero-content">
+                    <div class="reid-hero-art" id="reida-hero-art"></div>
+                    <div class="reid-hero-meta">
+                        <div class="reid-hero-eyebrow" id="reida-hero-eyebrow">Re-identify album</div>
+                        <div class="reid-hero-title" id="reida-hero-title">Album</div>
+                        <div class="reid-hero-sub" id="reida-hero-sub"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="reid-tabs" id="reida-tabs"></div>
+
+            <div class="reid-search" id="reida-search-row">
+                <svg class="reid-search-icon" viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14z"/></svg>
+                <input type="text" id="reida-search-input" class="reid-search-input"
+                    placeholder="Search for the release…" onkeydown="if(event.key==='Enter')runReidentifyAlbumSearch()" />
+                <button class="reid-search-btn" onclick="runReidentifyAlbumSearch()">Search</button>
+            </div>
+
+            <div class="reid-results" id="reida-results"></div>
+
+            <div class="reid-footer">
+                <label class="reid-replace" title="When on, each original file is deleted once its re-filed copy has been imported. A track whose import fails keeps its original either way.">
+                    <input type="checkbox" id="reida-replace" checked />
+                    <span class="reid-replace-box"></span>
+                    <span class="reid-replace-text">Replace the original files <em>(recommended)</em></span>
+                </label>
+                <div class="reid-footer-actions">
+                    <button class="btn btn--secondary" id="reida-back-btn" style="display:none" onclick="reidentifyAlbumBack()">Back</button>
+                    <button class="btn btn--secondary" onclick="closeReidentifyAlbumModal()">Cancel</button>
+                    <button class="btn btn--primary" id="reida-confirm-btn" disabled onclick="confirmReidentifyAlbum()">Re-identify album</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Watchlist Artist Config Modal -->
     <div class="modal-overlay hidden" id="watchlist-artist-config-modal-overlay">
         <div class="watchlist-artist-config-modal" role="dialog" aria-modal="true" aria-label="Watchlist artist settings" id="watchlist-artist-config-modal">
