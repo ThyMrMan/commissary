@@ -617,6 +617,175 @@ def _track_duration_ms(track: Dict[str, Any]) -> int:
     return value
 
 
+# ---------------------------------------------------------------------------
+# Language versions, and pairing by place in the album and length
+# ---------------------------------------------------------------------------
+# A title in another language scores ~0 against the tracklist, so a Japanese-
+# titled file paired only through its track number -- and not at all when a
+# multi-disc release is numbered straight through (file 41 is disc 2, track 1).
+# Position alone is too weak to trust; a file and a track at the same place in
+# the album whose lengths agree within a few seconds are the same song. And a
+# language version is a different recording, whatever else agrees.
+
+POSITION_DURATION_TOLERANCE_MS = 3000
+# Recorded for such a pair: above MATCH_THRESHOLD, below the 0.8 at which a
+# single auto-import match carries a whole album on its own.
+POSITION_DURATION_CONFIDENCE = 0.7
+
+_SPACED_NUMBER_RE = re.compile(r'^\s*(\d{1,3})\s+\S')
+
+
+def _positive_int(value: Any) -> int:
+    try:
+        number = int(str(value).split('/')[0].strip())
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
+
+
+def durations_agree(file_duration_ms: Any, track_duration_ms: Any,
+                    tolerance_ms: int = POSITION_DURATION_TOLERANCE_MS) -> bool:
+    """True when both lengths are known and within ``tolerance_ms`` of each other."""
+    try:
+        a, b = int(float(file_duration_ms or 0)), int(float(track_duration_ms or 0))
+    except (TypeError, ValueError):
+        return False
+    return a > 0 and b > 0 and abs(a - b) <= tolerance_ms
+
+
+def file_track_number(file_path: str, tag_number: Any = 0) -> int:
+    """A file's track number: its tag, else the number its filename starts with --
+    "01 - Title" and "1-03 Title", and also the bare "41 常夏の島" that
+    ``extract_explicit_track_number`` leaves alone."""
+    number = _positive_int(tag_number)
+    if number:
+        return number
+    from core.imports.filename import extract_explicit_track_number
+    number = extract_explicit_track_number(file_path)
+    if number:
+        return number
+    match = _SPACED_NUMBER_RE.match(os.path.splitext(os.path.basename(file_path or ''))[0])
+    return int(match.group(1)) if match else 0
+
+
+def _file_disc_number(file_path: str, tags: Dict[str, Any]) -> int:
+    """The file's disc: its tag, else the disc folder it sits in ("CD2"), else 1."""
+    disc = _coerce_disc_number(tags.get('disc_number'), default=1)
+    if disc <= 1:
+        folder = DISC_FOLDER_RE.match(os.path.basename(os.path.dirname(file_path)))
+        if folder:
+            return max(int(folder.group(1)), 1)
+    return max(disc, 1)
+
+
+def _file_language_version(file_path: str, tags: Dict[str, Any]) -> Optional[str]:
+    """The language version a file's title, album tag or filename names."""
+    from core.text.language_version import language_version
+    return (language_version(tags.get('title'))
+            or language_version(tags.get('album'))
+            or language_version(os.path.splitext(os.path.basename(file_path))[0]))
+
+
+def _track_language_version(track: Dict[str, Any], target_album: str) -> Optional[str]:
+    """The language version a track's name names -- or failing that its album's
+    ("UNDEAD" on the single "UNDEAD (English Version)")."""
+    from core.text.language_version import language_version
+    return language_version(track.get('name')) or language_version(target_album)
+
+
+def pair_by_position_and_duration(
+    audio_files: List[str],
+    file_tags: Dict[str, Dict[str, Any]],
+    tracks: List[Dict[str, Any]],
+    *,
+    target_album: str,
+    matches: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Pair the files ``matches`` left over with the tracks it left over, by
+    their place in the album, where their lengths agree.
+
+    A track's place is its position counted through the discs: disc 2, track 1
+    of a 40 + 44 track album is 41. A file's place is its number -- the tag, or
+    one its filename starts with -- read per disc when the file names a disc (a
+    tag, or a "CD2" folder) and the number fits that disc, and straight through
+    otherwise.
+
+    Position is trusted only once the numbering is confirmed: at least two pairs
+    in all sit at the same place (the matches already made count), and most of
+    the leftover places agree on length. A place pairs only with a single file
+    that agrees, and different language versions never pair. Returns the new
+    matches, each with ``'match_type': 'position_duration'``."""
+    disc_lengths: Dict[int, int] = {}
+    for track in tracks:
+        number = _positive_int(track.get('track_number'))
+        if number:
+            disc = _extract_track_disc(track)
+            disc_lengths[disc] = max(disc_lengths.get(disc, 0), number)
+    if not disc_lengths:
+        return []
+    offsets: Dict[int, int] = {}
+    total = 0
+    for disc in sorted(disc_lengths):
+        offsets[disc] = total
+        total += disc_lengths[disc]
+
+    def track_place(track: Dict[str, Any]) -> int:
+        number = _positive_int(track.get('track_number'))
+        disc = _extract_track_disc(track)
+        return offsets[disc] + number if number and disc in offsets else 0
+
+    def file_place(file_path: str) -> int:
+        tags = file_tags.get(file_path, {})
+        number = file_track_number(file_path, tags.get('track_number'))
+        if not number:
+            return 0
+        disc = _file_disc_number(file_path, tags)
+        if disc > 1:
+            if disc not in offsets:
+                return 0
+            if number <= disc_lengths[disc]:
+                return offsets[disc] + number
+        return number if number <= total else 0
+
+    matched_files = {m['file'] for m in matches}
+    matched_tracks = {id(m['track']) for m in matches}
+    confirmed = sum(1 for m in matches
+                    if track_place(m['track']) and file_place(m['file']) == track_place(m['track']))
+
+    files_at: Dict[int, List[str]] = {}
+    for file_path in audio_files:
+        if file_path not in matched_files:
+            place = file_place(file_path)
+            if place:
+                files_at.setdefault(place, []).append(file_path)
+
+    placed = 0
+    agreeing: List[Tuple[Dict[str, Any], str]] = []
+    taken: Set[str] = set()
+    for track in tracks:
+        if id(track) in matched_tracks:
+            continue
+        candidates = files_at.get(track_place(track)) or []
+        if not candidates:
+            continue
+        placed += 1
+        track_ms = _track_duration_ms(track)
+        language = _track_language_version(track, target_album)
+        fits = [f for f in candidates
+                if f not in taken
+                and durations_agree(file_tags.get(f, {}).get('duration_ms'), track_ms)
+                and _file_language_version(f, file_tags.get(f, {})) == language]
+        if len(fits) == 1:
+            agreeing.append((track, fits[0]))
+            taken.add(fits[0])
+
+    if len(agreeing) + confirmed < 2 or len(agreeing) * 2 < placed:
+        return []
+    return [{'track': track, 'file': file_path,
+             'confidence': POSITION_DURATION_CONFIDENCE, 'match_type': 'position_duration'}
+            for track, file_path in agreeing]
+
+
 def match_files_to_tracks(
     audio_files: List[str],
     file_tags: Dict[str, Dict[str, Any]],
@@ -646,7 +815,14 @@ def match_files_to_tracks(
        sanity gate (files whose audio length is more than
        ``DURATION_TOLERANCE_MS`` from the candidate track are rejected
        before scoring, regardless of how good the title agreement
-       looks).
+       looks). A file and a track in different language versions are
+       never scored either (``core.text.language_version``).
+
+    4. **Place and length** (``pair_by_position_and_duration``) — what
+       titles could not pair (a title in another language, files numbered
+       straight through the discs) pairs by position in the album where
+       the lengths agree, once the numbering is confirmed. These matches
+       carry ``'match_type': 'position_duration'``.
 
     Returns a dict with:
     - ``matches``: list of ``{'track': dict, 'file': str, 'confidence': float}``;
@@ -674,6 +850,7 @@ def match_files_to_tracks(
 
     # Phase 3 — fuzzy scoring on remaining tracks.
     duration_rejected = 0     # diagnostics for the "no matches" case
+    file_languages = {f: _file_language_version(f, file_tags.get(f, {})) for f in deduped}
     below_threshold = 0
     sample_rejection_logged = False
     for i, track in enumerate(tracks):
@@ -681,6 +858,7 @@ def match_files_to_tracks(
             continue
 
         track_duration = _track_duration_ms(track)
+        track_language = _track_language_version(track, target_album)
 
         best_file = None
         best_score = 0.0
@@ -720,6 +898,12 @@ def match_files_to_tracks(
                     )
                 continue
 
+            # A language version is a different recording: "FEARLESS (Japanese
+            # Version)" must not fill the Korean album's "FEARLESS", however well
+            # its position, artist and album tag agree.
+            if file_languages.get(f) != track_language:
+                continue
+
             score = score_file_against_track(
                 f, tags, track,
                 target_album=target_album,
@@ -738,6 +922,19 @@ def match_files_to_tracks(
             })
         elif deduped:
             below_threshold += 1
+
+    # Phase 4 — place and length, for what titles could not pair.
+    paired = pair_by_position_and_duration(
+        deduped, file_tags, tracks, target_album=target_album, matches=matches,
+    )
+    if paired:
+        matches.extend(paired)
+        used_files.update(m['file'] for m in paired)
+        if log_diagnostics:
+            logger.info(
+                "[Album Matching] '%s': paired %d file(s) by their place in the album and length",
+                target_album, len(paired),
+            )
 
     # Diagnostic surface — when the matcher returns 0 matches against
     # a non-trivial input, it's nearly always one of: duration gate too

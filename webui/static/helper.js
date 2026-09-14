@@ -3491,6 +3491,12 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.3.8': [
+        { date: 'September 2026 · 2.3.8' },
+        { title: "Albums titled in another language now match by each track's place and length", desc: "when an album's tracklist is in English and its files are titled in Japanese, the titles have nothing in common, so those files paired only when their track numbers happened to line up — and not at all when a two-disc release numbers its files straight through, making the first track of disc 2 file 41. A file no title matches now pairs with the track at the same place in the album when their lengths agree to within three seconds. The numbering has to prove itself first: at least two files must sit at their track's place, and at least half of the rest must agree on length. This covers auto-import, the Import page and album Re-identify, and torrent and usenet album downloads, where a track that finds no file by name now takes the file at its place." },
+        { title: "A song's English and Japanese versions are no longer mistaken for each other", desc: "“UNDEAD” and “UNDEAD (English Version)” share a backing track, a length and most of a title, and nothing told them apart: a download for one could take the other, AcoustID verification passed it, and album matching would file “FEARLESS (Japanese Version)” into the Korean album FEARLESS. A language version is now its own recording wherever songs are compared — download checks, Soulseek results (a marker on the folder counts), AcoustID verification, album matching, torrent and usenet album downloads, and checking whether you already own a song. English, Japanese, Korean and Chinese markers are recognised, among them “(English Version)”, “-Japanese ver.-”, “JP ver”, a bare “(English)” and “英語版”." },
+        { title: "…and what still won't match", desc: "searches still look for the tracklist's own titles, so a release titled only in another language can still go unfound, and auto-import still has to identify an album before any of its files can pair by place. A language version marked nowhere — not on the track, its album or its folder — still reads as the original. A torrent or usenet album download for one missing track has no other track to confirm the numbering, so it still matches by name alone. Nothing already in your library is moved." },
+    ],
     '2.3.7': [
         { date: 'September 2026 · 2.3.7' },
         { title: "Big download batches no longer stop after the first few tracks", desc: "a download batch works through its tracks a few at a time — three by default — starting the next one as each finishes. Two background checks keep that count honest, and both were counting every track still waiting its turn as a download in progress. A 98-track wishlist album with three downloading looked like 98 downloads in progress, so when the first three finished nothing else ever started. Any batch of about twice its limit or more — six tracks, by default — stopped this way. The album queue then sat waiting on it for an hour, and the automatic wishlist run kept skipping itself because a wishlist batch still looked busy. The checks now count only tracks that have actually started." },
@@ -4045,6 +4051,24 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.3.8: albums titled in another language, and a song's language versions told apart",
+        description: "Files an English tracklist can't pair by title - Japanese titles, or two discs numbered straight through - now pair by their place in the album and their length, and a language version of a song is a different recording to every matcher.",
+        features: [
+            "core/text/language_version reads English, Japanese, Korean and Chinese version markers: '(English Version)', '-Japanese ver.-', 'JP ver', a bare '(English)', '英語版', '日本語ver.'",
+            "similarity_score caps a pair in different language versions at 0.30 (a lower ratio stays lower), under download validation's 0.60",
+            "the Soulseek scorer rejects a language version the request didn't name, both ways round - the whole path counts, and so does the requested single's name",
+            "AcoustID fails a recording in another language version; when one fingerprint lists both versions, the one in the expected language is the match (language versions only)",
+            "album matching's title phase and staged-file claims never pair different language versions, however well position, artist and album tag agree",
+            "ownership's subtitle stripping now keeps '(ver)' and a bare language qualifier",
+            "match_files_to_tracks phase 4, pair_by_position_and_duration: leftover files pair with leftover tracks at the same place counted through the discs, lengths within 3 s",
+            "a file's place is its tag or filename number ('41 Title' included), read per disc when a disc tag or CD2 folder names one and it fits, else straight through",
+            "trusted once confirmed: two pairs at their place in all (earlier matches count) and at least half the leftover places agreeing; recorded at 0.7 as match_type position_duration",
+            "album bundles: a track no staged file claims by name takes the file at its place when lengths agree; a straight-through offset is read off the files and confirmed by the batch's other tracks",
+            "the staging file cache keeps duration_ms, and a position claim imports under the task's own disc and track number",
+        ],
+        usage_note: "Nothing to change, and nothing already in the library moves. Searches still use the tracklist's own titles, and a language version marked nowhere - track, album or folder - still reads as the original.",
+    },
     {
         title: "2.3.7: big download batches keep going, and re-identify listens the second time",
         description: "Download batches bigger than their download limit stopped after the first few tracks - a regression from 2.3.4 - and asking to re-identify a track a second time was silently ignored. Both are fixed.",

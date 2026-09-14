@@ -52,7 +52,7 @@ logger = setup_logging(_log_level, _log_path)
 # the published image moved (ghcr.io/thymrman/commissary) even though nothing
 # about the data changed — see tests/test_branding.py for what deliberately
 # kept its old `soulsync` name.
-_SOULSYNC_BASE_VERSION = "2.3.7"
+_SOULSYNC_BASE_VERSION = "2.3.8"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -21574,6 +21574,7 @@ def _get_staging_file_cache(batch_id):
                 'album': meta['album'] or '',
                 'track_number': meta.get('track_number'),
                 'disc_number': meta.get('disc_number'),
+                'duration_ms': meta.get('duration_ms') or 0,
                 'extension': ext,
             })
 

@@ -177,6 +177,7 @@ def evaluate(expected_title: str, expected_artist: str,
     """
     from core.matching.script_compat import is_cross_script_mismatch
     from core.matching.version_mismatch import is_acceptable_version_mismatch
+    from core.text.language_version import is_language_version_label
 
     # No expected artist on record (legacy/compilation rows): compare on title
     # only — the old scanner treated this as artist-match=1.0 and a missing DB
@@ -200,6 +201,26 @@ def evaluate(expected_title: str, expected_artist: str,
     # Version gate: original vs instrumental/live/remix is a real difference.
     expected_version = _detect_title_version(expected_title)
     matched_version = _detect_title_version(matched_title)
+    if (expected_version != matched_version
+            and (is_language_version_label(expected_version)
+                 or is_language_version_label(matched_version))):
+        # Both language versions of a song often share one fingerprint -- the same
+        # backing track -- and their normalized titles tie, so whichever recording
+        # AcoustID listed first used to decide. Prefer one in the language the
+        # caller expected; only when none is listed is the file really the other.
+        for rec in recordings:
+            rec_title = rec.get('title') or ''
+            if _detect_title_version(rec_title) != expected_version:
+                continue
+            rec_title_sim = similarity(expected_title, rec_title)
+            rec_artist_sim = (1.0 if no_expected_artist else _alias_aware_artist_sim(
+                expected_artist, rec.get('artist', ''), aliases_provider))
+            if rec_title_sim >= TITLE_MATCH_THRESHOLD and rec_artist_sim >= ARTIST_MATCH_THRESHOLD:
+                best_rec, title_sim, artist_sim = rec, rec_title_sim, rec_artist_sim
+                matched_title = rec_title or '?'
+                matched_artist = rec.get('artist', '?') or '?'
+                matched_version = expected_version
+                break
     if expected_version != matched_version:
         if not is_acceptable_version_mismatch(
             expected_version, matched_version,

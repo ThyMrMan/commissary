@@ -146,6 +146,133 @@ def _staging_title_variants(title: Any, normalize: Callable[[str], str]) -> list
     return variants
 
 
+def _staged_language_version(staged_file):
+    """The language version a staged file's title, album tag or filename names."""
+    from core.text.language_version import language_version
+    stem = os.path.splitext(os.path.basename(str(staged_file.get('full_path') or '')))[0]
+    return (language_version(staged_file.get('title'))
+            or language_version(staged_file.get('album'))
+            or language_version(stem))
+
+
+def _positive_ms(value: Any) -> int:
+    try:
+        ms = int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+    return ms if ms > 0 else 0
+
+
+def _track_place(track_info: Any, fallback_duration_ms: Any = 0):
+    """``(disc, track number, length in ms)`` of a task's track: 0 where unknown,
+    and the disc 1 when it isn't said."""
+    info = track_info if isinstance(track_info, dict) else {}
+    disc = (_coerce_positive_int(info.get('disc_number'), 0)
+            or _coerce_positive_int(info.get('discNumber'), 0) or 1)
+    number = (_coerce_positive_int(info.get('track_number'), 0)
+              or _coerce_positive_int(info.get('trackNumber'), 0))
+    duration = _positive_ms(info.get('duration_ms')) or _positive_ms(fallback_duration_ms)
+    return disc, number, duration
+
+
+def _batch_track_places(batch_id, deps):
+    """The places of the batch's queued tracks whose number and length are known."""
+    if not batch_id or deps.get_batch_field is None:
+        return []
+    try:
+        queue = list(deps.get_batch_field(batch_id, 'queue') or [])
+    except Exception as exc:
+        logger.debug("[Staging] batch queue unavailable for %s: %s", batch_id, exc)
+        return []
+    places = []
+    with tasks_lock:
+        for queued_id in queue:
+            place = _track_place((download_tasks.get(queued_id) or {}).get('track_info'))
+            if place[1] and place[2]:
+                places.append(place)
+    return places
+
+
+def _corroborated_file(files_at, target, others, agree):
+    """The one file at ``target``'s place whose length agrees -- once the
+    numbering is confirmed: another track's place agrees as well, and most of
+    the places that have a file do. Returns ``(file, places agreeing)``, or
+    ``(None, 0)``."""
+    disc, number, duration = target
+    fits = [sf for sf in files_at(disc, number) if agree(sf, duration)]
+    if len(fits) != 1:
+        return None, 0
+    checked = agreeing = 1
+    for other_disc, other_number, other_duration in others:
+        if (other_disc, other_number) == (disc, number):
+            continue
+        candidates = files_at(other_disc, other_number)
+        if not candidates:
+            continue
+        checked += 1
+        if any(agree(sf, other_duration) for sf in candidates):
+            agreeing += 1
+    if agreeing >= 2 and agreeing * 2 >= checked:
+        return fits[0], agreeing
+    return None, 0
+
+
+def _match_staged_file_by_position(task_id, batch_id, track, staging_files, track_language, deps):
+    """The staged file at this track's place in the album whose length agrees,
+    for a track nothing claimed by name -- a title in another language, say.
+
+    A release is numbered per disc (a disc tag, 1..N on each disc) or straight
+    through the discs, so disc 2, track 1 of a 40 + 44 album is file 41. The
+    batch holds only the tracks still missing, not the whole tracklist, so that
+    offset can't be counted from the album: it is read off the files, and
+    accepted only when other tracks of the batch agree on it by length. Never
+    claims a different language version."""
+    from core.imports.album_matching import durations_agree, file_track_number
+
+    with tasks_lock:
+        track_info = (download_tasks.get(task_id) or {}).get('track_info')
+    target = _track_place(track_info, getattr(track, 'duration_ms', 0))
+    disc, number, duration = target
+    if not number or not duration:
+        return None
+
+    def agree(staged_file, duration_ms):
+        return durations_agree(staged_file.get('duration_ms'), duration_ms)
+
+    numbered = []
+    for sf in staging_files:
+        file_number = file_track_number(sf.get('full_path') or '', sf.get('track_number'))
+        if (file_number and _positive_ms(sf.get('duration_ms'))
+                and _staged_language_version(sf) == track_language):
+            numbered.append((sf, file_number, _coerce_positive_int(sf.get('disc_number'), 0) or 1))
+    if not numbered:
+        return None
+    places = _batch_track_places(batch_id, deps)
+
+    per_disc = {}
+    for sf, file_number, file_disc in numbered:
+        per_disc.setdefault((file_disc, file_number), []).append(sf)
+    found, _agreeing = _corroborated_file(
+        lambda d, n: per_disc.get((d, n), []), target, places, agree)
+    if found is not None or disc <= 1:
+        return found
+
+    straight = {}
+    for sf, file_number, file_disc in numbered:
+        if file_disc == 1:
+            straight.setdefault(file_number, []).append(sf)
+    same_disc = [place for place in places if place[0] == disc]
+    offsets = sorted({file_number - number for file_number, files in straight.items()
+                      if file_number > number and any(agree(sf, duration) for sf in files)})
+    best, best_agreeing = None, 0
+    for offset in offsets:
+        found, agreeing = _corroborated_file(
+            lambda _d, n, offset=offset: straight.get(offset + n, []), target, same_disc, agree)
+        if found is not None and agreeing > best_agreeing:
+            best, best_agreeing = found, agreeing
+    return best
+
+
 @dataclass
 class StagingDeps:
     """Bundle of cross-cutting deps the staging-match helper needs."""
@@ -208,7 +335,19 @@ def try_staging_match(task_id, batch_id, track, deps: StagingDeps):
     # point below the threshold).
     candidate_scores: list = []
 
+    from core.text.language_version import language_version
+    track_language = (language_version(track_title)
+                      or language_version(getattr(track, 'album', '') or ''))
+
     for sf in staging_files:
+        # A language version is a different recording: an English version never
+        # claims the original, however alike the two titles read.
+        if _staged_language_version(sf) != track_language:
+            logger.debug(
+                "[Staging] Skip candidate %s — a different language version",
+                os.path.basename(sf.get('full_path', '?')),
+            )
+            continue
         sf_title_variants = _staging_title_variants(sf['title'], normalize)
         sf_norm_artist = normalize(sf['artist'])
 
@@ -259,7 +398,15 @@ def try_staging_match(task_id, batch_id, track, deps: StagingDeps):
             best_match = sf
 
     # Require high confidence to avoid false positives
+    position_matched = False
     if not best_match or best_score < 0.75:
+        # Nothing reads as this track by name. Its place in the album and its
+        # length can still pick out the file.
+        position_match = _match_staged_file_by_position(
+            task_id, batch_id, track, staging_files, track_language, deps)
+        if position_match is not None:
+            best_match, position_matched = position_match, True
+    if not position_matched and (not best_match or best_score < 0.75):
         # Log the rejection with the best near-miss so we can see why
         # the staged files didn't claim this wishlist track. Pre-fix
         # this returned False silently and the loop "download album,
@@ -285,8 +432,12 @@ def try_staging_match(task_id, batch_id, track, deps: StagingDeps):
             )
         return False
 
-    logger.info(f"[Staging] Match found for '{track_title}' by '{track_artist}': "
-          f"{os.path.basename(best_match['full_path'])} (score: {best_score:.2f})")
+    if position_matched:
+        logger.info(f"[Staging] Position match for '{track_title}' by '{track_artist}': "
+                    f"{os.path.basename(best_match['full_path'])} (its place in the album and its length agree)")
+    else:
+        logger.info(f"[Staging] Match found for '{track_title}' by '{track_artist}': "
+              f"{os.path.basename(best_match['full_path'])} (score: {best_score:.2f})")
 
     # Copy the file to the transfer folder
     try:
@@ -422,7 +573,9 @@ def try_staging_match(task_id, batch_id, track, deps: StagingDeps):
             _extract_explicit_track_number(best_match.get('full_path', ''))
         )
         file_disc_number = _coerce_positive_int(best_match.get('disc_number'), 0)
-        if _private_album_bundle_staging:
+        # A position match knows its place from the task; the file's own number
+        # may count straight through the discs.
+        if _private_album_bundle_staging and not position_matched:
             track_number = (
                 file_track_number or
                 _coerce_positive_int(track_info.get('track_number'), 0) or

@@ -133,6 +133,9 @@ _VERSION_MARKER_TOKENS = frozenset({
     "sessions", "mono", "stereo", "duet", "rework", "dub", "vip", "single",
     "radio", "alt", "alternate", "alternative", "take", "edition", "orchestral",
     "symphonic", "piano", "acapella", "cappella", "nightcore",
+    # Language versions ('(English Version)' already stops on 'version'):
+    # '(Japanese ver.)' and a bare '(English)' are different recordings too.
+    "ver", "english", "japanese", "korean", "chinese", "mandarin", "cantonese",
     # Distinct-track qualifiers — '(Interlude)' etc. are SEPARATE short tracks
     # that share the base name with the full song; never treat as subtitles.
     "interlude", "intro", "outro", "skit", "freestyle", "medley", "snippet",

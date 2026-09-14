@@ -12,6 +12,7 @@ from core.media_server.types import TrackInfo
 # neutral download_plugins package (download PR's Gap 1 lift). Import
 # from the new location.
 from core.download_plugins.types import TrackResult, AlbumResult
+from core.text.language_version import LANGUAGE_VERSION_LABELS, language_version
 
 
 logger = get_logger("matching_engine")
@@ -217,6 +218,13 @@ class MusicMatchingEngine:
         # Exact match - highest score
         if str1 == str2:
             return 1.0
+
+        # A language version is a different recording: "idol" and "idol english
+        # version" share a backing track, a length and most of a title, and
+        # nothing below knows it. Capped, never raised -- an unrelated pair keeps
+        # its own lower ratio.
+        if language_version(str1) != language_version(str2):
+            return min(SequenceMatcher(None, str1, str2).ratio(), 0.30)
 
         # Standard similarity
         standard_ratio = SequenceMatcher(None, str1, str2).ratio()
@@ -949,6 +957,14 @@ class MusicMatchingEngine:
                 if re.search(pattern, filename_lower):
                     return version_type, config['penalty']
         
+        # A language version ("(English Version)", "-Japanese ver.-", "英語版") is
+        # its own recording. No penalty of its own: the Soulseek scorer rejects a
+        # language the request didn't name, and AcoustID verification fails a file
+        # whose recording is in another language.
+        language = language_version(filename_lower)
+        if language:
+            return LANGUAGE_VERSION_LABELS[language], 0.0
+
         # No version indicators found - assume original
         return 'original', 0.0
     
@@ -968,6 +984,15 @@ class MusicMatchingEngine:
 
         # Detect version type in Soulseek result
         version_type, penalty = self.detect_version_type(slskd_track.filename)
+
+        # A language version is a different recording, both ways round: the
+        # request for "Idol" must not take "Idol (English Version)", nor the
+        # request for the English version the unmarked original. The whole path
+        # counts -- "UNDEAD (English Version)/01 UNDEAD.flac" is the English one.
+        wanted_language = (language_version(spotify_track.name)
+                           or language_version(getattr(spotify_track, 'album', '') or ''))
+        if wanted_language != language_version(slskd_track.filename):
+            return 0.0, 'rejected_version_mismatch'
 
         # Check if Spotify track title contains version indicators
         spotify_title_lower = spotify_track.name.lower()
