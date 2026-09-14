@@ -3491,6 +3491,12 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.3.7': [
+        { date: 'September 2026 · 2.3.7' },
+        { title: "Big download batches no longer stop after the first few tracks", desc: "a download batch works through its tracks a few at a time — three by default — starting the next one as each finishes. Two background checks keep that count honest, and both were counting every track still waiting its turn as a download in progress. A 98-track wishlist album with three downloading looked like 98 downloads in progress, so when the first three finished nothing else ever started. Any batch of about twice its limit or more — six tracks, by default — stopped this way. The album queue then sat waiting on it for an hour, and the automatic wishlist run kept skipping itself because a wishlist batch still looked busy. The checks now count only tracks that have actually started." },
+        { title: "…a bug 2.3.4 introduced", desc: "2.3.4 made those two checks agree on one count, and the count they agreed on was the wrong one. Until then one of them kept pulling the number back down, which is the only reason big batches still crept forward. Restarting cleared a stuck batch, but the next wishlist run stalled again." },
+        { title: "Re-identifying a track a second time now does something", desc: "if a re-identify didn't work out — the release you picked had no matching track, filing the song failed, or it landed where it already was — choosing a release again did nothing. The second request copied the same song under the same name, auto-import recognised it as the file it had already tried, and your new choice sat waiting for good. A re-identify you ask for after the last attempt is now imported, and a failed attempt still never retries itself on every scan." },
+    ],
     '2.3.6': [
         { date: 'September 2026 · 2.3.6' },
         { title: "Re-identifying two songs from one album now files both", desc: "a re-identify copies the song into staging and remembers the release you picked. The copy still carries the album tag of the album it is leaving, and auto-import groups loose files by that tag — so two songs from one album re-identified within about a minute of each other, or one song next to a fresh download of its album, became a single import. The release you picked only applies to a single file, so it was ignored: both songs were filed straight back into the album they came from, and your choice sat waiting for good. Every re-identified copy is now its own import, exactly as if it had been staged alone, and copies still waiting in staging from before should be picked up on the next scans." },
@@ -4039,6 +4045,23 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.3.7: big download batches keep going, and re-identify listens the second time",
+        description: "Download batches bigger than their download limit stopped after the first few tracks - a regression from 2.3.4 - and asking to re-identify a track a second time was silently ignored. Both are fixed.",
+        features: [
+            "a batch starts a worker only while active_count is below max_concurrent",
+            "the worker-count validator and the batch healer counted every unfinished task as busy, including 'pending' tasks still waiting to start",
+            "a 98-track batch running 3 read as 98 busy, so nothing past the first 3 was dispatched",
+            "runtime_state.count_active_workers: a busy slot is a DISPATCHED task (queue position below queue_index) that hasn't finished",
+            "both counters share it; a dispatched task still counts whatever its status, so 2.1.1's never-free-a-busy-slot rule stands",
+            "knock-on: album serialization no longer waits out its hour, and scheduled wishlist runs stop skipping",
+            "a Re-identify retry stages the same file under the same name, so it carried the previous attempt's folder hash",
+            "_is_already_processed found that hash in the import history and skipped it for good; the new hint stayed pending",
+            "a processed candidate is now let through when a pending hint for its file is newer than its latest history row",
+            "the hint an attempt used predates that attempt's row, so a failure never loops - including a retry that fails again",
+        ],
+        usage_note: "Nothing to change. Batches stuck right now are cleared by the restart that installs this version, and the next wishlist run works through every track. To retry a re-identify that went nowhere, pick the release again - requests made before this version stay skipped until you do.",
+    },
     {
         title: "2.3.6: the whole deluxe edition, and two re-identified songs from one album",
         description: "Re-identifying two songs from one album filed both back where they came from, and downloading a deluxe edition of an album you owned fetched only its bonus tracks. The first is fixed; the second is a new option, Prefer deluxe editions.",

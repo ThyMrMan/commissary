@@ -596,8 +596,10 @@ class AutoImportWorker:
             if self.should_stop or self.paused:
                 break
 
-            # Skip if already processed (DB-level dedup)
-            if self._is_already_processed(candidate.folder_hash):
+            # Skip if already processed (DB-level dedup) — unless it is a
+            # Re-identify the user has asked for again since (#889).
+            if (self._is_already_processed(candidate.folder_hash)
+                    and not self._is_rematch_retry(candidate)):
                 continue
 
             # Skip if already submitted to / running in the pool. This
@@ -1053,6 +1055,46 @@ class AutoImportWorker:
         except Exception as e:
             logger.debug("[Auto-Import] pending re-identify lookup skipped: %s", e)
             return frozenset(), frozenset()
+
+    def _is_rematch_retry(self, candidate: 'FolderCandidate') -> bool:
+        """True when a candidate the history calls processed is a Re-identify
+        the user has asked for again since its last attempt.
+
+        Asking again stages the same file under the same ``[reid-<id>]`` name,
+        so the copy has the folder hash of the attempt before it, and
+        `_is_already_processed` skipped it for good: it sat in staging and the
+        new hint stayed pending. What is new is the hint — written after the
+        latest history row for that hash. The hint an attempt used predates the
+        row that attempt wrote, so a failure is never retried on its own.
+
+        Single files only, like `_resolve_rematch_hint`. Fail-safe the other
+        way from the hint lookups: any error answers False, so a file already
+        tried stays skipped rather than being tried again on every scan."""
+        files = candidate.audio_files or []
+        if len(files) != 1:
+            return False
+        try:
+            from core.imports.rematch_hints import pending_hint_written_after
+            conn = self.database._get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT created_at FROM auto_import_history WHERE folder_hash = ? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (candidate.folder_hash,),
+                )
+                row = cursor.fetchone()
+                retry = row is not None and pending_hint_written_after(
+                    cursor, files[0], row['created_at'])
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug("[Auto-Import] re-identify retry check skipped: %s", e)
+            return False
+        if retry:
+            logger.debug("[Auto-Import] %s was re-identified again since its last attempt",
+                         os.path.basename(files[0]))
+        return retry
 
     def _resolve_rematch_hint(self, candidate: 'FolderCandidate'):
         """If this staged file carries a user-designated re-identify hint, return

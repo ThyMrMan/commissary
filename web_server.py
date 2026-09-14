@@ -52,7 +52,7 @@ logger = setup_logging(_log_level, _log_path)
 # the published image moved (ghcr.io/thymrman/commissary) even though nothing
 # about the data changed — see tests/test_branding.py for what deliberately
 # kept its old `soulsync` name.
-_SOULSYNC_BASE_VERSION = "2.3.6"
+_SOULSYNC_BASE_VERSION = "2.3.7"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -217,6 +217,7 @@ from core.runtime_state import (
     activity_feed_lock,
     add_activity_item,
     claim_for_post_processing,
+    count_active_workers,
     download_batches,
     download_tasks,
     matched_context_lock,
@@ -224,7 +225,6 @@ from core.runtime_state import (
     mark_task_completed,
     processed_download_ids,
     set_activity_toast_emitter,
-    task_is_active,
     tasks_lock,
 )
 from core.metadata import enrichment as metadata_enrichment
@@ -2158,31 +2158,21 @@ def validate_and_heal_batch_states():
                             batches_to_cleanup.append(batch_id)
                             continue  # Skip other healing logic for this batch
 
-                # Count actually active tasks
-                actually_active = 0
+                # Busy slots are DISPATCHED tasks that haven't finished — ONE
+                # definition, shared with the worker-count validator in
+                # core/downloads/monitor.py. Two enumerated lists once disagreed
+                # and fought (4,992 heals against 4,982 validations in one log);
+                # then a shared count of every unfinished task made them agree on
+                # a wrong number and wedged every batch bigger than its worker
+                # limit. See runtime_state.count_active_workers.
+                actually_active = count_active_workers(batch_data, download_tasks)
                 finished_tasks = []   # reached a terminal status — the NORMAL case
                 missing_tasks = []    # queued but absent from download_tasks — a real fault
-                # Respect _on_download_completed dedup set — don't re-inflate active_count
-                completed_task_ids = batch_data.get('_completed_task_ids', set())
 
                 for task_id in queue:
                     if task_id in download_tasks:
                         task_status = download_tasks[task_id]['status']
-                        # ONE definition of active, shared with the worker-count
-                        # validator in core/downloads/monitor.py. Both used to
-                        # enumerate their own list. This one omitted 'pending' --
-                        # the status every task is created with -- so it counted 3
-                        # where the validator counted 21, and each "fixed" the
-                        # other's answer on its own 30-second tick: 4,992 heals
-                        # against 4,982 validations in a single 21-hour log, one
-                        # batch oscillating 21 <-> 3 for its entire life without
-                        # ever converging. task_is_active DERIVES from the terminal
-                        # set for exactly this reason -- a second enumerated copy
-                        # drifts the moment a status is added.
-                        if task_is_active(task_status):
-                            if task_id not in completed_task_ids:
-                                actually_active += 1
-                        elif task_status in TERMINAL_TASK_STATUSES:
+                        if task_status in TERMINAL_TASK_STATUSES:
                             finished_tasks.append(task_id)
                     else:
                         # Task in queue but not in download_tasks dict

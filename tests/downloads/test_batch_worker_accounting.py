@@ -181,7 +181,7 @@ class TestTheCountAndTheGate:
 class TestThereIsOnlyOneAnswer:
     def test_the_validator_asks_runtime_state(self):
         src = (_SRC / "core" / "downloads" / "monitor.py").read_text(encoding="utf-8")
-        assert "if task_is_active(task_status):" in src
+        assert "actually_active = count_active_workers(batch, download_tasks)" in src
         assert "['searching', 'downloading', 'queued', 'post_processing']" not in src, \
             "a second hand-maintained list is how this drifted in the first place"
 

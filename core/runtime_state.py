@@ -55,6 +55,41 @@ def task_is_active(status) -> bool:
         return False
     return str(status) not in TERMINAL_TASK_STATUSES
 
+
+def count_active_workers(batch: Dict[str, Any], tasks: Dict[str, Dict[str, Any]]) -> int:
+    """How many of ``batch``'s worker slots are in use: its tasks that have been
+    DISPATCHED to a worker and have not finished.
+
+    A task is dispatched once the batch's ``queue_index`` has moved past it —
+    ``start_next_batch_of_downloads`` advances the index as it hands each task
+    to a worker, and a batch that starts its own worker (a redownload) is
+    created already past it. Everything from ``queue_index`` on is waiting for a
+    slot and holds none.
+
+    The status alone cannot tell the two apart. ``task_is_active`` reads every
+    status that isn't terminal as still working, so an unknown one can never
+    free a slot — and 'pending', the status every waiting task has, is one of
+    them. Counted by status, a 98-track batch with three workers running held 98
+    busy slots. A worker only starts while the count is below
+    ``max_concurrent``, so once the first three tracks finished nothing else
+    started: the worker-count validator and the batch healer both re-asserted
+    that count on their ticks (3 → 98, 3 → 64, 3 → 102 in one live log), and
+    every wishlist album bigger than three tracks sat at 3/N until a restart
+    discarded it.
+
+    A task already through the completion callback (``_completed_task_ids``)
+    holds nothing even while its status catches up, and neither does a task
+    missing from ``tasks``."""
+    queue = batch.get('queue') or []
+    dispatched = queue[:batch.get('queue_index') or 0]
+    completed = batch.get('_completed_task_ids') or ()
+    return sum(
+        1 for task_id in dispatched
+        if task_id not in completed
+        and task_is_active((tasks.get(task_id) or {}).get('status'))
+    )
+
+
 activity_feed = []
 activity_feed_lock = threading.Lock()
 _activity_toast_emitter = None

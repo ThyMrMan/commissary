@@ -11,11 +11,11 @@ import time
 from config.settings import config_manager
 from core.runtime_state import (
     TERMINAL_TASK_STATUSES,
+    count_active_workers,
     download_batches,
     download_tasks,
     matched_context_lock,
     matched_downloads_context,
-    task_is_active,
     tasks_lock,
 )
 from utils.async_helpers import run_async
@@ -1108,35 +1108,17 @@ class WebUIDownloadMonitor:
                     queue = batch.get('queue', [])
                     queue_index = batch.get('queue_index', 0)
 
-                    # Count actually active tasks based on status
-                    actually_active = 0
-                    orphaned_tasks = []
-                    # Tasks already processed by _on_download_completed should NOT be counted
-                    # as active, even if their status hasn't been updated yet (race condition
-                    # between stream processor calling _on_download_completed and
-                    # _run_post_processing_worker setting status to 'completed')
-                    completed_task_ids = batch.get('_completed_task_ids', set())
-
-                    for task_id in queue:
-                        if task_id in download_tasks:
-                            task_status = download_tasks[task_id]['status']
-                            # Both branches derive from ONE set (runtime_state).
-                            # They used to enumerate their own, and the active
-                            # list was missing 'pending' — the status every task
-                            # is created with. A pending task matched neither
-                            # branch and simply vanished from the count, so this
-                            # validator repeatedly "fixed" a correct count down,
-                            # freed a slot that was in use, and started another
-                            # worker whose task was also pending. The orphan list
-                            # had the mirror-image gap: it omitted 'skipped' and
-                            # 'already_owned', so those sat in the live queue
-                            # region unnoticed.
-                            if task_is_active(task_status):
-                                if task_id not in completed_task_ids:
-                                    actually_active += 1
-                            elif task_status in TERMINAL_TASK_STATUSES and task_id in queue[queue_index:]:
-                                # These are orphaned tasks - they're done but still in active queue
-                                orphaned_tasks.append(task_id)
+                    # Busy slots are DISPATCHED tasks that haven't finished — one
+                    # definition, shared with the batch healer in web_server.py.
+                    # Counting every unfinished task in the queue read the tracks
+                    # still waiting for a worker as busy, and wedged every batch
+                    # bigger than its worker limit (runtime_state.count_active_workers).
+                    actually_active = count_active_workers(batch, download_tasks)
+                    # Finished tasks still sitting in the undispatched part of the queue.
+                    orphaned_tasks = [
+                        task_id for task_id in queue[queue_index:]
+                        if (download_tasks.get(task_id) or {}).get('status') in TERMINAL_TASK_STATUSES
+                    ]
 
                     # Check for discrepancies
                     if reported_active != actually_active or orphaned_tasks:

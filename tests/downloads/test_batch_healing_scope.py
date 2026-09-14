@@ -47,7 +47,7 @@ def test_finished_tasks_are_no_longer_called_orphans():
 
 def test_a_terminal_status_counts_as_finished_not_missing():
     block = _healer()
-    terminal = block.split("elif task_status in TERMINAL_TASK_STATUSES", 1)[1][:120]
+    terminal = block.split("if task_status in TERMINAL_TASK_STATUSES", 1)[1][:120]
     assert "finished_tasks.append" in terminal
 
 
@@ -61,12 +61,16 @@ def test_the_healer_shares_one_definition_of_active_with_the_validator():
         [Batch Healing]     fixing active count 21 -> 3
         [Worker Validation] reported=3, actual=21 ... Fixed active count: 3 -> 21
 
-    4,992 heals against 4,982 validations in one 21-hour log. task_is_active
-    derives from the terminal set so a second copy cannot drift; the point of
-    this test is that the healer keeps USING it rather than growing a list back.
+    4,992 heals against 4,982 validations in one 21-hour log. Sharing a status
+    predicate was not enough: a status cannot say whether a task has a worker
+    yet, so both then counted every task still WAITING for one as busy, agreed
+    on 98 for a batch running three, and never started a fourth.
+    runtime_state.count_active_workers counts dispatched tasks only; the point of
+    this test is that the healer keeps USING it rather than growing its own
+    count back.
     """
     block = _healer()
-    assert "task_is_active(task_status)" in block
+    assert "count_active_workers(batch_data, download_tasks)" in block
     assert "'searching', 'downloading', 'queued', 'post_processing'" not in block
 
 

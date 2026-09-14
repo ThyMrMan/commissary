@@ -223,6 +223,37 @@ def pending_staged_keys(cursor: Any) -> Tuple[frozenset, frozenset]:
     return frozenset(path_keys), frozenset(name_keys)
 
 
+def pending_hint_written_after(cursor: Any, staged_path: Optional[str], timestamp: Any) -> bool:
+    """True when a PENDING hint for ``staged_path`` was written after ``timestamp``
+    -- a time the database recorded, such as the ``created_at`` of the latest
+    auto-import history row for the file.
+
+    This is what tells asking again from a file already tried. A second
+    Re-identify of a track stages the same file under the same name, so to the
+    auto-import scanner it is the attempt before it; only the hint is new. The
+    hint an attempt used was written before that attempt's history row, so it
+    never counts -- a failure does not retry itself.
+
+    A hint binds on the terms of :func:`staged_file_keys`, without reading the
+    file. SQLite's ``julianday`` compares the times, so both spellings it accepts
+    ('2026-09-13 10:00:00', '2026-09-13T10:00:00') order correctly, and a missing
+    or unreadable time is never "after". Times have one-second resolution: a
+    hint written in the same second as ``timestamp`` is not after it."""
+    if not staged_path or not timestamp:
+        return False
+    cursor.execute(
+        "SELECT staged_path FROM rematch_hints WHERE status = 'pending' "
+        "AND julianday(created_at) > julianday(?)",
+        (timestamp,),
+    )
+    path_key, name_key = staged_file_keys(staged_path)
+    for row in cursor.fetchall():
+        hint_path, hint_name = staged_file_keys(row[0])
+        if hint_path == path_key or (name_key and hint_name == name_key):
+            return True
+    return False
+
+
 def build_identification_from_hint(hint: RematchHint) -> dict:
     """Turn a hint into the ``identification`` dict the auto-import matcher expects,
     so a re-identify SKIPS the guessing tiers entirely and matches straight against
@@ -359,6 +390,7 @@ __all__ = [
     "consume_hint",
     "list_pending_hints",
     "pending_staged_keys",
+    "pending_hint_written_after",
     "staged_file_keys",
     "build_identification_from_hint",
     "delete_replaced_track",

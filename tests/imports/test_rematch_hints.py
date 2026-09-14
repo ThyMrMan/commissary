@@ -19,6 +19,7 @@ from core.imports.rematch_hints import (
     create_hint,
     find_hint_for_file,
     list_pending_hints,
+    pending_hint_written_after,
     quick_file_signature,
 )
 
@@ -136,6 +137,55 @@ def test_exempt_dedup_false_roundtrips(cur):
     create_hint(cur, _hint(staged_path="/staging/Keep.flac", exempt_dedup=False))
     got = find_hint_for_file(cur, "/staging/Keep.flac")
     assert got.exempt_dedup is False
+
+
+# ── asking again: a hint written after an attempt ─────────────────────────────
+_REID = "/staging/Song [reid-42].flac"
+_ATTEMPT = "2026-09-13 10:00:00"
+
+
+def _written_at(cur, hint_id, when):
+    cur.execute("UPDATE rematch_hints SET created_at = ? WHERE id = ?", (when, hint_id))
+
+
+@pytest.mark.parametrize("written, expected", [
+    ("2026-09-13 10:00:01", True),     # after the attempt: the user asked again
+    ("2026-09-13 10:00:00", False),    # the same second is not after it
+    ("2026-09-13 09:59:59", False),    # before it: the hint that attempt used
+])
+def test_pending_hint_written_after_compares_with_the_attempt(cur, written, expected):
+    _written_at(cur, create_hint(cur, _hint(staged_path=_REID)), written)
+    assert pending_hint_written_after(cur, _REID, _ATTEMPT) is expected
+
+
+def test_pending_hint_written_after_binds_by_filename_under_another_spelling(cur):
+    # The apply route and the worker can spell the staging folder differently
+    # (a Docker-mapped path); the filename carries the track id.
+    _written_at(cur, create_hint(cur, _hint(staged_path="/app/Staging/Song [reid-42].flac")),
+                "2026-09-13 11:00:00")
+    assert pending_hint_written_after(cur, r"C:\Staging\Song [reid-42].flac", _ATTEMPT) is True
+
+
+def test_pending_hint_written_after_ignores_consumed_hints_and_other_files(cur):
+    consumed = create_hint(cur, _hint(staged_path=_REID))
+    consume_hint(cur, consumed)
+    other = create_hint(cur, _hint(staged_path="/staging/Other [reid-43].flac"))
+    for hint_id in (consumed, other):
+        _written_at(cur, hint_id, "2026-09-13 11:00:00")
+    assert pending_hint_written_after(cur, _REID, _ATTEMPT) is False
+
+
+@pytest.mark.parametrize("attempt", [None, "", "not a time"])
+def test_pending_hint_written_after_without_a_usable_time_is_false(cur, attempt):
+    _written_at(cur, create_hint(cur, _hint(staged_path=_REID)), "2026-09-13 11:00:00")
+    assert pending_hint_written_after(cur, _REID, attempt) is False
+
+
+def test_pending_hint_written_after_reads_either_spelling_of_a_time(cur):
+    # ' ' sorts before 'T', so comparing the strings would put 10:00:01 first.
+    _written_at(cur, create_hint(cur, _hint(staged_path=_REID)), "2026-09-13 10:00:01")
+    assert pending_hint_written_after(cur, _REID, "2026-09-13T10:00:00") is True
+    assert pending_hint_written_after(cur, _REID, "2026-09-13T10:00:02") is False
 
 
 # ── content fingerprint ───────────────────────────────────────────────────────
