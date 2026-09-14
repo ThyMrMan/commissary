@@ -653,3 +653,56 @@ def test_remove_artist_unknown_404_and_missing_400():
     assert status == 404 and service.removed == []
     payload, status = remove_artist_from_wishlist(runtime, artist_name="   ")
     assert status == 400
+
+
+# ── Prefer deluxe editions: owned only on a smaller edition isn't owned ─────
+
+def _deluxe_album_track_args():
+    return dict(track={"id": "t", "name": "Stan", "artists": [{"name": "Eminem"}]},
+                artist={"id": "a1", "name": "Eminem"},
+                album={"id": "al2", "name": "Curtain Call: The Hits (Deluxe Edition)",
+                       "total_tracks": 24},
+                source_type="album")
+
+
+def _edition_config(monkeypatch, *, prefer):
+    from config.settings import config_manager
+    values = {'wishlist.allow_duplicate_tracks': False, 'wishlist.prefer_deluxe_editions': prefer}
+    monkeypatch.setattr(config_manager, 'get', lambda key, default=None: values.get(key, default))
+
+
+def _owned_on(db, album_title, track_count):
+    class _Row:
+        album_id = 7
+
+    row = _Row()
+    row.album_title = album_title
+    db.check_track_exists = lambda *a, **k: (row, 0.95)
+    db.get_tracks_by_album = lambda album_id: [object()] * track_count
+
+
+def test_prefer_deluxe_adds_a_song_owned_only_on_the_standard_edition(monkeypatch):
+    _edition_config(monkeypatch, prefer=True)
+    runtime, service, db, _logger, _ = _build_runtime()
+    _owned_on(db, "Curtain Call: The Hits", 15)
+    payload, status = add_album_track_to_wishlist(runtime, **_deluxe_album_track_args())
+    assert status == 200 and not payload.get("skipped")
+    assert len(service.add_calls) == 1
+
+
+def test_without_prefer_deluxe_the_standard_copy_still_counts_as_owned(monkeypatch):
+    _edition_config(monkeypatch, prefer=False)
+    runtime, service, db, _logger, _ = _build_runtime()
+    _owned_on(db, "Curtain Call: The Hits", 15)
+    payload, status = add_album_track_to_wishlist(runtime, **_deluxe_album_track_args())
+    assert payload.get("skipped") is True
+    assert service.add_calls == []
+
+
+def test_a_song_already_on_the_deluxe_is_still_skipped(monkeypatch):
+    _edition_config(monkeypatch, prefer=True)
+    runtime, service, db, _logger, _ = _build_runtime()
+    _owned_on(db, "Curtain Call: The Hits (Deluxe Edition)", 24)
+    payload, status = add_album_track_to_wishlist(runtime, **_deluxe_album_track_args())
+    assert payload.get("skipped") is True
+    assert service.add_calls == []

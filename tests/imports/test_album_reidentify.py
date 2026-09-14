@@ -1,11 +1,10 @@
 """Re-identifying a whole library album under a different release.
 
 Asked for as "if all I wanted to do was rematch a downloaded album to update it".
-The per-track Re-identify could not be repeated per track: the auto-import worker
-groups loose staging copies by album tag, so twelve copies from one album become
-one candidate, and ``_resolve_rematch_hint`` only honours single-file candidates
--- every hint would be ignored. So an album goes through the Import page's album
-path, one confirmed track at a time, with the original removed only after its
+An album goes through the Import page's album path rather than the per-track
+Re-identify repeated per track: the user confirms every pairing before anything
+moves, each track reports its own result, and nothing waits on the auto-import
+worker. One confirmed track at a time, with the original removed only after its
 copy has landed.
 
 These run against the REAL MusicDatabase schema, so a wrong column name fails

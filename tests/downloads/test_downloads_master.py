@@ -1196,3 +1196,143 @@ def test_batch_removed_before_phase_two_returns_cleanly(monkeypatch):
     # (batch was deleted, so phase=complete update silently no-ops)
     assert monitor.started == []
     assert next_batch_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Prefer deluxe editions (wishlist.prefer_deluxe_editions)
+# ---------------------------------------------------------------------------
+# Owning "X" used to count as owning every song "X (Deluxe Edition)" shares with
+# it, so a deluxe download fetched only the bonus tracks, into a folder of their
+# own, and the album was split. With the option on, an owned SMALLER edition does
+# not own the deluxe's songs; off, the analysis is exactly what it was.
+
+_STANDARD_TITLE = 'Curtain Call: The Hits'
+_DELUXE_TITLE = 'Curtain Call: The Hits (Deluxe Edition)'
+_STANDARD_SONGS = ['My Name Is', 'The Way I Am', 'Stan', 'Without Me', 'Mockingbird']
+_BONUS_SONGS = ['Intro', 'FACK', 'Shit On You', 'Criminal']
+_DELUXE_SONGS = _BONUS_SONGS[:2] + _STANDARD_SONGS + _BONUS_SONGS[2:]
+
+
+class _LibraryAlbum:
+    def __init__(self, id_, title, songs):
+        self.id = id_
+        self.title = title
+        self.track_count = len(songs)
+
+
+class _LibraryTrack:
+    def __init__(self, title, album):
+        self.title = title
+        self.album_id = album.id
+        self.album_title = album.title
+
+
+class _EditionLibraryDB(_FakeDB):
+    """Whole albums: the album match, per-album tracks and the global per-track
+    search all read the same rows, in the order the albums were given."""
+
+    def __init__(self, albums, matched=None):
+        super().__init__()
+        self._albums = {}
+        self._tracks = {}
+        for album_id, (title, songs) in albums.items():
+            album = _LibraryAlbum(album_id, title, songs)
+            self._albums[album_id] = album
+            self._tracks[album_id] = [_LibraryTrack(song, album) for song in songs]
+        self._matched = matched
+
+    def check_album_exists_with_editions(self, title, artist, confidence_threshold=0.7,
+                                         expected_track_count=None, server_source=None,
+                                         expected_year=None):
+        if self._matched is None:
+            return (None, 0.0)
+        return (self._albums[self._matched], 0.95)
+
+    def get_tracks_by_album(self, album_id):
+        return list(self._tracks.get(album_id, []))
+
+    def get_album_title_year(self, album_id):
+        album = self._albums.get(album_id)
+        return (album.title, 2005) if album else None
+
+    def check_track_exists(self, title, artist, confidence_threshold=0.7, server_source=None, album=None):
+        for tracks in self._tracks.values():
+            for track in tracks:
+                if track.title.lower() == title.lower():
+                    return (track, 0.95)
+        return (None, 0.0)
+
+
+def _queued_songs(monkeypatch, batch_id, db, *, album, songs, prefer, allow_duplicates=True):
+    monkeypatch.setattr('database.music_database.MusicDatabase', lambda: db)
+    deps = _build_deps(config=_FakeConfig({
+        'wishlist.prefer_deluxe_editions': prefer,
+        'wishlist.allow_duplicate_tracks': allow_duplicates,
+    }))
+    _seed_batch(batch_id, is_album_download=True,
+                album_context={'name': album, 'total_tracks': len(songs)},
+                artist_context={'name': 'Eminem'})
+    mw.run_full_missing_tracks_process(
+        batch_id, 'album:1', [{'name': song, 'artists': ['Eminem']} for song in songs], deps)
+    return sorted(download_tasks[task_id]['track_info']['name']
+                  for task_id in download_batches[batch_id]['queue'])
+
+
+def test_prefer_deluxe_downloads_the_whole_deluxe_when_the_standard_is_owned(monkeypatch):
+    db = _EditionLibraryDB({1: (_STANDARD_TITLE, _STANDARD_SONGS)}, matched=1)
+    queued = _queued_songs(monkeypatch, 'PD1', db, album=_DELUXE_TITLE, songs=_DELUXE_SONGS,
+                           prefer=True)
+    assert queued == sorted(_DELUXE_SONGS)
+
+
+def test_without_prefer_deluxe_the_deluxe_gets_only_its_bonus_tracks(monkeypatch):
+    """The split the option exists to avoid, pinned so the default stays put."""
+    db = _EditionLibraryDB({1: (_STANDARD_TITLE, _STANDARD_SONGS)}, matched=1)
+    queued = _queued_songs(monkeypatch, 'PD2', db, album=_DELUXE_TITLE, songs=_DELUXE_SONGS,
+                           prefer=False)
+    assert queued == sorted(_BONUS_SONGS)
+
+
+def test_an_owned_deluxe_still_satisfies_a_standard_download(monkeypatch):
+    db = _EditionLibraryDB({2: (_DELUXE_TITLE, _DELUXE_SONGS)}, matched=2)
+    queued = _queued_songs(monkeypatch, 'PD3', db, album=_STANDARD_TITLE, songs=_STANDARD_SONGS,
+                           prefer=True)
+    assert queued == []
+    assert download_batches['PD3']['phase'] == 'complete'
+
+
+def test_a_split_library_gets_the_rest_of_the_deluxe_with_duplicates_off(monkeypatch):
+    """The library the old behaviour leaves: the standard album plus a deluxe row
+    holding two bonus tracks. The album match finds that deluxe row; the shared
+    songs fall back to the global search, which lands on the standard album."""
+    library = {1: (_STANDARD_TITLE, _STANDARD_SONGS), 2: (_DELUXE_TITLE, ['Intro', 'FACK'])}
+    queued = _queued_songs(monkeypatch, 'PD4', _EditionLibraryDB(library, matched=2),
+                           album=_DELUXE_TITLE, songs=_DELUXE_SONGS, prefer=True,
+                           allow_duplicates=False)
+    assert queued == sorted(_STANDARD_SONGS + ['Shit On You', 'Criminal'])
+
+
+def test_a_split_library_without_the_option_keeps_counting_the_standard(monkeypatch):
+    library = {1: (_STANDARD_TITLE, _STANDARD_SONGS), 2: (_DELUXE_TITLE, ['Intro', 'FACK'])}
+    queued = _queued_songs(monkeypatch, 'PD5', _EditionLibraryDB(library, matched=2),
+                           album=_DELUXE_TITLE, songs=_DELUXE_SONGS, prefer=False,
+                           allow_duplicates=False)
+    assert queued == ['Criminal', 'Shit On You']
+
+
+def test_duplicates_off_with_no_album_match_uses_the_same_gate(monkeypatch):
+    library = {1: (_STANDARD_TITLE, _STANDARD_SONGS)}
+    on = _queued_songs(monkeypatch, 'PD6', _EditionLibraryDB(library), album=_DELUXE_TITLE,
+                       songs=_DELUXE_SONGS, prefer=True, allow_duplicates=False)
+    off = _queued_songs(monkeypatch, 'PD7', _EditionLibraryDB(library), album=_DELUXE_TITLE,
+                        songs=_DELUXE_SONGS, prefer=False, allow_duplicates=False)
+    assert on == sorted(_DELUXE_SONGS)
+    assert off == sorted(_BONUS_SONGS)
+
+
+def test_a_remaster_is_not_treated_as_a_bigger_edition(monkeypatch):
+    songs = ['One', 'Two', 'Three']
+    db = _EditionLibraryDB({1: ('Album X', songs)}, matched=1)
+    queued = _queued_songs(monkeypatch, 'PD8', db, album='Album X (Remastered)',
+                           songs=songs + ['Four'], prefer=True)
+    assert queued == ['Four']

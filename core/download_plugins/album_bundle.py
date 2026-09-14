@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 from config.settings import config_manager
+from core.edition_preference import PREFER_DELUXE_KEY, has_deluxe_marker
 from utils.logging_config import get_logger
 
 logger = get_logger("download_plugins.album_bundle")
@@ -181,7 +182,8 @@ def album_title_relevance(candidate_title: str, album_name: str) -> float:
 
 
 def pick_best_album_release(candidates, quality_guess,
-                            album_name: str = "") -> Optional[object]:
+                            album_name: str = "",
+                            prefer_deluxe: Optional[bool] = None) -> Optional[object]:
     """Pick the single best torrent / NZB for an album-bundle download.
 
     Heuristic, in priority order:
@@ -224,6 +226,23 @@ def pick_best_album_release(candidates, quality_guess,
     pool = sized or list(candidates)
     if not pool:
         return None
+
+    # Prefer deluxe editions: for a deluxe request, a release that names an
+    # edition beats one that doesn't — a standard-edition torrent lacks the bonus
+    # tracks. Only among releases not known to be dead; when none names an
+    # edition the pool is unchanged.
+    if album_name and has_deluxe_marker(album_name):
+        if prefer_deluxe is None:
+            try:
+                prefer_deluxe = bool(config_manager.get(PREFER_DELUXE_KEY, False))
+            except Exception:
+                prefer_deluxe = False
+        if prefer_deluxe:
+            same_edition = [c for c in pool
+                            if has_deluxe_marker(c.title or '')
+                            and (c.seeders is None or c.seeders > 0)]
+            if same_edition:
+                pool = same_edition
 
     def _score(c) -> tuple:
         seeders = c.seeders if c.seeders is not None else (c.grabs or 0)

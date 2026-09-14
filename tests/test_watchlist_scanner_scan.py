@@ -1277,3 +1277,135 @@ def test_scan_records_per_run_track_ledger(monkeypatch):
     assert events[0]["artist_name"] == "Artist One"
     # The 10-item live FIFO only carries the ADDED one, as before.
     assert [a["track_name"] for a in scan_state["recent_wishlist_additions"]] == ["Added Track"]
+
+
+# ---------------------------------------------------------------------------
+# Prefer deluxe editions (wishlist.prefer_deluxe_editions)
+# ---------------------------------------------------------------------------
+
+def _set_config(monkeypatch, **values):
+    import config.settings as settings_module
+    monkeypatch.setattr(settings_module.config_manager, "get",
+                        lambda key, default=None: values.get(key, default))
+
+
+def _albums_checked_in_a_scan(monkeypatch, *, prefer):
+    monkeypatch.setattr(watchlist_scanner_module, "DELAY_BETWEEN_ARTISTS", 0)
+    monkeypatch.setattr(watchlist_scanner_module, "DELAY_BETWEEN_ALBUMS", 0)
+    _set_config(monkeypatch, **{"wishlist.prefer_deluxe_editions": prefer})
+
+    artist = _build_artist()
+    standard = types.SimpleNamespace(id="std", name="Curtain Call: The Hits", total_tracks=15)
+    deluxe = types.SimpleNamespace(id="dlx", name="Curtain Call: The Hits (Deluxe Edition)",
+                                   total_tracks=24)
+    song = {"id": "track-1", "name": "Stan", "track_number": 1, "disc_number": 1,
+            "artists": [{"name": "Artist One"}]}
+    album_data = {album.id: {"name": album.name, "images": [], "tracks": {"items": [song]}}
+                  for album in (standard, deluxe)}
+    scanner = _build_scanner(album_data["std"], [artist])
+    scanner._database.has_fresh_similar_artists = lambda *args, **kwargs: False
+    monkeypatch.setattr(scanner.metadata_service, "get_album", lambda album_id: album_data[album_id])
+
+    checked = []
+    monkeypatch.setattr(scanner, "_backfill_missing_ids", lambda *a, **k: None)
+    monkeypatch.setattr(scanner, "get_artist_image_url", lambda *a, **k: "https://example.com/a.jpg")
+    monkeypatch.setattr(scanner, "get_artist_discography_for_watchlist", lambda *a, **k: [standard, deluxe])
+    monkeypatch.setattr(scanner, "_get_lookback_period_setting", lambda: "30")
+    monkeypatch.setattr(scanner, "_get_rescan_cutoff", lambda: None)
+    monkeypatch.setattr(scanner, "_should_include_release", lambda *a, **k: True)
+    monkeypatch.setattr(scanner, "_should_include_track", lambda *a, **k: True)
+    monkeypatch.setattr(scanner, "is_track_missing_from_library",
+                        lambda track, album_name=None, album_track_count=None:
+                        checked.append(album_name) and False)
+    monkeypatch.setattr(scanner, "add_track_to_wishlist", lambda *a, **k: True)
+    monkeypatch.setattr(scanner, "update_artist_scan_timestamp", lambda *a, **k: True)
+    monkeypatch.setattr(scanner, "update_similar_artists", lambda *a, **k: True)
+    monkeypatch.setattr(scanner, "_backfill_similar_artists_fallback_ids", lambda *a, **k: 0)
+
+    scanner.scan_watchlist_artists([artist], scan_state={})
+    return checked
+
+
+def test_a_scan_with_both_editions_checks_only_the_deluxe(monkeypatch):
+    assert _albums_checked_in_a_scan(monkeypatch, prefer=True) == [
+        "Curtain Call: The Hits (Deluxe Edition)"]
+
+
+def test_without_prefer_deluxe_a_scan_checks_both_editions(monkeypatch):
+    assert _albums_checked_in_a_scan(monkeypatch, prefer=False) == [
+        "Curtain Call: The Hits", "Curtain Call: The Hits (Deluxe Edition)"]
+
+
+class _EditionLibrary:
+    """One owned song, on the album given; the per-track check's view of the library."""
+
+    def __init__(self, album_title, album_size):
+        self.album_title = album_title
+        self.album_size = album_size
+
+    def check_track_exists(self, title, artist, confidence_threshold=0.7, server_source=None,
+                           album=None, **kwargs):
+        if title != "Stan":
+            return (None, 0.0)
+        return (types.SimpleNamespace(album_id=7, album_title=self.album_title), 0.95)
+
+    def get_tracks_by_album(self, album_id):
+        return [object()] * self.album_size
+
+    def get_album_title_year(self, album_id):
+        return (self.album_title, 2005)
+
+
+def _missing_for_the_deluxe(monkeypatch, *, prefer, allow_duplicates, owned_album, owned_size,
+                            external_id_match=False):
+    import core.library.track_identity as track_identity
+
+    _set_config(monkeypatch, **{"wishlist.prefer_deluxe_editions": prefer,
+                                "wishlist.allow_duplicate_tracks": allow_duplicates})
+    monkeypatch.setattr(watchlist_scanner_module, "get_primary_source", lambda: "spotify")
+    owned = {"album_id": 7, "album_title": owned_album}
+    monkeypatch.setattr(track_identity, "extract_external_ids",
+                        lambda track, source_hint=None: {"isrc": "USIR10000001"} if external_id_match else {})
+    monkeypatch.setattr(track_identity, "find_library_track_by_external_id",
+                        lambda db, external_ids=None, server_source=None: owned if external_id_match else None)
+    monkeypatch.setattr(track_identity, "find_provenance_by_external_id",
+                        lambda db, external_ids=None: None)
+
+    scanner = _build_scanner({}, [])
+    scanner._database = _EditionLibrary(owned_album, owned_size)
+    scanner._matching_engine = types.SimpleNamespace(clean_title=lambda title: title)
+    track = {"name": "Stan", "artists": [{"name": "Eminem"}]}
+    return scanner.is_track_missing_from_library(
+        track, album_name="Curtain Call: The Hits (Deluxe Edition)", album_track_count=24)
+
+
+def test_prefer_deluxe_treats_a_standard_copy_as_missing_for_the_deluxe(monkeypatch):
+    assert _missing_for_the_deluxe(monkeypatch, prefer=True, allow_duplicates=True,
+                                   owned_album="Curtain Call: The Hits", owned_size=15) is True
+
+
+def test_without_prefer_deluxe_the_standard_copy_owns_the_song(monkeypatch):
+    assert _missing_for_the_deluxe(monkeypatch, prefer=False, allow_duplicates=True,
+                                   owned_album="Curtain Call: The Hits", owned_size=15) is False
+
+
+def test_prefer_deluxe_applies_with_duplicates_off(monkeypatch):
+    assert _missing_for_the_deluxe(monkeypatch, prefer=True, allow_duplicates=False,
+                                   owned_album="Curtain Call: The Hits", owned_size=15) is True
+    assert _missing_for_the_deluxe(monkeypatch, prefer=False, allow_duplicates=False,
+                                   owned_album="Curtain Call: The Hits", owned_size=15) is False
+
+
+def test_prefer_deluxe_applies_to_an_external_id_match(monkeypatch):
+    assert _missing_for_the_deluxe(monkeypatch, prefer=True, allow_duplicates=False,
+                                   owned_album="Curtain Call: The Hits", owned_size=15,
+                                   external_id_match=True) is True
+    assert _missing_for_the_deluxe(monkeypatch, prefer=False, allow_duplicates=False,
+                                   owned_album="Curtain Call: The Hits", owned_size=15,
+                                   external_id_match=True) is False
+
+
+def test_a_copy_on_the_deluxe_itself_still_owns_the_song(monkeypatch):
+    assert _missing_for_the_deluxe(monkeypatch, prefer=True, allow_duplicates=True,
+                                   owned_album="Curtain Call: The Hits (Deluxe Edition)",
+                                   owned_size=24) is False

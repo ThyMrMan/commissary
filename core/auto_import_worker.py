@@ -99,6 +99,28 @@ def _compute_folder_hash(audio_files: List[str]) -> str:
     return hashlib.md5('|'.join(items).encode()).hexdigest()
 
 
+def _split_rematch_copies(files: List[str], keys) -> Tuple[List[str], List[str]]:
+    """Separate staged Re-identify copies (#889) from the other loose files.
+
+    ``keys`` is ``(path_keys, name_keys)`` from ``pending_staged_keys``. A file
+    is a copy when its path or its bare filename belongs to a pending hint --
+    the terms ``find_hint_for_file`` binds on. Returns ``(others, copies)``,
+    each in its original order."""
+    path_keys, name_keys = keys or (frozenset(), frozenset())
+    if not path_keys and not name_keys:
+        return files, []
+    from core.imports.rematch_hints import staged_file_keys
+    others: List[str] = []
+    copies: List[str] = []
+    for f in files:
+        path_key, name_key = staged_file_keys(f)
+        if path_key in path_keys or name_key in name_keys:
+            copies.append(f)
+        else:
+            others.append(f)
+    return others, copies
+
+
 def _read_file_tags(file_path: str) -> Dict[str, Any]:
     """Read embedded tags from an audio file.
 
@@ -761,7 +783,8 @@ class AutoImportWorker:
         self._scan_directory(staging, candidates, staging_root=staging)
         return candidates
 
-    def _scan_directory(self, directory: str, candidates: List[FolderCandidate], staging_root: str = ''):
+    def _scan_directory(self, directory: str, candidates: List[FolderCandidate], staging_root: str = '',
+                        rematch_keys=None):
         """Recursively scan a directory for album folders and loose audio files.
 
         Loose-file handling:
@@ -783,7 +806,19 @@ class AutoImportWorker:
           ignored album subfolders sitting next to loose files —
           common when a user moves some tracks out of an album folder
           while leaving the parent album folder intact.
+
+        Re-identify copies (#889):
+        - A loose file with a PENDING re-identify hint becomes its own
+          candidate, built exactly as it would be if it were the only file
+          here. The copy keeps the album tag of the album it is leaving, so
+          grouping by tag put two copies from one album — or a copy beside a
+          new download of that album — into one candidate, and
+          `_resolve_rematch_hint` honours only a single file: every hint in
+          the group was ignored. Pending hints are read once per scan and
+          passed down the recursion.
         """
+        if rematch_keys is None:
+            rematch_keys = self._pending_rematch_keys()
         try:
             entries = sorted(os.listdir(directory))
         except OSError:
@@ -817,6 +852,12 @@ class AutoImportWorker:
             if disc_files:
                 disc_files_by_num[disc_num] = disc_files
 
+        loose_files, rematch_copies = _split_rematch_copies(loose_files, rematch_keys)
+        for copy_path in rematch_copies:
+            # The candidate this copy gets when staged alone — the shape the
+            # hint path has always handled. No disc folder is ever part of it.
+            self._build_loose_file_candidates(directory, [copy_path], {}, candidates)
+
         if loose_files:
             self._build_loose_file_candidates(
                 directory, loose_files, disc_files_by_num, candidates,
@@ -846,7 +887,8 @@ class AutoImportWorker:
         # beside loose tracks get silently ignored (the bug a chaotic
         # staging root surfaced on 2026-05-09).
         for _sub_name, sub_path in non_disc_subdirs:
-            self._scan_directory(sub_path, candidates, staging_root=staging_root)
+            self._scan_directory(sub_path, candidates, staging_root=staging_root,
+                                 rematch_keys=rematch_keys)
 
     def _build_loose_file_candidates(
         self,
@@ -996,6 +1038,22 @@ class AutoImportWorker:
 
     # ── Re-identify hints (#889) ──
 
+    def _pending_rematch_keys(self):
+        """Keys of every pending re-identify hint, so the scanner can keep each
+        staged copy out of an album-tag group. Fail-safe like the lookup below:
+        any error (a bare worker with no database, no table, a DB hiccup) yields
+        no keys, and the scan is exactly what it was before hints were read."""
+        try:
+            from core.imports.rematch_hints import pending_staged_keys
+            conn = self.database._get_connection()
+            try:
+                return pending_staged_keys(conn.cursor())
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug("[Auto-Import] pending re-identify lookup skipped: %s", e)
+            return frozenset(), frozenset()
+
     def _resolve_rematch_hint(self, candidate: 'FolderCandidate'):
         """If this staged file carries a user-designated re-identify hint, return
         ``(hint, identification)`` so matching skips the guessing tiers; otherwise
@@ -1003,7 +1061,9 @@ class AutoImportWorker:
 
         Fail-safe: ANY error (no table, DB hiccup) returns ``(None, None)`` so a
         re-identify problem can never break ordinary auto-import. Only single-file
-        candidates are eligible — a re-identify always stages exactly one track."""
+        candidates are eligible — a re-identify always stages exactly one track, and
+        `_scan_directory` gives every staged copy a candidate of its own, even beside
+        loose files that share its album tag."""
         try:
             files = candidate.audio_files or []
             if len(files) != 1:

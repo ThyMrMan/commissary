@@ -8972,6 +8972,15 @@
                                 </div>
 
                                 <div class="form-group">
+                                    <label class="checkbox-label">
+                                        <input type="checkbox" id="prefer-deluxe-editions">
+                                        Prefer deluxe editions
+                                    </label>
+                                    <span class="info-icon" role="button" tabindex="0" title="What's this?" onclick="toggleSettingHelp(this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSettingHelp(this);}">i</span>
+                                    <small class="settings-hint setting-help-body" hidden>When an album comes in a deluxe or expanded edition, go for the bigger one. Artist pages show the deluxe edition, the watchlist skips the standard edition when both turn up, and downloading a deluxe edition gets every track even if you already own the standard one. The songs the two share stay in both albums until you remove the standard one. Album tags keep the edition's name, so your media server lists it as its own album.</small>
+                                </div>
+
+                                <div class="form-group">
                                     <label for="wishlist-ignore-ttl">Removed-track re-try window (days)</label>
                                     <input type="number" id="wishlist-ignore-ttl" min="1" max="365" step="1" value="30">
                                     <span class="info-icon" role="button" tabindex="0" title="What's this?" onclick="toggleSettingHelp(this)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSettingHelp(this);}">i</span>

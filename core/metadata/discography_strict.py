@@ -21,6 +21,7 @@ from core.metadata.discography_result import (
     DiscographyRequest,
     DiscographyStatus,
 )
+from core.edition_preference import prefer_deluxe_enabled
 from core.metadata.lookup import MetadataLookupOptions
 from utils.logging_config import get_logger
 
@@ -287,9 +288,10 @@ def get_artist_detail_discography(
             albums.append(card)
 
     if options is None or options.dedup_variants:
-        albums = _dedup_variant_releases(albums)
-        eps = _dedup_variant_releases(eps)
-        singles = _dedup_variant_releases(singles)
+        prefer_deluxe = prefer_deluxe_enabled()
+        albums = _dedup_variant_releases(albums, prefer_deluxe=prefer_deluxe)
+        eps = _dedup_variant_releases(eps, prefer_deluxe=prefer_deluxe)
+        singles = _dedup_variant_releases(singles, prefer_deluxe=prefer_deluxe)
 
     albums = _sort_discography_releases(albums)
     eps = _sort_discography_releases(eps)

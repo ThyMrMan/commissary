@@ -612,6 +612,10 @@ def add_album_track_to_wishlist(
         # re-download flow uses a different endpoint, so it's unaffected.)
         try:
             from config.settings import config_manager as _cfg
+            from core.edition_preference import (
+                PREFER_DELUXE_KEY,
+                owned_row_is_smaller_edition,
+            )
             if not _cfg.get('wishlist.allow_duplicate_tracks', True):
                 _db = runtime.get_music_database()
                 _existing, _conf = _db.check_track_exists(
@@ -620,6 +624,15 @@ def add_album_track_to_wishlist(
                     server_source=runtime.active_server,
                     album=album.get('name', ''),
                 )
+                if _existing and _conf >= 0.7 and _cfg.get(PREFER_DELUXE_KEY, False):
+                    # Prefer deluxe editions: owned only on a smaller edition of
+                    # this album isn't owned for it.
+                    if owned_row_is_smaller_edition(_db, album.get('name', ''),
+                                                    album.get('total_tracks'), _existing):
+                        runtime.logger.info(
+                            "[Wishlist Add] '%s' is owned only on a smaller edition of '%s' "
+                            "— adding it", track.get('name'), album.get('name'))
+                        _existing = None
                 if _existing and _conf >= 0.7:
                     runtime.logger.info(
                         "[Wishlist Add] skipping '%s' by '%s' — already in library "

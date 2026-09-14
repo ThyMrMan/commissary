@@ -26,9 +26,10 @@ fallback in case the staging watcher normalizes the filename on ingest.
 
 from __future__ import annotations
 
+import ntpath
 import os
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 # Columns in INSERT/SELECT order — single source of truth so the dataclass, the
 # write, and the read can't drift apart.
@@ -193,6 +194,35 @@ def list_pending_hints(cursor: Any) -> list:
     return [_row_to_hint(r) for r in cursor.fetchall()]
 
 
+def staged_file_keys(path: Optional[str]) -> Tuple[str, str]:
+    """``(path_key, name_key)`` binding a staged file to a hint without a query
+    per file: the normalised full path, and the bare filename.
+
+    The filename is the fallback ``find_hint_for_file`` takes as well. It carries
+    ``[reid-<track id>]``, so it is unique in practice, and it still matches when
+    the path a hint was written with is spelled differently from the one the
+    scanner lists -- a Docker-mapped staging folder, say. ``ntpath`` splits on
+    both separators, so a path recorded in either form yields its name."""
+    if not path:
+        return "", ""
+    return os.path.normcase(os.path.normpath(path)), os.path.normcase(ntpath.basename(path))
+
+
+def pending_staged_keys(cursor: Any) -> Tuple[frozenset, frozenset]:
+    """The keys (see :func:`staged_file_keys`) of every PENDING hint, in one
+    query: ``(path_keys, name_keys)``. The auto-import scanner checks each loose
+    file against these so a staged copy is never grouped with other files."""
+    cursor.execute("SELECT staged_path FROM rematch_hints WHERE status = 'pending'")
+    path_keys, name_keys = set(), set()
+    for row in cursor.fetchall():
+        path_key, name_key = staged_file_keys(row[0])
+        if path_key:
+            path_keys.add(path_key)
+        if name_key:
+            name_keys.add(name_key)
+    return frozenset(path_keys), frozenset(name_keys)
+
+
 def build_identification_from_hint(hint: RematchHint) -> dict:
     """Turn a hint into the ``identification`` dict the auto-import matcher expects,
     so a re-identify SKIPS the guessing tiers entirely and matches straight against
@@ -328,6 +358,8 @@ __all__ = [
     "find_hint_for_file",
     "consume_hint",
     "list_pending_hints",
+    "pending_staged_keys",
+    "staged_file_keys",
     "build_identification_from_hint",
     "delete_replaced_track",
     "quick_file_signature",

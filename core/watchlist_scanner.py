@@ -21,6 +21,11 @@ from core.metadata_service import (
     get_source_priority,
 )
 from core.wishlist_service import get_wishlist_service
+from core.edition_preference import (
+    PREFER_DELUXE_KEY,
+    drop_smaller_editions,
+    owned_row_is_smaller_edition,
+)
 from core.matching_engine import MusicMatchingEngine
 from utils.logging_config import get_logger
 
@@ -1305,6 +1310,8 @@ class WatchlistScanner:
                     artist_image_url = discography_result.image_url or self.get_artist_image_url(artist) or ''
                     album_fetcher = lambda album_id, album_name='', source=source: self._get_album_data_for_source(source, album_id, album_name)
 
+                albums = self._prefer_bigger_editions(albums)
+
                 absolute_index = artist_index_offset + i + 1
                 if scan_state is not None:
                     scan_state.update({
@@ -1407,7 +1414,8 @@ class WatchlistScanner:
                             if scan_state is not None:
                                 scan_state['current_track_name'] = track_name
 
-                            if self.is_track_missing_from_library(track, album_name=album_name):
+                            if self.is_track_missing_from_library(
+                                    track, album_name=album_name, album_track_count=len(tracks)):
                                 artist_new_tracks += 1
                                 if scan_state is not None:
                                     scan_state['tracks_found_this_scan'] += 1
@@ -2029,6 +2037,27 @@ class WatchlistScanner:
         # (some albums legitimately have a track called "Track X" but not most of them)
         return placeholder_count > len(tracks) / 2
 
+    def _prefer_bigger_editions(self, albums):
+        """With "Prefer deluxe editions" on, drop a release when a bigger edition of
+        the same album is in the same scan ("X" when "X (Deluxe Edition)" is there
+        too), so one album isn't wishlisted twice. Off, or on any error, the list
+        comes back unchanged."""
+        try:
+            from config.settings import config_manager
+            if not config_manager.get(PREFER_DELUXE_KEY, False):
+                return albums
+            kept = drop_smaller_editions(albums)
+            if len(kept) != len(albums):
+                kept_ids = {id(album) for album in kept}
+                for album in albums:
+                    if id(album) not in kept_ids:
+                        name = album.get('name') if isinstance(album, dict) else getattr(album, 'name', '')
+                        logger.info("[Prefer Deluxe] Skipping '%s' — a bigger edition of it is in this scan", name)
+            return kept
+        except Exception as e:
+            logger.debug("prefer-deluxe release filter skipped: %s", e)
+            return albums
+
     def _should_include_release(self, track_count: int, watchlist_artist: WatchlistArtist) -> bool:
         """
         Check if a release should be included based on user's preferences.
@@ -2151,7 +2180,8 @@ class WatchlistScanner:
             logger.warning(f"Error checking track content type inclusion: {e}")
             return True  # Default to including on error
 
-    def is_track_missing_from_library(self, track, album_name: str = None) -> bool:
+    def is_track_missing_from_library(self, track, album_name: str = None,
+                                      album_track_count: int = None) -> bool:
         """
         Check if a track is missing from the local library.
         Uses the same matching logic as the download missing tracks modals.
@@ -2185,6 +2215,9 @@ class WatchlistScanner:
             from config.settings import config_manager
             active_server = config_manager.get_active_media_server()
             allow_duplicates = config_manager.get('wishlist.allow_duplicate_tracks', True)
+            # Prefer deluxe editions: a copy owned only on a SMALLER edition of the
+            # album being scanned doesn't count as owning the song for this edition.
+            prefer_deluxe = bool(album_name) and bool(config_manager.get(PREFER_DELUXE_KEY, False))
 
             # Provider-neutral external-ID short-circuit: before doing
             # title+artist+album fuzzy comparison, ask the library if any
@@ -2227,18 +2260,27 @@ class WatchlistScanner:
                         # same recording on a DIFFERENT edition (soundtrack remix vs the bonus edition
                         # the user owns) is one they WANT — wishlist it, and don't let the provenance
                         # fallback below re-skip it either.
-                        if _extid_match_is_owned(album_name, matched_album, allow_duplicates):
+                        _on_smaller_edition = prefer_deluxe and owned_row_is_smaller_edition(
+                            self.database, album_name, album_track_count, matched)
+                        if (not _on_smaller_edition
+                                and _extid_match_is_owned(album_name, matched_album, allow_duplicates)):
                             logger.info(
                                 f"[ExtID Match] Track found in library by external ID: "
                                 f"'{original_title}' by '{artists_to_search[0] if artists_to_search else 'Unknown'}' "
                                 f"(matched on: {', '.join(sorted(source_ids.keys()))})"
                             )
                             return False  # Track exists in library (same album / duplicates off)
-                        logger.info(
-                            f"[ExtID Match] Same recording on a DIFFERENT album — allowing "
-                            f"(allow_duplicates): '{original_title}' (wanted: '{album_name}', "
-                            f"library: '{matched_album}')"
-                        )
+                        if _on_smaller_edition:
+                            logger.info(
+                                f"[Prefer Deluxe] '{original_title}' is owned only on a smaller "
+                                f"edition of '{album_name}' (library: '{matched_album}') — not counted"
+                            )
+                        else:
+                            logger.info(
+                                f"[ExtID Match] Same recording on a DIFFERENT album — allowing "
+                                f"(allow_duplicates): '{original_title}' (wanted: '{album_name}', "
+                                f"library: '{matched_album}')"
+                            )
                         # fall through to the fuzzy path (same album gate), which wishlists it
                     else:
                         # Second-tier fallback: provenance table. Catches the
@@ -2269,6 +2311,12 @@ class WatchlistScanner:
                     db_track, confidence = self.database.check_track_exists(query_title, artist_name, confidence_threshold=0.7, server_source=active_server, album=search_album)
 
                     if db_track and confidence >= 0.7:
+                        if prefer_deluxe and owned_row_is_smaller_edition(
+                                self.database, album_name, album_track_count, db_track):
+                            logger.info(
+                                f"[Prefer Deluxe] '{original_title}' owned only on a smaller "
+                                f"edition of '{album_name}' — not counted")
+                            continue
                         # When allow_duplicates is on, only skip if we believe
                         # the library copy is on the same album the watchlist
                         # is asking about. Album name drift between Spotify

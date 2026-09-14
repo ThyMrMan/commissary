@@ -10533,12 +10533,12 @@ async function confirmReidentify() {
 
 
 // ==================== Re-identify Album Modal ====================
-// Re-files every track of a library album under ONE chosen release. The
-// per-track modal above cannot simply be run once per track: the auto-import
-// worker groups copies from the same album into a single candidate and ignores
-// their hints. So this goes through the Import page's album path instead -- a
-// preview the user confirms, then one track at a time, each original removed
-// only after its copy has landed (core/imports/album_reidentify.py).
+// Re-files every track of a library album under ONE chosen release. Rather
+// than the per-track modal above run once per track -- which reports back only
+// on the auto-import worker's schedule, and only while Auto-Import is on -- this
+// goes through the Import page's album path: a preview the user confirms, then
+// one track at a time, each original removed only after its copy has landed
+// (core/imports/album_reidentify.py).
 
 const reidaState = {
     album: null, source: null, sources: [], releases: [], release: null,

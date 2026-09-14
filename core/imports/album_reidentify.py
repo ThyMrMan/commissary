@@ -1,11 +1,11 @@
 """Re-identify a whole library album under a different release.
 
 The per-track Re-identify (#889) copies one library file into the staging root
-and leaves a single-use hint for the auto-import worker. That cannot simply be
-repeated for every track of an album: the worker groups loose staging files by
-their album tag, so twelve copies from one album become ONE candidate, and
-``_resolve_rematch_hint`` only honours single-file candidates. Every hint would
-be ignored and the album re-filed under the very tags it already had.
+and leaves a single-use hint for the auto-import worker. Repeating that for every
+track is the wrong tool for an album: nothing shows how the tracks pair with the
+release before files move, results arrive on the worker's schedule instead of per
+track, and nothing happens at all while Auto-Import is off (the worker is only
+started when it is enabled).
 
 So an album takes the path the Import page uses to import an album it has
 matched, one confirmed track at a time:

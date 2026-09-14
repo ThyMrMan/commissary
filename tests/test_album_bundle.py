@@ -1551,3 +1551,55 @@ def test_subfolder_scan_survives_an_unreadable_root(tmp_path: Path) -> None:
     (tmp_path / "MyAlbum").mkdir()
     assert resolve_reported_save_path(
         '/data/downloads/MyAlbum', config_get=cfg) == str(tmp_path / "MyAlbum")
+
+
+# ---------------------------------------------------------------------------
+# Prefer deluxe editions: a deluxe request prefers a release naming an edition
+# ---------------------------------------------------------------------------
+
+_EDITION_SIZE = ALBUM_PICK_MIN_BYTES * 4
+_DELUXE_REQUEST = "Curtain Call: The Hits (Deluxe Edition)"
+
+
+def _edition_candidates(deluxe_seeders=5):
+    standard = _Release("Eminem - Curtain Call The Hits [FLAC]", _EDITION_SIZE, seeders=90)
+    deluxe = _Release("Eminem - Curtain Call The Hits (Deluxe Edition) [FLAC]", _EDITION_SIZE,
+                      seeders=deluxe_seeders)
+    return standard, deluxe
+
+
+def test_prefer_deluxe_picks_the_release_that_names_the_edition():
+    standard, deluxe = _edition_candidates()
+    picked = pick_best_album_release([standard, deluxe], _flac_quality_guess,
+                                     album_name=_DELUXE_REQUEST, prefer_deluxe=True)
+    assert picked is deluxe
+
+
+def test_without_prefer_deluxe_seeders_still_decide():
+    standard, deluxe = _edition_candidates()
+    picked = pick_best_album_release([standard, deluxe], _flac_quality_guess,
+                                     album_name=_DELUXE_REQUEST, prefer_deluxe=False)
+    assert picked is standard
+
+
+def test_a_dead_edition_release_is_not_preferred():
+    standard, deluxe = _edition_candidates(deluxe_seeders=0)
+    picked = pick_best_album_release([standard, deluxe], _flac_quality_guess,
+                                     album_name=_DELUXE_REQUEST, prefer_deluxe=True)
+    assert picked is standard
+
+
+def test_a_standard_request_is_unaffected_by_prefer_deluxe():
+    standard, deluxe = _edition_candidates()
+    picked = pick_best_album_release([standard, deluxe], _flac_quality_guess,
+                                     album_name="Curtain Call: The Hits", prefer_deluxe=True)
+    assert picked is standard
+
+
+def test_the_picker_reads_the_setting_when_not_told(monkeypatch):
+    import core.download_plugins.album_bundle as album_bundle_module
+    monkeypatch.setattr(album_bundle_module.config_manager, "get",
+                        lambda key, default=None: True if key == "wishlist.prefer_deluxe_editions" else default)
+    standard, deluxe = _edition_candidates()
+    assert pick_best_album_release([standard, deluxe], _flac_quality_guess,
+                                   album_name=_DELUXE_REQUEST) is deluxe

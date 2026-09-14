@@ -1668,6 +1668,7 @@ async function loadSettingsData() {
         document.getElementById('write-multi-artist').checked = settings.metadata_enhancement?.tags?.write_multi_artist || false;
         document.getElementById('feat-in-title').checked = settings.metadata_enhancement?.tags?.feat_in_title || false;
         document.getElementById('allow-duplicate-tracks').checked = settings.wishlist?.allow_duplicate_tracks !== false;
+        document.getElementById('prefer-deluxe-editions').checked = settings.wishlist?.prefer_deluxe_editions === true;
         const _wlTtl = document.getElementById('wishlist-ignore-ttl');
         if (_wlTtl) _wlTtl.value = settings.wishlist?.ignore_ttl_days ?? 30;
 
@@ -5119,6 +5120,7 @@ async function saveSettings(quiet = false) {
         },
         wishlist: {
             allow_duplicate_tracks: document.getElementById('allow-duplicate-tracks').checked,
+            prefer_deluxe_editions: document.getElementById('prefer-deluxe-editions').checked,
             ignore_ttl_days: Math.max(1, Math.min(365,
                 parseInt(document.getElementById('wishlist-ignore-ttl')?.value, 10) || 30)),
         },

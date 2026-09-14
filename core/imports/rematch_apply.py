@@ -23,10 +23,15 @@ from core.imports.rematch_hints import RematchHint, quick_file_signature
 
 
 def staged_destination(staging_dir: str, real_path: str, library_track_id: Any) -> str:
-    """Where the staged copy lands: a single loose file in the staging ROOT (so the
-    worker treats it as a single-track candidate), named to keep the extension and
-    be unique + traceable to the track it re-identifies. The filename is cosmetic —
-    matching is driven by the hint, not the name."""
+    """Where the staged copy lands: a single loose file in the staging ROOT, named to
+    keep the extension and be unique + traceable to the track it re-identifies.
+
+    It becomes a single-track candidate because it has a pending hint, not because it
+    is alone: the copy keeps the album tag of the album it is leaving, and the scanner
+    groups loose files by that tag (see ``AutoImportWorker._scan_directory``). The name
+    is not purely cosmetic -- its ``[reid-<track id>]`` suffix is what binds the copy
+    to its hint when the hint's recorded path is spelled differently from the
+    scanner's."""
     base = os.path.basename(real_path)
     stem, ext = os.path.splitext(base)
     safe_stem = sanitize_filename(stem).strip() or "track"

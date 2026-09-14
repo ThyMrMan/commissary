@@ -14,6 +14,11 @@ from mutagen.id3 import ID3, TALB, TPE2, TXXX
 from mutagen.mp4 import MP4, MP4FreeForm
 from mutagen.oggvorbis import OggVorbis
 
+from core.edition_preference import (
+    has_deluxe_marker,
+    prefer_deluxe_enabled,
+    same_album_family,
+)
 from utils.logging_config import get_logger
 
 logger = get_logger("album_consistency")
@@ -243,7 +248,7 @@ def _find_best_release(album_name, artist_name, track_count, mb_service):
         return None
 
 
-def _resolve_album_release(album_name, artist_name, track_count, mb_service):
+def _resolve_album_release(album_name, artist_name, track_count, mb_service, keep_edition=False):
     """Resolve ONE MusicBrainz release for the album, PINNED across runs.
 
     The bug this fixes (#999-adjacent, Meshuggah "Catch Thirtythree" split): an
@@ -263,7 +268,10 @@ def _resolve_album_release(album_name, artist_name, track_count, mb_service):
     norm_key = artist_key = None
     try:
         from core.metadata.source import normalize_album_cache_key
-        norm_key = normalize_album_cache_key(album_name)
+        # keep_edition (prefer deluxe): a deluxe edition gets its OWN pinned release
+        # instead of sharing the standard edition's edition-stripped key.
+        norm_key = (" ".join((album_name or "").lower().split()) if keep_edition
+                    else normalize_album_cache_key(album_name))
         artist_key = (artist_name or "").lower().strip()
     except Exception:   # noqa: BLE001 - key derivation must never break tagging
         norm_key = artist_key = None
@@ -531,6 +539,7 @@ def run_album_consistency(
     mb_service: Any,
     total_discs: int = 1,
     file_lock_fn=None,
+    prefer_deluxe: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Picard-style album consistency: pick ONE MusicBrainz release for the album,
@@ -605,7 +614,13 @@ def run_album_consistency(
     # Step 1: Resolve the album's release — PINNED across runs (via the persistent
     # album MBID cache) so re-runs can't pick a different release and fracture the
     # album into multiple MUSICBRAINZ_ALBUMIDs.
-    release = _resolve_album_release(album_name, artist_name, len(file_infos), mb_service)
+    # Prefer deluxe editions: a deluxe album keeps its own identity — its own
+    # pinned release, and its edition name in the album tag (step 4).
+    if prefer_deluxe is None:
+        prefer_deluxe = prefer_deluxe_enabled()
+    keep_edition = bool(prefer_deluxe) and has_deluxe_marker(album_name)
+    release = _resolve_album_release(album_name, artist_name, len(file_infos), mb_service,
+                                     keep_edition=keep_edition)
     if not release:
         result['error'] = f'No MusicBrainz release found for "{album_name}"'
         return result
@@ -669,6 +684,14 @@ def run_album_consistency(
 
     # Album name and artist from the release (canonical MB values)
     release_album_name = release.get('title', album_name)
+    if (keep_edition and release_album_name and not has_deluxe_marker(release_album_name)
+            and same_album_family(album_name, release_album_name)):
+        # MusicBrainz often titles a deluxe release without "(Deluxe Edition)".
+        # Writing that title would file these tracks under the standard album in
+        # the media server, so the edition's own name is kept.
+        logger.info("[Album Consistency] Keeping edition name %r (MusicBrainz title %r)",
+                    album_name, release_album_name)
+        release_album_name = album_name
     release_artist_name = artist_name
     if ac:
         # Build full artist credit string

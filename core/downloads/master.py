@@ -38,6 +38,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from core.downloads import album_bundle_dispatch as _album_bundle_dispatch
+from core.edition_preference import (
+    PREFER_DELUXE_KEY,
+    is_smaller_edition,
+    owned_row_is_smaller_edition,
+)
 from core.runtime_state import (
     download_batches,
     download_tasks,
@@ -509,6 +514,15 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
         if allow_duplicates and batch_is_album:
             logger.info("[Duplicates] Allow duplicate tracks enabled — only checking ownership within target album")
 
+        # Prefer deluxe editions: an owned SMALLER edition of the album being
+        # downloaded doesn't count as owning its songs. Without it, downloading
+        # "X (Deluxe Edition)" while owning "X" fetched only the bonus tracks and
+        # split the album across two folders (core/edition_preference.py).
+        prefer_deluxe = bool(batch_is_album and deps.config_manager.get(PREFER_DELUXE_KEY, False))
+        _requested_album_name = (batch_album_context or {}).get('name', '') if prefer_deluxe else ''
+        _requested_track_count = (batch_album_context or {}).get('total_tracks') if prefer_deluxe else None
+        _owned_edition_memo: dict = {}
+
         # PREFLIGHT: Pre-populate MusicBrainz release cache for album downloads.
         # This ensures ALL tracks in the album use the same release MBID during
         # per-track post-processing, preventing Navidrome album splits.
@@ -563,7 +577,16 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                         server_source=active_server,
                         expected_year=batch_expected_year
                     )
-                    if db_album and album_confidence >= 0.7:
+                    if (db_album and album_confidence >= 0.7 and prefer_deluxe
+                            and is_smaller_edition(album_name, total_tracks,
+                                                   getattr(db_album, 'title', ''),
+                                                   getattr(db_album, 'track_count', None))):
+                        # Owned album is a smaller edition of this one: its songs
+                        # must not count toward the bigger edition.
+                        logger.info(
+                            f"[Prefer Deluxe] '{db_album.title}' is a smaller edition of "
+                            f"'{album_name}' — its tracks don't count toward this edition")
+                    elif db_album and album_confidence >= 0.7:
                         db_album_tracks = db.get_tracks_by_album(db_album.id)
                         for t in db_album_tracks:
                             album_tracks_map[t.title.lower().strip()] = t
@@ -708,6 +731,13 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                                             "release of '%s' — re-release stays missing",
                                             track_name, _fallback_album)
                                         continue
+                                    if prefer_deluxe and owned_row_is_smaller_edition(
+                                            db, _requested_album_name, _requested_track_count,
+                                            db_track, _owned_edition_memo):
+                                        logger.info(
+                                            "[Prefer Deluxe] '%s' owned only on a smaller edition "
+                                            "of '%s' — stays missing", track_name, _requested_album_name)
+                                        continue
                                     found, confidence = True, track_confidence
                                     matched_track = db_track
                                     break
@@ -728,6 +758,15 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                         track_name, artist_name, confidence_threshold=0.7, server_source=active_server
                     )
                     if db_track and track_confidence >= 0.7:
+                        # An album download lands here with duplicates off and no
+                        # album match; the same prefer-deluxe gate applies.
+                        if prefer_deluxe and owned_row_is_smaller_edition(
+                                db, _requested_album_name, _requested_track_count,
+                                db_track, _owned_edition_memo):
+                            logger.info(
+                                "[Prefer Deluxe] '%s' owned only on a smaller edition "
+                                "of '%s' — stays missing", track_name, _requested_album_name)
+                            continue
                         found, confidence = True, track_confidence
                         matched_track = db_track
                         break

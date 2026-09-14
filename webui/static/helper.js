@@ -3491,6 +3491,14 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.3.6': [
+        { date: 'September 2026 · 2.3.6' },
+        { title: "Re-identifying two songs from one album now files both", desc: "a re-identify copies the song into staging and remembers the release you picked. The copy still carries the album tag of the album it is leaving, and auto-import groups loose files by that tag — so two songs from one album re-identified within about a minute of each other, or one song next to a fresh download of its album, became a single import. The release you picked only applies to a single file, so it was ignored: both songs were filed straight back into the album they came from, and your choice sat waiting for good. Every re-identified copy is now its own import, exactly as if it had been staged alone, and copies still waiting in staging from before should be picked up on the next scans." },
+        { title: "New: Prefer deluxe editions", desc: "in Settings → Library, next to “Allow duplicate tracks across albums”, and off by default. If you owned an album's standard edition, downloading its deluxe edition fetched only the bonus tracks — into a folder of their own — because every song the two share counted as already owned. With the option on, a deluxe download gets every track. Owning the deluxe still counts as owning the standard, so the reverse never downloads anything twice." },
+        { title: "…and the deluxe is the edition Commissary goes for", desc: "artist pages show the deluxe card when editions of one album are merged into one; a watchlist scan that finds both editions checks only the deluxe; adding a deluxe album to the wishlist no longer skips songs you only have on the standard edition; and for a deluxe download, a torrent or NZB that names the edition beats a better-seeded standard one, as long as it is alive." },
+        { title: "Deluxe albums keep their name in the tags", desc: "after an album download, a consistency pass writes the MusicBrainz release's title into the files — and MusicBrainz often titles a deluxe release without “(Deluxe Edition)”, which can make your media server file those songs under the standard album. With the option on, the edition's own name is kept and the deluxe gets a MusicBrainz release of its own. <strong>What counts as deluxe:</strong> Deluxe, Super Deluxe, Expanded, Anniversary, Bonus, and Special, Complete, Platinum, Collector's or Extended Edition — not Remastered, Limited, Explicit or live albums." },
+        { title: "What it deliberately leaves alone", desc: "nothing already on disk is changed. An album that was split stays split until you download the deluxe again — and then the songs the two editions share are in both albums until you remove the standard one, because nothing is ever deleted for you. Songs downloaded one at a time still go under whichever edition their track data names, and an edition with no edition word in its title, like “Relapse: Refill”, isn't recognised as a deluxe." },
+    ],
     '2.3.5': [
         { date: 'September 2026 · 2.3.5' },
         { title: "Choosing an album on the Import page matches <em>that</em> album's files", desc: "given no file list, the matcher was handed every audio file in the folder, and each track took its best-scoring file from anywhere in it — so in a downloads folder holding dozens of albums, an “Intro”, an interlude or a same-numbered track from some other album could take the slot. One step made it worse: the pass that keeps a single file per track position ran across the whole folder <em>before</em> any scoring, so an album's own <code>01 Intro.mp3</code> could be thrown out in favour of another album's <code>01 Intro.flac</code>. Each album folder is now matched on its own and the one that best fits the tracklist wins, with <code>CD1</code> and <code>Disc 2</code> subfolders counted as part of their album. If no single folder fits, every file is considered, exactly as before." },
@@ -4031,6 +4039,24 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.3.6: the whole deluxe edition, and two re-identified songs from one album",
+        description: "Re-identifying two songs from one album filed both back where they came from, and downloading a deluxe edition of an album you owned fetched only its bonus tracks. The first is fixed; the second is a new option, Prefer deluxe editions.",
+        features: [
+            "a re-identify copy keeps the album tag of the album it is leaving; auto-import groups loose staging files by that tag",
+            "two copies from one album (or a copy beside a download of it) became one candidate - and a hint only applies to a single file",
+            "the scanner reads pending hints once per scan and gives each copy the candidate it would get if staged alone",
+            "a copy binds by path or by its [reid-<id>] filename, as the hint lookup does; with no pending hints the scan is unchanged",
+            "Prefer deluxe editions (wishlist.prefer_deluxe_editions), off by default: an owned SMALLER edition no longer owns the deluxe's songs",
+            "gated at the album match, the album-scoped fallback and the duplicates-off global search in the download analysis",
+            "artist-page cards: a deluxe-marked edition wins the merge, biggest first; non-deluxe variants keep the usual order",
+            "watchlist: a scan drops the smaller edition when both appear; title and external-ID hits on a smaller edition don't count",
+            "Album Consistency keeps the edition name in ALBUM and pins the deluxe to its own MusicBrainz release",
+            "bundle picker: for a deluxe request, a live release that names an edition beats a better-seeded standard one",
+            "same album = exact match once edition words are stripped - 'The Marshall Mathers LP' and 'LP2' stay apart",
+        ],
+        usage_note: "Settings → Library → Paths & Organization → Prefer deluxe editions. Nothing on disk is changed: a split album stays split until you download the deluxe again, and the standard album is never deleted for you. Re-identify copies already waiting in staging are picked up by the next auto-import scans.",
+    },
     {
         title: "2.3.5: importing the album you picked, and re-filing one you already have",
         description: "The Import page matched a chosen album against every file in the folder, could read a folder that wasn't on screen, and never gave its safety checks a file's length. Plus Re-identify for a whole library album, and a unit bug caught before the new length check could trip over it.",
