@@ -281,6 +281,10 @@ class iTunesClient:
         """
         return True
     
+    # A search waits out the rate limit here, where its request is made, and
+    # nowhere above: search_tracks and search_albums check the metadata cache
+    # first and must not wait for a request they may not send. Both carried the
+    # limit as well, so a new search waited twice and a cached one still waited.
     @rate_limited
     def _search(self, term: str, entity: str, limit: int = 50) -> List[Dict[str, Any]]:
         """Generic search method for iTunes API"""
@@ -372,7 +376,6 @@ class iTunesClient:
     
     # ==================== Track Methods ====================
     
-    @rate_limited
     def search_tracks(self, query: str, limit: int = 20) -> List[Track]:
         """Search for tracks using iTunes API"""
         # Check search cache
@@ -558,7 +561,6 @@ class iTunesClient:
     
     # ==================== Album Methods ====================
     
-    @rate_limited
     def search_albums(self, query: str, limit: int = 20) -> List[Album]:
         """Search for albums using iTunes API.
 

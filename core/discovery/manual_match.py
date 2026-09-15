@@ -20,6 +20,10 @@ to test in isolation:
 3. *Should the Playlist Pipeline pre-scan (re)discover this track at all?*
    — `should_rediscover` encapsulates that gate, with the manual match
    checked FIRST so a leftover Wing It flag can't override the user's pick.
+
+4. *Did the user mark the track "Not available"?* — `is_marked_unavailable`.
+   No source has it, so every discovery pass leaves it alone until a match
+   is saved for it.
 """
 
 from __future__ import annotations
@@ -52,6 +56,57 @@ def derive_manual_match_provider(
     return 'spotify'
 
 
+def is_wing_it_guess(extra_data: Optional[Dict[str, Any]]) -> bool:
+    """Return True for a Wing It stub still standing in for a match.
+
+    No metadata source matched the track, so its provider is
+    ``'wing_it_fallback'`` -- it belongs to no source. ``extra_data`` is merged on
+    save, so a track matched or fixed later can still carry the old
+    ``wing_it_fallback`` flag; its provider (or ``manual_match``) says otherwise.
+    """
+    if not isinstance(extra_data, dict):
+        return False
+    return (bool(extra_data.get('wing_it_fallback'))
+            and extra_data.get('provider') == 'wing_it_fallback'
+            and not extra_data.get('manual_match'))
+
+
+def is_marked_unavailable(extra_data: Optional[Dict[str, Any]]) -> bool:
+    """Return True for a track the user marked "Not available".
+
+    No metadata source has it, so discovery leaves it alone: it is never
+    re-discovered, never provider drift, and a discovery pass keeps its row
+    without searching. ``extra_data`` is merged on save, so a match saved later
+    can still carry the flag; ``discovered`` says the track has a match now.
+    """
+    if not isinstance(extra_data, dict):
+        return False
+    return bool(extra_data.get('unavailable')) and not extra_data.get('discovered')
+
+
+def unavailable_result_row(index: int, track_name: str, artist_name: str,
+                           duration_ms: Any = 0) -> Dict[str, Any]:
+    """The discovery row for a track marked "Not available": no match, so
+    nothing syncs or downloads it."""
+    try:
+        dur = int(duration_ms or 0)
+    except (TypeError, ValueError):
+        dur = 0
+    return {
+        'index': index,
+        'yt_track': track_name,
+        'yt_artist': artist_name,
+        'status': 'Not available',
+        'status_class': 'unavailable',
+        'unavailable': True,
+        'spotify_track': '',
+        'spotify_artist': '',
+        'spotify_album': '',
+        'duration': f"{dur // 60000}:{(dur % 60000) // 1000:02d}" if dur else '0:00',
+        'confidence': 0,
+    }
+
+
 def is_drifted_for_redo(
     extra_data: Optional[Dict[str, Any]],
     active_provider: Optional[str],
@@ -69,6 +124,19 @@ def is_drifted_for_redo(
     if not isinstance(extra_data, dict):
         return False
     if extra_data.get('manual_match'):
+        return False
+    # An exact ISRC match is the recording itself, looked up on Deezer whatever the
+    # discovery source; no source switch can improve on it.
+    if extra_data.get('isrc_match'):
+        return False
+    # A Wing It guess matched no source, so there is no source for it to drift from.
+    if is_wing_it_guess(extra_data):
+        return False
+    # Nor did a track the user marked "Not available".
+    if is_marked_unavailable(extra_data):
+        return False
+    # A track the user unmatched waits for them, not for a source.
+    if extra_data.get('unmatched_by_user') and not extra_data.get('discovered'):
         return False
     cached_provider = extra_data.get('provider', 'spotify')
     return cached_provider != active_provider
@@ -90,9 +158,11 @@ def should_rediscover(extra_data: Optional[Dict[str, Any]]) -> bool:
 
     Decision order:
       * manual_match            -> skip   (authoritative; never re-discover)
+      * isrc_match              -> skip   (the exact recording; nothing to improve)
       * wing_it_fallback        -> redo   (stub — keep trying for a real match)
       * discovered + complete   -> skip   (full metadata already stored)
       * discovered + incomplete -> redo   (backfill track_number / album fields)
+      * unavailable             -> skip   (the user marked it "Not available")
       * unmatched_by_user       -> skip   (user deliberately removed the match)
       * never discovered        -> redo   (first-time discovery)
     """
@@ -100,6 +170,8 @@ def should_rediscover(extra_data: Optional[Dict[str, Any]]) -> bool:
 
     if extra.get('discovered'):
         if extra.get('manual_match'):
+            return False
+        if extra.get('isrc_match'):
             return False
         if extra.get('wing_it_fallback'):
             return True
@@ -115,6 +187,8 @@ def should_rediscover(extra_data: Optional[Dict[str, Any]]) -> bool:
         has_album_id = album.get('id')
         return not (has_track_num and (has_release or has_album_id))
 
+    if extra.get('unavailable'):
+        return False
     if extra.get('unmatched_by_user'):
         return False
     return True

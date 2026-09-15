@@ -26,6 +26,7 @@ import requests as http_requests
 
 from utils.logging_config import get_logger
 from config.settings import config_manager
+from core.text.isrc import normalize_isrc
 
 # Import Soulseek data structures for drop-in replacement compatibility
 from core.download_plugins.types import TrackResult, AlbumResult, DownloadStatus
@@ -806,6 +807,8 @@ class QobuzClient(DownloadSourcePlugin):
             'image_url': image_url,
             'external_urls': {'qobuz': f"https://play.qobuz.com/track/{t.get('id', '')}"} if t.get('id') else {},
             'explicit': bool(t.get('parental_warning', False)),
+            # The code every release of this recording shares; discovery matches it exactly.
+            'isrc': normalize_isrc(t.get('isrc')),
         }
 
     def get_user_playlists(self) -> List[Dict[str, Any]]:

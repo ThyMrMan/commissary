@@ -1548,7 +1548,7 @@ async function loadQobuzPlaylists() {
                 mirrorPlaylist('qobuz', p.id, p.name, p.tracks.map(t => ({
                     track_name: t.name || '', artist_name: Array.isArray(t.artists) ? t.artists[0] : (t.artists || ''),
                     album_name: typeof t.album === 'string' ? t.album : '', duration_ms: t.duration_ms || 0,
-                    source_track_id: t.id || ''
+                    source_track_id: t.id || '', isrc: t.isrc || ''
                 })), { owner: p.owner, image_url: p.image_url, description: p.description });
                 continue;
             }
@@ -1564,7 +1564,7 @@ async function loadQobuzPlaylists() {
                         mirrorPlaylist('qobuz', p.id, p.name, fullData.tracks.map(t => ({
                             track_name: t.name || '', artist_name: Array.isArray(t.artists) ? t.artists[0] : (t.artists || ''),
                             album_name: typeof t.album === 'string' ? t.album : '', duration_ms: t.duration_ms || 0,
-                            source_track_id: t.id || ''
+                            source_track_id: t.id || '', isrc: t.isrc || ''
                         })), { owner: p.owner, image_url: p.image_url, description: p.description });
                     }
                 }
@@ -9500,9 +9500,12 @@ function openYouTubeDiscoveryModal(urlHash) {
 
                     <!-- Discovery Fix Modal (nested inside) -->
                     <div class="discovery-fix-modal-overlay hidden" id="discovery-fix-modal-overlay">
-                        <div class="discovery-fix-modal">
+                        <div class="discovery-fix-modal" tabindex="-1">
                             <div class="discovery-fix-modal-header">
-                                <h2>Fix Track Match</h2>
+                                <div class="fix-modal-title">
+                                    <h2>Fix Track Match</h2>
+                                    <span class="fix-review-progress" hidden></span>
+                                </div>
                                 <button class="modal-close-btn" onclick="closeDiscoveryFixModal()">✕</button>
                             </div>
 
@@ -9556,6 +9559,7 @@ function openYouTubeDiscoveryModal(urlHash) {
                                 <!-- Search results -->
                                 <div class="search-results-section">
                                     <h3>Results</h3>
+                                    <div id="fix-modal-source-chips" class="fix-source-chips"></div>
                                     <div id="fix-modal-results" class="fix-modal-results">
                                         <!-- Auto-populated on modal open, updated on search -->
                                     </div>
@@ -9563,7 +9567,14 @@ function openYouTubeDiscoveryModal(urlHash) {
                             </div>
 
                             <div class="discovery-fix-modal-footer">
-                                <button class="modal-btn secondary" onclick="closeDiscoveryFixModal()">
+                                <span class="fix-review-keys" hidden><kbd>1</kbd>–<kbd>9</kbd> choose · <kbd>Enter</kbd> accept · <kbd>S</kbd> skip · <kbd>Esc</kbd> close</span>
+                                <button class="modal-btn secondary fix-review-unavailable" hidden onclick="markDiscoveryReviewUnavailable()" title="No source has this track: stop it coming back">
+                                    Not available
+                                </button>
+                                <button class="modal-btn secondary fix-review-skip" hidden onclick="skipDiscoveryReviewTrack()">
+                                    Skip (S)
+                                </button>
+                                <button class="modal-btn secondary fix-modal-cancel" onclick="closeDiscoveryFixModal()">
                                     Cancel
                                 </button>
                             </div>
@@ -9754,12 +9765,36 @@ function getModalActionButtons(urlHash, phase, state = null) {
                 }
             }
 
+            // Step through every track still waiting for a decision, in one dialog
+            // (startDiscoveryReview).
+            const reviewCount = discoveryReviewQueue(state).length;
+            if (reviewCount > 0) {
+                buttons += `<button class="modal-btn modal-btn-secondary" onclick="startDiscoveryReview('${discoveryPlatformForState(state)}', '${urlHash}')" title="Step through unmatched and low-confidence tracks: 1–9 choose, Enter accepts, S skips, Esc closes">🎯 Review (${reviewCount})</button>`;
+            }
+
             // Retry Failed button for mirrored playlists
             if (state && state.is_mirrored_playlist) {
                 const results = state.discovery_results || state.discoveryResults || [];
-                const failedCount = results.filter(r => r.status_class !== 'found').length;
+                const failedCount = results.filter(r => r.status_class !== 'found' && r.status_class !== 'unavailable').length;
                 if (failedCount > 0) {
                     buttons += `<button class="modal-btn modal-btn-secondary" onclick="retryFailedMirroredDiscovery('${urlHash}')">🔄 Retry Failed (${failedCount})</button>`;
+                }
+            }
+
+            // Accept every suggested match at or above a chosen confidence -- the near
+            // misses discovery kept for tracks it couldn't match (mirrored and
+            // YouTube playlists keep them).
+            if (state && (state.is_mirrored_playlist
+                || !(isListenBrainz || isTidal || isQobuz || isDeezer || isSpotifyPublic || isITunesLink || isBeatport))) {
+                const suggestionResults = state.discovery_results || state.discoveryResults || [];
+                const suggestedCount = suggestionResults.filter(r => r.status_class !== 'found'
+                    && Array.isArray(r.suggestions) && r.suggestions.length > 0).length;
+                if (suggestedCount > 0) {
+                    const suggestionPlatform = state.is_mirrored_playlist ? 'mirrored' : 'youtube';
+                    buttons += `<span class="accept-suggestions-wrap" title="Accept every suggested match at or above this confidence">
+                        Accept suggestions ≥ <input type="number" class="accept-suggestions-min" id="accept-suggestions-min-${urlHash}" min="1" max="99" step="1" value="80">%
+                        <button class="modal-btn modal-btn-secondary" onclick="acceptAllDiscoverySuggestions('${suggestionPlatform}', '${urlHash}')">✓ Accept all (${suggestedCount})</button>
+                    </span>`;
                 }
             }
 
@@ -10054,6 +10089,7 @@ const DISCOVERY_BUCKETS = [
     { id: 'wing-it', label: 'Wing It' },
     { id: 'not-found', label: 'Not found' },
     { id: 'error', label: 'Error' },
+    { id: 'unavailable', label: 'Not available' },
 ];
 
 // Active bucket per open modal. Module-level rather than on `state` so a
@@ -10063,6 +10099,7 @@ const _discoveryFilters = {};
 function discoveryBucketFor(result) {
     if (!result) return 'not-found';
     const cls = result.status_class || '';
+    if (cls === 'unavailable') return 'unavailable';
     if (cls === 'error' || result.status === 'error') return 'error';
     if (result.wing_it_fallback || cls === 'wing-it') return 'wing-it';
 
@@ -10080,7 +10117,7 @@ function discoveryBucketFor(result) {
 }
 
 function discoveryBucketCounts(results) {
-    const counts = { all: 0, perfect: 0, low: 0, 'wing-it': 0, 'not-found': 0, error: 0 };
+    const counts = { all: 0, perfect: 0, low: 0, 'wing-it': 0, 'not-found': 0, error: 0, unavailable: 0 };
     (results || []).forEach(r => {
         counts.all++;
         counts[discoveryBucketFor(r)]++;
@@ -10114,10 +10151,31 @@ function setDiscoveryFilter(urlHash, bucket) {
     const root = (state && state.modalElement) || document;
     const tbody = root.querySelector(`#youtube-discovery-table-${urlHash}`);
     if (tbody && state) tbody.innerHTML = generateTableRowsFromState(state, urlHash);
-    const bar = root.querySelector(`#discovery-filter-bar-${urlHash}`);
-    if (bar && state) bar.outerHTML = buildDiscoveryFilterBarHtml(state, urlHash);
+    refreshDiscoveryFilterBar(urlHash, state);
 }
 window.setDiscoveryFilter = setDiscoveryFilter;
+
+/** Redraw a discovery modal's filter chips from its rows, after a row changed group. */
+function refreshDiscoveryFilterBar(urlHash, state) {
+    if (!state) return;
+    const root = state.modalElement || document;
+    const bar = root.querySelector(`#discovery-filter-bar-${urlHash}`);
+    if (bar) bar.outerHTML = buildDiscoveryFilterBarHtml(state, urlHash);
+}
+
+/** The platform a discovery modal's rows, Fix and Review pass for this state. */
+function discoveryPlatformForState(state) {
+    if (!state) return 'youtube';
+    if (state.is_mirrored_playlist) return 'mirrored';
+    if (state.is_spotify_public_playlist) return 'spotify_public';
+    if (state.is_itunes_link_playlist) return 'itunes_link';
+    if (state.is_deezer_playlist) return 'deezer';
+    if (state.is_listenbrainz_playlist) return 'listenbrainz';
+    if (state.is_tidal_playlist) return 'tidal';
+    if (state.is_qobuz_playlist) return 'qobuz';
+    if (state.is_beatport_playlist) return 'beatport';
+    return 'youtube';
+}
 
 function generateTableRowsFromState(state, urlHash) {
     const isTidal = state.is_tidal_playlist;
@@ -10128,7 +10186,7 @@ function generateTableRowsFromState(state, urlHash) {
     const isBeatport = state.is_beatport_playlist;
     const isListenBrainz = state.is_listenbrainz_playlist;
     const isMirrored = state.is_mirrored_playlist;
-    const platform = isMirrored ? 'mirrored' : (isSpotifyPublic ? 'spotify_public' : (isITunesLink ? 'itunes_link' : (isDeezer ? 'deezer' : (isListenBrainz ? 'listenbrainz' : (isTidal ? 'tidal' : (isQobuz ? 'qobuz' : (isBeatport ? 'beatport' : 'youtube')))))));
+    const platform = discoveryPlatformForState(state);
 
     // Support both camelCase and snake_case
     const discoveryResults = state.discoveryResults || state.discovery_results;
@@ -10215,6 +10273,20 @@ function formatDuration(durationMs) {
  * Generate action button for discovery table row
  */
 function generateDiscoveryActionButton(result, identifier, platform) {
+    // A track marked "Not available" is left out of review and discovery. Fix can
+    // still find it a match; ↺ puts it back in line.
+    if (result.status_class === 'unavailable') {
+        return `<button class="fix-match-btn"
+                        onclick="openDiscoveryFixModal('${platform}', '${identifier}', ${result.index})"
+                        title="Search for a match anyway">
+                    🔧 Fix
+                </button><button class="rematch-btn" style="margin-left:4px"
+                        onclick="setDiscoveryTrackUnavailable('${platform}', '${identifier}', ${result.index}, false)"
+                        title="Mark as available again">
+                    ↺
+                </button>`;
+    }
+
     // Show fix button for not_found, error, or any non-found status
     const isNotFound = result.status === 'not_found' ||
         result.status_class === 'not-found' ||
@@ -10232,8 +10304,27 @@ function generateDiscoveryActionButton(result, identifier, platform) {
         result.status_class === 'found' ||
         result.status === '✅ Found';
 
+    // A track discovery couldn't match can carry its best near misses: offer the
+    // top one beside Fix, accepted in one click.
+    const topSuggestion = !isError && (isNotFound || isWingIt) && Array.isArray(result.suggestions)
+        ? result.suggestions[0] : null;
+    let suggestionHtml = '';
+    if (topSuggestion) {
+        const pct = Math.round((Number(topSuggestion.confidence) || 0) * 100);
+        const suggestedArtists = Array.isArray(topSuggestion.artists)
+            ? topSuggestion.artists.join(', ') : (topSuggestion.artists || '');
+        const label = escapeHtml(`${topSuggestion.name || 'Unknown Track'}${suggestedArtists ? ` — ${suggestedArtists}` : ''}`);
+        suggestionHtml = `<div class="discovery-suggestion">
+                    <span class="discovery-suggestion-name" title="${label.replace(/"/g, '&quot;')}">${label}</span>
+                    <span class="discovery-suggestion-pct">${pct}%</span>
+                    <button class="discovery-suggestion-accept"
+                            onclick="acceptDiscoverySuggestion('${platform}', '${identifier}', ${result.index})"
+                            title="Accept this suggested match">✓ Accept</button>
+                </div>`;
+    }
+
     if (isNotFound || isError) {
-        return `<button class="fix-match-btn"
+        return `${suggestionHtml}<button class="fix-match-btn"
                         onclick="openDiscoveryFixModal('${platform}', '${identifier}', ${result.index})"
                         title="Manually search for this track">
                     🔧 Fix
@@ -10242,7 +10333,7 @@ function generateDiscoveryActionButton(result, identifier, platform) {
 
     // For wing-it fallbacks, show fix button so user can find a real match
     if (isWingIt) {
-        return `<button class="fix-match-btn"
+        return `${suggestionHtml}<button class="fix-match-btn"
                         onclick="openDiscoveryFixModal('${platform}', '${identifier}', ${result.index})"
                         title="Search for a proper metadata match">
                     🔧 Fix

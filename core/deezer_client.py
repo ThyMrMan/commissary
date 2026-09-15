@@ -627,6 +627,33 @@ class DeezerClient:
         cache.store_entity('deezer', 'track', str(track_id), data)
         return self._build_enhanced_track(data)
 
+    def get_track_by_isrc(self, isrc: str) -> Optional[Dict[str, Any]]:
+        """The raw Deezer track with this ISRC, or None (not a valid code, unknown, API error).
+
+        Deezer answers ``/track/isrc:<code>`` without an account. The answer is cached
+        like a search for ``isrc:<code>`` pointing at the cached track, so asking
+        again costs no request -- and no wait: only an actual request is rate limited.
+        """
+        from core.text.isrc import normalize_isrc
+        code = normalize_isrc(isrc)
+        if not code:
+            return None
+        cache = get_metadata_cache()
+        cached = cache.get_search_results('deezer', 'track', f'isrc:{code}', 1)
+        if cached:
+            return cached[0]
+        data = self._request_track_by_isrc(code)
+        if not isinstance(data, dict) or not data.get('id'):
+            return None
+        track_id = str(data['id'])
+        cache.store_entity('deezer', 'track', track_id, data)
+        cache.store_search_results('deezer', 'track', f'isrc:{code}', 1, [track_id])
+        return data
+
+    @rate_limited
+    def _request_track_by_isrc(self, code: str) -> Optional[Dict[str, Any]]:
+        return self._api_get(f'track/isrc:{code}')
+
     def _build_enhanced_track(self, track_data: Dict[str, Any]) -> Dict[str, Any]:
         """Build Spotify-compatible enhanced track dict from raw Deezer data"""
         artist_data = track_data.get('artist', {})

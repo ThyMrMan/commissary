@@ -608,6 +608,7 @@ class MusicDatabase:
                     image_url TEXT,
                     source_track_id TEXT,
                     extra_data TEXT,
+                    isrc TEXT,
                     FOREIGN KEY (playlist_id) REFERENCES mirrored_playlists(id) ON DELETE CASCADE,
                     UNIQUE(playlist_id, position)
                 )
@@ -683,6 +684,7 @@ class MusicDatabase:
             self._add_mirrored_playlist_explored_column(cursor)
             self._add_mirrored_playlist_organize_column(cursor)
             self._add_mirrored_playlist_custom_name_column(cursor)
+            self._add_mirrored_playlist_tracks_isrc_column(cursor)
 
             # Add notification columns to automations (migration)
             self._add_automation_notify_columns(cursor)
@@ -1616,6 +1618,20 @@ class MusicDatabase:
                 logger.info("Added custom_name column to mirrored_playlists table")
         except Exception as e:
             logger.error(f"Error adding custom_name column to mirrored_playlists: {e}")
+
+    def _add_mirrored_playlist_tracks_isrc_column(self, cursor):
+        """Add isrc to mirrored_playlist_tracks: the recording's code, so discovery
+        can match it exactly. Its own column rather than extra_data, which a
+        re-mirror replaces for any track that arrives with some -- that would wipe
+        the track's discovery results."""
+        try:
+            cursor.execute("PRAGMA table_info(mirrored_playlist_tracks)")
+            cols = [c[1] for c in cursor.fetchall()]
+            if 'isrc' not in cols:
+                cursor.execute("ALTER TABLE mirrored_playlist_tracks ADD COLUMN isrc TEXT DEFAULT NULL")
+                logger.info("Added isrc column to mirrored_playlist_tracks table")
+        except Exception as e:
+            logger.error(f"Error adding isrc column to mirrored_playlist_tracks: {e}")
 
     def _add_automation_notify_columns(self, cursor):
         """Add notification and result columns to automations table."""
@@ -15207,7 +15223,8 @@ class MusicDatabase:
             return []
 
     def get_discovery_pool_failed(self, profile_id: int = None, playlist_id: int = None) -> list:
-        """Get all tracks where discovery was attempted but failed."""
+        """Get all tracks where discovery was attempted but failed, leaving out
+        the ones the user marked "Not available"."""
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
@@ -15218,6 +15235,7 @@ class MusicDatabase:
                 JOIN mirrored_playlists mp ON mpt.playlist_id = mp.id
                 WHERE mpt.extra_data LIKE '%"discovery_attempted": true%'
                   AND mpt.extra_data NOT LIKE '%"discovered": true%'
+                  AND mpt.extra_data NOT LIKE '%"unavailable": true%'
             """
             params = []
             if playlist_id:
@@ -15232,6 +15250,22 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error getting discovery pool failed: {e}")
             return []
+
+    def get_discovery_cache_entry(self, entry_id: int) -> Optional[Dict]:
+        """One discovery cache entry's key -- normalized title and artist, provider --
+        and original names, by id; None when there is none."""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, normalized_title, normalized_artist, provider, original_title, original_artist
+                FROM discovery_match_cache WHERE id = ?
+            """, (entry_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error reading discovery cache entry: {e}")
+            return None
 
     def delete_discovery_cache_entry(self, entry_id: int) -> bool:
         """Delete a single entry from the discovery match cache."""
@@ -15258,6 +15292,7 @@ class MusicDatabase:
                 JOIN mirrored_playlists mp ON mpt.playlist_id = mp.id
                 WHERE mpt.extra_data LIKE '%"discovery_attempted": true%'
                   AND mpt.extra_data NOT LIKE '%"discovered": true%'
+                  AND mpt.extra_data NOT LIKE '%"unavailable": true%'
             """
             params = []
             if profile_id:
@@ -16633,6 +16668,7 @@ class MusicDatabase:
                         tracks: List[Dict], profile_id: int = 1, **kwargs) -> Optional[int]:
         """Upsert a mirrored playlist and replace all its tracks."""
         from core.playlists.source_refs import coalesce_mirror_track, stable_source_track_id
+        from core.text.isrc import normalize_isrc
 
         # #990: accept mirror-shaped AND Spotify-shaped tracks (the GET playlist
         # endpoints return the Spotify shape, which users feed straight back in).
@@ -16694,6 +16730,17 @@ class MusicDatabase:
                 except Exception as e:
                     logger.debug("Failed to preserve mirrored playlist extra_data: %s", e)
 
+                # ...and each track's ISRC, for a re-mirror from a path that doesn't carry one
+                old_isrc_map = {}
+                try:
+                    cursor.execute("""
+                        SELECT source_track_id, isrc FROM mirrored_playlist_tracks
+                        WHERE playlist_id = ? AND source_track_id IS NOT NULL AND isrc IS NOT NULL AND isrc != ''
+                    """, (playlist_id,))
+                    old_isrc_map = {row['source_track_id']: row['isrc'] for row in cursor.fetchall()}
+                except Exception as e:
+                    logger.debug("Failed to preserve mirrored playlist ISRCs: %s", e)
+
                 # Replace all tracks
                 from core.playlists.source_refs import stable_source_track_id
                 cursor.execute("DELETE FROM mirrored_playlist_tracks WHERE playlist_id=?", (playlist_id,))
@@ -16709,15 +16756,16 @@ class MusicDatabase:
                     # Restore preserved discovery data if the incoming track doesn't have its own
                     if not extra and sid and sid in old_extra_map:
                         extra = old_extra_map[sid]
+                    isrc = normalize_isrc(t.get('isrc')) or old_isrc_map.get(sid) or None
                     cursor.execute("""
                         INSERT INTO mirrored_playlist_tracks
-                            (playlist_id, position, track_name, artist_name, album_name, duration_ms, image_url, source_track_id, extra_data)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            (playlist_id, position, track_name, artist_name, album_name, duration_ms, image_url, source_track_id, extra_data, isrc)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         playlist_id, i + 1,
                         t.get('track_name', ''), t.get('artist_name', ''),
                         t.get('album_name', ''), t.get('duration_ms', 0),
-                        t.get('image_url'), sid or None, extra
+                        t.get('image_url'), sid or None, extra, isrc
                     ))
                 conn.commit()
                 logger.info(f"Mirrored playlist '{name}' ({source}) with {len(tracks)} tracks")

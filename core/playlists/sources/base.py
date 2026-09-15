@@ -224,6 +224,12 @@ def to_mirror_track_dict(track: NormalizedTrack) -> Dict[str, Any]:
     }
 
     extra = track.extra or {}
+    # An adapter passes a track's ISRC through in ``extra`` (Qobuz does); it is
+    # stored in its own column so discovery can match the recording exactly.
+    from core.text.isrc import normalize_isrc
+    isrc = normalize_isrc(extra.get("isrc"))
+    if isrc:
+        result["isrc"] = isrc
     matched_data = extra.get("matched_data")
     is_discovered = bool(extra.get("discovered"))
     spotify_hint = extra.get("spotify_hint")

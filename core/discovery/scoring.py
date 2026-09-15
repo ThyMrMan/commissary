@@ -1,6 +1,7 @@
 """Discovery scoring + tidal-track search — lifted from web_server.py.
 
-Both function bodies are byte-identical to the originals. The
+Both function bodies were lifted byte-identical; the scorer has since been
+split so the candidates it ranks can also be kept as suggestions. The
 ``spotify_client`` proxy and ``_get_metadata_fallback_source`` shim
 let the bodies resolve their original names without modification.
 ``matching_engine`` is injected via init() because it is constructed
@@ -46,7 +47,7 @@ def init(matching_engine_obj):
     matching_engine = matching_engine_obj
 
 
-def _discovery_score_candidates(source_title, source_artist, source_duration_ms, search_results):
+def _discovery_rank_candidates(source_title, source_artist, source_duration_ms, search_results):
     """Score search results against a source track using the matching engine.
 
     Both artist AND title must independently pass minimum similarity floors.
@@ -61,11 +62,10 @@ def _discovery_score_candidates(source_title, source_artist, source_duration_ms,
         search_results: List of Track objects (Spotify or iTunes) from search
 
     Returns:
-        (best_match, best_confidence, best_index) or (None, 0.0, -1) if no results
+        ``[(confidence, index, candidate), ...]`` for every candidate that passes
+        both floors, best first; equal confidences keep search order.
     """
-    best_match = None
-    best_confidence = 0.0
-    best_index = -1
+    ranked = []
     min_artist_similarity = 0.5
     min_title_similarity = 0.5
 
@@ -122,16 +122,29 @@ def _discovery_score_candidates(source_title, source_artist, source_duration_ms,
                 candidate_duration_ms=result_duration
             )
 
-            if confidence > best_confidence:
-                best_confidence = confidence
-                best_match = result
-                best_index = idx
+            ranked.append((confidence, idx, result))
 
         except Exception as e:
             logger.error(f"Error scoring candidate {idx}: {e}")
             continue
 
-    return best_match, best_confidence, best_index
+    # The sort is stable, so equal confidences keep search order -- the first
+    # of them is the one the scorer has always picked.
+    ranked.sort(key=lambda entry: entry[0], reverse=True)
+    return ranked
+
+
+def _discovery_score_candidates(source_title, source_artist, source_duration_ms, search_results):
+    """The best candidate ``_discovery_rank_candidates`` finds.
+
+    Returns:
+        (best_match, best_confidence, best_index) or (None, 0.0, -1) if no results
+    """
+    ranked = _discovery_rank_candidates(source_title, source_artist, source_duration_ms, search_results)
+    if not ranked:
+        return None, 0.0, -1
+    confidence, index, match = ranked[0]
+    return match, confidence, index
 
 
 def _search_spotify_for_tidal_track(tidal_track, use_spotify=True, itunes_client=None):

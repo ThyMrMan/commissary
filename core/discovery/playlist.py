@@ -38,11 +38,27 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from core.discovery.manual_match import should_rediscover
+from core.discovery.suggestions import build_discovery_suggestions
 
 logger = logging.getLogger(__name__)
 
 
-def _canonical_best_score(deps, title, artist, duration_ms, results):
+def _score_candidates(deps, title, artist, duration_ms, results, near_misses):
+    """``discovery_score_candidates`` -- or, with the ranker wired, the top of the
+    ranking, every ranked candidate kept in ``near_misses`` for suggestions."""
+    rank = getattr(deps, 'discovery_rank_candidates', None)
+    if rank is None:
+        return deps.discovery_score_candidates(title, artist, duration_ms, results)
+    ranked = rank(title, artist, duration_ms, results)
+    if near_misses is not None:
+        near_misses.extend(ranked)
+    if not ranked:
+        return None, 0.0, -1
+    confidence, index, match = ranked[0]
+    return match, confidence, index
+
+
+def _canonical_best_score(deps, title, artist, duration_ms, results, near_misses=None):
     """Score search results against the source track, trying the canonicalized
     title/artist too and keeping the better confidence (#785).
 
@@ -52,15 +68,17 @@ def _canonical_best_score(deps, title, artist, duration_ms, results):
     library's "Do I Wanna Know?" never matched. canonical_source_track is
     conservative (only strips an "<artist> - " prefix when it equals the
     artist), so this can only ADD a better candidate, never weaken a match.
-    Returns (match, confidence)."""
-    match, confidence, _ = deps.discovery_score_candidates(title, artist, duration_ms, results)
+    Returns (match, confidence). Candidates ranked on the way are added to
+    ``near_misses`` when it's given."""
+    match, confidence, _ = _score_candidates(deps, title, artist, duration_ms, results, near_misses)
     try:
         from core.text.source_title import canonical_source_track
         canon_title, canon_artist = canonical_source_track(title or '', artist or '')
     except Exception:
         return match, confidence
     if (canon_title, canon_artist) != (title, artist):
-        alt_match, alt_conf, _ = deps.discovery_score_candidates(canon_title, canon_artist, duration_ms, results)
+        alt_match, alt_conf, _ = _score_candidates(
+            deps, canon_title, canon_artist, duration_ms, results, near_misses)
         if alt_match and alt_conf > confidence:
             return alt_match, alt_conf
     return match, confidence
@@ -85,6 +103,11 @@ class PlaylistDiscoveryDeps:
     discovery_score_candidates: Callable
     get_metadata_cache: Callable[[], Any]
     build_discovery_wing_it_stub: Callable
+    # Ranks every candidate that clears the similarity floors (best first), so a
+    # Wing It guess keeps its near misses as suggestions. Optional.
+    discovery_rank_candidates: Callable = None
+    # Looks a track's ISRC up exactly (core.discovery.isrc_match). Optional.
+    resolve_isrc_match: Callable = None
 
 
 def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistDiscoveryDeps = None):
@@ -186,6 +209,28 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
                 artist_name = track.get('artist_name', '')
                 duration_ms = track.get('duration_ms', 0)
 
+                # Step 0: an ISRC names the recording exactly -- look it up before the
+                # cache or any search. A hit comes from Deezer whatever the discovery
+                # source is, and is marked so it is never re-discovered or drifted.
+                if getattr(deps, 'resolve_isrc_match', None) is not None and track.get('isrc'):
+                    isrc_hit = deps.resolve_isrc_match(track['isrc'], duration_ms)
+                    if isrc_hit:
+                        db.update_mirrored_track_extra_data(track_id, {
+                            'discovered': True,
+                            'provider': isrc_hit.get('source', 'deezer'),
+                            'confidence': 1.0,
+                            'matched_data': isrc_hit,
+                            'isrc_match': True,
+                            'suggestions': [],
+                        })
+                        total_discovered += 1
+                        logger.info(f"ISRC [{i+1}/{len(undiscovered_tracks)}]: {track_name} -> {isrc_hit.get('name', '?')}")
+                        deps.update_automation_progress(automation_id,
+                            progress=((total_skipped + total_discovered + total_failed) / max(1, grand_total)) * 100,
+                            current_item=track_name,
+                            log_line=f'{track_name} → {isrc_hit.get("name", "?")} (ISRC)', log_type='success')
+                        continue
+
                 # Step 1: Check discovery cache
                 cache_key = deps.get_discovery_cache_key(track_name, artist_name)
                 try:
@@ -196,6 +241,8 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
                             'provider': discovery_source,
                             'confidence': cached_match.get('confidence', 0.85),
                             'matched_data': cached_match,
+                            'suggestions': [],
+                            'isrc_match': False,
                         }
                         db.update_mirrored_track_extra_data(track_id, extra_data)
                         total_discovered += 1
@@ -237,6 +284,7 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
                 best_match = None
                 best_confidence = 0.0
                 min_confidence = 0.7
+                near_misses = []
 
                 for search_query in search_queries:
                     try:
@@ -248,7 +296,7 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
                             continue
 
                         match, confidence = _canonical_best_score(
-                            deps, track_name, artist_name, duration_ms, results
+                            deps, track_name, artist_name, duration_ms, results, near_misses
                         )
 
                         if match and confidence > best_confidence:
@@ -270,7 +318,7 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
                             extended = itunes_client_instance.search_tracks(query, limit=50)
                         if extended:
                             match, confidence = _canonical_best_score(
-                                deps, track_name, artist_name, duration_ms, extended
+                                deps, track_name, artist_name, duration_ms, extended, near_misses
                             )
                             if match and confidence > best_confidence:
                                 best_confidence = confidence
@@ -349,6 +397,10 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
                         'provider': discovery_source,
                         'confidence': best_confidence,
                         'matched_data': matched_data,
+                        # Always written: extra_data merges on save, and a match
+                        # must clear the suggestions a guess had.
+                        'suggestions': [],
+                        'isrc_match': False,
                     }
                     db.update_mirrored_track_extra_data(track_id, extra_data)
                     total_discovered += 1
@@ -378,6 +430,9 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
                         'confidence': 0,
                         'wing_it_fallback': True,
                         'matched_data': stub,
+                        'suggestions': build_discovery_suggestions(
+                            near_misses, discovery_source, below=min_confidence),
+                        'isrc_match': False,
                     }
                     db.update_mirrored_track_extra_data(track_id, extra_data)
                     total_discovered += 1

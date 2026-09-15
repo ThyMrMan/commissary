@@ -15963,6 +15963,28 @@ body:has(.vrn-panel.vrn-open) #helper-float-btn {
     font-variant-numeric: tabular-nums;
 }
 
+/* The source a Wing It Pool Fix result came from, and versions below the rest
+   (stats-automations.js drawPoolFixResults). */
+.pool-fix-result-source {
+    flex-shrink: 0;
+    padding: 1px 7px;
+    border-radius: 8px;
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.7);
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.pool-fix-result.is-version {
+    opacity: 0.7;
+}
+
+.pool-fix-results-pending {
+    padding: 8px 12px;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.4);
+    text-align: center;
+}
+
 /* Empty / loading states */
 .pool-fix-empty {
     display: flex;
@@ -19229,6 +19251,11 @@ body:has(.vrn-panel.vrn-open) #helper-float-btn {
 
 .youtube-discovery-modal .discovery-table .discovery-status.wing-it {
     color: #ffb84d;
+    font-weight: 600;
+}
+
+.youtube-discovery-modal .discovery-table .discovery-status.unavailable {
+    color: rgba(255, 255, 255, 0.45);
     font-weight: 600;
 }
 
@@ -33283,6 +33310,193 @@ div.artist-hero-badge {
     margin-top: 2px;
 }
 
+/* The Fix dialog's every-source results and its review mode (wishlist-tools.js). */
+.discovery-fix-modal [hidden] {
+    display: none !important;
+}
+
+.discovery-fix-modal:focus {
+    outline: none;
+}
+
+.fix-modal-title {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    min-width: 0;
+}
+
+.fix-review-progress {
+    font-size: 13px;
+    color: rgba(255, 255, 255, 0.55);
+    white-space: nowrap;
+}
+
+.fix-source-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 0 0 10px 0;
+    flex-shrink: 0;
+}
+
+.fix-source-chip:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+
+.fix-versions-chip {
+    margin-left: auto;
+}
+
+.fix-result-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.fix-result-card-content {
+    flex: 1;
+    min-width: 0;
+}
+
+.fix-result-card-content > div {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.fix-result-card.is-version {
+    opacity: 0.7;
+}
+
+.fix-result-card.is-chosen {
+    background: rgba(var(--accent-rgb), 0.16);
+    border-color: rgba(var(--accent-rgb), 0.6);
+    box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0.35) inset;
+}
+
+.fix-result-number {
+    flex-shrink: 0;
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.85);
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.fix-result-art {
+    flex-shrink: 0;
+    width: 48px;
+    height: 48px;
+    border-radius: 6px;
+    overflow: hidden;
+    background: rgba(255, 255, 255, 0.06);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: rgba(255, 255, 255, 0.35);
+}
+
+.fix-result-art img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.fix-result-version {
+    display: inline-block;
+    margin-left: 6px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    font-size: 11px;
+    font-weight: 500;
+    vertical-align: middle;
+    color: #ffb84d;
+    background: rgba(255, 184, 77, 0.12);
+}
+
+.fix-result-meta {
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 3px;
+    font-size: 12px;
+}
+
+.fix-result-source {
+    padding: 1px 7px;
+    border-radius: 8px;
+    color: rgba(255, 255, 255, 0.75);
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.fix-result-meta .fix-result-duration {
+    margin-top: 0;
+}
+
+.fix-result-suggested {
+    color: rgb(var(--accent-light-rgb));
+}
+
+.fix-result-delta {
+    font-size: 11px;
+}
+
+.fix-result-delta.is-close {
+    color: #6fd08c;
+}
+
+.fix-result-delta.is-near {
+    color: rgba(255, 255, 255, 0.6);
+}
+
+.fix-result-delta.is-far {
+    color: #ff8a80;
+}
+
+.fix-results-pending {
+    padding: 8px 4px;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.45);
+    text-align: center;
+}
+
+.fix-review-keys {
+    margin-right: auto;
+    align-self: center;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.5);
+}
+
+.fix-review-keys kbd {
+    display: inline-block;
+    padding: 0 5px;
+    border-radius: 4px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: rgba(255, 255, 255, 0.06);
+    font-family: inherit;
+    font-size: 11px;
+}
+
+@media (max-width: 600px) {
+    .fix-review-keys {
+        display: none;
+    }
+
+    .fix-result-art {
+        width: 40px;
+        height: 40px;
+    }
+}
+
 .discovery-fix-modal-footer {
     background: rgba(255, 255, 255, 0.02);
     border-top: 1px solid rgba(255, 255, 255, 0.08);
@@ -33404,6 +33618,80 @@ div.artist-hero-badge {
     background: linear-gradient(135deg, rgba(255, 255, 255, 0.12) 0%, rgba(255, 255, 255, 0.08) 100%);
     border-color: rgba(255, 255, 255, 0.25);
     color: rgba(255, 255, 255, 0.9);
+}
+
+/* A suggested match for a track discovery couldn't match, accepted in one click */
+.discovery-suggestion {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    max-width: 280px;
+    margin: 0 auto 6px;
+    font-size: 12px;
+}
+
+.discovery-suggestion-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: rgba(255, 255, 255, 0.85);
+}
+
+.discovery-suggestion-pct {
+    color: rgba(var(--accent-rgb), 0.95);
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.discovery-suggestion-accept {
+    background: rgba(var(--accent-rgb), 0.25);
+    border: 1px solid rgba(var(--accent-rgb), 0.45);
+    border-radius: 6px;
+    padding: 3px 8px;
+    color: #ffffff;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.discovery-suggestion-accept:hover {
+    background: rgba(var(--accent-rgb), 0.4);
+}
+
+.accept-suggestions-wrap,
+.pool-suggestion-toolbar {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: rgba(255, 255, 255, 0.75);
+}
+
+.accept-suggestions-wrap {
+    margin-left: 8px;
+}
+
+.pool-suggestion-toolbar {
+    display: flex;
+    justify-content: flex-end;
+    padding: 6px 4px 10px;
+}
+
+.accept-suggestions-min {
+    width: 52px;
+    padding: 4px 6px;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: rgba(0, 0, 0, 0.3);
+    color: #ffffff;
+}
+
+.pool-suggestion {
+    margin-top: 4px;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.75);
 }
 
 /* Loading and error states */

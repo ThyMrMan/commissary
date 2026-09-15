@@ -30,6 +30,9 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from core.discovery.manual_match import is_marked_unavailable, unavailable_result_row
+from core.discovery.suggestions import build_discovery_suggestions
+
 logger = logging.getLogger(__name__)
 
 _UNKNOWN_ARTIST = 'Unknown Artist'
@@ -51,6 +54,19 @@ def resolve_display_artist(yt_artist: str, matched_artist: str) -> str:
         return current                      # recovery already gave a real name — keep it
     fallback = (matched_artist or '').strip()
     return fallback or _UNKNOWN_ARTIST      # backfill from the match, else honest Unknown
+
+
+def _score_candidates(deps, title, artist, duration_ms, results, near_misses):
+    """``discovery_score_candidates`` -- or, with the ranker wired, the top of the
+    ranking, every ranked candidate kept in ``near_misses`` for suggestions."""
+    if deps.discovery_rank_candidates is None:
+        return deps.discovery_score_candidates(title, artist, duration_ms, results)
+    ranked = deps.discovery_rank_candidates(title, artist, duration_ms, results)
+    near_misses.extend(ranked)
+    if not ranked:
+        return None, 0.0, -1
+    confidence, index, match = ranked[0]
+    return match, confidence, index
 
 
 @dataclass
@@ -76,6 +92,13 @@ class YoutubeDiscoveryDeps:
     # extraction left it "Unknown Artist" (#863). Takes a video id, returns a raw
     # artist string or ''. Optional — discovery still works without it.
     recover_youtube_artist: Callable[[str], str] = None
+    # Ranks every candidate that clears the similarity floors (best first), so a
+    # track that matches nothing keeps its near misses as suggestions. Optional:
+    # without it discovery scores exactly as before and suggests nothing.
+    discovery_rank_candidates: Callable = None
+    # Looks a track's ISRC up exactly (core.discovery.isrc_match): discovery
+    # matched_data, or None. Optional.
+    resolve_isrc_match: Callable = None
 
 
 def run_youtube_discovery_worker(url_hash, deps: YoutubeDiscoveryDeps):
@@ -114,6 +137,13 @@ def run_youtube_discovery_worker(url_hash, deps: YoutubeDiscoveryDeps):
                 if track.get('skip_discovery'):
                     continue
 
+                # The user marked this track "Not available": keep its row, search nothing.
+                if track.get('unavailable') or is_marked_unavailable(track.get('extra_data')):
+                    state['discovery_results'].append(unavailable_result_row(
+                        i, track['name'], track['artists'][0] if track['artists'] else 'Unknown',
+                        track.get('duration_ms', 0)))
+                    continue
+
                 # Search for track using active provider
                 cleaned_title = track['name']
                 cleaned_artist = track['artists'][0] if track['artists'] else 'Unknown Artist'
@@ -143,6 +173,34 @@ def run_youtube_discovery_worker(url_hash, deps: YoutubeDiscoveryDeps):
                                         f"'{cleaned_title}' ({track['id']}) — leaving Unknown")
 
                 logger.info(f"Searching {discovery_source} for: '{cleaned_artist}' - '{cleaned_title}'")
+
+                # An ISRC names the recording exactly: look it up before the cache or
+                # any search. A hit comes from Deezer whatever the discovery source is.
+                if deps.resolve_isrc_match is not None and track.get('isrc'):
+                    isrc_hit = deps.resolve_isrc_match(track['isrc'], track.get('duration_ms', 0) or 0)
+                    if isrc_hit:
+                        _isrc_artist = ', '.join(a.get('name', '') if isinstance(a, dict) else str(a)
+                                                 for a in isrc_hit.get('artists', []))
+                        _isrc_dur = track.get('duration_ms') or 0
+                        state['spotify_matches'] += 1
+                        state['discovery_results'].append({
+                            'index': i,
+                            'yt_track': cleaned_title,
+                            'yt_artist': resolve_display_artist(cleaned_artist, _isrc_artist),
+                            'status': 'Found',
+                            'status_class': 'found',
+                            'spotify_track': isrc_hit.get('name', ''),
+                            'spotify_artist': _isrc_artist,
+                            'spotify_album': (isrc_hit.get('album') or {}).get('name', ''),
+                            'duration': f"{int(_isrc_dur) // 60000}:{(int(_isrc_dur) % 60000) // 1000:02d}" if _isrc_dur else '0:00',
+                            'discovery_source': isrc_hit.get('source', 'deezer'),
+                            'confidence': 1.0,
+                            'matched_data': isrc_hit,
+                            'spotify_data': isrc_hit,
+                            'isrc_match': True,
+                        })
+                        logger.info(f"ISRC MATCH [{i+1}/{len(tracks)}]: {cleaned_artist} - {cleaned_title} -> {isrc_hit.get('name', '')}")
+                        continue
 
                 # Check discovery cache first
                 cache_key = deps.get_discovery_cache_key(cleaned_title, cleaned_artist)
@@ -178,6 +236,7 @@ def run_youtube_discovery_worker(url_hash, deps: YoutubeDiscoveryDeps):
                 best_raw_track = None
                 min_confidence = 0.9
                 source_duration = track.get('duration_ms', 0) or 0
+                near_misses = []
 
                 # Strategy 1: Use matching_engine search queries
                 try:
@@ -207,8 +266,8 @@ def run_youtube_discovery_worker(url_hash, deps: YoutubeDiscoveryDeps):
                             continue
 
                         # Score all results using the matching engine
-                        match, confidence, match_idx = deps.discovery_score_candidates(
-                            cleaned_title, cleaned_artist, source_duration, search_results
+                        match, confidence, match_idx = _score_candidates(
+                            deps, cleaned_title, cleaned_artist, source_duration, search_results, near_misses
                         )
 
                         if match and confidence > best_confidence and confidence >= min_confidence:
@@ -242,8 +301,8 @@ def run_youtube_discovery_worker(url_hash, deps: YoutubeDiscoveryDeps):
                         query = f"{cleaned_title} {cleaned_artist}"
                         fallback_results = itunes_client.search_tracks(query, limit=5)
                     if fallback_results:
-                        match, confidence, _ = deps.discovery_score_candidates(
-                            cleaned_title, cleaned_artist, source_duration, fallback_results
+                        match, confidence, _ = _score_candidates(
+                            deps, cleaned_title, cleaned_artist, source_duration, fallback_results, near_misses
                         )
                         if match and confidence >= min_confidence:
                             matched_track = match
@@ -261,8 +320,8 @@ def run_youtube_discovery_worker(url_hash, deps: YoutubeDiscoveryDeps):
                     else:
                         fallback_results = itunes_client.search_tracks(query, limit=5)
                     if fallback_results:
-                        match, confidence, _ = deps.discovery_score_candidates(
-                            cleaned_title, cleaned_artist, source_duration, fallback_results
+                        match, confidence, _ = _score_candidates(
+                            deps, cleaned_title, cleaned_artist, source_duration, fallback_results, near_misses
                         )
                         if match and confidence >= min_confidence:
                             matched_track = match
@@ -278,8 +337,8 @@ def run_youtube_discovery_worker(url_hash, deps: YoutubeDiscoveryDeps):
                     else:
                         extended_results = itunes_client.search_tracks(query, limit=50)
                     if extended_results:
-                        match, confidence, _ = deps.discovery_score_candidates(
-                            cleaned_title, cleaned_artist, source_duration, extended_results
+                        match, confidence, _ = _score_candidates(
+                            deps, cleaned_title, cleaned_artist, source_duration, extended_results, near_misses
                         )
                         if match and confidence >= min_confidence:
                             matched_track = match
@@ -355,6 +414,8 @@ def run_youtube_discovery_worker(url_hash, deps: YoutubeDiscoveryDeps):
                     result['matched_data'] = stub
                     result['spotify_data'] = stub
                     result['wing_it_fallback'] = True
+                    result['suggestions'] = build_discovery_suggestions(
+                        near_misses, discovery_source, below=min_confidence)
                     state['wing_it_count'] = state.get('wing_it_count', 0) + 1
 
                 state['discovery_results'].append(result)
@@ -394,6 +455,9 @@ def run_youtube_discovery_worker(url_hash, deps: YoutubeDiscoveryDeps):
                     idx = result.get('index', -1)
                     if idx < 0 or idx >= len(tracks):
                         continue
+                    # A track marked "Not available" keeps what the mark saved.
+                    if result.get('status_class') == 'unavailable':
+                        continue
                     db_track_id = tracks[idx].get('db_track_id')
                     if not db_track_id:
                         continue
@@ -403,6 +467,10 @@ def run_youtube_discovery_worker(url_hash, deps: YoutubeDiscoveryDeps):
                             'provider': result.get('discovery_source', discovery_source),
                             'confidence': result.get('confidence', 0),
                             'matched_data': result['matched_data'],
+                            # Always written: extra_data merges on save, and a
+                            # match must clear the suggestions a guess had.
+                            'suggestions': result.get('suggestions') or [],
+                            'isrc_match': bool(result.get('isrc_match')),
                         }
                         if result.get('manual_match'):
                             extra_data['manual_match'] = True

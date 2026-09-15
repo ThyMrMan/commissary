@@ -52,7 +52,7 @@ logger = setup_logging(_log_level, _log_path)
 # the published image moved (ghcr.io/thymrman/commissary) even though nothing
 # about the data changed — see tests/test_branding.py for what deliberately
 # kept its old `soulsync` name.
-_SOULSYNC_BASE_VERSION = "2.3.8"
+_SOULSYNC_BASE_VERSION = "2.3.9"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -24866,6 +24866,87 @@ def search_musicbrainz_tracks():
         return jsonify({"error": str(e)}), 500
 
 
+# The metadata sources the Fix dialog searches, one request each.
+_FIX_SEARCH_SOURCES = ('spotify', 'deezer', 'itunes', 'musicbrainz')
+
+
+def _fix_search_result(track, source, expected_title, expected_artist):
+    """One result in the Fix dialog's shape: what its card shows, the details a
+    saved pick keeps (core.discovery.fix_pick), and a relevance score the dialog
+    can rank every source's results by (core.metadata.relevance.score_track)."""
+    from core.metadata.relevance import score_track
+    try:
+        relevance = float(score_track(track, expected_title=expected_title, expected_artist=expected_artist))
+    except Exception:
+        relevance = 0.0
+    return {
+        'id': str(track.id),
+        'name': track.name,
+        'artists': list(track.artists or []),
+        'album': track.album if isinstance(track.album, str) else str(track.album or ''),
+        'duration_ms': int(track.duration_ms or 0),
+        'image_url': getattr(track, 'image_url', None) or '',
+        'source': source,
+        'track_number': getattr(track, 'track_number', None) or 0,
+        'disc_number': getattr(track, 'disc_number', None) or 0,
+        'release_date': str(getattr(track, 'release_date', None) or '').split('T', 1)[0],
+        'total_tracks': getattr(track, 'total_tracks', None) or 0,
+        'album_type': getattr(track, 'album_type', None) or '',
+        'album_id': str(getattr(track, 'album_id', None) or ''),
+        'relevance': round(relevance, 4),
+    }
+
+
+@app.route('/api/discovery/fix-search', methods=['GET'])
+def discovery_fix_search():
+    """One metadata source's results for the Fix dialog.
+
+    The dialog used to search the main source and fall back to the next only when
+    it found nothing. It now asks every source at once, one request each, and
+    shows each answer as it arrives. A source that isn't connected answers
+    ``status: not_connected``. Spotify answers from Spotify alone: its client
+    otherwise falls back to another source, whose results would carry Spotify's
+    name. Results are reranked like the per-source search routes and carry their
+    album details.
+    """
+    source = (request.args.get('source') or '').strip().lower()
+    if source not in _FIX_SEARCH_SOURCES:
+        return jsonify({'source': source, 'status': 'error', 'error': 'Unknown source', 'tracks': []}), 400
+    track_q = (request.args.get('track') or '').strip()
+    artist_q = (request.args.get('artist') or '').strip()
+    try:
+        limit = max(1, min(int(request.args.get('limit', 20)), 50))
+    except (TypeError, ValueError):
+        limit = 20
+
+    from core.metadata.relevance import build_combined_search_query, rerank_tracks
+    query = build_combined_search_query(track_q, artist_q)
+    if not query:
+        return jsonify({'source': source, 'status': 'error', 'error': 'Query parameter is required',
+                        'tracks': []}), 400
+
+    try:
+        if source == 'musicbrainz':
+            from core.musicbrainz_search import MusicBrainzSearchClient
+            tracks = MusicBrainzSearchClient().search_tracks_with_artist(track_q or query, artist_q, limit=limit)
+        else:
+            from core.metadata.registry import get_client_for_source
+            client = get_client_for_source(source)
+            if client is None:
+                return jsonify({'source': source, 'status': 'not_connected', 'tracks': []})
+            if source == 'spotify':
+                tracks = client.search_tracks(query, limit=limit, allow_fallback=False)
+            else:
+                tracks = client.search_tracks(query, limit=limit)
+        tracks = rerank_tracks(list(tracks or []), expected_title=track_q, expected_artist=artist_q,
+                               prefer_known_duration=(source == 'musicbrainz'))
+        return jsonify({'source': source, 'status': 'ok',
+                        'tracks': [_fix_search_result(t, source, track_q, artist_q) for t in tracks]})
+    except Exception as e:
+        logger.warning(f"Fix search on {source} failed: {e}")
+        return jsonify({'source': source, 'status': 'error', 'error': str(e), 'tracks': []}), 502
+
+
 @app.route('/api/itunes/album/<album_id>', methods=['GET'])
 def get_itunes_album_tracks(album_id):
     """Fetches full track details for a specific iTunes album."""
@@ -26104,16 +26185,28 @@ def _sync_discovery_results_to_mirrored(source_type, source_playlist_id, discove
         if not mirrored_tracks:
             return
 
-        # Build lookup maps: source_track_id → db_id AND position → db_id
+        # Build lookup maps: source_track_id → db_id AND result index → db_id.
+        # Mirrored positions count from 1; a result's index counts from 0.
         source_id_to_db_id = {}
-        position_to_db_id = {}
+        index_to_db_id = {}
+        # A track the user marked "Not available" takes no discovery result.
+        from core.discovery.manual_match import is_marked_unavailable
+        unavailable_db_ids = set()
         for mt in mirrored_tracks:
+            mt_extra = mt.get('extra_data')
+            if isinstance(mt_extra, str):
+                try:
+                    mt_extra = json.loads(mt_extra)
+                except (TypeError, ValueError):
+                    mt_extra = None
+            if is_marked_unavailable(mt_extra):
+                unavailable_db_ids.add(mt['id'])
             sid = mt.get('source_track_id', '')
             if sid:
                 source_id_to_db_id[str(sid)] = mt['id']
             pos = mt.get('position')
             if pos is not None:
-                position_to_db_id[pos] = mt['id']
+                index_to_db_id[pos - 1] = mt['id']
 
         updated = 0
         for result in discovery_results:
@@ -26129,19 +26222,20 @@ def _sync_discovery_results_to_mirrored(source_type, source_playlist_id, discove
             # Try to find the mirrored track DB ID
             db_track_id = None
 
-            # Method 1: match by source track ID
-            source_track = result.get('tidal_track') or result.get('source_track') or {}
-            source_tid = str(source_track.get('id', '')) if source_track else ''
+            # Method 1: match by source track ID (each source names its track its own way)
+            source_track = (result.get('tidal_track') or result.get('qobuz_track')
+                            or result.get('deezer_track') or result.get('source_track') or {})
+            source_tid = str(source_track.get('id', '') or '') if isinstance(source_track, dict) else ''
             if source_tid and source_tid in source_id_to_db_id:
                 db_track_id = source_id_to_db_id[source_tid]
 
             # Method 2: match by position/index
             if not db_track_id:
                 idx = result.get('index')
-                if idx is not None and idx in position_to_db_id:
-                    db_track_id = position_to_db_id[idx]
+                if idx is not None and idx in index_to_db_id:
+                    db_track_id = index_to_db_id[idx]
 
-            if not db_track_id:
+            if not db_track_id or db_track_id in unavailable_db_ids:
                 continue
 
             extra_data = {
@@ -26149,7 +26243,14 @@ def _sync_discovery_results_to_mirrored(source_type, source_playlist_id, discove
                 'provider': discovery_source,
                 'confidence': confidence,
                 'matched_data': match_data,
+                # Always written: extra_data merges on save, and a match must
+                # clear the suggestions a guess had.
+                'suggestions': result.get('suggestions') or [],
+                'isrc_match': bool(result.get('isrc_match')),
             }
+            if result.get('isrc_match'):
+                # An ISRC match comes from its own source, not the one discovery searched.
+                extra_data['provider'] = match_data.get('source') or discovery_source
             if result.get('wing_it_fallback'):
                 extra_data['wing_it_fallback'] = True
                 extra_data['provider'] = 'wing_it_fallback'
@@ -26188,6 +26289,8 @@ def _build_playlist_discovery_deps():
         discovery_score_candidates=_discovery_score_candidates,
         get_metadata_cache=get_metadata_cache,
         build_discovery_wing_it_stub=_build_discovery_wing_it_stub,
+        discovery_rank_candidates=_discovery_rank_candidates,
+        resolve_isrc_match=_resolve_isrc_match,
     )
 
 
@@ -26255,6 +26358,7 @@ def _validate_discovery_cache_artist(source_artist, cached_match):
 
 
 from core.discovery.scoring import (
+    _discovery_rank_candidates,
     _discovery_score_candidates,
     _search_spotify_for_tidal_track,
     init as _init_discovery_scoring,
@@ -26385,7 +26489,7 @@ def _update_source_discovery_match(states, source_log_label, error_label,
     """Thin glue for the per-source update_*_discovery_match (fix-modal) routes
     (Tidal/Deezer/Qobuz/Spotify-Public) — injects the web_server helpers."""
     body, code = _update_discovery_match_core(
-        states, lambda: request.get_json(),
+        states, lambda: _completed_fix_payload(request.get_json()),
         source_log_label=source_log_label, error_label=error_label,
         original_track_key=original_track_key, original_artist_getter=artist_getter,
         join_artist_names=_join_artist_names, extract_artist_name=_extract_artist_name,
@@ -27869,6 +27973,8 @@ def _update_itunes_link_discovery_result(identifier, track_index, spotify_track)
 
     result = state['discovery_results'][track_index]
     old_status = result.get('status')
+    # Link-playlist discovery counted a Wing It guess as a match already.
+    was_guess = bool(result.get('wing_it_fallback')) or result.get('status_class') == 'wing-it'
     result['status'] = 'Found'
     result['status_class'] = 'found'
     result['spotify_track'] = spotify_track['name']
@@ -27882,7 +27988,7 @@ def _update_itunes_link_discovery_result(identifier, track_index, spotify_track)
     result['spotify_data'] = _build_fix_modal_spotify_data(spotify_track)
     result['wing_it_fallback'] = False
     result['manual_match'] = True
-    if old_status not in ('found', 'Found'):
+    if old_status not in ('found', 'Found') and not was_guess:
         state['spotify_matches'] = state.get('spotify_matches', 0) + 1
     return result, None
 
@@ -27897,6 +28003,7 @@ def update_itunes_link_discovery_match():
 
         if not identifier or track_index is None or not spotify_track:
             return jsonify({'error': 'Missing required fields'}), 400
+        spotify_track = _complete_fix_pick(spotify_track)
 
         result, error = _update_itunes_link_discovery_result(identifier, track_index, spotify_track)
         if error:
@@ -28240,31 +28347,61 @@ def get_youtube_discovery_status(url_hash):
     return _get_source_discovery_status(youtube_playlist_states, url_hash, "YouTube playlist not found", "YouTube")
 
 
+# Discovery on these platforms counts a Wing It guess as a match; YouTube discovery
+# (mirrored playlists too) and ListenBrainz discovery don't (core/discovery/*.py).
+_GUESSES_COUNT_AS_MATCHES = frozenset({'tidal', 'deezer', 'qobuz', 'spotify_public', 'itunes_link', 'beatport'})
+
+
+def _find_discovery_state(identifier):
+    """``(state, kind)`` for the open discovery a row action names -- kind being the
+    platform it was discovered from, 'youtube' for a mirrored playlist -- or
+    ``(None, None)``. ListenBrainz keeps its states per profile (_lb_state_key), so a
+    lookup by the bare playlist id never found one."""
+    for kind, states in (('youtube', youtube_playlist_states), ('tidal', tidal_discovery_states),
+                             ('deezer', deezer_discovery_states), ('qobuz', qobuz_discovery_states),
+                             ('spotify_public', spotify_public_discovery_states),
+                             ('itunes_link', itunes_link_discovery_states), ('beatport', beatport_chart_states)):
+        state = states.get(identifier)
+        if state:
+            return state, kind
+    state = listenbrainz_playlist_states.get(_lb_state_key(identifier))
+    return (state, 'listenbrainz') if state else (None, None)
+
+
+def _uncount_discovery_match(state, result, kind):
+    """Take a row that is losing its match, or its Wing It guess, out of its
+    playlist's counts, as its platform counted it."""
+    was_guess = bool(result.get('wing_it_fallback')) or result.get('status_class') == 'wing-it'
+    if result.get('status_class') == 'found' or (was_guess and kind in _GUESSES_COUNT_AS_MATCHES):
+        state['spotify_matches'] = max(0, state.get('spotify_matches', 0) - 1)
+    if was_guess:
+        state['wing_it_count'] = max(0, state.get('wing_it_count', 0) - 1)
+
+
 @app.route('/api/youtube/discovery/unmatch', methods=['POST'])
 @app.route('/api/tidal/discovery/unmatch', methods=['POST'])
 @app.route('/api/deezer/discovery/unmatch', methods=['POST'])
+@app.route('/api/qobuz/discovery/unmatch', methods=['POST'])
 @app.route('/api/spotify-public/discovery/unmatch', methods=['POST'])
 @app.route('/api/itunes-link/discovery/unmatch', methods=['POST'])
 @app.route('/api/beatport/discovery/unmatch', methods=['POST'])
 @app.route('/api/listenbrainz/discovery/unmatch', methods=['POST'])
 def unmatch_discovery_track():
-    """Remove a discovery match — sets track back to Not Found"""
+    """Remove a discovery match — sets track back to Not Found.
+
+    A mirrored playlist keeps the removal in its database, its old match and Wing It
+    guess cleared: the track reopens Not Found, and the Playlist Pipeline leaves it
+    for the user (core.discovery.manual_match.should_rediscover).
+    """
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         identifier = data.get('identifier')
         track_index = data.get('track_index')
 
         if not identifier or track_index is None:
             return jsonify({'success': False, 'error': 'Missing required fields'}), 400
 
-        # Find the state dict for this discovery
-        state = (youtube_playlist_states.get(identifier)
-                 or tidal_discovery_states.get(identifier)
-                 or deezer_discovery_states.get(identifier)
-                 or spotify_public_discovery_states.get(identifier)
-                 or itunes_link_discovery_states.get(identifier)
-                 or beatport_chart_states.get(identifier)
-                 or listenbrainz_playlist_states.get(identifier))
+        state, kind = _find_discovery_state(identifier)
 
         if not state:
             return jsonify({'success': False, 'error': 'Discovery state not found'}), 404
@@ -28274,7 +28411,33 @@ def unmatch_discovery_track():
             return jsonify({'success': False, 'error': 'Invalid track index'}), 400
 
         result = results[track_index]
-        old_status = result.get('status_class')
+
+        # A mirrored playlist keeps the removal in its database -- saved first, so a
+        # removal that didn't save doesn't look saved. Its tracks live under
+        # 'playlist'; this read state['tracks'], which no state has, and saved nothing.
+        if identifier.startswith('mirrored_'):
+            tracks = (state.get('playlist') or {}).get('tracks') or []
+            track = tracks[track_index] if track_index < len(tracks) and isinstance(tracks[track_index], dict) else None
+            if track and track.get('db_track_id'):
+                cleared = {
+                    'discovered': False,
+                    'discovery_attempted': True,
+                    'provider': _get_active_discovery_source(),
+                    'unmatched_by_user': True,
+                    # extra_data merges on save: clear what the match left behind.
+                    'matched_data': None,
+                    'confidence': 0,
+                    'wing_it_fallback': False,
+                    'manual_match': False,
+                    'isrc_match': False,
+                    'suggestions': [],
+                }
+                if not get_database().update_mirrored_track_extra_data(track['db_track_id'], cleared):
+                    return jsonify({'success': False, 'error': 'Could not save the track'}), 500
+                if isinstance(track.get('extra_data'), dict):
+                    track['extra_data'].update(cleared)
+
+        _uncount_discovery_match(state, result, kind)
 
         # Clear the match
         result['status'] = 'Not Found'
@@ -28288,35 +28451,109 @@ def unmatch_discovery_track():
         result['confidence'] = 0
         result['wing_it_fallback'] = False
         result['manual_match'] = False
-
-        # Update match count
-        if old_status in ('found', 'wing-it'):
-            state['spotify_matches'] = max(0, state.get('spotify_matches', 0) - 1)
-        if old_status == 'wing-it':
-            state['wing_it_count'] = max(0, state.get('wing_it_count', 0) - 1)
-
-        # If mirrored playlist, also clear in DB
-        if identifier.startswith('mirrored_'):
-            try:
-                db = get_database()
-                tracks = state.get('tracks', [])
-                if track_index < len(tracks):
-                    db_track_id = tracks[track_index].get('db_track_id')
-                    if db_track_id:
-                        db.update_mirrored_track_extra_data(db_track_id, {
-                            'discovered': False,
-                            'discovery_attempted': True,
-                            'provider': '',
-                            'unmatched_by_user': True,
-                        })
-            except Exception as e:
-                logger.error(f"Error clearing mirrored track match: {e}")
+        result['isrc_match'] = False
 
         logger.info(f"Unmatched discovery track {track_index}: {result.get('yt_track', result.get('lb_track', ''))}")
         return jsonify({'success': True})
 
     except Exception as e:
         logger.error(f"Error unmatching discovery track: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/discovery/unavailable', methods=['POST'])
+def set_discovery_track_unavailable():
+    """Mark a discovery track "Not available", or available again.
+
+    A track no metadata source has keeps coming back: Review offers it again,
+    Retry Failed and the Playlist Pipeline search it again, and so does the
+    playlist's next discovery. The mark clears its match and any Wing It guess, so
+    nothing syncs or downloads it, and every discovery pass leaves it alone
+    (core.discovery.manual_match.is_marked_unavailable). A mirrored playlist keeps
+    the mark in its database; any other playlist keeps it while its discovery
+    state lives. Fixing the track by hand clears it, and so does
+    ``unavailable: false``.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        identifier = data.get('identifier')
+        track_index = data.get('track_index')
+        unavailable = data.get('unavailable', True) is not False
+        if (not identifier or not isinstance(track_index, int) or isinstance(track_index, bool)
+                or track_index < 0):
+            return jsonify({'success': False, 'error': 'Missing required fields'}), 400
+
+        state, kind = _find_discovery_state(identifier)
+        if not state:
+            return jsonify({'success': False, 'error': 'Discovery state not found'}), 404
+        # Results are appended as discovery runs, so a position means nothing yet.
+        if state.get('phase') == 'discovering':
+            return jsonify({'success': False, 'error': 'Discovery is still running'}), 409
+
+        results = state.get('discovery_results') or []
+        if track_index >= len(results):
+            return jsonify({'success': False, 'error': 'Invalid track index'}), 400
+        result = results[track_index]
+        old_class = result.get('status_class')
+        if not unavailable and old_class != 'unavailable':
+            # Only a mark is undone; a match or a guess stays as it is.
+            return jsonify({'success': True, 'result': result})
+
+        if unavailable:
+            saved = {
+                'unavailable': True,
+                'discovered': False,
+                'discovery_attempted': True,
+                'wing_it_fallback': False,
+                'manual_match': False,
+                'isrc_match': False,
+                'matched_data': None,
+                'suggestions': [],
+                'confidence': 0,
+            }
+        else:
+            saved = {'unavailable': False, 'discovered': False, 'discovery_attempted': True}
+
+        tracks = (state.get('playlist') or {}).get('tracks') or []
+        track = tracks[track_index] if track_index < len(tracks) and isinstance(tracks[track_index], dict) else None
+        # The database first: a mark that didn't save must not look saved.
+        if identifier.startswith('mirrored_') and track and track.get('db_track_id'):
+            if not get_database().update_mirrored_track_extra_data(track['db_track_id'], saved):
+                return jsonify({'success': False, 'error': 'Could not save the track'}), 500
+        if track is not None:
+            # A later discovery of this playlist skips it too (core/discovery/youtube.py).
+            track['unavailable'] = unavailable
+            if isinstance(track.get('extra_data'), dict):
+                track['extra_data'].update(saved)
+
+        if unavailable:
+            _uncount_discovery_match(state, result, kind)
+            result.update({
+                'status': 'Not available',
+                'status_class': 'unavailable',
+                'unavailable': True,
+                'spotify_track': '',
+                'spotify_artist': '',
+                'spotify_album': '',
+                'spotify_id': '',
+                'spotify_data': None,
+                'matched_data': None,
+                'match_data': None,
+                'confidence': 0,
+                'wing_it_fallback': False,
+                'manual_match': False,
+                'isrc_match': False,
+                'suggestions': [],
+            })
+        else:
+            result.update({'status': 'Not Found', 'status_class': 'not-found', 'unavailable': False})
+
+        logger.info(f"Discovery track {track_index} of {identifier} marked "
+                    f"{'not available' if unavailable else 'available again'}")
+        return jsonify({'success': True, 'result': result})
+
+    except Exception as e:
+        logger.error(f"Error marking discovery track unavailable: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
@@ -28331,6 +28568,7 @@ def update_youtube_discovery_match():
 
         if not identifier or track_index is None or not spotify_track:
             return jsonify({'error': 'Missing required fields'}), 400
+        spotify_track = _complete_fix_pick(spotify_track)
 
         # Get the state
         state = youtube_playlist_states.get(identifier)
@@ -28371,6 +28609,13 @@ def update_youtube_discovery_match():
         result['wing_it_fallback'] = False
 
         result['manual_match'] = True  # Flag for tracking
+        result['suggestions'] = []
+        result['isrc_match'] = False
+        # A match puts a track marked "Not available" back in play.
+        result['unavailable'] = False
+        _fixed_tracks = (state.get('playlist') or {}).get('tracks') or []
+        if track_index < len(_fixed_tracks) and isinstance(_fixed_tracks[track_index], dict):
+            _fixed_tracks[track_index]['unavailable'] = False
 
         # Update match count if status changed from not found/error
         if old_status != 'found' and old_status != 'Found':
@@ -28395,14 +28640,16 @@ def update_youtube_discovery_match():
 
         # Save manual fix to discovery cache so it appears in discovery pool
         try:
-            # Get original track name from the YouTube/source track data
-            original_track = result.get('youtube_track', result.get('tidal_track', result.get('deezer_track', {})))
-            original_name = original_track.get('name', spotify_track['name'])
-            original_artists = original_track.get('artists', [])
-            if original_artists:
-                original_artist = original_artists[0] if isinstance(original_artists[0], str) else original_artists[0].get('name', '')
-            else:
-                original_artist = ''
+            # Key the fix as discovery looks it up: the playlist track's own name
+            # and first artist, "Unknown Artist" when it has none
+            # (core/discovery/youtube.py). This used to read a 'youtube_track' no
+            # discovery result has, so every YouTube and mirrored fix was saved
+            # under the picked song's title with no artist, where nothing looks.
+            source_tracks = (state.get('playlist') or {}).get('tracks') or []
+            source_track = source_tracks[track_index] if track_index < len(source_tracks) else {}
+            original_name = source_track.get('name') or spotify_track['name']
+            source_artists = source_track.get('artists') or []
+            original_artist = _extract_artist_name(source_artists[0]) if source_artists else 'Unknown Artist'
 
             cache_key = _get_discovery_cache_key(original_name, original_artist)
             # Normalize artists to plain strings for cache consistency
@@ -28414,18 +28661,10 @@ def update_youtube_discovery_match():
             # sends image_url at the top level; search results often return
             # album as a bare string, which previously dropped the artwork.
             image_url = spotify_track.get('image_url') or ''
-            album_raw = spotify_track.get('album', '')
-            if isinstance(album_raw, dict):
-                album_obj = dict(album_raw)
-                if image_url and not album_obj.get('image_url'):
-                    album_obj['image_url'] = image_url
-                if image_url and not album_obj.get('images'):
-                    album_obj['images'] = [{'url': image_url}]
-            else:
-                album_obj = {'name': album_raw or ''}
-                if image_url:
-                    album_obj['image_url'] = image_url
-                    album_obj['images'] = [{'url': image_url}]
+            from core.discovery.fix_pick import fix_pick_album, fix_pick_numbers
+            # A completed pick's album also carries the details a download would
+            # otherwise look up (core.discovery.fix_pick).
+            album_obj = fix_pick_album(spotify_track)
 
             matched_data = {
                 'id': spotify_track['id'],
@@ -28435,6 +28674,7 @@ def update_youtube_discovery_match():
                 'duration_ms': spotify_track.get('duration_ms', 0),
                 'image_url': image_url,
                 'source': match_source,
+                **fix_pick_numbers(spotify_track),
             }
             cache_db = get_database()
             cache_db.save_discovery_cache_match(
@@ -28468,9 +28708,14 @@ def update_youtube_discovery_match():
                             # pipeline re-discover and revert this manual pick.
                             'wing_it_fallback': False,
                             'unmatched_by_user': False,
+                            'suggestions': [],
+                            'isrc_match': False,
+                            'unavailable': False,
                         }
                         db.update_mirrored_track_extra_data(db_track_id, extra_data)
                         result['matched_data'] = matched_data
+                        if isinstance(tracks[track_index].get('extra_data'), dict):
+                            tracks[track_index]['extra_data'].update(extra_data)
                         logger.info(f"Persisted manual fix to DB for track {db_track_id}")
             except Exception as wb_err:
                 logger.error(f"Error persisting manual fix to DB: {wb_err}")
@@ -28507,37 +28752,59 @@ def _build_fix_modal_spotify_data(spotify_track):
       with Spotify API responses
     - handles both legacy string albums (most search endpoints return this) and
       newer object albums
+    - keeps a completed pick's track and disc number, album details and source
+      (core.discovery.fix_pick), so a download doesn't look them up again
     """
     if not isinstance(spotify_track, dict):
         spotify_track = {}
 
+    from core.discovery.fix_pick import fix_pick_album, fix_pick_numbers
     image_url = spotify_track.get('image_url') or ''
-    album_raw = spotify_track.get('album', '')
-
-    if isinstance(album_raw, dict):
-        album_obj = dict(album_raw)
-        if image_url and not album_obj.get('image_url'):
-            album_obj['image_url'] = image_url
-        if image_url and not album_obj.get('images'):
-            album_obj['images'] = [{'url': image_url}]
-    else:
-        album_obj = {'name': album_raw or ''}
-        if image_url:
-            album_obj['image_url'] = image_url
-            album_obj['images'] = [{'url': image_url}]
-
-    return {
+    saved = {
         'id': spotify_track.get('id', ''),
         'name': spotify_track.get('name', ''),
         'artists': spotify_track.get('artists', []),
-        'album': album_obj,
+        'album': fix_pick_album(spotify_track),
         'duration_ms': spotify_track.get('duration_ms', 0),
         'image_url': image_url,
+        **fix_pick_numbers(spotify_track),
     }
+    if spotify_track.get('source'):
+        saved['source'] = spotify_track['source']
+    return saved
+
+
+def _complete_fix_pick(spotify_track):
+    """A Fix pick completed from its own metadata source before it's saved, so a
+    download never looks its id up on another source's client
+    (core.discovery.fix_pick)."""
+    from core.discovery.fix_pick import complete_fix_pick
+    from core.metadata.registry import get_client_for_source
+    return complete_fix_pick(spotify_track, get_client_for_source)
+
+
+def _completed_fix_payload(data):
+    """A Fix route's request body with its pick completed (_complete_fix_pick)."""
+    if isinstance(data, dict) and isinstance(data.get('spotify_track'), dict):
+        data = dict(data, spotify_track=_complete_fix_pick(data['spotify_track']))
+    return data
 
 
 # YouTube discovery worker logic lives in core/discovery/youtube.py.
 from core.discovery import youtube as _discovery_youtube
+
+
+def _resolve_isrc_match(isrc, duration_ms=0):
+    """Discovery matched_data for a playlist track's ISRC, looked up on Deezer
+    (core.discovery.isrc_match), or None."""
+    from core.discovery.isrc_match import resolve_isrc_track
+    from core.metadata.registry import get_client_for_source
+    try:
+        deezer = get_client_for_source('deezer')
+    except Exception as exc:
+        logger.debug("[ISRC] no Deezer client: %s", exc)
+        return None
+    return resolve_isrc_track(isrc, duration_ms, deezer)
 
 
 def _build_youtube_discovery_deps():
@@ -28560,6 +28827,8 @@ def _build_youtube_discovery_deps():
         get_database=get_database,
         add_activity_item=add_activity_item,
         recover_youtube_artist=_recover_youtube_artist_cleaned,
+        discovery_rank_candidates=_discovery_rank_candidates,
+        resolve_isrc_match=_resolve_isrc_match,
     )
 
 
@@ -36209,6 +36478,7 @@ def update_listenbrainz_discovery_match():
 
         if not identifier or track_index is None or not spotify_track:
             return jsonify({'error': 'Missing required fields'}), 400
+        spotify_track = _complete_fix_pick(spotify_track)
 
         # Get the state (identifier is playlist_mbid)
         state = listenbrainz_playlist_states.get(_lb_state_key(identifier))
@@ -36220,8 +36490,9 @@ def update_listenbrainz_discovery_match():
         if track_index < len(state['discovery_results']):
             result = state['discovery_results'][track_index]
 
-            # Was previously not found, now found
-            if result['status_class'] == 'not-found' and spotify_track:
+            # Was previously not found (or a Wing It guess, which ListenBrainz
+            # discovery never counted), now found
+            if result['status_class'] in ('not-found', 'wing-it') and spotify_track:
                 state['spotify_matches'] += 1
             # Was previously found, now not found
             elif result['status_class'] == 'found' and not spotify_track:
@@ -38165,6 +38436,7 @@ def update_beatport_discovery_match():
 
         if not identifier or track_index is None or not spotify_track:
             return jsonify({'error': 'Missing required fields'}), 400
+        spotify_track = _complete_fix_pick(spotify_track)
 
         # Get the state
         state = beatport_chart_states.get(identifier)
@@ -39128,6 +39400,7 @@ def fix_discovery_pool_track():
         spotify_track = data.get('spotify_track')
         if not track_id or not spotify_track:
             return jsonify({"error": "track_id and spotify_track required"}), 400
+        spotify_track = _complete_fix_pick(spotify_track)
 
         database = get_database()
 
@@ -39139,19 +39412,15 @@ def fix_discovery_pool_track():
             images = album_raw.get('images', [])
             image_url = images[0].get('url', '') if images else ''
         # Ensure album carries the artwork too — download pipeline checks
-        # album.images / album.image_url when extracting cover art.
-        if isinstance(album_raw, dict):
-            album_obj = dict(album_raw)
-            if image_url and not album_obj.get('image_url'):
-                album_obj['image_url'] = image_url
-            if image_url and not album_obj.get('images'):
-                album_obj['images'] = [{'url': image_url}]
-        else:
-            album_obj = {'name': album_raw or ''}
-            if image_url:
-                album_obj['image_url'] = image_url
-                album_obj['images'] = [{'url': image_url}]
+        # album.images / album.image_url when extracting cover art — and, for a
+        # completed pick, the details a download would otherwise look up.
+        from core.discovery.fix_pick import fix_pick_album, fix_pick_numbers
+        album_obj = fix_pick_album(dict(spotify_track, image_url=image_url))
 
+        # A suggestion accepted in the Wing It Pool names the source it came from;
+        # a pick from the pool's search doesn't, so it takes the active source.
+        from core.discovery.manual_match import derive_manual_match_provider
+        match_source = derive_manual_match_provider(spotify_track, _get_active_discovery_source())
         matched_data = {
             'id': spotify_track.get('id', ''),
             'name': spotify_track.get('name', ''),
@@ -39159,17 +39428,21 @@ def fix_discovery_pool_track():
             'album': album_obj,
             'duration_ms': spotify_track.get('duration_ms', 0),
             'image_url': image_url,
-            'source': 'spotify',
+            'source': match_source,
+            **fix_pick_numbers(spotify_track),
         }
 
         # Update the mirrored track's extra_data (merges, so a wing-it track keeps its
         # wing_it_fallback flag — that + manual_match is how the Wing It Pool lists resolved guesses).
         extra_data = {
             'discovered': True,
-            'provider': 'spotify',
+            'provider': match_source,
             'confidence': 1.0,
             'matched_data': matched_data,
             'manual_match': True,
+            'suggestions': [],
+            'isrc_match': False,
+            'unavailable': False,
         }
         database.update_mirrored_track_extra_data(track_id, extra_data)
 
@@ -39208,31 +39481,36 @@ def delete_discovery_pool_cache_entry(entry_id):
 
 @app.route('/api/discovery-pool/rematch', methods=['POST'])
 def rematch_discovery_pool_track():
-    """Replace a discovery cache entry with a new match chosen by the user."""
+    """Replace a discovery cache entry with a new match chosen by the user.
+
+    The new match keeps the entry's own key -- its normalized title and artist and the
+    source it was cached for -- so the discovery that found the old match finds this
+    one. It used to be saved under a freshly normalized title and 'spotify', where no
+    lookup (by _get_discovery_cache_key, for the active source) ever looked.
+    """
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         cache_id = data.get('cache_id')
-        original_title = (data.get('original_title') or '').strip()
-        original_artist = (data.get('original_artist') or '').strip()
         spotify_track = data.get('spotify_track')
 
         if not cache_id:
             return jsonify({"error": "cache_id required"}), 400
 
         database = get_database()
+        entry = database.get_discovery_cache_entry(cache_id)
+        if not entry:
+            return jsonify({"error": "Cached match not found"}), 404
 
         # If no spotify_track provided, just delete the cache entry (phase 1 of rematch)
         if not spotify_track:
             database.delete_discovery_cache_entry(cache_id)
             return jsonify({"success": True, "action": "cache_cleared"})
 
-        # spotify_track provided — delete old cache and save new match (phase 2)
-        database.delete_discovery_cache_entry(cache_id)
-
-        # Build cache entry in same format as discovery flow
-        artists = spotify_track.get('artists', [])
+        # Saved like a Fix-dialog pick, completed from its own source (core.discovery.fix_pick).
+        from core.discovery.fix_pick import fix_pick_album, fix_pick_numbers
+        from core.discovery.manual_match import derive_manual_match_provider
+        spotify_track = _complete_fix_pick(spotify_track)
         album_raw = spotify_track.get('album', '')
-        album_obj = album_raw if isinstance(album_raw, dict) else {'name': album_raw or ''}
         image_url = spotify_track.get('image_url', '')
         if not image_url and isinstance(album_raw, dict):
             images = album_raw.get('images', [])
@@ -39241,25 +39519,25 @@ def rematch_discovery_pool_track():
         matched_data = {
             'id': spotify_track.get('id', ''),
             'name': spotify_track.get('name', ''),
-            'artists': [{'name': a} if isinstance(a, str) else a for a in artists],
-            'album': album_obj,
+            'artists': [{'name': a} if isinstance(a, str) else a for a in spotify_track.get('artists', [])],
+            'album': fix_pick_album(dict(spotify_track, image_url=image_url)),
             'duration_ms': spotify_track.get('duration_ms', 0),
             'image_url': image_url,
-            'source': 'spotify',
+            'source': derive_manual_match_provider(spotify_track, entry['provider']),
+            **fix_pick_numbers(spotify_track),
         }
 
-        # Save to discovery cache
-        normalized_title = matching_engine.normalize_string(original_title) if original_title else ''
-        normalized_artist = matching_engine.normalize_string(original_artist) if original_artist else ''
-        database.save_discovery_cache_match(
-            normalized_title=normalized_title,
-            normalized_artist=normalized_artist,
-            provider='spotify',
+        # The same key replaces the entry in place: the cache is unique on it.
+        if not database.save_discovery_cache_match(
+            normalized_title=entry['normalized_title'],
+            normalized_artist=entry['normalized_artist'],
+            provider=entry['provider'],
             confidence=1.0,
             matched_data=matched_data,
-            original_title=original_title,
-            original_artist=original_artist,
-        )
+            original_title=entry['original_title'],
+            original_artist=entry['original_artist'],
+        ):
+            return jsonify({"error": "Could not save the match"}), 500
 
         return jsonify({"success": True, "action": "rematched", "name": spotify_track.get('name', '')})
     except Exception as e:
@@ -39295,6 +39573,7 @@ def prepare_mirrored_discovery(playlist_id):
                 'artists': [t['artist_name']],
                 'album': t.get('album_name', ''),
                 'duration_ms': t.get('duration_ms', 0),
+                'isrc': t.get('isrc') or '',
                 'extra_data': extra,
             })
 
@@ -39307,10 +39586,17 @@ def prepare_mirrored_discovery(playlist_id):
         pre_discovered_count = 0
         has_pending = False
 
-        from core.discovery.manual_match import is_drifted_for_redo
+        from core.discovery.manual_match import (
+            is_drifted_for_redo, is_marked_unavailable, is_wing_it_guess, unavailable_result_row,
+        )
 
         for idx, track in enumerate(tracks):
             extra = track.get('extra_data')
+            if is_marked_unavailable(extra):
+                pre_discovered_results.append(unavailable_result_row(
+                    idx, track['name'], track['artists'][0] if track['artists'] else 'Unknown',
+                    track.get('duration_ms', 0)))
+                continue
             if extra and extra.get('discovered'):
                 cached_provider = extra.get('provider', 'spotify')
 
@@ -39334,6 +39620,32 @@ def prepare_mirrored_discovery(playlist_id):
                         'spotify_album': '',
                         'duration': f"{int(dur) // 60000}:{(int(dur) % 60000) // 1000:02d}" if dur else '0:00',
                         'confidence': 0,
+                    })
+                    continue
+
+                if is_wing_it_guess(extra):
+                    # Nothing matched this track: reopen it as the Wing It guess it
+                    # is, with the near misses kept for it, not as an empty
+                    # "Provider changed" row. Its provider is 'wing_it_fallback',
+                    # which no metadata source will ever equal.
+                    stub = extra.get('matched_data') or {}
+                    dur = track.get('duration_ms', 0)
+                    pre_discovered_results.append({
+                        'index': idx,
+                        'yt_track': track['name'],
+                        'yt_artist': track['artists'][0] if track['artists'] else 'Unknown',
+                        'status': 'Wing It',
+                        'status_class': 'wing-it',
+                        'spotify_track': track['name'],
+                        'spotify_artist': track['artists'][0] if track['artists'] else '',
+                        'spotify_album': '',
+                        'duration': f"{int(dur) // 60000}:{(int(dur) % 60000) // 1000:02d}" if dur else '0:00',
+                        'discovery_source': _current_provider,
+                        'confidence': 0,
+                        'matched_data': stub,
+                        'spotify_data': stub,
+                        'wing_it_fallback': True,
+                        'suggestions': extra.get('suggestions') or [],
                     })
                     continue
 
@@ -39364,19 +39676,23 @@ def prepare_mirrored_discovery(playlist_id):
                 }
                 if extra.get('manual_match'):
                     result['manual_match'] = True
+                if extra.get('isrc_match'):
+                    result['isrc_match'] = True
                 pre_discovered_results.append(result)
                 pre_discovered_count += 1
             elif extra and extra.get('discovery_attempted'):
-                # Previously attempted but not found — also retry if provider changed
+                # Previously attempted but not found — also retry if provider changed,
+                # unless the user removed the match: that track waits for them.
                 cached_provider = extra.get('provider', 'spotify')
-                if cached_provider != _current_provider:
+                provider_changed = cached_provider != _current_provider and not extra.get('unmatched_by_user')
+                if provider_changed:
                     has_pending = True
                 dur = track.get('duration_ms', 0)
                 pre_discovered_results.append({
                     'index': idx,
                     'yt_track': track['name'],
                     'yt_artist': track['artists'][0] if track['artists'] else 'Unknown',
-                    'status': 'Provider changed' if cached_provider != _current_provider else 'Not Found',
+                    'status': 'Provider changed' if provider_changed else 'Not Found',
                     'status_class': 'not-found',
                     'spotify_track': '',
                     'spotify_artist': '',
@@ -39470,25 +39786,29 @@ def retry_failed_mirrored_discovery(playlist_id):
         tracks = state['playlist']['tracks']
         results = state.get('discovery_results', [])
 
-        # Build set of found track indices
+        # Build set of found track indices. A track marked "Not available" keeps
+        # its row and isn't retried either.
         found_indices = set()
+        skip_indices = set()
         kept_results = []
         for r in results:
-            if r.get('status_class') == 'found':
-                found_indices.add(r.get('index', -1))
+            if r.get('status_class') in ('found', 'unavailable'):
+                if r.get('status_class') == 'found':
+                    found_indices.add(r.get('index', -1))
+                skip_indices.add(r.get('index', -1))
                 kept_results.append(r)
 
         already_found = len(found_indices)
-        retry_count = len(tracks) - already_found
+        retry_count = len(tracks) - len(skip_indices)
 
         if retry_count == 0:
             return jsonify({"success": True, "retry_count": 0, "already_found": already_found, "message": "All tracks already found"})
 
-        # Flag found tracks to skip, clear flag on others
+        # Flag found and not-available tracks to skip, clear flag on others
         for i, track in enumerate(tracks):
-            track['skip_discovery'] = (i in found_indices)
+            track['skip_discovery'] = (i in skip_indices)
 
-        # Keep only found results, remove failed/pending
+        # Keep found and not-available results, remove failed/pending
         state['discovery_results'] = kept_results
         state['phase'] = 'discovering'
         state['status'] = 'discovering'
@@ -39500,7 +39820,7 @@ def retry_failed_mirrored_discovery(playlist_id):
         try:
             db = get_database()
             for i, track in enumerate(tracks):
-                if i not in found_indices:
+                if i not in skip_indices:
                     db_track_id = track.get('db_track_id')
                     if db_track_id:
                         db.update_mirrored_track_extra_data(db_track_id, {

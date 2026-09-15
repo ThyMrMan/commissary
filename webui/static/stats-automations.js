@@ -474,6 +474,7 @@ function mirrorPlaylist(source, sourceId, name, tracks, metadata = {}) {
         duration_ms: t.duration_ms || 0,
         image_url: t.image_url || (t.album && typeof t.album === 'object' && t.album.images && t.album.images[0] ? t.album.images[0].url : null),
         source_track_id: t.source_track_id || t.id || t.spotify_track_id || '',
+        isrc: t.isrc || '',
         extra_data: t.extra_data || null
     }));
 
@@ -1479,6 +1480,14 @@ function _wingItMatchedName(t) {
     } catch (e) { return ''; }
 }
 
+// The top suggestion discovery kept for a Wing It guess, or null.
+function _wingItSuggestion(t) {
+    try {
+        const suggestions = JSON.parse(t.extra_data || '{}').suggestions;
+        return Array.isArray(suggestions) && suggestions.length ? suggestions[0] : null;
+    } catch (e) { return null; }
+}
+
 function renderWingItPoolList() {
     const container = document.getElementById('wing-it-list-content');
     if (!container || !_wingItPoolData) return;
@@ -1503,7 +1512,16 @@ function renderWingItPoolList() {
             : `<div class="pool-empty">${emptyMsg}</div>`;
         return;
     }
-    container.innerHTML = tracks.map(t => {
+    // Guesses with a suggestion can all be accepted at once.
+    const suggested = isMatched ? [] : tracks.filter(t => _wingItSuggestion(t));
+    const minInput = document.getElementById('wing-it-suggest-min');
+    const minPercent = (minInput && minInput.value) || '80';
+    const toolbar = suggested.length ? `
+        <div class="pool-suggestion-toolbar">
+            Accept suggestions ≥ <input type="number" class="accept-suggestions-min" id="wing-it-suggest-min" min="1" max="99" step="1" value="${_esc(String(minPercent))}">%
+            <button class="playlist-modal-btn playlist-modal-btn-secondary" onclick="acceptAllWingItSuggestions()">✓ Accept all (${suggested.length})</button>
+        </div>` : '';
+    container.innerHTML = toolbar + tracks.map(t => {
         if (isMatched) {
             const matchedName = _wingItMatchedName(t);
             return `
@@ -1520,6 +1538,9 @@ function renderWingItPoolList() {
                 </div>
             `;
         }
+        const suggestion = _wingItSuggestion(t);
+        const pct = suggestion ? Math.round((Number(suggestion.confidence) || 0) * 100) : 0;
+        const suggestedArtists = suggestion ? (suggestion.artists || []).join(', ') : '';
         return `
             <div class="pool-track-row pool-failed">
                 <div class="pool-track-info">
@@ -1528,7 +1549,9 @@ function renderWingItPoolList() {
                         <span class="pool-track-artist">${_esc(t.artist_name)}</span>
                         <span class="pool-track-playlist-badge">${_esc(t.playlist_name)}</span>
                     </div>
+                    ${suggestion ? `<div class="pool-suggestion">Suggested: <span class="pool-match-name">${_esc(suggestion.name)}</span>${suggestedArtists ? ` — ${_esc(suggestedArtists)}` : ''} · ${pct}%</div>` : ''}
                 </div>
+                ${suggestion ? `<button class="pool-rematch-btn" onclick="acceptWingItSuggestion(${t.id})" title="Accept the suggested match">✓ Accept</button>` : ''}
                 <button class="playlist-modal-btn playlist-modal-btn-primary pool-fix-btn" onclick="openPoolFixModal(${t.id}, '${_escJs(t.track_name)}', '${_escJs(t.artist_name)}')">Fix Match</button>
             </div>
         `;
@@ -1568,6 +1591,63 @@ function _updateWingItHeaderCounts() {
 // Re-fetch + re-render the open Wing It pool (used after a Fix Match resolves a track).
 function refreshWingItPool() {
     filterWingItPool(_wingItPoolPlaylistFilter || '');
+}
+
+// Accept the top suggestion kept for a Wing It guess: it is saved as the fix, as
+// if picked in Fix Match, with nothing to confirm.
+async function acceptWingItSuggestion(trackId, { quiet = false } = {}) {
+    const track = ((_wingItPoolData && _wingItPoolData.tracks) || []).find(t => String(t.id) === String(trackId));
+    const suggestion = track && _wingItSuggestion(track);
+    if (!suggestion) {
+        if (!quiet) showToast('That suggestion is no longer available', 'error');
+        return false;
+    }
+    try {
+        const res = await fetch('/api/discovery-pool/fix', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ track_id: track.id, spotify_track: suggestion }),
+        });
+        const data = await res.json();
+        if (!data.success) {
+            if (!quiet) showToast(data.error || 'Failed to accept the suggestion', 'error');
+            return false;
+        }
+    } catch (err) {
+        if (!quiet) showToast(`Error: ${err.message}`, 'error');
+        return false;
+    }
+    if (!quiet) {
+        showToast(`Matched: ${suggestion.name}`, 'success');
+        refreshWingItPool();
+    }
+    return true;
+}
+
+// Accept every guess's top suggestion at or above the "Accept suggestions ≥"
+// percentage: one confirmation, one track at a time, one reload at the end.
+async function acceptAllWingItSuggestions() {
+    const input = document.getElementById('wing-it-suggest-min');
+    const minPercent = Math.max(1, Math.min(99, parseInt(input && input.value, 10) || 80));
+    const picks = ((_wingItPoolData && _wingItPoolData.tracks) || []).filter(t => {
+        const suggestion = _wingItSuggestion(t);
+        return suggestion && Math.round((Number(suggestion.confidence) || 0) * 100) >= minPercent;
+    });
+    if (!picks.length) {
+        showToast(`No suggestions at ${minPercent}% or above`, 'info');
+        return;
+    }
+    if (!await showConfirmDialog({
+        title: 'Accept suggestions',
+        message: `Accept the suggested match for ${picks.length} track${picks.length === 1 ? '' : 's'} at ${minPercent}% or above?`,
+        confirmText: 'Accept all',
+    })) return;
+    let accepted = 0;
+    for (const track of picks) {
+        if (await acceptWingItSuggestion(track.id, { quiet: true })) accepted++;
+    }
+    showToast(`Accepted ${accepted} of ${picks.length} suggestions`, accepted === picks.length ? 'success' : 'warning');
+    refreshWingItPool();
 }
 
 function closeWingItPoolModal() {
@@ -1913,45 +1993,89 @@ async function searchPoolFix() {
 
     resultsContainer.innerHTML = '<div class="pool-fix-empty"><div class="pool-fix-spinner"></div>Searching…</div>';
 
-    try {
-        const params = new URLSearchParams();
-        if (trackVal) params.set('track', trackVal);
-        if (artistVal) params.set('artist', artistVal);
-        params.set('limit', '20');
-        const res = await fetch(`/api/spotify/search_tracks?${params.toString()}`);
-        const data = await res.json().catch(() => ({}));
+    const params = new URLSearchParams();
+    if (trackVal) params.set('track', trackVal);
+    if (artistVal) params.set('artist', artistVal);
+    params.set('limit', '20');
 
-        // Surface the real failure instead of masking every error (auth, 500, an
-        // upstream connection abort) as a bland "No results found".
-        if (!res.ok || data.error) {
-            const msg = data.error || res.statusText || `request failed (${res.status})`;
-            resultsContainer.innerHTML = `<div class="pool-fix-empty">Search error: ${_esc(msg)}</div>`;
+    // Every metadata source at once, one request each, like the discovery Fix dialog
+    // (searchDiscoveryFix). This asked Spotify alone, so without a Spotify connection
+    // it found nothing. A newer search takes over the list from this one.
+    const search = String(Number(resultsContainer.dataset.search || 0) + 1);
+    resultsContainer.dataset.search = search;
+    const answers = discoveryFixSourceList().map(source => ({ ...source, status: 'searching', tracks: [], error: '' }));
+    await Promise.all(answers.map(async entry => {
+        try {
+            const res = await fetch(`/api/discovery/fix-search?source=${entry.key}&${params.toString()}`);
+            const data = await res.json().catch(() => ({}));
+            // A source that isn't connected answers with no tracks, like one that found none.
+            if (!res.ok || data.status === 'error') {
+                entry.status = 'error';
+                entry.error = data.error || res.statusText || `request failed (${res.status})`;
+            } else {
+                entry.status = 'done';
+                entry.tracks = (data.tracks || []).map(track => ({ ...track, source: track.source || entry.key }));
+            }
+        } catch (err) {
+            entry.status = 'error';
+            entry.error = err.message;
+        }
+        if (resultsContainer.dataset.search === search) drawPoolFixResults(resultsContainer, answers, trackVal);
+    }));
+}
+
+/**
+ * The pool Fix dialog's results from every source so far: best first, with karaoke,
+ * cover, live and remix versions below the rest (discoveryVersionTag), each marked with
+ * the source it came from.
+ */
+function drawPoolFixResults(resultsContainer, answers, trackName) {
+    const sourceKind = discoveryVersionTag({ name: trackName });
+    const seen = new Set();
+    const rows = [];
+    answers.forEach((entry, sourceIndex) => (entry.tracks || []).forEach((track, rank) => {
+        const key = `${track.source || entry.key}:${track.id}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        const kind = discoveryVersionTag(track);
+        rows.push({ track, rank, sourceIndex, kind, sunk: Boolean(kind) && kind !== sourceKind, label: entry.label });
+    }));
+    rows.sort((a, b) => (Number(a.sunk) - Number(b.sunk))
+        || ((Number(b.track.relevance) || 0) - (Number(a.track.relevance) || 0))
+        || (a.sourceIndex - b.sourceIndex)
+        || (a.rank - b.rank));
+
+    const waiting = answers.filter(entry => entry.status === 'searching').map(entry => entry.label);
+    if (!rows.length) {
+        if (waiting.length) {
+            resultsContainer.innerHTML = '<div class="pool-fix-empty"><div class="pool-fix-spinner"></div>Searching…</div>';
             return;
         }
-
-        const tracks = data.tracks || [];
-        if (tracks.length === 0) {
-            resultsContainer.innerHTML = '<div class="pool-fix-empty">No results found</div>';
-            return;
-        }
-
-        resultsContainer.innerHTML = tracks.map((track) => {
-            const artists = (track.artists || []).join(', ');
-            const duration = track.duration_ms ? formatDuration(track.duration_ms) : '';
-            const albumText = track.album ? ` · ${_esc(track.album)}` : '';
-            return `
-                <div class="pool-fix-result" onclick='selectPoolFixTrack(${JSON.stringify(track).replace(/'/g, "&#39;")})'>
-                    <div class="pool-fix-result-main">
-                        <div class="pool-fix-result-title">${_esc(track.name || 'Unknown')}</div>
-                        <div class="pool-fix-result-meta">${_esc(artists)}${albumText}</div>
-                    </div>
-                    ${duration ? `<div class="pool-fix-result-dur">${duration}</div>` : ''}
-                </div>
-            `;
-        }).join('');
-    } catch (err) {
-        resultsContainer.innerHTML = `<div class="pool-fix-empty">Search failed: ${_esc(err.message)}</div>`;
+        const failed = answers.filter(entry => entry.status === 'error');
+        resultsContainer.innerHTML = failed.length === answers.length
+            ? `<div class="pool-fix-empty">Search error: ${_esc(failed[0].error)}</div>`
+            : '<div class="pool-fix-empty">No results found</div>';
+        return;
     }
+
+    const kindLabels = { karaoke: 'Karaoke', cover: 'Cover', live: 'Live', remix: 'Remix' };
+    resultsContainer.innerHTML = rows.map(({ track, kind, sunk, label }) => {
+        const artists = (track.artists || []).map(a => (typeof a === 'string' ? a : a?.name || '')).filter(Boolean).join(', ');
+        const album = typeof track.album === 'string' ? track.album : (track.album?.name || '');
+        const duration = track.duration_ms ? formatDuration(track.duration_ms) : '';
+        return `
+            <div class="pool-fix-result${sunk ? ' is-version' : ''}" onclick='selectPoolFixTrack(${JSON.stringify(track).replace(/'/g, "&#39;")})'>
+                <div class="pool-fix-result-main">
+                    <div class="pool-fix-result-title">${_esc(track.name || 'Unknown')}${kind ? ` <span class="fix-result-version">${kindLabels[kind]}</span>` : ''}</div>
+                    <div class="pool-fix-result-meta">${_esc(artists)}${album ? ` · ${_esc(album)}` : ''}</div>
+                </div>
+                <span class="pool-fix-result-source">${_esc(label)}</span>
+                ${duration ? `<div class="pool-fix-result-dur">${duration}</div>` : ''}
+            </div>
+        `;
+    }).join('') + (waiting.length
+        ? `<div class="pool-fix-results-pending">Still searching ${_esc(waiting.join(', '))}…</div>`
+        : '');
 }
 
 async function selectPoolFixTrack(track) {

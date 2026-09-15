@@ -17,6 +17,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from core.discovery.fix_pick import fix_pick_album, fix_pick_numbers
 from utils.logging_config import get_logger
 
 logger = get_logger("discovery.endpoints")
@@ -642,6 +643,9 @@ def update_discovery_match(
 
             result = state['discovery_results'][track_index]
             old_status = result.get('status')
+            # Tidal, Deezer, Qobuz and Spotify-link discovery counted a Wing It guess
+            # as a match already.
+            was_guess = bool(result.get('wing_it_fallback')) or result.get('status_class') == 'wing-it'
 
             result['status'] = 'Found'
             result['status_class'] = 'found'
@@ -662,7 +666,7 @@ def update_discovery_match(
             result['wing_it_fallback'] = False
             result['manual_match'] = True
 
-            if old_status != 'found' and old_status != 'Found':
+            if old_status != 'found' and old_status != 'Found' and not was_guess:
                 state['spotify_matches'] = state.get('spotify_matches', 0) + 1
 
             logger.info(f"Manual match updated: {source_log_label} - {identifier} - track {track_index}")
@@ -702,27 +706,19 @@ def update_discovery_match(
             if isinstance(artists_list, list):
                 artists_list = [a if isinstance(a, str) else a.get('name', '') for a in artists_list]
             image_url = spotify_track.get('image_url') or ''
-            album_raw = spotify_track.get('album', '')
-            if isinstance(album_raw, dict):
-                album_obj = dict(album_raw)
-                if image_url and not album_obj.get('image_url'):
-                    album_obj['image_url'] = image_url
-                if image_url and not album_obj.get('images'):
-                    album_obj['images'] = [{'url': image_url}]
-            else:
-                album_obj = {'name': album_raw or ''}
-                if image_url:
-                    album_obj['image_url'] = image_url
-                    album_obj['images'] = [{'url': image_url}]
 
             matched_data = {
                 'id': spotify_track['id'],
                 'name': spotify_track['name'],
                 'artists': artists_list,
-                'album': album_obj,
+                # A completed pick's album carries the details a download would
+                # otherwise look up (core.discovery.fix_pick).
+                'album': fix_pick_album(spotify_track),
                 'duration_ms': spotify_track.get('duration_ms', 0),
                 'image_url': image_url,
-                'source': 'spotify',
+                # Where the pick came from; this said Spotify whatever it was.
+                'source': spotify_track.get('source') or 'spotify',
+                **fix_pick_numbers(spotify_track),
             }
             cache_db = get_database()
             cache_db.save_discovery_cache_match(

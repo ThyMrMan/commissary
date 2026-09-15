@@ -215,6 +215,7 @@ def test_get_playlist_normalizes_tracks(authed_client):
         'image_url': 'https://qobuz.example/art.jpg',
         'external_urls': {'qobuz': 'https://play.qobuz.com/track/555'},
         'explicit': True,
+        'isrc': '',
     }]
 
 
