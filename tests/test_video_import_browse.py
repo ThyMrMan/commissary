@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 from flask import Flask, g
 
+import api.video.manual_import as manual_import
 from database.video_database import VideoDatabase
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -73,9 +74,13 @@ def tree(tmp_path, monkeypatch):
     return dl
 
 
-def _browse(client, path=None):
-    q = "?path=%s" % path if path else ""
-    return client.get("/api/video/import/browse" + q).get_json()
+def _browse(client, path=None, q=None):
+    params = {}
+    if path:
+        params["path"] = str(path)
+    if q is not None:
+        params["q"] = q
+    return client.get("/api/video/import/browse", query_string=params).get_json()
 
 
 # ── listing ──────────────────────────────────────────────────────────────────
@@ -120,6 +125,85 @@ def test_every_offered_file_would_be_accepted_by_the_import(app_db, tree):
     from core.video.importer import is_video
     for f in _browse(client, str(tree))["files"]:
         assert is_video(f["name"]), f
+
+
+# ── filtering ────────────────────────────────────────────────────────────────
+def test_a_query_narrows_the_listing_to_matching_names(app_db, tree):
+    """The point of it: find one release in a folder of hundreds, without
+    scrolling to it."""
+    client, _, _ = app_db
+    d = _browse(client, tree, q="movie")
+    assert [x["name"] for x in d["files"]] == ["movie.mkv"]
+    assert d["dirs"] == []
+    assert (d["q"], d["matched"], d["total"]) == ("movie", 1, 3)
+
+
+def test_a_query_matches_folders_as_well_as_files(app_db, tree):
+    """A release usually arrives as a folder, so filtering files alone would miss
+    the thing most often being looked for. TWO folders: with one, a listing that
+    filtered folders and one that didn't would look exactly the same."""
+    client, _, _ = app_db
+    (tree / "Other.Show.S03").mkdir()
+    d = _browse(client, tree, q="some")
+    assert [x["name"] for x in d["dirs"]] == ["Some.Show.S01"]
+    assert d["files"] == []
+
+
+def test_every_word_must_appear_in_any_order(app_db, tree):
+    client, _, _ = app_db
+    (tree / "Bleach - Sennen Kessen Hen - 48 [1080p].mkv").write_bytes(b"b")
+    hit = ["Bleach - Sennen Kessen Hen - 48 [1080p].mkv"]
+    assert [x["name"] for x in _browse(client, tree, q="bleach 48")["files"]] == hit
+    assert [x["name"] for x in _browse(client, tree, q="48 bleach")["files"]] == hit
+    assert _browse(client, tree, q="bleach 47")["files"] == []
+
+
+def test_matching_ignores_case(app_db, tree):
+    """Both directions. Lower-casing only the query satisfies the first of these
+    and fails the second, so one alone proves nothing."""
+    client, _, _ = app_db
+    (tree / "MiXeD.Case.Movie.mkv").write_bytes(b"m")
+    assert [x["name"] for x in _browse(client, tree, q="MOVIE")["files"]] \
+        == ["MiXeD.Case.Movie.mkv", "movie.mkv"]
+    assert [x["name"] for x in _browse(client, tree, q="mixed")["files"]] \
+        == ["MiXeD.Case.Movie.mkv"]
+
+
+def test_a_query_matching_nothing_is_an_empty_listing_not_an_error(app_db, tree):
+    client, _, _ = app_db
+    d = _browse(client, tree, q="nothing-here-at-all")
+    assert d["success"] is True and d["dirs"] == [] and d["files"] == []
+    assert (d["matched"], d["total"]) == (0, 3)
+
+
+def test_the_whole_folder_offer_describes_the_folder_not_the_filtered_view(app_db, tree):
+    """The pack button imports everything in the folder. Counting only what the
+    filter left would make it claim to import less than it does."""
+    client, _, _ = app_db
+    pack = tree / "Pack.S02"
+    pack.mkdir()
+    for ep in (1, 2, 3):
+        (pack / ("Pack.S02E%02d.mkv" % ep)).write_bytes(b"e")
+    assert _browse(client, pack)["pack"]["count"] == 3
+    filtered = _browse(client, pack, q="E01")
+    assert filtered["pack"]["count"] == 3
+    assert [x["name"] for x in filtered["files"]] == ["Pack.S02E01.mkv"]
+
+
+def test_filtering_happens_before_the_cap(app_db, tree, monkeypatch):
+    """A folder too big to list is the one most worth searching. Filtering only
+    what survived the cap would report 'nothing matches' for a file right there."""
+    client, _, _ = app_db
+    monkeypatch.setattr(manual_import, "_BROWSE_LIMIT", 4)
+    big = tree / "Big"
+    big.mkdir()
+    for i in range(12):
+        (big / ("filler.%02d.mkv" % i)).write_bytes(b"f")
+    (big / "needle.mkv").write_bytes(b"n")
+    assert _browse(client, big)["truncated"] is True
+    d = _browse(client, big, q="needle")
+    assert [x["name"] for x in d["files"]] == ["needle.mkv"]
+    assert d["truncated"] is False and d["total"] == 13
 
 
 # ── failure modes ────────────────────────────────────────────────────────────
@@ -210,3 +294,11 @@ def test_the_modal_browses_and_still_accepts_a_typed_path():
     assert "data-vimp-add-path" in _IMPORT_JS
     assert "syncAddConfirm" in _IMPORT_JS
     assert ".vimp-browse-list" in _CSS and ".vimp-chip" in _CSS
+
+
+def test_the_browser_can_be_filtered_without_scrolling():
+    """The filter box, the rule behind it, and the re-fetch that keeps a folder
+    bigger than the cap searchable."""
+    assert "data-vimp-filter" in _IMPORT_JS and ".vimp-browse-filter" in _CSS
+    assert "function browseView(" in _IMPORT_JS
+    assert "q=' + encodeURIComponent(opts.q)" in _IMPORT_JS

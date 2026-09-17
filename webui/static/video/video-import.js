@@ -193,6 +193,11 @@
                 '</div>' +
                 '<div class="vimp-browse" data-vimp-browse>' +
                     '<div class="vimp-browse-shortcuts" data-vimp-shortcuts></div>' +
+                    '<div class="vimp-browse-filter">' +
+                        '<input type="search" class="vimp-browse-filter-input" data-vimp-filter ' +
+                            'placeholder="Filter this folder \u2014 part of a name" autocomplete="off" spellcheck="false">' +
+                        '<span class="vimp-browse-filter-n" data-vimp-filter-n></span>' +
+                    '</div>' +
                     '<div class="vimp-browse-crumb" data-vimp-crumb></div>' +
                     '<div class="vimp-browse-list" data-vimp-list></div>' +
                 '</div>' +
@@ -209,24 +214,79 @@
     // still the fastest route for a pasted path) but it starts on the download
     // folder and the list below walks the server's filesystem, so the usual case
     // is a couple of clicks.
-    var _browse = { path: '', loading: false };
+    var _browse = { path: '', loading: false, q: '', big: false, data: null, seq: 0, searching: false };
+    var filterTimer = null;
 
-    function browseTo(path) {
-        _browse.loading = true;
-        renderBrowse(null);
-        var q = path ? '?path=' + encodeURIComponent(path) : '';
-        fetch('/api/video/import/browse' + q, { headers: { Accept: 'application/json' } })
+    function browseTo(path, opts) {
+        opts = opts || {};
+        var seq = ++_browse.seq;
+        if (!opts.quiet) {
+            // A navigation, not a filter re-fetch: the filter belonged to the
+            // folder you just left.
+            _browse.q = '';
+            _browse.big = false;
+            var fi = $('[data-vimp-filter]');
+            if (fi) fi.value = '';
+            _browse.loading = true;
+            renderBrowse(null);
+        }
+        var qs = [];
+        if (path) qs.push('path=' + encodeURIComponent(path));
+        if (opts.q) qs.push('q=' + encodeURIComponent(opts.q));
+        fetch('/api/video/import/browse' + (qs.length ? '?' + qs.join('&') : ''),
+              { headers: { Accept: 'application/json' } })
             .then(function (r) { return r.json().catch(function () { return null; }); })
             .then(function (d) {
+                if (seq !== _browse.seq) return;    // a newer keystroke or click won
                 _browse.loading = false;
+                _browse.searching = false;
                 if (!d) { renderBrowse({ error: 'Couldn’t read that folder.' }); return; }
                 if (d.path) _browse.path = d.path;
+                // Remembered per folder, not per payload: a filtered answer is
+                // usually small enough to fit, and deleting a character has to
+                // reach the whole folder again.
+                if (d.truncated && !opts.q) _browse.big = true;
                 renderBrowse(d);
             })
             .catch(function () {
+                if (seq !== _browse.seq) return;
                 _browse.loading = false;
+                _browse.searching = false;
                 renderBrowse({ error: 'Couldn’t read that folder.' });
             });
+    }
+
+    // What the list shows for a payload and the current filter. Pure, so the rule
+    // -- every word of the query, anywhere in the name, in any order -- is testable
+    // without a DOM. The server applies the SAME rule before its cap; re-applying it
+    // here is what makes typing instant, and it is a no-op on a payload the server
+    // has already narrowed.
+    function browseView(d, q) {
+        var terms = String(q || '').toLowerCase().split(/\s+/).filter(Boolean);
+        function keep(x) {
+            var low = String((x && x.name) || '').toLowerCase();
+            for (var i = 0; i < terms.length; i++) { if (low.indexOf(terms[i]) === -1) return false; }
+            return true;
+        }
+        var dirs = ((d && d.dirs) || []).filter(keep);
+        var files = ((d && d.files) || []).filter(keep);
+        var total = (d && d.total != null) ? d.total
+            : (((d && d.dirs) || []).length + ((d && d.files) || []).length);
+        return { dirs: dirs, files: files, total: total,
+                 matched: dirs.length + files.length, filtered: terms.length > 0 };
+    }
+
+    function onFilterInput(value) {
+        _browse.q = String(value || '');
+        renderBrowse(_browse.data);          // instant, from what is already here
+        clearTimeout(filterTimer);
+        // Only a folder the server had to cut short needs asking again -- anything
+        // else is already on screen, and the line above just narrowed it.
+        if (!_browse.big) return;
+        _browse.searching = true;
+        filterTimer = setTimeout(function () {
+            browseTo(_browse.path, { q: _browse.q, quiet: true });
+        }, 250);
     }
 
     function renderBrowse(d) {
@@ -242,6 +302,7 @@
             }).join('');
         }
         if (crumb) crumb.textContent = d.path || '';
+        _browse.data = d;                    // what the filter re-renders from
         if (d.error) {
             list.innerHTML = '<div class="vimp-browse-msg">' + esc(d.error) + '</div>';
             return;
@@ -264,19 +325,30 @@
                 esc(d.parent) + '"><span class="vimp-row-ic">↰</span>' +
                 '<span class="vimp-row-name">Parent folder</span></button>';
         }
-        rows += (d.dirs || []).map(function (x) {
+        var view = browseView(d, _browse.q);
+        rows += view.dirs.map(function (x) {
             return '<button type="button" class="vimp-row vimp-row--dir" data-vimp-go="' + esc(x.path) + '">' +
                 '<span class="vimp-row-ic">📁</span><span class="vimp-row-name">' + esc(x.name) + '</span></button>';
         }).join('');
-        rows += (d.files || []).map(function (x) {
+        rows += view.files.map(function (x) {
             return '<button type="button" class="vimp-row vimp-row--file" data-vimp-pick="' + esc(x.path) + '">' +
                 '<span class="vimp-row-ic">🎬</span><span class="vimp-row-name">' + esc(x.name) + '</span>' +
                 '<span class="vimp-row-size">' + fmtSize(x.size) + '</span></button>';
         }).join('');
-        if (!rows) rows = '<div class="vimp-browse-msg">Nothing to import in this folder.</div>';
-        else if (d.truncated) {
+        var n = $('[data-vimp-filter-n]');
+        if (n) {
+            n.textContent = !view.filtered ? ''
+                : _browse.searching ? 'searching…'
+                : view.matched + ' of ' + view.total;
+        }
+        if (!view.matched) {
+            rows += '<div class="vimp-browse-msg">' + (view.filtered
+                ? 'Nothing in this folder matches “' + esc(_browse.q) + '”.'
+                : 'Nothing to import in this folder.') + '</div>';
+        } else if (d.truncated) {
             rows += '<div class="vimp-browse-msg">Too many entries to show them all — ' +
-                'open a subfolder or type the path above.</div>';
+                (view.filtered ? 'narrow the filter' : 'filter above, open a subfolder') +
+                ' or type the path above.</div>';
         }
         list.innerHTML = rows;
     }
@@ -312,7 +384,7 @@
         var input = $('[data-vimp-add-path]');
         if (input) { input.value = ''; input.focus(); }
         var btn = $('[data-vimp-add-confirm]'); if (btn) { btn.disabled = true; btn.textContent = 'Add'; }
-        _browse = { path: '', loading: false };
+        _browse = { path: '', loading: false, q: '', big: false, data: null, seq: 0, searching: false };
         browseTo('');   // no path → the backend opens on the first configured download folder
     }
 
@@ -844,9 +916,17 @@
         document.addEventListener('input', function (e) {
             if (state.resolve && e.target.closest('[data-vimp-modal]')) onModalInput(e);
             if (e.target.matches('[data-vimp-add-path]')) syncAddConfirm();
+            if (e.target.matches('[data-vimp-filter]')) onFilterInput(e.target.value);
         });
         document.addEventListener('keydown', function (e) {
             if (e.key === 'Enter' && e.target.matches('[data-vimp-add-path]') && e.target.value.trim()) submitAddFile();
+            // Esc clears the filter before anything else reads it: losing the whole
+            // dialog because you wanted the list back is a bad trade.
+            if (e.key === 'Escape' && e.target.matches('[data-vimp-filter]') && e.target.value) {
+                e.stopPropagation();
+                e.target.value = '';
+                onFilterInput('');
+            }
         });
         document.addEventListener('soulsync:video-page-shown', onShown);
         if (isShown()) onShown({ detail: PAGE_ID });

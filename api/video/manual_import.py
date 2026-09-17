@@ -171,6 +171,17 @@ def _browse_shortcuts(db) -> list:
 _BROWSE_LIMIT = 1000
 
 
+def _query_terms(q) -> list:
+    """The words of a browse filter, lowercased. Every one has to appear, in any
+    order, so 'bleach 48' finds 'Bleach - Sennen Kessen Hen - 48'."""
+    return [t for t in str(q or "").lower().split() if t]
+
+
+def _name_matches(name, terms) -> bool:
+    low = str(name or "").lower()
+    return all(t in low for t in terms)
+
+
 def register_routes(bp):
     @bp.route("/import/browse", methods=["GET"])
     def video_import_browse():
@@ -224,7 +235,6 @@ def register_routes(bp):
 
         dirs.sort(key=lambda d: d["name"].lower())
         files.sort(key=lambda f: f["name"].lower())
-        truncated = len(dirs) + len(files) > _BROWSE_LIMIT
         parent = os.path.dirname(path.rstrip(os.sep)) or None
         # Does THIS folder look like a season pack? Computed from the names already
         # listed, so it costs nothing extra. Only offered at 2+ numbered episodes:
@@ -236,11 +246,24 @@ def register_routes(bp):
             if p.get("episode") is not None and p.get("season") is not None:
                 pack_count += 1
                 pack_seasons.add(p["season"])
+        # ``q`` narrows the listing BEFORE the cap. A folder with more entries
+        # than the cap is exactly the one worth searching, and filtering only
+        # what survived the cap would report "nothing matches" for a file that
+        # is sitting right there. The pack offer above describes the FOLDER, so
+        # it is counted from every file here and a filter never changes it.
+        total = len(dirs) + len(files)
+        terms = _query_terms(request.args.get("q"))
+        if terms:
+            dirs = [d for d in dirs if _name_matches(d["name"], terms)]
+            files = [f for f in files if _name_matches(f["name"], terms)]
+        truncated = len(dirs) + len(files) > _BROWSE_LIMIT
         return jsonify({"success": True, "path": path,
                         "parent": parent if parent and parent != path else None,
                         "dirs": dirs[:_BROWSE_LIMIT],
                         "files": files[:max(0, _BROWSE_LIMIT - len(dirs))],
                         "shortcuts": shortcuts, "truncated": truncated,
+                        "q": " ".join(terms), "total": total,
+                        "matched": len(dirs) + len(files),
                         "pack": {"count": pack_count, "seasons": sorted(pack_seasons)}
                                 if pack_count >= 2 else None})
 

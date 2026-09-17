@@ -3491,6 +3491,11 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.4.1': [
+        { date: 'September 2026 · 2.4.1' },
+        { title: "Search the folder you're importing from, instead of scrolling it", desc: "picking a file on the Import page meant scrolling a download folder that can hold hundreds of entries. “Add file…” now has a filter box: type any part of a name and the folders and files narrow as you type, with a count of how many are left. Several words match in any order — “bleach 48” finds “Bleach - Sennen Kessen Hen - 48” — and case doesn't matter. Esc clears the filter without closing the dialog, and opening a folder starts you fresh. A folder too big to list in one go is searched on the server, so what you're after is found even when it was never on screen to scroll to." },
+        { title: "…and what it doesn't cover", desc: "the filter reads the folder you are in, not the folders inside it, so a release buried a level down still needs opening on the way past. The downloads waiting to be placed — the cards on the page itself — aren't filtered." },
+    ],
     '2.4.0': [
         { date: 'September 2026 · 2.4.0' },
         { title: "An anime season that is a story arc now matches the releases people post", desc: "a long-running anime is filed one season per arc, and the arc's releases count from 1 within it — the 48th episode of Bleach's Thousand-Year Blood War is posted as “Bleach - Sennen Kessen Hen - 48”. Discovery asked for the show's absolute number instead (414: the 366 episodes that came before the arc, plus 48), which appears on no release, and read the arc's name after the show's title as a different show entirely. Every release of the arc was turned away twice over, so the season could only be filled by hand however many trackers were searched. A release now matches when its name extends the show's title with the arc's name AND the number on the end is the episode you asked for — both, so the show's own episode 48 from 2004 is still never mistaken for the 48th of the arc." },
@@ -4070,6 +4075,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.4.1: filter the import browser",
+        description: "Picking a file to import meant scrolling the whole download folder. The Add-file browser now filters as you type - on the server as well as the page, so a folder past the listing cap stays searchable.",
+        features: [
+            "GET /api/video/import/browse takes ?q= and filters names BEFORE the entry cap: filtering only what survived the cap reports 'nothing matches' for a file that is sitting right there",
+            "one rule, both sides - every word of the query, anywhere in the name, in any order, case-insensitive",
+            "the page re-applies that rule to the payload it already holds, so typing is instant, and only re-asks the server (debounced) for a folder that came back truncated",
+            "the whole-folder import offer is counted before any filter: it describes the FOLDER, not the filtered view",
+            "Esc clears the filter ahead of the dialog's own handler, opening a folder resets it, and the count reads 'matched of total' from the server's own total",
+        ],
+        usage_note: "The filter covers the folder you are in, not its subfolders, and the import queue on the page is not filtered.",
+    },
     {
         title: "2.4.0: an arc's own episode numbering, and folders that don't claim an id",
         description: "A season that IS a story arc is numbered from 1 by the people posting it, which matched nothing we asked for - and an id tag whose id never resolved went into the folder name anyway.",
