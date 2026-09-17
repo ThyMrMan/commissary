@@ -151,8 +151,21 @@ def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_tit
     # Title gate first — applies to every scope. Rejects a confident title mismatch;
     # an unknown/unisolable title passes through to the scope/year checks below.
     if want_title:
-        from core.video.release_parse import extract_title, titles_match
-        if not titles_match(parsed.get("title"), want_title):
+        from core.video.release_parse import (arc_episode_match, arc_episode_number,
+                                              extract_title, titles_match)
+        # An arc's releases extend the show's title with the arc's name
+        # ('Bleach - Sennen Kessen Hen'), which reads here as a different show.
+        # The judgement is deferred to the episode branch below, which is where
+        # the arc's numbering has to agree and where a pack is turned away.
+        _arc = scope == "episode" and arc_episode_match(
+            parsed.get("title"), want_title, want_episode)
+        if not _arc and not titles_match(parsed.get("title"), want_title):
+            # The same show's arc, a different episode of it. Saying 'wrong title'
+            # here greys out every episode of an arc in the picker as though none
+            # of them were the show at all.
+            if scope == "episode" and arc_episode_number(
+                    parsed.get("title"), want_title) is not None:
+                return None, "Wrong episode"
             # want_title may be a whole alias set — render it readably rather than
             # letting a list repr ("wanted ['A', 'B']") reach the user.
             wanted = (want_title if isinstance(want_title, str)
@@ -183,6 +196,13 @@ def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_tit
                 from core.video.release_parse import has_absolute_episode
                 if has_absolute_episode(parsed.get("title"), want_absolute):
                     return None, None
+            # The arc's OWN numbering: a season that IS an arc counts from 1, so
+            # the number on the release is the season's episode number and the
+            # show's absolute (414 for Bleach S17E48) is written nowhere on it.
+            from core.video.release_parse import arc_episode_match
+            if not parsed.get("is_season_pack") and arc_episode_match(
+                    parsed.get("title"), want_title, want_episode):
+                return None, None
             # NOT "this is a pack" — the parser found no episode number at all.
             # The old wording ("Not a single episode") described a conclusion the
             # code never reached, and sent people off checking whether the file

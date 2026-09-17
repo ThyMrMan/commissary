@@ -565,6 +565,16 @@ def render_template(template: Any, values: dict, brace: Any = None) -> str:
     return out
 
 
+# '(tmdb-)' / '[tvdb-]' / '{imdb-}' -- an id tag left empty because its token
+# resolved to nothing. The Sonarr-style schemes write the brackets as LITERAL
+# text around the token ('(tmdb-{TmdbId})'), so unlike '{({Series Year})}' the
+# tag does not collapse with its id and the folder goes out claiming an id it
+# hasn't got -- which the media server then matches by guesswork. Only the EMPTY
+# form matches here; '(tmdb-30984)' is left exactly as written.
+_EMPTY_ID_TAG = re.compile(
+    r"[\(\[\{]\s*(?:tmdb|tvdb|imdb|tvmaze|anidb|tvrage)(?:id)?\s*-\s*[\)\]\}]", re.I)
+
+
 def _tidy_component(part: str) -> str:
     """Clean one path segment: drop a ' - ' left dangling by an empty token, remove
     empty ()/[] left by an empty $year, collapse whitespace, trim stray dashes and
@@ -574,6 +584,7 @@ def _tidy_component(part: str) -> str:
     spreads one bracket pair across two groups, so when only one survives the
     segment is left lopsided ('[EAC3' / ' 5.1]')."""
     p = naming_tokens.strip_orphan_brackets(part)
+    p = _EMPTY_ID_TAG.sub("", p)                 # '(tmdb-)' with no id in it
     p = re.sub(r"\s+-\s+(?=(\s|$))", " ", p)      # ' - ' before an empty token
     p = re.sub(r"\(\s*\)", "", p)                 # empty ( ) from a missing $year
     p = re.sub(r"\[\s*\]", "", p)

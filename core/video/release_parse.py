@@ -249,6 +249,17 @@ def extract_title(release_name: Any) -> str:
     AFTER the SxxExx, and cutting only at the year would leave numbering junk in the
     title. Returns '' when the title can't be isolated (e.g. a numeric-only title
     like '2012' with no release year)."""
+    return _spaces(_title_region(release_name))
+
+
+def _title_region(release_name: Any) -> str:
+    """The title portion of a release name exactly as written, separators intact.
+
+    ``extract_title`` is this with separators folded to spaces -- which is what a
+    reader wants and what every title comparison uses, but the fold destroys the
+    dash a fansub name glues its episode number onto ('... Hen - 48'), and that
+    dash is the only thing telling an episode number from a number that is part
+    of the name itself ('... Part 2')."""
     t = str(release_name or "").strip()
     if not t:
         return ""
@@ -261,7 +272,7 @@ def extract_title(release_name: Any) -> str:
         cut = m.start()
     if cut is None:
         cut = len(t)
-    return _spaces(t[:cut])
+    return t[:cut]
 
 
 def fansub_absolute_episode(release_name: Any):
@@ -300,6 +311,74 @@ def has_absolute_episode(release_name: Any, absolute: Any) -> bool:
     m = _META_BOUNDARY.search(t)
     head = _spaces(t[:m.start()] if m else t)
     return bool(re.search(r"(?<!\w)[Ee]?0*%d(?:v\d+)?(?!\w)" % n, head))
+
+
+# The episode number a fansub-style name glues onto the END of its title region
+# with a dash ('... - Sennen Kessen Hen - 48'). The dash is the whole signal: it
+# separates an episode number from a number that is part of the name itself
+# ('... - Part 2'), which must never read as an episode.
+_ARC_GLUED_NUM = re.compile(r"[-_\u2013\u2014]\s*0*(\d{1,4})(?:v\d+)?$")
+
+
+def arc_episode_match(release_name: Any, want_title: Any, want_episode: Any) -> bool:
+    """True when a release names a show's ARC and numbers this episode within it.
+
+    TVDB files a long-running anime as one season per arc, so a season's own
+    episode numbers are what that arc's releases carry: Bleach S17E48 ships as
+    '[SubsPlease] Bleach - Sennen Kessen Hen - 48'. The show's absolute number
+    (414 -- the 366 episodes before the arc, plus 48) appears nowhere on it, so
+    ``has_absolute_episode`` can only miss, and the arc subtitle reads as a
+    different show to the title gate. Between them those two rejected every
+    release of the arc, on every tracker that names them this way.
+
+    Two independent signals must agree, which is what keeps this off the show's
+    OWN episode 48 ('[SubsPlease] Bleach - 48', the 2004 run in absolute
+    numbering): the title must EXTEND an acceptable title with an arc subtitle,
+    and the number glued onto the end of the title region with a dash must be
+    the episode wanted. Accept-only -- a miss is never a rejection by itself.
+
+    The cost is a show whose name extends another's ('Bleach Rock Musical - 48'
+    against 'Bleach'): it has to carry the same episode number for the same
+    wanted show to land. Telling those apart by the subtitle alone is what scene
+    mappings exist for, and we have none.
+    """
+    try:
+        want = int(want_episode)
+    except (TypeError, ValueError):
+        return False
+    n = arc_episode_number(release_name, want_title)
+    return n is not None and n == want
+
+
+def arc_episode_number(release_name: Any, want_title: Any):
+    """The episode number an ARC-named release of this show carries, or None.
+
+    Both signals of ``arc_episode_match`` live here: the title must EXTEND an
+    acceptable title with the arc's name, and a number must be glued onto the end
+    of the title region with a dash. Returning the number rather than a verdict
+    is what lets a caller say 'wrong episode' about the arc's OTHER episodes
+    instead of rejecting them as a title that doesn't match.
+    """
+    wants = acceptable_titles(want_title)
+    if not wants:
+        return None
+    raw = str(release_name or "")
+    cands = [raw]
+    tagless = _LEADING_GROUP_TAG.sub("", raw, count=1)
+    if tagless != raw:
+        cands.append(tagless)
+    for cand in cands:
+        # _title_region, not extract_title: the latter folds dashes into spaces
+        # and the dash is the signal. A cut at a quality token can leave behind
+        # the bracket that introduced it.
+        head = _title_region(cand).strip().rstrip(" ([{")
+        m = _ARC_GLUED_NUM.search(head)
+        if not m:
+            continue
+        name = normalize_title(head[:m.start()])
+        if any(name != w and name.startswith(w + " ") for w in wants):
+            return int(m.group(1))
+    return None
 
 
 def normalize_title(s: Any) -> str:
@@ -406,5 +485,6 @@ def titles_match(release_name: Any, want_title: Any) -> bool:
     return not saw_any
 
 
-__all__ = ["parse_release", "extract_title", "normalize_title",
+__all__ = ["parse_release", "extract_title", "normalize_title", "arc_episode_match",
+           "arc_episode_number",
            "acceptable_titles", "titles_match", "has_absolute_episode"]

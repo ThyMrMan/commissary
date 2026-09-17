@@ -3491,6 +3491,13 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.4.0': [
+        { date: 'September 2026 · 2.4.0' },
+        { title: "An anime season that is a story arc now matches the releases people post", desc: "a long-running anime is filed one season per arc, and the arc's releases count from 1 within it — the 48th episode of Bleach's Thousand-Year Blood War is posted as “Bleach - Sennen Kessen Hen - 48”. Discovery asked for the show's absolute number instead (414: the 366 episodes that came before the arc, plus 48), which appears on no release, and read the arc's name after the show's title as a different show entirely. Every release of the arc was turned away twice over, so the season could only be filled by hand however many trackers were searched. A release now matches when its name extends the show's title with the arc's name AND the number on the end is the episode you asked for — both, so the show's own episode 48 from 2004 is still never mistaken for the 48th of the arc." },
+        { title: "“Wrong title” no longer means “wrong episode”", desc: "a manual search greys out what it turned away and says why, and every release of an arc was greyed out as a title that doesn't match the show: a screenful of the right show, each row claiming to be something else. When it is the show you asked for and only the number differs, the reason now reads “Wrong episode” — which is also what the filter above the list goes by." },
+        { title: "A folder no longer claims an id it hasn't got", desc: "the naming templates write an id tag's brackets as plain text around the token — “(tmdb-{TmdbId})” — so an episode grabbed before its show had an id landed in a folder called “Bleach (tmdb-)”. Your media server then has only the name to match on, and can file the same show twice in two libraries. An id tag with nothing in it is now dropped from the name; one with an id in it is left exactly as written." },
+        { title: "…and what still doesn't", desc: "a show already split across two library entries stays split — this stops new ones, it doesn't merge what is already there. Searches still ask for an anime by its absolute number, so a tracker that answers only an arc's own numbering may still return little. And a Library restricted to particular trackers still searches those alone, which looks exactly like “no releases exist”." },
+    ],
     '2.3.9': [
         { date: 'September 2026 · 2.3.9' },
         { title: "Tracks discovery can't match now come with suggestions", desc: "when no candidate was good enough, playlist discovery made a Wing It guess and threw away everything else it had found, so fixing the track meant searching again from scratch. It now keeps the best few near misses with the track — saved with a mirrored playlist, and kept by the Playlist Pipeline too. A row shows its top suggestion with an Accept button, “✓ Accept all” takes every suggestion at or above the “Accept suggestions ≥” percentage you set, the Fix dialog lists them straight away, and the Wing It Pool offers the same." },
@@ -4063,6 +4070,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.4.0: an arc's own episode numbering, and folders that don't claim an id",
+        description: "A season that IS a story arc is numbered from 1 by the people posting it, which matched nothing we asked for - and an id tag whose id never resolved went into the folder name anyway.",
+        features: [
+            "core/video/release_parse.arc_episode_number: an arc release matches when its title EXTENDS an acceptable title and a dash-glued number ends the title region - two signals, so a show's own absolute 48 is never the arc's 48th",
+            "_title_region splits the cut out of extract_title, which folds separators to spaces and so destroyed the dash the rule reads",
+            "quality_eval._scope_ok: the title gate defers to the arc rule rather than loosening title matching for everything; the episode branch accepts the arc's number once want_absolute has missed; a season pack is still turned away",
+            "an arc release of a different episode is rejected as 'Wrong episode', not 'Wrong title' - the manual picker's filter reads that reason",
+            "organization._tidy_component drops an EMPTY id tag in any bracket shape ('(tmdb-)', '[tvdb-]', '{imdb-}'); a tag with an id in it is untouched",
+        ],
+        usage_note: "Nothing to change. A show already split across two library entries stays split - this prevents new ones. A Library restricted to particular trackers still searches only those.",
+    },
     {
         title: "2.3.9: discovery suggestions, exact ISRC matches, and a Fix dialog that searches everywhere",
         description: "Discovery keeps its near misses to accept, matches mirrored Qobuz tracks by ISRC, and fixes a playlist from one keyboard-driven Review dialog that asks every metadata source at once - plus fixes, removals and counts that were quietly lost.",
