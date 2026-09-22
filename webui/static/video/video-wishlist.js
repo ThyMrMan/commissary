@@ -1053,17 +1053,22 @@
     }
 
     // Manual pick — open the shared release-picker modal (VideoDownload.manualSearch,
-    // the exact modal the detail page uses). No media context is passed: like a
-    // tmdb-only item on the detail page, the grab lands as a plain download+import.
+    // the exact modal the detail page uses). Every pick button carries the title's
+    // TMDB id, and it rides along as the media context: the backend needs it for the
+    // alias set, the user's own AKA titles and the air-date/absolute hints. Without
+    // it a wishlist pick searched by one title with no hints at all — the opposite
+    // of what the wishlist's own drain does with the very same episode.
     function doPick(btn) {
         if (!window.VideoDownload || !VideoDownload.manualSearch) {
             if (typeof showToast === 'function') showToast('Manual search unavailable', 'error');
             return;
         }
         var scope = btn.getAttribute('data-vwsh-pick');
+        var tmdb = btn.getAttribute('data-tmdb') || null;
         if (scope === 'movie') {
             VideoDownload.manualSearch({
                 title: btn.getAttribute('data-title') || '', scope: 'movie',
+                mediaId: tmdb, mediaSource: 'tmdb',
                 year: btn.getAttribute('data-year') || null,
                 poster: btn.getAttribute('data-poster') || null });
             return;
@@ -1071,6 +1076,7 @@
         var sh = state.showData[parseInt(btn.getAttribute('data-tmdb'), 10)] || {};
         VideoDownload.manualSearch({
             title: sh.title || '', scope: scope,
+            mediaId: tmdb, mediaSource: 'tmdb',
             season: parseInt(btn.getAttribute('data-s'), 10),
             episode: btn.hasAttribute('data-e') ? parseInt(btn.getAttribute('data-e'), 10) : null,
             year: sh.year || null, poster: sh.poster_url || null });

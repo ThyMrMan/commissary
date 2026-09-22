@@ -381,6 +381,19 @@ def arc_episode_number(release_name: Any, want_title: Any):
     return None
 
 
+def compared_title(release_name: Any) -> str:
+    """The title ``titles_match`` actually compares — ``extract_title`` once a
+    leading fansub/group tag is off the front.
+
+    The rejection reason used to print the raw extraction, tag and all
+    ('SubsPlease Re:ZERO'), while the matcher had stripped that tag before
+    comparing anything. It reads as though the group name were part of the title
+    the release claims, and it sends people off adding the group name to the
+    show's AKA titles — an alias that cannot ever help, because the tag never
+    reached the comparison in the first place."""
+    return extract_title(_LEADING_GROUP_TAG.sub("", str(release_name or ""), count=1))
+
+
 def normalize_title(s: Any) -> str:
     """Fold a title to a comparable key: strip accents, lowercase, '&'→'and',
     punctuation → space, drop a single leading article. 'The Dark Knight' and
@@ -485,6 +498,7 @@ def titles_match(release_name: Any, want_title: Any) -> bool:
     return not saw_any
 
 
-__all__ = ["parse_release", "extract_title", "normalize_title", "arc_episode_match",
+__all__ = ["parse_release", "extract_title", "compared_title", "normalize_title",
+           "arc_episode_match",
            "arc_episode_number",
            "acceptable_titles", "titles_match", "has_absolute_episode"]

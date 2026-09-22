@@ -1245,7 +1245,20 @@ def register_routes(bp):
 
         import json as _json
         from core.video.slskd_search import build_query
-        ctx = body.get("search_ctx") if isinstance(body.get("search_ctx"), dict) else {}
+        ctx = dict(body.get("search_ctx") if isinstance(body.get("search_ctx"), dict) else {})
+        # The episode hints, filled in HERE rather than trusted from the client.
+        # The unattended paths write air_date + absolute into the context they
+        # build, and the importer's numbering gate reads them back; a grab from
+        # the picker carried neither, so a release named by air date or by the
+        # show's absolute number passed the search and was then turned away at
+        # import as the wrong episode. The client cannot know either number —
+        # the server looks them up from the same episode rows the search used.
+        if str(ctx.get("scope") or "").lower() == "episode":
+            _hint_date, _hint_abs = _episode_hints(db, body, ctx.get("season"), ctx.get("episode"))
+            if _hint_date and not ctx.get("air_date"):
+                ctx["air_date"] = _hint_date
+            if _hint_abs and not ctx.get("absolute"):
+                ctx["absolute"] = _hint_abs
         _prof, _pid = _profile_for_request(db, body)
         common = {
             "kind": str(body.get("kind") or "movie"), "title": body.get("title"),

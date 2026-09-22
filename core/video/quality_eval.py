@@ -140,6 +140,30 @@ def tier_key(source, resolution) -> str:
     return (pre + "-" + resolution) if resolution else ""
 
 
+# How many wanted titles a rejection spells out before it starts counting.
+# A handful of aliases is worth reading — seeing that 'Sur Ecoute' was tried
+# answers the question on its own. A well-travelled show's alias set is the
+# primary title plus every TMDB alternative, thirty names in a dozen scripts,
+# and all of them joined buries the one name the user would recognise.
+_WANTED_SPELLED_OUT = 3
+
+
+def _wanted_text(want_title) -> str:
+    """The wanted side of a title rejection, in a form a person can read.
+
+    A list repr ("wanted ['A', 'B']") must never reach the user, and neither
+    should thirty titles: the ones that fit are named, the rest are counted."""
+    if isinstance(want_title, str):
+        return want_title
+    names = [str(t) for t in (want_title or []) if t]
+    if not names:
+        return "?"
+    if len(names) <= _WANTED_SPELLED_OUT:
+        return " / ".join(names)
+    return "%s (+%d more)" % (" / ".join(names[:_WANTED_SPELLED_OUT]),
+                              len(names) - _WANTED_SPELLED_OUT)
+
+
 def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_title=None,
               want_date=None, want_absolute=None):
     """Validate a hit actually matches what was searched (Sonarr/Radarr-style): the
@@ -152,7 +176,7 @@ def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_tit
     # an unknown/unisolable title passes through to the scope/year checks below.
     if want_title:
         from core.video.release_parse import (arc_episode_match, arc_episode_number,
-                                              extract_title, titles_match)
+                                              compared_title, titles_match)
         # An arc's releases extend the show's title with the arc's name
         # ('Bleach - Sennen Kessen Hen'), which reads here as a different show.
         # The judgement is deferred to the episode branch below, which is where
@@ -166,12 +190,8 @@ def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_tit
             if scope == "episode" and arc_episode_number(
                     parsed.get("title"), want_title) is not None:
                 return None, "Wrong episode"
-            # want_title may be a whole alias set — render it readably rather than
-            # letting a list repr ("wanted ['A', 'B']") reach the user.
-            wanted = (want_title if isinstance(want_title, str)
-                      else " / ".join(str(t) for t in want_title if t))
             return None, "Wrong title (%s — wanted %s)" % (
-                extract_title(parsed.get("title")) or "?", wanted)
+                compared_title(parsed.get("title")) or "?", _wanted_text(want_title))
     season, episode = parsed.get("season"), parsed.get("episode")
     if scope == "movie":
         if season is not None:
@@ -220,6 +240,17 @@ def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_tit
         ep_end = parsed.get("episode_end") or episode
         if want_episode is not None and not (episode <= want_episode <= ep_end):
             if want_date and parsed.get("air_date") == want_date:
+                return None, None
+            # Scene/indexer ABSOLUTE numbering: an anime tracker writes the show's
+            # absolute number into the SxxExx it synthesises — Re:ZERO S4E16 ships
+            # as 'Season 4 S04E82 - 82', 82 being the 66 episodes before season 4
+            # plus 16. The season is right and only the counter differs, so the
+            # numbering check above turns away the very episode that was asked for.
+            # Both signals have to agree before this accepts: the season check
+            # above has already passed, and the number IS the absolute computed
+            # for the episode asked for — never merely close to it, and never a
+            # guess when the show's absolute numbering is unknown (None).
+            if want_absolute and episode <= want_absolute <= ep_end:
                 return None, None
             return None, "Wrong episode"
         return None, None

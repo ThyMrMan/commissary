@@ -3491,6 +3491,13 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.4.2': [
+        { date: 'September 2026 · 2.4.2' },
+        { title: "Manual search knows which show you are searching for", desc: "picking a release by hand searched by the show's name alone. It never passed on WHICH title it was — so it had none of the show's other names, no air date, no absolute episode number, none of your own “also known as” titles, and it ignored the Library's tracker choice and quality profile. That is why a release could be turned away as the wrong title when the name it carried is one TMDB lists for the show, and why typing that name in as an AKA changed nothing: the AKA is looked up from an identity the search never sent. Every way in — an episode row, a season, the Get modal, the wishlist's pick button — now sends it." },
+        { title: "Anime releases numbered by absolute episode", desc: "anime trackers write the show's ABSOLUTE number into the SxxExx they build: Re:ZERO S4E16 arrives as “Season 4 S04E82 - 82”, 82 being the 66 episodes before season 4 plus 16. The season was right and only the counter differed, so the search called it the wrong episode — and a copy grabbed by hand anyway was refused again on import with “Release is S04E82, not the episode requested”. Both now accept it when the season agrees AND the number is exactly the absolute for the episode you asked for. A grab also records the air date and absolute number it was judged by, so the import reads the same facts the search did — which is what the {absolute} naming token needed too." },
+        { title: "“Wrong title” names the title that was compared", desc: "the reason printed the release name's title with the release group still on the front (“SubsPlease Re:ZERO”), while the matcher had already stripped that tag before comparing — so it named a title nothing was ever judged against, and reads as an invitation to add the group's name to the show's AKAs, which cannot help. It now shows what was actually compared. The wanted side spells out up to three titles and counts the rest, instead of running a show's thirty TMDB aliases into one line." },
+        { title: "API keys no longer reach the log file", desc: "a failed call to a keyed API wrote its whole URL into the log, key and all, because the key travels in the query string and the error carries the URL. Redaction now happens where every line is finished — the traceback included, which is where they were escaping — so values become *** while their names stay, and a line that merely reports whether a credential is configured keeps saying so. Logs written before this update still contain them: rotate any key that has been in one." },
+    ],
     '2.4.1': [
         { date: 'September 2026 · 2.4.1' },
         { title: "Search the folder you're importing from, instead of scrolling it", desc: "picking a file on the Import page meant scrolling a download folder that can hold hundreds of entries. “Add file…” now has a filter box: type any part of a name and the folders and files narrow as you type, with a count of how many are left. Several words match in any order — “bleach 48” finds “Bleach - Sennen Kessen Hen - 48” — and case doesn't matter. Esc clears the filter without closing the dialog, and opening a folder starts you fresh. A folder too big to list in one go is searched on the server, so what you're after is found even when it was never on screen to scroll to." },
@@ -4075,6 +4082,18 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.4.2: the manual picker knows what it is searching for",
+        description: "A manual search passed no media identity, so it ran with one title, no episode hints and no Library. Fixed at all four entry points, along with the absolute-numbered releases that were turned away even once it did.",
+        features: [
+            "media_id + media_source now travel together and AGREE - the show search sent its TMDB id labelled 'library', a row id that does not exist, and the manual-search overlay sent no pair at all",
+            "an indexer's SxxExx that carries the show's ABSOLUTE number is accepted by the search AND the importer, when the season agrees and the number is exactly that episode's absolute",
+            "a grab records the air date and absolute number in its search context, so the importer judges by what the search judged by (and {absolute} finally renders)",
+            "'Wrong title' names the title the matcher compared, group tag stripped, and lists at most three wanted titles before counting",
+            "credential values are redacted from every log line, traceback included, with their names kept",
+        ],
+        usage_note: "Manual searches now honour the Library's tracker selection, so an anime title searches the anime tracker only. Logs written before this update still hold any key they leaked.",
+    },
     {
         title: "2.4.1: filter the import browser",
         description: "Picking a file to import meant scrolling the whole download folder. The Add-file browser now filters as you type - on the server as well as the page, so a folder past the listing cap stays searchable.",

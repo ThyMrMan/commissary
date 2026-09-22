@@ -112,6 +112,10 @@ def _ctx(dl: dict) -> dict:
         "episode": sc.get("episode"),
         "episode_title": sc.get("episode_title"),
         "air_date": sc.get("air_date"),
+        # The show's absolute episode number. Carried for the numbering gate below
+        # (an indexer's SxxExx often IS the absolute) and for the {absolute} naming
+        # token, which read it from this dict and so was always empty.
+        "absolute": sc.get("absolute"),
     }
 
 
@@ -241,7 +245,15 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
                                 and parsed.get("episode") <= ctx.get("episode") <= span_end)
                 date_ok = bool(ctx.get("air_date")
                                and parsed.get("air_date") == ctx.get("air_date"))
-                if not numbering_ok and not date_ok:
+                # An anime tracker's synthesised SxxExx carries the show's ABSOLUTE
+                # number ('S04E82' for the episode filed as S4E16), so the file the
+                # search accepted arrives here looking like the wrong episode. Same
+                # two signals the search gate uses: the season agrees and the number
+                # is exactly the absolute computed for the episode requested.
+                absolute_ok = bool(ctx.get("absolute")
+                                   and parsed.get("season") == ctx.get("season")
+                                   and parsed.get("episode") <= ctx.get("absolute") <= span_end)
+                if not numbering_ok and not date_ok and not absolute_ok:
                     return _reject("Release is S%02dE%02d, not the episode requested"
                                    % (parsed.get("season") or 0, parsed.get("episode") or 0))
     else:

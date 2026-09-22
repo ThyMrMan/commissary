@@ -494,6 +494,24 @@
 
     // Start a search; for Soulseek, stream results in (poll like the music side —
     // results trickle in over ~30s, so a single short wait misses them).
+    // The (id, source) pair that says WHICH title is being searched. The two have
+    // to agree: 'library' means a shows/movies ROW id, 'tmdb' means a TMDB id, and
+    // the backend resolves the alias set, the user's own AKA titles, the air-date
+    // and absolute-number hints, the series type and the Library's tracker list
+    // from that pair. Show state (_dl) keeps the row id on `mediaId` and the TMDB
+    // id on `tvId`; movie state (_opts) keeps whichever it has on `id`, with
+    // `source` saying which. Reading `id` and falling back to `tvId` while taking
+    // the source from `source` sent a TMDB id labelled 'library' for every show
+    // search -- a row id that does not exist, so the lookup answered nothing and
+    // the search ran with one title, no hints and no Library.
+    function mediaRef(ident) {
+        ident = ident || {};
+        if (ident.mediaId != null) return { id: ident.mediaId, source: ident.mediaSource || ident.source || 'library' };
+        if (ident.id != null) return { id: ident.id, source: ident.source || 'library' };
+        if (ident.tvId != null) return { id: ident.tvId, source: 'tmdb' };
+        return null;
+    }
+
     function searchInto(container, resultsEl, params, triggerRows, onDone) {
         if (!resultsEl) return;
         // Per-Library tracker preference (multi-library torrent preferences):
@@ -507,11 +525,10 @@
         // it, a release carrying no SxxExx is rejected as having no episode
         // number, and an alias-named release as a wrong title. Shows keep their
         // state on _dl, movies on _opts.
-        var ident = (container && (container._opts || container._dl)) || {};
-        var mid = ident.id != null ? ident.id : ident.tvId;
-        if (mid != null && params.media_id == null) {
-            params.media_id = mid;
-            params.media_source = ident.source || 'library';
+        var ref = mediaRef((container && (container._opts || container._dl)) || {});
+        if (ref && params.media_id == null) {
+            params.media_id = ref.id;
+            params.media_source = ref.source;
         }
         triggerRows = (triggerRows || []).filter(Boolean);
         if (resultsEl._poll) { clearTimeout(resultsEl._poll); resultsEl._poll = null; }
@@ -1419,7 +1436,13 @@
             }).join('');
             srcs.forEach(function (s) {
                 var res = body.querySelector('[data-vms-results-for="' + s + '"]');
-                searchInto(ov, res, { scope: scope, title: opts.title, season: opts.season,
+                // `body`, not `ov`: _opts is set on the body element above, and
+                // searchInto reads the media identity off the container it is
+                // handed. Passing the overlay handed it an element carrying no
+                // identity at all, so every manual search -- the one place a user
+                // goes when the automatic one got it wrong -- ran without the
+                // show's aliases, its AKAs or its episode hints.
+                searchInto(body, res, { scope: scope, title: opts.title, season: opts.season,
                     year: opts.year || null,   // movies search title+year (same as the get-modal)
                     episode: (scope === 'episode' ? opts.episode : null), source: s }, []);
             });

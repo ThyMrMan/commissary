@@ -3013,8 +3013,12 @@
     // and lets you pick any release (single episode or season pack).
     function _openManualSearch(scope, en) {
         if (!window.VideoDownload || !window.VideoDownload.manualSearch || !data) return;
+        // The id goes out whatever the source is; `mediaSource` is what tells the
+        // backend how to read it ('tmdb' = a TMDB id, anything else = a library row
+        // id). Withholding it for tmdb-sourced pages cost them the alias set and the
+        // episode hints -- the case with nothing on disk to fall back on.
         VideoDownload.manualSearch({ title: data.title, scope: scope, season: selectedSeason, episode: en,
-            mediaId: (data.source !== 'tmdb' ? data.id : null), mediaSource: data.source, year: data.year, poster: _showPoster() });
+            mediaId: data.id, mediaSource: data.source, year: data.year, poster: _showPoster() });
     }
     function manualSearchEpisode(btn) { _openManualSearch('episode', parseInt(btn.getAttribute('data-vd-ep-search'), 10)); }
     function manualSearchSeason() { _openManualSearch('season'); }
