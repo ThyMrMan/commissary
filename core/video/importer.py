@@ -33,7 +33,7 @@ from core.video.download_pipeline import basename_of
 logger = get_logger("video.importer")
 from core.video.library_paths import quality_full
 from core.video.quality_eval import resolution_rank
-from core.video.release_parse import parse_release
+from core.video.release_parse import fansub_absolute_episode, parse_release
 
 VIDEO_EXTS = frozenset({
     ".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".wmv",
@@ -559,10 +559,55 @@ def pack_members(src_dir: str, lister: Callable, *, size_of: Callable | None = N
         if is_sample(name, (size_of(path) if size_of else 0)):
             continue
         p = parse_release(name)
-        if p.get("episode") is None or p.get("season") is None:
+        if p.get("episode") is not None and p.get("season") is not None:
+            out.append({"path": path, "season": p["season"], "episode": p["episode"],
+                        "episode_end": p.get("episode_end") or p["episode"], "parsed": p})
             continue
-        out.append({"path": path, "season": p["season"], "episode": p["episode"],
-                    "episode_end": p.get("episode_end") or p["episode"], "parsed": p})
+        # Fansub numbering: a leading group tag and a bare number glued on with a
+        # dash — '[GHOST] Nana - 01 [BD 1080p]'. That number is the show's ABSOLUTE
+        # episode, and nothing in the name says which season it falls in, so the
+        # member is kept with season None and resolved against the chosen show
+        # when it is placed (``resolve_absolute_members``). Dropping these made a
+        # whole BD release folder look like it held no episodes at all.
+        absolute = fansub_absolute_episode(name)
+        if absolute:
+            out.append({"path": path, "season": None, "episode": absolute,
+                        "episode_end": absolute, "absolute": absolute, "parsed": p})
+    out.sort(key=lambda m: (m["season"] is None, m["season"] or 0, m["episode"]))
+    return out
+
+
+def resolve_absolute_members(members: list, *, identity: dict | None = None,
+                             season: int | None = None) -> list:
+    """Give absolute-numbered pack members a real (season, episode).
+
+    In order of trust:
+      1. the chosen show's own episode list — the Nth aired episode, specials
+         excluded, IS absolute N, which is how a 2-season BD box files correctly;
+      2. a season the user typed in, read as 'these are that season's episodes';
+      3. season 1, where the absolute number and the episode number are the same
+         thing by definition — the same derivation manual search already uses.
+    A member the show's list cannot place (numbered past its last known episode)
+    falls through to the next rule rather than being dropped.
+    """
+    order = []
+    eps = (identity or {}).get("episodes") or {}
+    if eps:
+        order = sorted(k for k in eps if isinstance(k, tuple) and len(k) == 2
+                       and k[0] is not None and k[0] >= 1)
+    out = []
+    for m in members:
+        if m.get("season") is not None or not m.get("absolute"):
+            out.append(m)
+            continue
+        a = m["absolute"]
+        if 0 < a <= len(order):
+            s, e = order[a - 1]
+        elif season is not None:
+            s, e = season, a
+        else:
+            s, e = 1, a
+        out.append({**m, "season": s, "episode": e, "episode_end": e})
     out.sort(key=lambda m: (m["season"], m["episode"]))
     return out
 
@@ -633,6 +678,12 @@ def run_season_import(dl: dict, src_dir: str, *, fs: Any, lister: Callable,
             renumber = int(override["season"])
         except (TypeError, ValueError):
             renumber = None
+    # Absolute-numbered members get their season/episode from the chosen show
+    # first. A season the user typed for such a pack says where its episodes go,
+    # so it seeds the resolution instead of renumbering on top of it.
+    if any(m.get("season") is None for m in members):
+        members = resolve_absolute_members(members, identity=identity, season=renumber)
+        renumber = None
     if renumber is not None:
         _seasons = sorted({m["season"] for m in members})
         if len(_seasons) > 1:

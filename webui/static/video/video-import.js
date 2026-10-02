@@ -534,8 +534,10 @@
         // them would file their episodes at the same paths.
         var one = p.seasons && p.seasons.length === 1;
         var rows = (p.items || []).map(function (i) {
-            return '<div class="vimp-pack-row"><span class="vimp-pack-se">S' + pad2(i.season) +
-                'E' + pad2(i.episode) + '<span class="vimp-pack-moved" data-vimp-pack-to="' +
+            // An absolute-numbered file has no season until the show is known.
+            var se = i.season == null ? '#' + pad2(i.episode) : 'S' + pad2(i.season) + 'E' + pad2(i.episode);
+            return '<div class="vimp-pack-row"><span class="vimp-pack-se">' + se +
+                '<span class="vimp-pack-moved" data-vimp-pack-to="' +
                 esc(i.episode) + '"></span></span><span class="vimp-pack-name">' +
                 esc(i.name) + '</span></div>';
         }).join('');
@@ -551,7 +553,12 @@
                 : '');
         return '<div class="vimp-pack-head">' + p.count + ' episode' + (p.count === 1 ? '' : 's') +
             ' will be imported' + (one ? ' (season ' + esc(p.seasons[0]) + ')' : '') +
-            '. Each file keeps its own episode number.</div>' + ctl +
+            '. Each file keeps its own episode number.</div>' +
+            (p.absolute ? '<div class="vimp-pack-msg">' + p.absolute + ' file' +
+                (p.absolute === 1 ? ' is' : 's are') + ' numbered by absolute episode (#01, #02…). ' +
+                'Each one is filed by its position in the show you pick, so a set spanning ' +
+                'several seasons lands in the right ones; without a known episode list it goes ' +
+                'to the season you enter, or season 1.</div>' : '') + ctl +
             '<div class="vimp-pack-list">' + rows + '</div>' +
             (p.truncated ? '<div class="vimp-pack-msg">…and more.</div>' : '');
     }
@@ -587,7 +594,8 @@
             .then(function (d) {
                 if (state.resolve !== r) return;      // dialog closed or moved on
                 r.pack = d && d.success
-                    ? { count: d.count, seasons: d.seasons, items: d.items, truncated: d.truncated }
+                    ? { count: d.count, seasons: d.seasons, absolute: d.absolute || 0,
+                        items: d.items, truncated: d.truncated }
                     : { count: 0, items: [], error: (d && d.error) || 'Could not read that folder.' };
                 renderModal();
             })

@@ -197,7 +197,7 @@ def register_routes(bp):
         itself uses), so nothing offered here can be rejected on the next step."""
         from . import get_video_db
         from core.video.importer import is_video
-        from core.video.release_parse import parse_release
+        from core.video.release_parse import fansub_absolute_episode, parse_release
 
         db = get_video_db()
         shortcuts = _browse_shortcuts(db)
@@ -242,10 +242,15 @@ def register_routes(bp):
         # would only take away the per-episode identity fields.
         pack_seasons, pack_count = set(), 0
         for f in files:
-            p = parse_release(os.path.splitext(f["name"])[0])
+            stem = os.path.splitext(f["name"])[0]
+            p = parse_release(stem)
             if p.get("episode") is not None and p.get("season") is not None:
                 pack_count += 1
                 pack_seasons.add(p["season"])
+            elif fansub_absolute_episode(stem):
+                # '[GHOST] Nana - 01 [BD …]': an episode by absolute number. It
+                # counts toward the offer; its season is worked out at placement.
+                pack_count += 1
         # ``q`` narrows the listing BEFORE the cap. A folder with more entries
         # than the cap is exactly the one worth searching, and filtering only
         # what survived the cap would report "nothing matches" for a file that
@@ -313,7 +318,7 @@ def register_routes(bp):
 
         name = os.path.basename(path.rstrip(os.sep)) or path
         if is_dir:
-            seasons = sorted({m["season"] for m in members})
+            seasons = sorted({m["season"] for m in members if m["season"] is not None})
             guess = {"scope": "season",
                      # One season → pre-fill it. Mixed (a full-series pack) stays
                      # blank rather than picking one arbitrarily; the files carry
@@ -351,8 +356,12 @@ def register_routes(bp):
         if not path or not os.path.isdir(path):
             return jsonify({"success": False, "error": "Not a folder."}), 404
         members = _pack_members_at(path)
+        # Absolute-numbered members ('[GHOST] Nana - 01') have no season until a
+        # show is chosen, so they are counted apart rather than shown as season None.
         return jsonify({"success": True, "count": len(members),
-                        "seasons": sorted({m["season"] for m in members}),
+                        "seasons": sorted({m["season"] for m in members
+                                           if m["season"] is not None}),
+                        "absolute": sum(1 for m in members if m["season"] is None),
                         "items": [{"season": m["season"], "episode": m["episode"],
                                    "name": os.path.basename(m["path"])}
                                   for m in members[:_PACK_PREVIEW_LIMIT]],

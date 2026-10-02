@@ -3491,6 +3491,10 @@ const WHATS_NEW = {
     // That is deliberate — it is the same app's own history. References to
     // UPSTREAM, however, must keep saying SoulSync, or the changelog starts
     // claiming this fork wrote the thing it forked.
+    '2.4.3': [
+        { date: 'October 2026 · 2.4.3' },
+        { title: "Import a whole folder of fansub-numbered episodes", desc: "a release folder named like “[GHOST] Nana (BD 1080p …)” holds files such as “[GHOST] Nana - 01 [BD 1080p]”: the group's tag and the show's overall episode number, with no season anywhere. The Import page only counted files that name a season and an episode, so it decided the folder held no episodes and never offered “Import folder” — leaving no way to import the show in one go. Those files now count. When you place the folder, each one is filed by its position in the show you pick, so a box set that runs across two seasons lands in both; with no episode list to go by, it goes to the season you enter, or season 1. The preview lists them as #01, #02… until then." },
+    ],
     '2.4.2': [
         { date: 'September 2026 · 2.4.2' },
         { title: "Manual search knows which show you are searching for", desc: "picking a release by hand searched by the show's name alone. It never passed on WHICH title it was — so it had none of the show's other names, no air date, no absolute episode number, none of your own “also known as” titles, and it ignored the Library's tracker choice and quality profile. That is why a release could be turned away as the wrong title when the name it carried is one TMDB lists for the show, and why typing that name in as an AKA changed nothing: the AKA is looked up from an identity the search never sent. Every way in — an episode row, a season, the Get modal, the wishlist's pick button — now sends it." },
@@ -4082,6 +4086,16 @@ const WHATS_NEW = {
 // Section shape: { title, description, features: [bullet strings],
 //                  usage_note?: 'optional hint shown at the bottom' }
 const VERSION_MODAL_SECTIONS = [
+    {
+        title: "2.4.3: absolute-numbered folders import as a pack",
+        description: "A folder of '[Group] Show - 01' files had no season on any name, so the pack scan found nothing and the Import page never offered the whole folder.",
+        features: [
+            "pack_members keeps fansub absolute-numbered files (leading group tag + '- NN') as members with no season yet",
+            "placement resolves each one through the chosen show's episode list - the Nth aired episode, specials excluded, is absolute N - then a typed season, then season 1",
+            "the browse offer, the add step and the pack preview all count them; a folder mixing both namings no longer crashes add or preview",
+        ],
+        usage_note: "The leading [Group] tag is required, so a film named 'Title - 2' is still never read as an episode.",
+    },
     {
         title: "2.4.2: the manual picker knows what it is searching for",
         description: "A manual search passed no media identity, so it ran with one title, no episode hints and no Library. Fixed at all four entry points, along with the absolute-numbered releases that were turned away even once it did.",
