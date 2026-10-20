@@ -618,6 +618,15 @@ def _require_login_enabled():
         return _last_known_require_login
 
 
+# Commissary: CSRF guard. Before the auth gates, so a cross-site probe is refused
+# as cross-site rather than learning whether it would have needed to log in.
+def _commissary_has_valid_api_key():
+    from api.auth import request_has_valid_api_key
+    return request_has_valid_api_key()
+from core.commissary.csrf import make_guard as _make_csrf_guard
+app.before_request(_make_csrf_guard(config_manager.get, _commissary_has_valid_api_key, logger))
+
+
 # --- API key scope (before_request hook) ---
 # Registered ahead of the login / launch-PIN / profile gates on purpose: each of
 # them waves a valid key through, so a read-scope key has to be held to its
