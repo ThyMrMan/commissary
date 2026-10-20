@@ -669,12 +669,16 @@ def _search_one_source(source: str, item: Dict[str, Any], media_type: str):
         hits = res.get("hits") or []
     elif source in ("torrent", "usenet"):
         from core.video.prowlarr_search import prowlarr_search
+        # Commissary: limited to the title's video Library's trackers, if it has any
+        from core.commissary.video_libraries import search_indexer_ids
+        lib_ids = search_indexer_ids(get_video_db(), media_type, item=item)
         pres = prowlarr_search(ctx["scope"], ctx["title"], year=ctx.get("year"),
                                season=ctx.get("season"), episode=ctx.get("episode"), source=source,
                                air_date=ctx.get("air_date"), absolute=ctx.get("absolute"),
                                series_type=ctx.get("series_type"),
                                imdb_id=ctx.get("imdb_id"), tmdb_id=ctx.get("tmdb_id"),
-                               tvdb_id=ctx.get("tvdb_id"), alt=ctx_alt(ctx))
+                               tvdb_id=ctx.get("tvdb_id"), alt=ctx_alt(ctx),
+                               **({"indexer_ids": lib_ids} if lib_ids else {}))
         prowlarr_err = None
         if not pres.get("configured"):
             prowlarr_err = "Prowlarr not configured"

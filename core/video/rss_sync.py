@@ -323,6 +323,9 @@ def _rank(pool: List[Dict[str, Any]], item: Dict[str, Any], media_type: str) -> 
     from core.video.numbering import ctx_alt
     from core.video.quality_profile import load_for_item
     ctx = search_context(item, media_type)
+    # Commissary: only releases from the title's video Library's trackers
+    from core.commissary.video_libraries import filter_hits, search_indexer_ids
+    pool = filter_hits(pool, search_indexer_ids(get_video_db(), media_type, item=item))
     cands = _evaluate_hits(pool, load_for_item(get_video_db(), item), ctx["scope"],
                            ctx.get("season"), ctx.get("episode"),
                            want_year=ctx.get("year"),

@@ -159,11 +159,16 @@ def _torrent_lane_hits(body, scope, title, want_season, want_episode, source):
     # shared Prowlarr budget (core.prowlarr_throttle). The background wishlist
     # drain queues happily; a manual search should say "busy, try again" rather
     # than hold a request worker while the drain empties the window.
+    # Commissary: limited to the title's video Library's trackers, if it has any
+    from . import get_video_db as _vlib_db
+    from core.commissary.video_libraries import search_indexer_ids
+    lib_ids = search_indexer_ids(_vlib_db(), "movie" if scope == "movie" else "show", body=body)
     pres = prowlarr_search(scope, title, year=body.get("year"),
                            season=want_season, episode=want_episode, source=source,
                            max_wait_seconds=MANUAL_SEARCH_MAX_WAIT_SECONDS,
                            indexer_names=_basic_indexer_names(body),
-                           **_external_ids(body))
+                           **_external_ids(body),
+                           **({"indexer_ids": lib_ids} if lib_ids else {}))
     prowlarr_error = None
     if not pres.get("configured"):
         prowlarr_error = ("Prowlarr isn't configured — set its URL + key on "

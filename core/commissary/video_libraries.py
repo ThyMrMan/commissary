@@ -314,6 +314,40 @@ def indexer_ids(db, kind, **kw) -> list | None:
     return [int(x) for x in ids.split(",")] if ids else None
 
 
+def search_indexer_ids(db, kind, *, item=None, body=None) -> list | None:
+    """Prowlarr indexers a search for this title is limited to, or None.
+
+    Only a library the title actually belongs to (or was sent to) restricts its
+    search. Unlike filing, an unassigned title does NOT inherit the primary
+    library's trackers: limiting every unknown title to one library's trackers
+    would hide releases for anything that library's trackers don't carry."""
+    kw = _body_kw(body) if body is not None else {}
+    rid = kw.get("root_folder_id")
+    tmdb = kw.get("tmdb_id")
+    if item:
+        rid = rid or item.get("root_folder_id")
+        tmdb = tmdb or item.get("tmdb_id") or item.get("show_tmdb_id")
+    row = get(db, rid) if rid not in (None, "", 0, "0") else None
+    if not (row and row.get("content_kind") == content_kind(kind)) and tmdb:
+        row = get(db, resolve_destination(db, kind, tmdb))
+    ids = norm_indexer_ids(row.get("preferred_indexer_ids")) if row else None
+    return [int(x) for x in ids.split(",")] if ids else None
+
+
+def restrict_indexers(library_ids, allowlist) -> list:
+    """A library's trackers within the global Prowlarr allowlist (empty = all)."""
+    allowed = set(allowlist or [])
+    return [i for i in library_ids if not allowed or i in allowed]
+
+
+def filter_hits(hits, library_ids) -> list:
+    """Keep only pre-fetched hits (RSS pool) from a library's trackers."""
+    if not library_ids:
+        return list(hits or [])
+    wanted = set(library_ids)
+    return [h for h in hits or [] if h.get("indexer_id") in wanted]
+
+
 def _body_kw(body) -> dict:
     """Library lookup arguments from a manual grab / match / import request."""
     body = body or {}

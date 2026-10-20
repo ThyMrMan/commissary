@@ -243,7 +243,8 @@ def prowlarr_search(scope: str, title: Any, *, year: Any = None, season: Any = N
                     tmdb_id: Any = None, tvdb_id: Any = None, air_date: Any = None,
                     absolute: Any = None, series_type: Any = None,
                     max_wait_seconds: Any = None, indexer_names: Any = None,
-                    alt: Any = None) -> dict:
+                    alt: Any = None,
+                    indexer_ids: Any = None) -> dict:  # Commissary: a Library's trackers
     """Search Prowlarr for a video release with the multi-strategy (structured + text)
     approach. ``source`` picks the protocol to keep (``torrent`` | ``usenet``). Returns
     ``{configured, error?, hits:[...]}`` — the hit shape ``_evaluate_hits`` consumes.
@@ -266,6 +267,14 @@ def prowlarr_search(scope: str, title: Any, *, year: Any = None, season: Any = N
         label = ", ".join(str(n) for n in (indexer_names if isinstance(indexer_names, (list, tuple, set)) else [indexer_names]))
         return {"configured": True, "error": "No enabled Prowlarr indexer matches " + label, "hits": []}
     ids = target_ids if target_ids is not None else _indexer_ids()
+    if indexer_ids and target_ids is None:
+        # Commissary: limit to the video Library's trackers (within the allowlist).
+        # A tracker the user named in Basic Search (target_ids) still wins.
+        from core.commissary.video_libraries import restrict_indexers
+        ids = restrict_indexers(indexer_ids, ids)
+        if not ids:
+            return {"configured": True, "hits": [],
+                    "error": "None of this library's trackers are enabled in Prowlarr"}
     strategies = build_strategies(scope, title, year=year, season=season, episode=episode,
                                   imdb_id=imdb_id, tmdb_id=tmdb_id, tvdb_id=tvdb_id,
                                   air_date=air_date, absolute=absolute, series_type=series_type,
