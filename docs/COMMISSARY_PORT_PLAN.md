@@ -120,7 +120,12 @@ AcoustID's `client=` included).
 
 ## Phase 3 — music features
 
-- Language versions kept apart — extend upstream `recording_version_markers` (M).
+- Language versions kept apart — extend upstream `recording_version_markers` (M) — **done**
+  (core/commissary/language_versions.py). Upstream's markers gain the spellings its tokens miss
+  ("-Japanese ver.-", "(JP ver.)", "英語版"); the engine's similarity is capped, its version detector
+  labels a language version (staging and AcoustID verification compare those labels), the Soulseek
+  scorer rejects another language (whole path + requested album), and album import's title scoring
+  and staging skip a file in another language (title, album tag or filename).
 - Foreign-language position+duration pairing (M).
 - Edition preference — fold download/consistency/bundle gates onto upstream `edition_grouping` (M).
 - Every source searchable + "search all sources" + album release picker (M–L; backend + vanilla downloads.js, React search chips).

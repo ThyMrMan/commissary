@@ -453,6 +453,10 @@ def recording_version_markers(title: str) -> frozenset[str]:
         for kana, marker in _RECORDING_KATAKANA_MARKERS.items():
             if kana in nfkc:
                 markers.add(marker)
+    # Commissary: "-Japanese ver.-", "(JP ver.)", "英語版" - language spellings
+    # the qualifier tokens miss (core/commissary/language_versions.py)
+    from core.commissary.language_versions import recording_markers
+    markers |= recording_markers(title)
     return frozenset(markers)
 
 

@@ -255,7 +255,16 @@ def try_staging_match(task_id, batch_id, track, deps: StagingDeps):
     # point below the threshold).
     candidate_scores: list = []
 
+    # Commissary: never claim another language version - its album tag and
+    # filename count too (core/commissary/language_versions.py)
+    from core.commissary.language_versions import file_language, first_language
+    _track_language = first_language(track_title, getattr(track, 'album', None))
+
     for sf in staging_files:
+        if file_language(sf.get('full_path'), sf.get('title'), sf.get('album')) != _track_language:
+            logger.debug("[Staging] Skip candidate %s — a different language version",
+                         os.path.basename(sf.get('full_path', '?')))
+            continue
         sf_title_variants = _staging_title_variants(sf['title'], normalize)
         sf_norm_artist = normalize(sf['artist'])
 

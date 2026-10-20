@@ -631,6 +631,8 @@ def match_files_to_tracks(
     # strict improvement over track-order greedy for the reported bug class.
     duration_rejected = 0     # diagnostics for the "no matches" case
     sample_rejection_logged = False
+    from core.commissary.language_versions import (  # Commissary: language versions
+        file_language as _file_language, first_language as _first_language)
     scored: list[tuple[float, int, str]] = []  # (score, track_idx, file)
     below_threshold_tracks: set[int] = set()
     for i, track in enumerate(tracks):
@@ -672,6 +674,12 @@ def match_files_to_tracks(
                         track.get('name', '?'), track_duration,
                         raw_dur_ms, raw_dur, raw_src,
                     )
+                continue
+
+            # Commissary: "FEARLESS (Japanese Version)" never fills the Korean
+            # album's "FEARLESS" (core/commissary/language_versions.py)
+            if _file_language(f, tags.get('title'), tags.get('album')) != \
+                    _first_language(track.get('name'), target_album):
                 continue
 
             score = score_file_against_track(

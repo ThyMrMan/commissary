@@ -282,6 +282,13 @@ class MusicMatchingEngine:
         if str1 == str2:
             return 1.0
 
+        # Commissary: a language version is a different recording - capped,
+        # never raised (core/commissary/language_versions.py)
+        from core.commissary.language_versions import capped_similarity
+        _language_capped = capped_similarity(str1, str2)
+        if _language_capped is not None:
+            return _language_capped
+
         # Standard similarity
         standard_ratio = SequenceMatcher(None, str1, str2).ratio()
 
@@ -1244,6 +1251,13 @@ class MusicMatchingEngine:
                 if re.search(pattern, filename_lower):
                     return version_type, config['penalty']
         
+        # Commissary: a language version is its own recording, no penalty of its
+        # own - staging and AcoustID verification compare these labels
+        from core.commissary.language_versions import version_label
+        _language_label = version_label(filename_lower)
+        if _language_label:
+            return _language_label, 0.0
+
         # No version indicators found - assume original
         return 'original', 0.0
     
@@ -1263,6 +1277,11 @@ class MusicMatchingEngine:
 
         # Detect version type in Soulseek result
         version_type, penalty = self.detect_version_type(slskd_track.filename)
+
+        # Commissary: another language version than the request, both ways round
+        from core.commissary.language_versions import soulseek_mismatch
+        if soulseek_mismatch(spotify_track, slskd_track.filename):
+            return 0.0, 'rejected_version_mismatch'
 
         # --- Base-title veto (#1626) ---
         # A shared version qualifier inflates whole-path similarity enough to
