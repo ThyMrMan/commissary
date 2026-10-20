@@ -193,7 +193,9 @@ class DelugeAdapter:
             method = 'core.add_torrent_url'
         torrent_hash = self._rpc_sync(method, [url_or_magnet, options])
         if not torrent_hash:
-            return None
+            # Commissary: Deluge raises on a duplicate; adopt what it holds.
+            from core.commissary.torrent_adopt import deluge_held
+            return deluge_held(self, url_or_magnet, category)
         self._apply_label(str(torrent_hash), category or self._category)
         return str(torrent_hash)
 
@@ -220,7 +222,9 @@ class DelugeAdapter:
         encoded = base64.b64encode(file_bytes).decode('ascii')
         torrent_hash = self._rpc_sync('core.add_torrent_file', ['soulsync.torrent', encoded, options])
         if not torrent_hash:
-            return None
+            # Commissary: Deluge raises on a duplicate; adopt what it holds.
+            from core.commissary.torrent_adopt import deluge_held
+            return deluge_held(self, file_bytes, category)
         self._apply_label(str(torrent_hash), category or self._category)
         return str(torrent_hash)
 

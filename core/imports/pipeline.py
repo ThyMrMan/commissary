@@ -1902,10 +1902,17 @@ def _attempt_version_mismatch_fallback(context, task_id, batch_id, runtime, meta
 
 def post_process_matched_download_with_verification(context_key, context, file_path, task_id, batch_id, runtime, metadata_runtime=None):
     on_download_completed = getattr(runtime, "on_download_completed", None)
+    # Commissary: a retry hand-off must be declared; the finally below frees
+    # the slot for every exit that neither notified nor handed off (1.9.16).
+    _slot_state = {"notified": False, "handed_off": None}
 
     def _notify_download_completed(batch_id, task_id, success=True):
+        _slot_state["notified"] = True
         if on_download_completed:
             on_download_completed(batch_id, task_id, success=success)
+
+    def _hand_off(reason):
+        _slot_state["handed_off"] = reason
 
     logger = pp_logger
     try:
@@ -1971,6 +1978,7 @@ def post_process_matched_download_with_verification(context_key, context, file_p
                     f"Task {task_id} quarantined by the {trigger} guard — "
                     f"retrying next-best candidate"
                 )
+                _hand_off(f"{trigger} retry queued")  # Commissary
                 return
             logger.info(
                 f"Task {task_id} quarantined by the {trigger} guard with no "
@@ -2036,11 +2044,13 @@ def post_process_matched_download_with_verification(context_key, context, file_p
                 logger.info(
                     f"AcoustID mismatch for task {task_id} — retrying next-best candidate: {failure_msg}"
                 )
+                _hand_off("acoustid retry queued")  # Commissary
                 return
             # Retries exhausted. Opt-in last resort: if every quarantined
             # candidate for this track failed the SAME version mismatch (e.g. all
             # instrumental), accept the best one rather than leaving it missing.
             if _attempt_version_mismatch_fallback(context, task_id, batch_id, runtime, metadata_runtime):
+                _hand_off("version-mismatch fallback re-dispatched")  # Commissary
                 return
             logger.info(f"File was quarantined by AcoustID verification (task={task_id}): {failure_msg}")
             _record_failed_download_blocklist(task_id, f"AcoustID verification failed: {failure_msg}")
@@ -2101,6 +2111,7 @@ def post_process_matched_download_with_verification(context_key, context, file_p
                 logger.info(
                     f"Integrity check failed for task {task_id} — retrying next-best candidate: {failure_msg}"
                 )
+                _hand_off("integrity retry queued")  # Commissary
                 return
             logger.error(
                 f"Task {task_id} failed integrity check — marking failed: {failure_msg}"
@@ -2286,3 +2297,9 @@ def post_process_matched_download_with_verification(context_key, context, file_p
             if context_key in matched_downloads_context:
                 del matched_downloads_context[context_key]
         _notify_download_completed(batch_id, task_id, success=False)
+    finally:
+        # Commissary: an exit that neither notified nor handed off leaks the
+        # worker slot and wedges the batch — free it and name the task.
+        from core.commissary.batch_slots import release_unclaimed_slot
+        release_unclaimed_slot(_slot_state, task_id, batch_id, context_key,
+                               _notify_download_completed)

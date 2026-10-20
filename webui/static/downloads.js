@@ -2797,6 +2797,22 @@ function _ssShortFileLabel(filename) {
     return filename.split(/[/\\]/).pop();
 }
 
+// Commissary: which tracker served a torrent/usenet result, linked to its
+// details page when there is one. Prowlarr puts many indexers behind one
+// "torrent" source, so "torrent" alone doesn't say which release is which.
+// info_url is scheme- and secret-checked server-side
+// (core/commissary/tracker_link.py), escaped again here, and opened detached
+// so a click never navigates the app away mid-download.
+function _candidateTrackerHtml(c, fallback) {
+    if (!c || !c.indexer) return escapeHtml(fallback || '-');
+    const name = escapeHtml(c.indexer);
+    const url = String(c.info_url || '');
+    if (!/^https?:\/\//i.test(url)) return name;
+    return `<a class="candidates-tracker-link" href="${escapeHtml(url)}"` +
+           ` target="_blank" rel="noopener noreferrer"` +
+           ` title="Open this release on ${name}">${name} ↗</a>`;
+}
+
 function _renderCandidateRow(c, index, rowClass, showSourceBadge) {
     const shortFile = _ssShortFileLabel(c.filename);
     const qBadge = c.quality
@@ -2815,7 +2831,7 @@ function _renderCandidateRow(c, index, rowClass, showSourceBadge) {
             // only SOULSEEK peers are messageable (torrent/youtube "usernames" aren't Soulseek users)
             (c.username && (!c.source || /soulseek/i.test(String(c.source))))
                 ? `<button type="button" class="chat-user-link" data-chat-msg-user="${escapeHtml(c.username).replace(/"/g, '&quot;')}" title="Message this user on Soulseek">${escapeHtml(c.username)}</button>`
-                : escapeHtml(c.username || '-')
+                : _candidateTrackerHtml(c, c.username)  // Commissary: tracker name + link
         }</td>
         <td class="candidates-col-action"><button class="candidates-download-btn" data-index="${index}" title="Download this file">⬇</button></td>
     </tr>`;

@@ -123,7 +123,11 @@ class Aria2Adapter:
 
     def _add_uri_sync(self, uri: str, save_path: Optional[str]) -> Optional[str]:
         result = self._rpc('aria2.addUri', [uri], self._opts(save_path))
-        return str(result) if result else None   # GID
+        if not result:
+            # Commissary: aria2 errors on a duplicate; adopt what it holds.
+            from core.commissary.torrent_adopt import aria2_held
+            return aria2_held(self, uri)
+        return str(result)   # GID
 
     async def add_torrent_file(self, file_bytes: bytes, category: str = "soulsync",
                                save_path: Optional[str] = None) -> Optional[str]:
@@ -132,7 +136,11 @@ class Aria2Adapter:
     def _add_file_sync(self, file_bytes: bytes, save_path: Optional[str]) -> Optional[str]:
         b64 = base64.b64encode(file_bytes).decode('ascii')
         result = self._rpc('aria2.addTorrent', b64, [], self._opts(save_path))
-        return str(result) if result else None
+        if not result:
+            # Commissary: aria2 errors on a duplicate; adopt what it holds.
+            from core.commissary.torrent_adopt import aria2_held
+            return aria2_held(self, file_bytes)
+        return str(result)
 
     # ── status ──
     async def get_status(self, torrent_id: str) -> Optional[TorrentStatus]:

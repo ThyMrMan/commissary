@@ -34,6 +34,7 @@ from core.download_plugins.album_bundle import (
     snapshot_incomplete_path,
 )
 from core.download_plugins.base import DownloadSourcePlugin
+from core.commissary.tracker_link import safe_info_url as _safe_info_url  # Commissary
 from core.download_plugins.candidate_store import get_candidate_store
 from core.download_plugins.release_identity import dedupe_prowlarr_releases, torrent_hash_evidence, release_sources, release_evidence as get_release_evidence
 from core.download_plugins.torrent import (
@@ -176,6 +177,10 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
                     'info_hash': torrent_hash_evidence(result)[0],
                     'hash_conflict': torrent_hash_evidence(result)[1],
                     'categories': list(result.categories or []),
+                    # Commissary: the tracker's details page for the picker,
+                    # never the download link (P0-03) — see tracker_link.
+                    'info_url': _safe_info_url(result.info_url, download_url=result.download_url,
+                                               magnet_uri=result.magnet_uri),
                 },
             )
             tr._release_sources = [

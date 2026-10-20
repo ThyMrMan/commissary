@@ -7751,6 +7751,9 @@ def _infer_candidate_source(username: str) -> str:
     return username if username in _STREAMING_SOURCE_NAMES else 'soulseek'
 
 
+from core.commissary.tracker_link import candidate_indexer_fields as _commissary_indexer_fields  # noqa: E402
+
+
 def _serialize_candidate(c, source_override: str = None) -> dict:
     """Convert a TrackResult (or dict) into the JSON shape the candidates
     modal expects. ``source_override`` lets manual-search callers stamp
@@ -7772,6 +7775,8 @@ def _serialize_candidate(c, source_override: str = None) -> dict:
             'title': getattr(c, 'title', None),
             'album': getattr(c, 'album', None),
             'source': source_override or _infer_candidate_source(username),
+            # Commissary: which tracker served a Prowlarr result + its details page
+            **_commissary_indexer_fields(c),
         }
     if isinstance(c, dict):
         out = dict(c)

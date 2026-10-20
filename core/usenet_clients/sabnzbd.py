@@ -157,7 +157,9 @@ class SABnzbdAdapter:
     async def add_nzb(
         self,
         url_or_bytes: Union[str, bytes],
-        category: str = "soulsync",
+        # Commissary: None, not "soulsync" — a truthy literal meant
+        # ``category or self._category`` never reached the setting.
+        category: Optional[str] = None,
         save_path: Optional[str] = None,
     ) -> Optional[str]:
         return await run_control(
@@ -166,7 +168,7 @@ class SABnzbdAdapter:
     def _add_nzb_sync(
         self,
         url_or_bytes: Union[str, bytes],
-        category: str,
+        category: Optional[str],
         save_path: Optional[str],
     ) -> Optional[str]:
         cat = category or self._category
