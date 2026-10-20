@@ -56,7 +56,7 @@ def shortcuts(db) -> List[Dict[str, str]]:
         out.append({"label": label, "path": os.path.abspath(p)})
 
     try:
-        from config.settings import config_manager
+        from core.settings import config_manager
         from core.commissary.paths import split_paths
         add("Downloads", config_manager.get("soulseek.download_path", ""))
         for name, key in (("Torrents", "soulseek.torrent_download_path"),

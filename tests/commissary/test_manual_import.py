@@ -111,6 +111,19 @@ def client(env):
     return app.test_client()
 
 
+def test_shortcuts_offer_the_download_folders_first(env, monkeypatch):
+    db, tmp, tv = env
+    dl, tor1, tor2 = tmp / "dl", tmp / "tor1", tmp / "tor2"
+    for d in (dl, tor1, tor2):
+        d.mkdir()
+    from core.settings import config_manager
+    values = {"soulseek.download_path": str(dl),
+              "soulseek.torrent_download_path": "%s;%s" % (tor1, tor2)}
+    monkeypatch.setattr(config_manager, "get", lambda key, default=None: values.get(key, default))
+    labels = [s["label"] for s in mi.shortcuts(db)]
+    assert labels[:3] == ["Downloads", "Torrents", "Torrents 2"]
+
+
 def test_browse_lists_folders_and_videos_filtered_before_the_cap(client, env):
     _db, tmp, _tv = env
     root = tmp / "dl"
