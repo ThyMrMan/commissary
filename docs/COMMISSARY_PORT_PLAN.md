@@ -16,8 +16,8 @@ Reference the old code with `git show legacy-2.4.3:<path>`.
   drop ours (list below).
 - **Each port brings its tests along.** Static-JS harnesses need the CRLF
   normalisation (see memory notes).
-- **Never mass-edit "SoulSync"** again. Branding goes through a display-name
-  constant.
+- **No rebranding.** The app keeps upstream's SoulSync name; only the repo,
+  image and update check point at the fork.
 
 ## Phase 0 — foundation (done)
 
@@ -28,7 +28,6 @@ only carry small hooks marked `Commissary:`.
 |---|---|
 | Publish workflow | `.github/workflows/commissary-publish.yml`: manual, guarded to `ThyMrMan/commissary`, ghcr.io/thymrman/commissary, tag read from `_SOULSYNC_BASE_VERSION` when left blank. Upstream workflows untouched (guarded to Nezreka, they skip). |
 | Version + update check | `_SOULSYNC_BASE_VERSION = "3.5.7-c.1"`; `core/commissary/update_check.py` compares the `-c.N` counter; `_GITHUB_REPO` from `core/commissary/brand.py`. |
-| Branding | `core/commissary/brand.py` + `web.py` (Jinja `app_name`, `commissary_head`, `window.COMMISSARY`): title, sidebar, sign-in/lock screens, manifest, compose image, `templates/commissary.*`, README notice, MusicBrainz/Discogs contact, bug-report link. Prose stays "SoulSync". Never-rename identifiers pinned in `tests/commissary/test_branding.py`. |
 | Chat + donation | `commissary.chat_enabled` / `commissary.support_button` (default off): chat blueprint and its two slskd loops not started; nav/page/support hidden by CSS. |
 | Download paths | `core/commissary/paths.split_paths`: torrent/usenet completed-download settings accept a list (legacy) or `;`-separated string; every folder is a resolver root. |
 | DB compatibility | Verified on copies of the live DBs (see Dev data). |

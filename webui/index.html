@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <title>{{ app_name }} - Music Sync & Manager</title>
+    <title>SoulSync - Music Sync & Manager</title>
     {{ commissary_head }}
     <meta name="soulsync-url-base" content="{{ request.script_root }}">
     <script src="{{ url_for('static', filename='url-base.js', v=static_v) }}"></script>
@@ -170,7 +170,7 @@
             <!-- PIN Entry (default view) -->
             <div id="launch-pin-entry">
                 <div class="launch-pin-icon">🔒</div>
-                <h2 class="launch-pin-title">{{ app_name }} is Locked</h2>
+                <h2 class="launch-pin-title">SoulSync is Locked</h2>
                 <p class="launch-pin-subtitle">Enter your PIN to continue</p>
                 <input type="password" id="launch-pin-input" class="launch-pin-input" maxlength="20" placeholder="PIN"
                     autocomplete="off">
@@ -200,7 +200,7 @@
             <!-- Sign-in view -->
             <div id="login-entry">
                 <div class="launch-pin-icon">🔐</div>
-                <h2 class="launch-pin-title">Sign in to {{ app_name }}</h2>
+                <h2 class="launch-pin-title">Sign in to SoulSync</h2>
                 <p class="launch-pin-subtitle">Enter your account name and password</p>
                 <!-- a real form with named fields so password managers pair the username
                      with this password, not the hidden recovery / pin fields -->
@@ -278,9 +278,9 @@
             <!-- Header Section -->
             <div class="sidebar-header">
                 <div class="sidebar-brand">
-                    <img src="/static/trans2.png" alt="{{ app_name }}" class="sidebar-logo">
+                    <img src="/static/trans2.png" alt="SoulSync" class="sidebar-logo">
                     <div class="sidebar-brand-text">
-                        <h1 class="app-name">{{ app_name }}</h1>
+                        <h1 class="app-name">SoulSync</h1>
                         <p class="app-subtitle">Music Sync & Manager</p>
                     </div>
                     <!-- #1155: collapses the sidebar to icon width. Lives here, not in

@@ -8,8 +8,7 @@ anyone turn a feature back on from config.
   /api/chat blueprint, and the two background loops that poll slskd for room
   and PM activity.
 - ``commissary.support_button`` (default False): upstream's "Support SoulSync"
-  donation button. Commissary takes no donations; upstream's own button would
-  point at upstream's maintainer, which on a fork reads as ours.
+  donation button.
 """
 
 from __future__ import annotations
