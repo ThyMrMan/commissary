@@ -118,6 +118,7 @@ def parse_ffprobe(data: Any) -> dict:
     duration = _float(fmt.get("duration")) or _float((video or {}).get("duration"))
     width = (video or {}).get("width")
     height = (video or {}).get("height")
+    from core.commissary.naming import probe_facts  # Commissary
     return {
         "ok": video is not None,
         "duration_sec": duration,
@@ -127,6 +128,9 @@ def parse_ffprobe(data: Any) -> dict:
         "aspect": canonical_aspect(_int(width) / _int(height)) if (video and _int(height)) else None,
         "video_codec": _norm_codec((video or {}).get("codec_name")),
         "audio_codec": str((audio or {}).get("codec_name") or "") or None,
+        # Commissary: {MediaInfo ...} naming facts from the same JSON (channels,
+        # HDR type, bit depth, audio languages) - the file's word, not the name's
+        **probe_facts(data),
     }
 
 

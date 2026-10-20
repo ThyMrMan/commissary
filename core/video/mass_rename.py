@@ -52,18 +52,20 @@ def is_running() -> bool:
 
 
 def _movie_fields(row: Dict[str, Any]) -> Dict[str, Any]:
-    return {"title": row.get("title"), "year": row.get("year"),
+    from core.commissary.naming import with_naming  # Commissary: the {Token} facts
+    return with_naming(row, {"title": row.get("title"), "year": row.get("year"),
             "quality": row.get("quality"), "resolution": row.get("resolution"),
             "source": row.get("release_source"), "codec": row.get("video_codec"),
-            "tmdbid": row.get("tmdb_id")}
+            "tmdbid": row.get("tmdb_id")})
 
 
 def _episode_fields(row: Dict[str, Any]) -> Dict[str, Any]:
-    return {"series": row.get("show_title"), "season": row.get("season_number"),
+    from core.commissary.naming import with_naming  # Commissary: the {Token} facts
+    return with_naming(row, {"series": row.get("show_title"), "season": row.get("season_number"),
             "episode": row.get("episode_number"), "episode_title": row.get("episode_title"),
             "year": row.get("show_year"), "quality": row.get("quality"),
             "resolution": row.get("resolution"), "source": row.get("release_source"),
-            "codec": row.get("video_codec")}
+            "codec": row.get("video_codec")})
 
 
 def _base_dir_of(path: str, base_dirs: List[str]) -> Optional[str]:
@@ -144,6 +146,11 @@ def preview(progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, 
 
     movies = db.repair_owned_movie_files()
     episodes = db.rename_owned_episode_files()
+    # Commissary: ids, air date and file facts, so a rename names a file exactly
+    # as its import did - never a shorter name that strips them off disk
+    from core.commissary.naming import with_library_facts
+    movies = with_library_facts(db, movies, "movie")
+    episodes = with_library_facts(db, episodes, "episode")
     total = len(movies) + len(episodes)
     done = 0
 

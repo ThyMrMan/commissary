@@ -351,6 +351,11 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
             parsed["aspect"] = probe["aspect"]
         if probe.get("video_codec") and not parsed.get("codec"):
             parsed["codec"] = probe["video_codec"]
+        # Commissary: {MediaInfo ...} tokens come from the container only
+        for _key in ("audio_codec", "audio_channels", "audio_languages",
+                     "video_bit_depth", "dynamic_range_type"):
+            if probe.get(_key):
+                parsed[_key] = probe[_key]
 
     # Duration-vs-expected. TV runtime metadata cannot be trusted to reject a file:
     # a new episode carries a placeholder (Name That Tune S06E02 listed at 159 min,
@@ -400,6 +405,7 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
             "youtube_id": ctx.get("youtube_id") or media_id,
         }
     else:
+        from core.commissary.naming import import_fields  # Commissary
         fields = {
             "title": ctx.get("title"), "year": ctx.get("year"),
             "series": ctx.get("title"), "season": ctx.get("season"),
@@ -411,6 +417,8 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
             "tmdbid": _ident.get("tmdbid") or (media_id if _tmdb_sourced else None),
             "tvdbid": _ident.get("tvdbid"),
             "imdbid": _ident.get("imdbid"),
+            # Commissary: the Sonarr/Radarr {Token} inputs (all optional)
+            **import_fields(dl, parsed, ctx, name),
         }
     dest = organization.render_path(scope, root, fields, settings, ext)
     # The library already owns this item at a REAL, resolved location

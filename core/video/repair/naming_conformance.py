@@ -28,11 +28,12 @@ _SIDECAR_SUFFIXES = (".nfo", "-thumb.jpg", "-thumb.jpeg", "-thumb.png", "-thumb.
 
 
 def _fields_of(row: dict) -> dict:
-    return {"title": row.get("title"), "series": row.get("series"),
+    from core.commissary.naming import with_naming  # Commissary: the {Token} facts
+    return with_naming(row, {"title": row.get("title"), "series": row.get("series"),
             "year": row.get("year"), "season": row.get("season"),
             "episode": row.get("episode"), "episode_title": row.get("episode_title"),
             "quality": row.get("quality"), "resolution": row.get("resolution"),
-            "codec": row.get("video_codec"), "tmdbid": row.get("tmdb_id")}
+            "codec": row.get("video_codec"), "tmdbid": row.get("tmdb_id")})
 
 
 def _same_path(a: str, b: str) -> bool:
@@ -102,6 +103,13 @@ class NamingConformanceJob(VideoRepairJob):
         from core.video.library_roots import library_roots, containing_root
         roots = {kind: library_roots(context.db, kind) for kind in ("movie", "episode")}
         rows = context.db.repair_library_files() or []
+        # Commissary: the same facts the import named the file from
+        from core.commissary.naming import template_uses_unavailable_tokens, with_library_facts
+        rows = with_library_facts(context.db, rows)
+        # tokens only an import can know: the finding is a warning naming them,
+        # since approving it would drop them from the filename
+        _lossy = {"movie": template_uses_unavailable_tokens(settings.get("movie_template")),
+                  "episode": template_uses_unavailable_tokens(settings.get("episode_template"))}
         context.report(total=len(rows), phase="checking names")
         valid = []
         for i, r in enumerate(rows, 1):
@@ -132,10 +140,13 @@ class NamingConformanceJob(VideoRepairJob):
             if r["scope"] == "episode":
                 label = "%s S%02dE%02d" % (label, r.get("season") or 0, r.get("episode") or 0)
             context.create_finding(
-                finding_type="naming_mismatch", severity="info",
+                finding_type="naming_mismatch",
+                severity="warning" if _lossy.get(r["scope"]) else "info",   # Commissary
                 entity_type=r["scope"], entity_id=entity_id,
                 title=f"{label} — file name doesn't match the template",
-                description=os.path.basename(real) + "  →  " + os.path.basename(expected),
+                description=os.path.basename(real) + "  →  " + os.path.basename(expected)
+                + ("  (can't rebuild %s for a file already in the library — check before "
+                   "approving)" % ", ".join(_lossy[r["scope"]]) if _lossy.get(r["scope"]) else ""),
                 details={"scope": r["scope"], "item_id": r["item_id"],
                          "file_id": r["file_id"], "title": r.get("title"),
                          "season": r.get("season"), "episode": r.get("episode"),

@@ -328,12 +328,19 @@ def _youtube_values(f: dict) -> dict:
     }
 
 
-def render_template(template: Any, values: dict) -> str:
+def render_template(template: Any, values: dict, brace: Any = None) -> str:
     """Substitute ``$token`` / ``${token}`` from ``values`` into ``template``. Each
     value is path-sanitised first (so a title with '/' can't spawn a folder), and
     tokens are replaced longest-name-first ($episodetitle before $episode)."""
     clean = {k: sanitize(v) for k, v in (values or {}).items()}
     out = str(template or "")
+    # Commissary: Sonarr/Radarr {Token} groups resolve FIRST, so a $token value
+    # that contains a brace (an episode titled 'The {Redacted} Job') can never be
+    # read as a group. core/commissary/naming_tokens.py
+    if brace is not None:
+        from core.commissary import naming_tokens as _nt
+        if _nt.has_brace_tokens(out):
+            out = _nt.render(out, brace, sanitize=sanitize)
     for tok in sorted(clean, key=len, reverse=True):
         out = out.replace("${" + tok + "}", clean[tok])
     for tok in sorted(clean, key=len, reverse=True):
@@ -352,10 +359,13 @@ def _tidy_component(part: str) -> str:
     """Clean one path segment: drop a ' - ' left dangling by an empty token, remove
     empty ()/[] left by an empty $year, collapse whitespace, trim stray dashes and
     Windows-hostile trailing dots/spaces."""
-    p = _EMPTY_ID_TAG.sub("", part)              # Commissary: '(tmdb-)' with no id
+    from core.commissary.naming_tokens import strip_orphan_brackets  # Commissary
+    p = strip_orphan_brackets(part)              # Commissary: '[EAC3' left by '{[A}{ B]}'
+    p = _EMPTY_ID_TAG.sub("", p)                 # Commissary: '(tmdb-)' with no id
     p = re.sub(r"\s+-\s+(?=(\s|$))", " ", p)      # ' - ' before an empty token
     p = re.sub(r"\(\s*\)", "", p)                 # empty ( ) from a missing $year
     p = re.sub(r"\[\s*\]", "", p)
+    p = re.sub(r"\{\s*\}", "", p)                 # Commissary: an empty { }
     p = re.sub(r"\s+", " ", p).strip()
     p = p.strip("-").strip()
     # Commissary: a LEADING dot hides the folder on Unix (and from media servers).
@@ -390,7 +400,8 @@ def render_path(scope: Any, root: Any, fields: dict, settings: Any, ext: Any) ->
         base = (sanitize(fields.get("title")) or "download") + _ext(ext)
         return {"dir": root, "filename": base, "path": os.path.join(root, base)}
 
-    rendered = render_template(tmpl, values)
+    from core.commissary.naming import token_set   # Commissary: the {Token} vocabulary
+    rendered = render_template(tmpl, values, token_set(sc, fields))
     parts = [p for p in (_tidy_component(seg) for seg in rendered.split("/")) if p]
     if not parts:
         parts = ["download"]

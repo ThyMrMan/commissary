@@ -262,6 +262,8 @@ def _make_organizer(db):
         except Exception:   # noqa: BLE001 - a probe crash must not block the import
             probe_info = None
         from core.commissary.naming_identity import library_identity  # Commissary
+        from core.commissary.naming import custom_formats_for          # Commissary: {Custom Formats}
+        dl = {**dl, "_custom_formats": custom_formats_for(db, dl)}
         plan = plan_import(dl, src, list_dir=fs.list_dir, probe=probe_info,
                            settings=settings, library_dir=_owned_library_dir(db, dl),
                            expected_duration_sec=_expected_duration_sec(db, dl),
