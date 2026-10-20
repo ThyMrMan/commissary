@@ -217,7 +217,8 @@ def _existing_match(scope: str, dest_dir: str, ctx: dict, list_dir: Callable) ->
 def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | None = None,
                 settings: dict | None = None, force: bool = False,
                 override: dict | None = None, library_dir: str | None = None,
-                expected_duration_sec: float | None = None) -> dict:
+                expected_duration_sec: float | None = None,
+                identity: dict | None = None) -> dict:
     """Decide what to do with a finished download. Returns one of:
 
       {"action": "import",  "dest": {...}, "quality_label": str}
@@ -236,7 +237,11 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
     episode, episode_title, target_dir, media_id}) trusts the user's chosen identity —
     it skips the auto sanity-gates (sample / wrong-episode / pack / not-an-upgrade) and
     files the file exactly where they said, replacing any worse copy. ffprobe is still
-    used for the true resolution, but never to reject."""
+    used for the true resolution, but never to reject.
+
+    Commissary: ``identity`` is the LIBRARY's naming facts for the title
+    (core.commissary.naming_identity), resolved by the caller. None (unowned)
+    names from the grab."""
     dl = dl or {}
     settings = organization.normalize(settings)
     override = override or {}
@@ -245,6 +250,13 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
     ext = ext_of(src_path)
     parsed = parse_release(dl.get("release_title") or name)
     ctx = _ctx(dl)
+    # Commissary: the library's title + PREMIERE year (the grab's year is the
+    # episode's air year). Numbering/air date stay the grab's — the gates judge
+    # the release against those. Applied before the override so manual wins.
+    _ident = identity if isinstance(identity, dict) else {}
+    for _k in ("title", "year"):
+        if _ident.get(_k) not in (None, ""):
+            ctx[_k] = _ident[_k]
     if force:   # the user told us what it is — let their identity win
         for k in ("title", "year", "season", "episode", "episode_title"):
             if override.get(k) is not None:
@@ -252,6 +264,10 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
         if override.get("season") is not None or override.get("episode") is not None:
             # a hand-picked episode: the stored scene numbering was for another one
             ctx["alt_season"] = ctx["alt_episode"] = None
+    # Commissary: the episode title from the library, read at the FINAL numbering.
+    _ep = (_ident.get("episodes") or {}).get((ctx.get("season"), ctx.get("episode")))
+    if _ep and _ep.get("episode_title") and not ctx.get("episode_title"):
+        ctx["episode_title"] = _ep["episode_title"]
 
     if not is_video(src_path):   # can't place a non-video, even on a forced import
         return _reject("Not a video file (%s)" % (ext or "no extension"), bad_release=True)
@@ -357,6 +373,9 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
         return _reject("No library folder configured for this type")
 
     media_id = override.get("media_id") if force else dl.get("media_id")
+    # Commissary: media_id is a TMDB id only for a tmdb-sourced grab or a forced
+    # placement (the Place dialog sends a TMDB id); otherwise it's a local row id.
+    _tmdb_sourced = bool(force) or str(dl.get("media_source") or "").lower() == "tmdb"
     quality = quality_full(parsed)
     # A multi-episode file is NAMED by its full span (S01E01-E02, the Sonarr/Plex
     # convention) even though the download row's identity is one episode of it.
@@ -380,8 +399,10 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
             "air_date": ctx.get("air_date"),
             "quality": quality, "resolution": parsed.get("resolution"),
             "source": parsed.get("source"), "codec": parsed.get("codec"),
-            "tmdbid": media_id if scope == "movie" else None,
-            "tvdbid": media_id if scope == "episode" else None,
+            # Commissary: real ids only — media_id is never a TVDB id.
+            "tmdbid": _ident.get("tmdbid") or (media_id if _tmdb_sourced else None),
+            "tvdbid": _ident.get("tvdbid"),
+            "imdbid": _ident.get("imdbid"),
         }
     dest = organization.render_path(scope, root, fields, settings, ext)
     # The library already owns this item at a REAL, resolved location
