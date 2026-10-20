@@ -35,8 +35,24 @@ def auth_open_paths() -> dict:
     }
 
 
+# Layout for the video Libraries editor (commissary-video-libraries.js).
+_VLIB_CSS = (
+    ".commissary-vlib{margin-top:16px}"
+    ".commissary-vlib-kind{margin:12px 0}"
+    ".commissary-vlib-row{display:flex;gap:12px;align-items:flex-start;padding:10px;margin:8px 0;"
+    "border:1px solid rgba(255,255,255,.08);border-radius:8px}"
+    ".commissary-vlib-grid{flex:1;display:grid;grid-template-columns:minmax(120px,max-content) 1fr;"
+    "gap:6px 10px;align-items:center}"
+    ".commissary-vlib-grid input,.commissary-vlib-grid select{width:100%;box-sizing:border-box}"
+    ".commissary-vlib-actions{display:flex;flex-direction:column;gap:6px}"
+    ".commissary-vlib-save{display:flex;gap:12px;align-items:center;margin-top:8px}"
+    "@media (max-width:640px){.commissary-vlib-row{flex-direction:column}"
+    ".commissary-vlib-grid{grid-template-columns:1fr}.commissary-vlib-actions{flex-direction:row}}"
+)
+
+
 def head_html(config_get=None) -> Markup:
-    rules = []
+    rules = [_VLIB_CSS]
     if not features.chat_enabled(config_get):
         rules.append(_HIDE_CHAT)
     if not features.support_button_enabled(config_get):
