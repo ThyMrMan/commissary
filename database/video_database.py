@@ -620,6 +620,10 @@ class VideoDatabase:
             self._ensure_indexes(conn)
             self._seed_named_links_from_scalar(conn)
             self._run_data_migrations(conn, prev_version)
+            # Commissary: video Libraries registry columns, AFTER the data
+            # migrations (v49 rebuilds video_watchlist with a fixed column list).
+            from core.commissary.video_libraries import ensure_columns as _vlib_columns
+            _vlib_columns(conn)
             conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
             conn.commit()
             logger.info(
