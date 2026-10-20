@@ -15,7 +15,13 @@ had. A copy binds by normalised path or by bare filename (its
 ``[reid-<track id>]`` suffix), the terms ``find_hint_for_file`` uses, so a
 Docker-mapped staging path still binds.
 
-Ported from the legacy fork (Release 2.3.6).
+Asking to re-identify the same track again stages the same file under the same
+name, so the copy has the folder hash of the attempt before it and the worker's
+``_is_already_processed`` skipped it for good. :func:`is_rematch_retry` lets it
+through when a pending hint for the file was written after the file's LATEST
+import-history row.
+
+Ported from the legacy fork (Releases 2.3.6 and 2.3.7).
 """
 
 from __future__ import annotations
@@ -74,6 +80,64 @@ def pending_rematch_keys(database: Any) -> Tuple[frozenset, frozenset]:
         return NO_KEYS
 
 
+def pending_hint_written_after(cursor: Any, staged_path: Optional[str], timestamp: Any) -> bool:
+    """True when a PENDING hint for ``staged_path`` was written after ``timestamp``
+    -- a time the database recorded, such as the ``created_at`` of the latest
+    auto-import history row for the file.
+
+    The hint an attempt used was written before that attempt's history row, so
+    it never counts -- a failure does not retry itself. A hint binds on the terms
+    of :func:`staged_file_keys`, without reading the file. ``julianday`` compares
+    the times, so both spellings SQLite accepts order correctly, and a missing or
+    unreadable time is never "after". Times have one-second resolution: a hint
+    written in the same second as ``timestamp`` is not after it."""
+    if not staged_path or not timestamp:
+        return False
+    cursor.execute(
+        "SELECT staged_path FROM rematch_hints WHERE status = 'pending' "
+        "AND julianday(created_at) > julianday(?)",
+        (timestamp,),
+    )
+    path_key, name_key = staged_file_keys(staged_path)
+    for row in cursor.fetchall():
+        hint_path, hint_name = staged_file_keys(row[0])
+        if hint_path == path_key or (name_key and hint_name == name_key):
+            return True
+    return False
+
+
+def is_rematch_retry(database: Any, candidate: Any) -> bool:
+    """True when a candidate the history calls processed is a Re-identify the
+    user has asked for again since its last attempt.
+
+    Single files only, like ``_resolve_rematch_hint``. Fail-safe the other way
+    from the hint lookups: any error answers False, so a file already tried
+    stays skipped rather than being tried again on every scan."""
+    files = getattr(candidate, "audio_files", None) or []
+    if len(files) != 1:
+        return False
+    try:
+        conn = database._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT created_at FROM auto_import_history WHERE folder_hash = ? "
+                "ORDER BY julianday(created_at) DESC, id DESC LIMIT 1",
+                (candidate.folder_hash,),
+            )
+            row = cursor.fetchone()
+            retry = row is not None and pending_hint_written_after(cursor, files[0], row[0])
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.debug("[Auto-Import] re-identify retry check skipped: %s", e)
+        return False
+    if retry:
+        logger.debug("[Auto-Import] %s was re-identified again since its last attempt",
+                     os.path.basename(files[0]))
+    return retry
+
+
 def split_rematch_copies(files: List[str], keys) -> Tuple[List[str], List[str]]:
     """Separate staged Re-identify copies from the other loose files.
 
@@ -93,6 +157,8 @@ def split_rematch_copies(files: List[str], keys) -> Tuple[List[str], List[str]]:
 
 
 __all__ = [
+    "is_rematch_retry",
+    "pending_hint_written_after",
     "pending_rematch_keys",
     "pending_staged_keys",
     "split_rematch_copies",

@@ -576,8 +576,11 @@ class AutoImportWorker:
         # included) are only listed, never re-run. count them apart so the log
         # doesn't read like the same folders are imported every minute.
         settled, fresh = [], []
+        # Commissary: unless it is a Re-identify the user has asked for again since.
+        from core.commissary.rematch_grouping import is_rematch_retry
         for c in candidates:
-            (settled if self._is_already_processed(c) else fresh).append(c)
+            (settled if self._is_already_processed(c) and not is_rematch_retry(self.database, c)
+             else fresh).append(c)
         summary = f"{len(candidates)} candidates in {staging}"
         if settled:
             summary += (f" ({len(settled)} already handled, left alone until you"
