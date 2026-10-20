@@ -58,6 +58,9 @@ Video: 100%-but-still-moving stability gate, Wishlist Audit fixes, importer
 naming from the library's identity, configurable manual-search caps, import
 failure logging. Retries already stay on their own transport upstream.
 
+Still open (security): legacy 2.4.2 redacted API keys/tokens from log lines in the
+log formatter (a keyed URL in a traceback leaked the key into app.log).
+
 Deferred to Phase 3: rest of 1.9.8 (picker open by default, Sources button on
 failed rows, album release picker).
 
@@ -69,8 +72,9 @@ failed rows, album release picker).
    profile + series type; Prowlarr searches limited to the library's trackers (unassigned titles
    unrestricted); Settings editor + assign endpoints. Still to do: wishlist/watchlist library
    pickers in the UI (endpoints exist), Library page tabs (item 12).
-2. Fansub/anime/arc release parsing (M) — merge into upstream `release_parse`.
-3. Manual search knows the title: aliases, AKAs, episode hints, absolute numbers (M).
+2. Fansub/anime/arc release parsing (M) — **done** (core/commissary/release_titles.py).
+3. Manual search knows the title: aliases, AKAs, episode hints, absolute numbers (M) — **done**
+   (core/commissary/search_identity.py + commissary-search-identity.js).
 4. tmdb-keyed title overrides before owning the show (S–M), mapped onto upstream `manual_aliases`/`pack_preference`/`series_type`.
 5. Season-pack "only" mode + RSS packs (M).
 6. Per-show TMDB/TVDB numbering provider + episode repair (M–L); skip 3.5.7 scene mapping when `episode_source='tvdb'`.
