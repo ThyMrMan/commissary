@@ -37,7 +37,9 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
                             find_video: Callable[[Any, Any], Any],
                             organizer: Optional[Callable] = None,
                             import_pack: Optional[Callable] = None,
-                            settled: Optional[Callable[[dict, str], bool]] = None) -> dict:
+                            settled: Optional[Callable[[dict, str], bool]] = None,
+                            list_files: Optional[Callable[[str, str], Any]] = None,
+                            listing: Optional[Callable[[Any], Any]] = None) -> dict:
     """Next-state patch for a torrent/usenet download. ``get_status(source, ref)`` returns the
     client's status object (or None if it forgot the job), ``resolve_path`` maps its reported
     save_path to a locally-readable one, ``find_video(root, name)`` returns the main video file
@@ -73,6 +75,14 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
     # "Downloading 100%" forever. A file that isn't settled on disk yet is handled below
     # (find_video returns nothing → we keep polling), so treating 100% as done is safe.
     if state != "completed" and pct < 100.0:
+        # Commissary: a torrent that is RAR parts and nothing playable can never
+        # import (nothing on the video side unpacks) - refuse it while there is
+        # still bandwidth to save. core/commissary/packed_release.py
+        if list_files is not None:
+            from core.commissary.packed_release import in_flight as _packed_in_flight
+            _refused = _packed_in_flight(dl, ref, list_files)
+            if _refused is not None:
+                return _refused
         speed = int(getattr(status, "download_speed", 0) or 0)
         eta = getattr(status, "eta", None)
         # clients report a huge sentinel (qBittorrent: 8640000s) for "unknown";
@@ -115,6 +125,13 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
         folder = find_content_dir(save, name) if settled is not None else None
         if folder and not settled(dl, folder):
             return {"progress": 100.0}
+        # Commissary: a season delivered as RAR parts would fail per file, deep
+        # in the importer, with a message about the wrong thing
+        if listing is not None and folder:
+            from core.commissary.packed_release import finished as _packed_finished
+            _refused = _packed_finished(dl, folder, lister=listing)
+            if _refused is not None:
+                return _refused
         packed = import_pack(dl, save, name)
         if packed is not None:
             return packed
@@ -122,6 +139,15 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
     if not src:
         if dl.get("dest_path"):
             return {"status": "completed", "progress": 100.0, "dest_path": dl.get("dest_path")}
+        # Commissary: 'not yet' and 'never' look the same from here - a finished job
+        # that is archives and nothing playable is refused once it has settled,
+        # instead of polling until the stall clock blames the save path
+        if listing is not None and save:
+            from core.commissary.packed_release import finished as _packed_finished
+            _own = _scoped_content(save, name) if name else save
+            _refused = _packed_finished(dl, _own, settled, lister=listing) if _own else None
+            if _refused is not None:
+                return _refused
         return {"progress": 100.0}   # complete but the file isn't visible yet — keep polling
     # Commissary: visible is not finished — a 'moving' torrent reads 100%.
     if settled is not None and not settled(dl, src):
@@ -226,6 +252,9 @@ def find_content_dir(root, name=None) -> Optional[str]:
 def process_active_client_download(dl: dict, organizer=None, import_pack=None) -> dict:
     """Production entry: poll the real client + resolve + find the video for one torrent/usenet row."""
     from core.commissary.settle import content_has_settled  # Commissary: settle gate
+    from core.commissary import packed_release as _packed
     return process_client_download(dl, get_status=_get_status, resolve_path=_resolve_path,
                                    find_video=find_video_file, organizer=organizer,
-                                   import_pack=import_pack, settled=content_has_settled)
+                                   import_pack=import_pack, settled=content_has_settled,
+                                   # Commissary: refuse RAR-only releases
+                                   list_files=_packed.client_files, listing=_packed.listing)
