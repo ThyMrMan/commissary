@@ -7,6 +7,8 @@ GET  /libraries/registry            libraries + server sections + quality profil
 POST /libraries/registry            save {movies: [...], tv: [...]} for the server
 POST /libraries/assign/wishlist     {kind, tmdb_id, root_folder_id} send a wished title
 POST /libraries/assign/watchlist    {tmdb_id, root_folder_id} send a followed show
+GET  /libraries/assignments         library choices + current wished/followed choices
+POST /libraries/assign/title        {kind, library_id, root_folder_id} move an owned title
 """
 
 from __future__ import annotations
@@ -60,6 +62,24 @@ def register_routes(bp):
         saved = vl.save_libraries(get_video_db(), server, movies=body.get("movies"),
                                   tv=body.get("tv"))
         return jsonify({"status": "saved", "server": server, "libraries": saved})
+
+    @bp.route("/libraries/assignments", methods=["GET"])
+    def commissary_library_assignments():
+        from . import get_video_db
+        from core.commissary import video_libraries as vl
+        return jsonify(vl.picker_state(get_video_db(), request.args.get("kind"),
+                                       request.args.get("library_id")))
+
+    @bp.route("/libraries/assign/title", methods=["POST"])
+    def commissary_library_assign_title():
+        from . import get_video_db
+        from core.commissary import video_libraries as vl
+        body = request.get_json(silent=True) or {}
+        if body.get("kind") not in ("movie", "show") or body.get("library_id") in (None, ""):
+            return jsonify({"error": "kind and library_id are required"}), 400
+        n = vl.set_title_library(get_video_db(), body["kind"], body["library_id"],
+                                 body.get("root_folder_id"))
+        return jsonify({"status": "saved", "updated": n})
 
     @bp.route("/libraries/assign/wishlist", methods=["POST"])
     def commissary_library_assign_wishlist():

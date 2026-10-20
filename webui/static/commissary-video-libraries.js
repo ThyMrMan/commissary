@@ -21,6 +21,7 @@
     function el(tag, attrs, children) {
         var n = document.createElement(tag);
         Object.keys(attrs || {}).forEach(function (k) {
+            if (attrs[k] == null) return;
             if (k === 'text') n.textContent = attrs[k];
             else if (k === 'className') n.className = attrs[k];
             else if (k.indexOf('on') === 0) n.addEventListener(k.slice(2), attrs[k]);
@@ -59,35 +60,41 @@
         return s;
     }
 
+    // One settings field the way upstream builds them: .form-group, its label
+    // above the control.
+    function field(label, control) {
+        return el('div', { className: 'form-group' },
+                  [el('label', { text: label }), control]);
+    }
+
     function row(kind, lib, index, list) {
         var sections = (state.available[kind] || []).slice();
         if (lib.server_title && sections.indexOf(lib.server_title) === -1) sections.unshift(lib.server_title);
         var fields = [
-            el('label', { text: index === 0 ? 'Section (primary)' : 'Section' }),
-            select([['', '— pick a server section —']].concat(sections.map(function (t) { return [t, t]; })),
-                   lib.server_title, function (e) { lib.server_title = e.target.value; }),
-            el('label', { text: 'Name' }),
-            input(lib.label, lib.server_title || 'shown in the app', function (e) { lib.label = e.target.value; }),
-            el('label', { text: 'Folder' }),
-            input(lib.path, '/media/movies', function (e) { lib.path = e.target.value; }),
-            el('label', { text: 'Client category' }),
-            input(lib.category, 'blank = the global category', function (e) { lib.category = e.target.value; }),
-            el('label', { text: 'Trackers (Prowlarr ids)' }),
-            input(lib.preferred_indexer_ids, 'blank = all, e.g. 1,7,9',
-                  function (e) { lib.preferred_indexer_ids = e.target.value; }),
-            el('label', { text: 'Default quality profile' }),
-            select([['', 'Global default']].concat((state.profiles || []).filter(function (p) {
-                return p.id; }).map(function (p) { return [p.id, p.name]; })),
+            field('Server section', select(
+                [['', 'Pick a server section']].concat(sections.map(function (t) { return [t, t]; })),
+                lib.server_title, function (e) { lib.server_title = e.target.value; })),
+            field('Name', input(lib.label, lib.server_title || 'Shown in the app',
+                                function (e) { lib.label = e.target.value; })),
+            field('Folder', input(lib.path, kind === 'tv' ? '/media/tv' : '/media/movies',
+                                  function (e) { lib.path = e.target.value; })),
+            field('Download client category', input(lib.category, 'Blank uses the global category',
+                                                    function (e) { lib.category = e.target.value; })),
+            field('Trackers (Prowlarr indexer ids)', input(lib.preferred_indexer_ids, 'Blank searches all, e.g. 1,7,9',
+                  function (e) { lib.preferred_indexer_ids = e.target.value; })),
+            field('Default quality profile', select(
+                [['', 'Global default']].concat((state.profiles || []).filter(function (p) {
+                    return p.id; }).map(function (p) { return [p.id, p.name]; })),
                 lib.default_quality_profile_id,
-                function (e) { lib.default_quality_profile_id = e.target.value || null; })
+                function (e) { lib.default_quality_profile_id = e.target.value || null; }))
         ];
         if (kind === 'tv') {
-            fields.push(el('label', { text: 'Default series type' }));
-            fields.push(select([['', 'Not set']].concat(state.series_types.map(function (t) { return [t, t]; })),
-                               lib.default_series_type,
-                               function (e) { lib.default_series_type = e.target.value || null; }));
+            fields.push(field('Default series type', select(
+                [['', 'Not set']].concat(state.series_types.map(function (t) {
+                    return [t, t.charAt(0).toUpperCase() + t.slice(1)]; })),
+                lib.default_series_type,
+                function (e) { lib.default_series_type = e.target.value || null; })));
         }
-        var grid = el('div', { className: 'commissary-vlib-grid' }, fields);
         var move = function (delta) {
             return function () {
                 var to = index + delta;
@@ -96,27 +103,32 @@
                 render();
             };
         };
-        var actions = el('div', { className: 'commissary-vlib-actions' }, [
-            el('button', { type: 'button', className: 'test-button', text: '↑', title: 'Move up',
-                           onclick: move(-1) }),
-            el('button', { type: 'button', className: 'test-button', text: '↓', title: 'Move down',
-                           onclick: move(1) }),
-            el('button', { type: 'button', className: 'test-button', text: 'Remove',
-                           onclick: function () { list.splice(index, 1); render(); } })
+        var title = (lib.label || lib.server_title || 'New library') + (index === 0 ? ' — primary' : '');
+        var head = el('div', { className: 'commissary-vlib-head' }, [
+            el('span', { className: 'commissary-vlib-title', text: title }),
+            el('div', { className: 'form-actions commissary-vlib-actions' }, [
+                el('button', { type: 'button', className: 'test-button', text: 'Move up',
+                               onclick: move(-1), disabled: index === 0 ? '' : null }),
+                el('button', { type: 'button', className: 'test-button', text: 'Move down',
+                               onclick: move(1), disabled: index === list.length - 1 ? '' : null }),
+                el('button', { type: 'button', className: 'test-button', text: 'Remove',
+                               onclick: function () { list.splice(index, 1); render(); } })
+            ])
         ]);
-        return el('div', { className: 'commissary-vlib-row' }, [grid, actions]);
+        return el('div', { className: 'commissary-vlib-row' },
+                  [head, el('div', { className: 'commissary-vlib-grid' }, fields)]);
     }
 
     function render() {
         var r = root();
         if (!r || !state) return;
         r.textContent = '';
-        r.appendChild(el('h4', { text: 'Video Libraries' }));
+        r.appendChild(el('h4', { className: 'settings-subheading', text: 'Video Libraries' }));
         r.appendChild(el('div', { className: 'setting-help-text', text:
             'Each library is a server section plus the folder its new downloads are filed into. '
-            + 'The first library of a kind is the primary: titles that belong to no library go there. '
-            + 'Trackers limit the searches for that library\'s titles; category sorts its downloads in '
-            + 'the torrent/usenet client.' }));
+            + 'The first library of a kind is its primary: titles that belong to no library go there. '
+            + "Trackers limit the searches for a library's titles, and the category sorts its downloads "
+            + 'in the torrent or usenet client.' }));
         if (!state.server) {
             r.appendChild(el('div', { className: 'setting-help-text', text:
                 'Connect a Plex or Jellyfin server above to set up libraries.' }));
@@ -124,15 +136,17 @@
         }
         KINDS.forEach(function (k) {
             var list = state.libraries[k[0]] = state.libraries[k[0]] || [];
-            var box = el('div', { className: 'commissary-vlib-kind' }, [el('h5', { text: k[1] })]);
+            var box = el('div', { className: 'commissary-vlib-kind' },
+                         [el('h4', { className: 'settings-subheading', text: k[1] })]);
             list.forEach(function (lib, i) { box.appendChild(row(k[0], lib, i, list)); });
-            box.appendChild(el('button', { type: 'button', className: 'test-button', text: '+ Add library',
-                onclick: function () { list.push({}); render(); } }));
+            box.appendChild(el('div', { className: 'form-actions' }, [
+                el('button', { type: 'button', className: 'test-button', text: 'Add library',
+                               onclick: function () { list.push({}); render(); } })]));
             r.appendChild(box);
         });
-        r.appendChild(el('div', { className: 'commissary-vlib-save' }, [
+        r.appendChild(el('div', { className: 'form-actions commissary-vlib-save' }, [
             el('button', { type: 'button', className: 'test-button', text: 'Save libraries', onclick: save }),
-            el('span', { 'data-commissary-video-libraries-status': '' })
+            el('span', { className: 'settings-hint', 'data-commissary-video-libraries-status': '' })
         ]));
         toggleUpstreamSelectors();
     }

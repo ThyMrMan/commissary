@@ -37,17 +37,40 @@ def auth_open_paths() -> dict:
 
 # Layout for the video Libraries editor (commissary-video-libraries.js).
 _VLIB_CSS = (
-    ".commissary-vlib{margin-top:16px}"
-    ".commissary-vlib-kind{margin:12px 0}"
-    ".commissary-vlib-row{display:flex;gap:12px;align-items:flex-start;padding:10px;margin:8px 0;"
-    "border:1px solid rgba(255,255,255,.08);border-radius:8px}"
-    ".commissary-vlib-grid{flex:1;display:grid;grid-template-columns:minmax(120px,max-content) 1fr;"
-    "gap:6px 10px;align-items:center}"
-    ".commissary-vlib-grid input,.commissary-vlib-grid select{width:100%;box-sizing:border-box}"
-    ".commissary-vlib-actions{display:flex;flex-direction:column;gap:6px}"
-    ".commissary-vlib-save{display:flex;gap:12px;align-items:center;margin-top:8px}"
-    "@media (max-width:640px){.commissary-vlib-row{flex-direction:column}"
-    ".commissary-vlib-grid{grid-template-columns:1fr}.commissary-vlib-actions{flex-direction:row}}"
+    # Editor: upstream's own pieces (.settings-subheading, .form-group,
+    # .setting-help-text, .test-button); each library is a card on the settings
+    # surface, the way upstream draws its boxed lists.
+    ".commissary-vlib{margin-top:8px}"
+    ".commissary-vlib-row{margin:10px 0;padding:14px 16px;background:var(--stg-surface,var(--white-a03));"
+    "border:1px solid var(--white-a09);border-radius:var(--radius-lg)}"
+    ".commissary-vlib-head{display:flex;flex-wrap:wrap;gap:10px;align-items:center;"
+    "justify-content:space-between;margin-bottom:12px}"
+    ".commissary-vlib-title{font-size:13px;font-weight:600;color:var(--white-a85,#fff)}"
+    ".commissary-vlib-actions{display:flex;flex-wrap:wrap;gap:8px;margin:0}"
+    # Fields: one upstream .form-group row per setting (label left, control
+    # right), exactly like the rest of this settings section.
+    ".commissary-vlib-grid{display:block}"
+    ".commissary-vlib-save{display:flex;flex-wrap:wrap;gap:12px;align-items:center}"
+    # Library picker buttons (commissary-video-library-pickers.js) sit in the
+    # next slot along from upstream's own card buttons and take their styles.
+    # Bottom-right: the top row (status pill + three buttons) has no room for a
+    # fourth on a narrow card without covering the pill.
+    ".vwsh-movie-art .vwsh-hunt.commissary-vlib-btn{top:auto;bottom:8px;right:8px}"
+    ".vwsh-nebula .wl-orb-group>.commissary-vlib-btn{right:26px}"
+    ".vwsh-nebula .wl-orb-group>.commissary-vlib-btn:hover{background:rgba(var(--accent-rgb),.85);color:#fff}"
+    # Watchlist: looks like upstream's .vwl-btn (its row neighbour) but must not
+    # BE one, since upstream toggles the watchlist on any .vwl-btn click.
+    ".commissary-vlib-wbtn{width:30px;height:30px;border-radius:9px;display:flex;align-items:center;"
+    "justify-content:center;background:rgba(0,0,0,.55);backdrop-filter:blur(8px);"
+    "border:1px solid var(--white-a14);color:rgba(255,255,255,.82);cursor:pointer;opacity:0;"
+    "transform:translateY(-2px);transition:opacity .18s ease,transform .18s ease,background .18s ease,"
+    "color .18s ease,border-color .18s ease}"
+    ".commissary-vlib-wbtn svg{width:15px;height:15px}"
+    ".commissary-vlib-wbtn:hover{background:rgba(0,0,0,.78);color:#fff;border-color:var(--white-a30)}"
+    ".vwlp-card:hover .commissary-vlib-wbtn,.commissary-vlib-wbtn.commissary-vlib-btn--set"
+    "{opacity:1;transform:none}"
+    "@media (hover:none){.commissary-vlib-wbtn{opacity:1;transform:none}}"
+    ".commissary-vlib-btn--set{color:rgb(var(--accent-rgb))}"
 )
 
 

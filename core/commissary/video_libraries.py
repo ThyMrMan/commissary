@@ -610,6 +610,64 @@ def set_watchlist_library(db, tmdb_id, root_folder_id) -> int:
         conn.close()
 
 
+def set_title_library(db, kind, library_id, root_folder_id) -> int:
+    """Move an OWNED movie/show to another library (Manage panel). Metadata
+    only: its files stay where they are; new grabs for it go to the new
+    library. Setting one also redirects its queued wishlist rows (and, for a
+    show, its follow) so the title doesn't end up split."""
+    rid = _checked_id(db, kind, root_folder_id)
+    if rid is False:
+        return 0
+    ck = content_kind(kind)
+    table = "movies" if ck == "movie" else "shows"
+    conn = db._get_connection()
+    try:
+        row = conn.execute(f"SELECT tmdb_id FROM {table} WHERE id=?", (int(library_id),)).fetchone()
+        if not row:
+            return 0
+        cur = conn.execute(f"UPDATE {table} SET root_folder_id=? WHERE id=?", (rid, int(library_id)))
+        tmdb = row[0]
+        if rid is not None and tmdb is not None:
+            conn.execute("UPDATE video_wishlist SET root_folder_id=? WHERE kind=? AND tmdb_id=?",
+                         (rid, "movie" if ck == "movie" else "episode", tmdb))
+            if ck == "show":
+                conn.execute("UPDATE video_watchlist SET root_folder_id=? WHERE kind='show' AND tmdb_id=?",
+                             (rid, tmdb))
+        conn.commit()
+        return cur.rowcount
+    except (sqlite3.Error, TypeError, ValueError):
+        logger.exception("set_title_library failed (%s %s)", kind, library_id)
+        return 0
+    finally:
+        conn.close()
+
+
+def picker_state(db, kind=None, library_id=None) -> dict:
+    """What the library pickers need: each kind's libraries (label, primary
+    first), the current choice per wished/followed title, and optionally the
+    owned title's library (Manage panel)."""
+    choices = {}
+    for ck in ("movie", "show"):
+        choices[ck] = [{"id": r["id"], "label": r.get("label") or r.get("server_title")
+                        or f"Library {r['id']}"} for r in all_rows(db, ck)]
+    wishlist = {"movie": {}, "show": {}}
+    for r in _rows(db, "SELECT kind, tmdb_id, root_folder_id FROM video_wishlist "
+                       "WHERE root_folder_id IS NOT NULL AND kind IN ('movie','episode')"):
+        wishlist["movie" if r["kind"] == "movie" else "show"][str(r["tmdb_id"])] = r["root_folder_id"]
+    watchlist = {str(r["tmdb_id"]): r["root_folder_id"] for r in _rows(
+        db, "SELECT tmdb_id, root_folder_id FROM video_watchlist "
+            "WHERE kind='show' AND root_folder_id IS NOT NULL")}
+    out = {"choices": choices, "wishlist": wishlist, "watchlist": watchlist}
+    if kind and library_id is not None:
+        table = "movies" if content_kind(kind) == "movie" else "shows"
+        try:
+            rows = _rows(db, f"SELECT root_folder_id FROM {table} WHERE id=?", (int(library_id),))
+        except (TypeError, ValueError):
+            rows = []
+        out["title"] = rows[0]["root_folder_id"] if rows else None
+    return out
+
+
 def _checked_id(db, kind, root_folder_id):
     """None to clear, the id if it is a library of this kind, False if not."""
     if root_folder_id in (None, "", "null", 0, "0"):

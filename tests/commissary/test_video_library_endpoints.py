@@ -85,3 +85,34 @@ def test_only_an_admin_can_use_them(app):
     assert c.get("/api/video/libraries/registry").status_code == 403
     assert c.post("/api/video/libraries/registry", json={"movies": []}).status_code == 403
     assert c.post("/api/video/libraries/assign/watchlist", json={"tmdb_id": 1}).status_code == 403
+
+
+def test_moving_an_owned_title_redirects_its_queued_grabs(app):
+    c, db, _ = app
+    vl.save_libraries(db, "plex", tv=[{"server_title": "TV Shows", "path": "/t"},
+                                      {"server_title": "Anime", "path": "/a"}])
+    ids = {r["server_title"]: r["id"] for r in vl.list_libraries(db, "plex")["tv"]}
+    conn = sqlite3.connect(str(db.database_path))
+    sid = conn.execute("INSERT INTO shows (title, tmdb_id, server_source, root_folder_id) "
+                       "VALUES ('Bleach', 30984, 'plex', ?)", (ids["TV Shows"],)).lastrowid
+    conn.commit()
+    conn.close()
+    db.add_episodes_to_wishlist(30984, "Bleach", [{"season_number": 1, "episode_number": 1, "title": "E1"}])
+    r = c.post("/api/video/libraries/assign/title",
+               json={"kind": "show", "library_id": sid, "root_folder_id": ids["Anime"]})
+    assert r.get_json()["updated"] == 1
+    assert c.get(f"/api/video/libraries/assignments?kind=show&library_id={sid}").get_json()["title"] == ids["Anime"]
+    ep = db.episode_wishlist_to_download(due_only=False)[0]
+    assert vl.target_dir(db, "episode", item=ep) == "/a"
+
+
+def test_assignments_list_choices_primary_first_and_current_picks(app):
+    c, db, _ = app
+    vl.save_libraries(db, "plex", movies=[{"server_title": "Movies", "label": "Films", "path": "/m"},
+                                          {"server_title": "Anime-Movies", "path": "/am"}])
+    ids = {r["server_title"]: r["id"] for r in vl.list_libraries(db, "plex")["movies"]}
+    db.add_movie_to_wishlist(149, "Akira")
+    vl.set_wishlist_library(db, "movie", 149, ids["Anime-Movies"])
+    d = c.get("/api/video/libraries/assignments").get_json()
+    assert [x["label"] for x in d["choices"]["movie"]] == ["Films", "Anime-Movies"]
+    assert d["wishlist"]["movie"] == {"149": ids["Anime-Movies"]}
