@@ -2465,6 +2465,11 @@ def validate_and_heal_batch_states():
                         # Task in queue but not in download_tasks dict
                         orphaned_tasks.append(task_id)
 
+                # Commissary: busy = dispatched and unfinished, ONE definition
+                # shared with the validator in core/downloads/monitor.py.
+                from core.commissary.batch_slots import count_active_workers
+                actually_active = count_active_workers(batch_data, download_tasks)
+
                 # Check for inconsistencies
                 if active_count != actually_active:
                     logger.info(f"[Batch Healing] {batch_id}: fixing active count {active_count} → {actually_active}")

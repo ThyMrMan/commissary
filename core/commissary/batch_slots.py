@@ -42,3 +42,37 @@ def release_unclaimed_slot(state: dict, task_id, batch_id, context_key, notify) 
             task.setdefault('error_message', 'Post-processing ended without recording an outcome')
     notify(batch_id, task_id, success=False)
     return True
+
+
+def count_active_workers(batch: dict, tasks: dict) -> int:
+    """Busy worker slots in ``batch``: tasks DISPATCHED to a worker and not finished.
+
+    ONE definition, shared by the worker-count validator (downloads/monitor.py)
+    and the batch healer (web_server.py) — fork 2.3.7. Two enumerated status
+    lists once disagreed and fought (2.3.4: "21 <-> 3" every 30s); counting
+    every unfinished task instead made them agree on a wrong number and wedged
+    every batch bigger than its worker limit (2.3.7: "3 -> 98").
+
+    Dispatched = before ``queue_index``: start_next_batch_of_downloads advances
+    it as it hands each task over, and batches that start their own workers
+    (pinned, redownload) are created already past them. Everything from
+    ``queue_index`` on is waiting and holds no slot.
+
+    A dispatched task counts whatever its status — including 'pending', which
+    upstream's lists left out, so a just-started worker read as a free slot and
+    the validator launched another. An unknown status counts too (safe
+    direction: the batch waits rather than over-starting). A terminal task, one
+    already through the completion callback, or one missing from ``tasks``
+    holds none.
+    """
+    queue = batch.get('queue') or []
+    dispatched = queue[:batch.get('queue_index') or 0]
+    completed = batch.get('_completed_task_ids') or ()
+    busy = 0
+    for task_id in dispatched:
+        if task_id in completed:
+            continue
+        status = (tasks.get(task_id) or {}).get('status')
+        if status and status not in _TERMINAL_STATUSES:
+            busy += 1
+    return busy
