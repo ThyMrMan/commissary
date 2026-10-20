@@ -33,11 +33,16 @@ def moved_default(monkeypatch):
     return 0.33
 
 
-def test_the_settings_screen_shows_the_shared_default(moved_default):
+def test_the_settings_screen_shows_the_shared_default(moved_default, monkeypatch):
     app = Flask(__name__)
     app.register_blueprint(api_auto_import.bp)
-    api_auto_import.configure(get_database=lambda: None, config_manager=_NoKeys(),
-                              _auto_import_worker=lambda: None)
+    # monkeypatch, not configure(): configure() rebinds the module globals for
+    # the rest of the run, so every later test of the real app's auto-import
+    # routes would see "Auto-import not available".
+    module_globals = vars(api_auto_import)
+    monkeypatch.setitem(module_globals, "get_database", lambda: None)
+    monkeypatch.setitem(module_globals, "config_manager", _NoKeys())
+    monkeypatch.setitem(module_globals, "_auto_import_worker", lambda: None)
 
     payload = app.test_client().get("/api/auto-import/settings").get_json()
 
