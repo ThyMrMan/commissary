@@ -43,3 +43,6 @@ Staging/
 Transfer/
 # Any hidden folders
 **/.*/
+
+# Commissary: local data for running a dev copy against real libraries
+/data/
