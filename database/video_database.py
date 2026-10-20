@@ -558,6 +558,11 @@ def _dedupe_wishlist_by_media(rows: list, key_fn) -> list:
     return list(seen.values())
 
 
+_MISSING = object()
+# Commissary: kept in sync with core.commissary.video_secrets.SECRET_KEYS (a test pins it).
+_COMMISSARY_SECRET_KEYS = frozenset({"video_plex_token", "video_jellyfin_key"})
+
+
 class VideoDatabase:
     """Connection + schema manager for the isolated video library DB."""
 
@@ -2314,6 +2319,14 @@ class VideoDatabase:
 
     # ── video_settings KV (temporary home until the settings.db move) ────────
     def get_setting(self, key: str, default=None):
+        row = self.raw_setting(key, _MISSING)
+        if row is _MISSING:
+            return default
+        from core.commissary.video_secrets import unseal  # Commissary: encrypted secrets
+        return unseal(key, row)
+
+    def raw_setting(self, key: str, default=None):
+        """The stored value exactly as written (secrets still encrypted)."""
         conn = self._get_connection()
         try:
             row = conn.execute(
@@ -2324,6 +2337,8 @@ class VideoDatabase:
             conn.close()
 
     def set_setting(self, key: str, value: str) -> None:
+        from core.commissary.video_secrets import seal  # Commissary: encrypted secrets
+        value = seal(key, value)
         conn = self._get_connection()
         try:
             conn.execute(
@@ -2351,7 +2366,7 @@ class VideoDatabase:
         out = {}
         for r in rows:
             k = r["key"]
-            if k in exclude:
+            if k in exclude or k in _COMMISSARY_SECRET_KEYS:  # Commissary: never export secrets
                 continue
             v = r["value"]
             try:

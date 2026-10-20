@@ -1,6 +1,7 @@
 """Commissary's hook into the Flask app.
 
-``install(app)`` is called once from web_server.py. index.html renders
+``install(app)`` is called once from web_server.py. It runs the fork's one-shot
+startup migrations and exposes template context: index.html renders
 ``commissary_head`` in its <head>: CSS that hides switched-off upstream
 features, and a small ``window.COMMISSARY`` object for scripts.
 """
@@ -41,3 +42,15 @@ def template_context(config_get=None) -> dict:
 
 def install(app) -> None:
     app.context_processor(template_context)
+    _run_startup_migrations()
+
+
+def _run_startup_migrations() -> None:
+    """One-shot, idempotent data fixes. Never fatal."""
+    try:
+        from core.commissary.video_secrets import migrate
+        from database.video_database import VideoDatabase
+        migrate(VideoDatabase())
+    except Exception:  # noqa: BLE001
+        from utils.logging_config import get_logger
+        get_logger("commissary.web").debug("video secret migration failed", exc_info=True)
