@@ -17,6 +17,10 @@ import re
 import unicodedata
 from typing import Any
 
+# Commissary: fansub names, colon subtitles and arcs (see the module).
+from core.commissary.release_titles import fansub_candidates as _fansub_candidates
+from core.commissary.release_titles import match_pairs as _match_pairs
+
 # Resolution — first match wins (most specific first).
 _RES = [
     (re.compile(r"\b(2160p|4k|uhd)\b", re.I), "2160p"),
@@ -309,6 +313,7 @@ def titles_match(release_name: Any, want_title: Any) -> bool:
     segs = [s for s in re.split(r"[\\/]+", raw) if s.strip()]
     if len(segs) > 1:
         cands += segs
+    cands += _fansub_candidates(cands)   # Commissary: '[Group] Title - 07'
     saw_any = False
     for cand in cands:
         got = normalize_title(extract_title(cand))
@@ -320,7 +325,8 @@ def titles_match(release_name: Any, want_title: Any) -> bool:
             if rel_year and any(got == base and abs(rel_year - year) <= 1
                                 for base, year in year_wants):
                 return True
-        for want in wants:
+        # Commissary: also the part before a colon subtitle ('Title: Subtitle')
+        for got, want in _match_pairs(extract_title(cand), normalize_title(extract_title(cand)), wants):
             if got == want:
                 return True
             if got.replace(" ", "") == want.replace(" ", ""):

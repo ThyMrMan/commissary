@@ -194,6 +194,12 @@ def tier_key(source, resolution) -> str:
     return ""
 
 
+def _rt_arc_match(release_name, want_title, want_episode):
+    """Commissary: core.commissary.release_titles.arc_episode_match."""
+    from core.commissary.release_titles import arc_episode_match
+    return arc_episode_match(release_name, want_title, want_episode)
+
+
 def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_title=None,
               want_date=None, want_absolute=None, want_alt=None):
     from core.video.release_parse import title_region_year
@@ -207,9 +213,20 @@ def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_tit
     # an unknown/unisolable title passes through to the scope/year checks below.
     if want_title:
         from core.video.release_parse import extract_title, titles_match
-        if not titles_match(parsed.get("title"), want_title):
+        # Commissary: an arc's releases extend the show's title with the arc's
+        # name ('Bleach - Sennen Kessen Hen - 48'), which reads as another show.
+        # The episode branch judges them; the arc's other episodes are the right
+        # show with the wrong number, not a wrong title.
+        from core.commissary import release_titles as _rt
+        _arc = scope == "episode" and _rt.arc_episode_match(
+            parsed.get("title"), want_title, want_episode)
+        if not _arc and not titles_match(parsed.get("title"), want_title):
+            if scope == "episode" and _rt.arc_episode_number(
+                    parsed.get("title"), want_title) is not None:
+                return None, "Wrong episode"
             return None, "Wrong title (%s — wanted %s)" % (
-                extract_title(parsed.get("title")) or "?", want_title)
+                _rt.compared_title(parsed.get("title")) or extract_title(parsed.get("title")) or "?",
+                _rt.wanted_text(want_title))
     season, episode = parsed.get("season"), parsed.get("episode")
     if scope == "movie":
         if season is not None:
@@ -234,6 +251,11 @@ def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_tit
                 from core.video.release_parse import has_absolute_episode
                 if has_absolute_episode(parsed.get("title"), want_absolute):
                     return None, None
+            # Commissary: an arc numbers its own episodes from 1 (Bleach S17E48 is
+            # '... Sennen Kessen Hen - 48'); never a season pack.
+            if not parsed.get("is_season_pack") and _rt_arc_match(
+                    parsed.get("title"), want_title, want_episode):
+                return None, None
             return None, "Not a single episode"
         # A multi-episode file (S01E01E02 / E01-03) satisfies any episode it spans.
         ep_end = parsed.get("episode_end") or episode
@@ -262,6 +284,11 @@ def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_tit
         if (not alt_ok and want_episode is not None
                 and not (episode <= want_episode <= ep_end)):
             if want_date and parsed.get("air_date") == want_date:
+                return None, None
+            # Commissary: an anime tracker writes the ABSOLUTE number into the
+            # SxxExx it makes up (Re:ZERO S4E16 ships as 'S04E82'). The season
+            # already matched; accept only the exact absolute for this episode.
+            if want_absolute and episode <= int(want_absolute) <= ep_end:
                 return None, None
             return None, "Wrong episode"
         # Show-identity gate (the "Dark Matter" case): two different shows can share

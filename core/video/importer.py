@@ -150,6 +150,8 @@ def _ctx(dl: dict) -> dict:
         "alt_season": sc.get("alt_season"),
         "alt_episode": sc.get("alt_episode"),
         "alt_exclusive": sc.get("alt_exclusive"),
+        # Commissary: the show's absolute episode number, for the numbering gate
+        "absolute": sc.get("absolute"),
     }
 
 
@@ -300,7 +302,13 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
                     numbering_ok = alt_ok
                 date_ok = bool(ctx.get("air_date")
                                and parsed.get("air_date") == ctx.get("air_date"))
-                if not numbering_ok and not date_ok:
+                # Commissary: an anime tracker's synthesised SxxExx carries the ABSOLUTE
+                # number ('S04E82' for S4E16). Same two signals as the search gate:
+                # the season agrees and the number is exactly this episode's absolute.
+                absolute_ok = bool(ctx.get("absolute")
+                                   and parsed.get("season") == ctx.get("season")
+                                   and parsed.get("episode") <= int(ctx["absolute"]) <= span_end)
+                if not numbering_ok and not date_ok and not absolute_ok:
                     return _reject("Release is S%02dE%02d, not the episode requested"
                                    % (parsed.get("season") or 0, parsed.get("episode") or 0))
                 # Show-identity gate (the "Dark Matter" case): two shows can share a
