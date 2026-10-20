@@ -1,3 +1,9 @@
+> **Commissary is a fork of [SoulSync](https://github.com/Nezreka/SoulSync) by Nezreka.**
+> It tracks upstream and merges its releases, and adds its own changes on top (versions read `<upstream>-c.<n>`).
+> It is not affiliated with, endorsed by, or supported by the upstream project: report Commissary problems at
+> [ThyMrMan/commissary/issues](https://github.com/ThyMrMan/commissary/issues), not upstream.
+> Image: `ghcr.io/thymrman/commissary:latest`. The rest of this README is upstream's.
+
 <p align="center">
   <img src="./assets/trans.png" alt="SoulSync" width="420">
 </p>

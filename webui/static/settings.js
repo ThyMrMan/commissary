@@ -3176,7 +3176,7 @@ async function loadSettingsData() {
             _tcMinSeed.value = (n === undefined || n === null) ? 1 : Number(n);
         }
         const _tcDlPath = document.getElementById('torrent-download-path');
-        if (_tcDlPath) _tcDlPath.value = settings.download_source?.torrent_download_path || '';
+        if (_tcDlPath) _tcDlPath.value = [].concat(settings.download_source?.torrent_download_path || []).join('; ');  // Commissary: several folders
         const _ucType = document.getElementById('usenet-client-type');
         const _ucUrl = document.getElementById('usenet-client-url');
         const _ucKey = document.getElementById('usenet-client-api-key');
@@ -3190,7 +3190,7 @@ async function loadSettingsData() {
         if (_ucPass) _ucPass.value = settings.usenet_client?.password || '';
         if (_ucCat) _ucCat.value = settings.usenet_client?.category || 'soulsync';
         const _ucDlPath = document.getElementById('usenet-download-path');
-        if (_ucDlPath) _ucDlPath.value = settings.download_source?.usenet_download_path || '';
+        if (_ucDlPath) _ucDlPath.value = [].concat(settings.download_source?.usenet_download_path || []).join('; ');  // Commissary: several folders
         if (typeof updateUsenetClientUI === 'function') updateUsenetClientUI();
         // Sync ARL to connections tab field + bidirectional listeners
         const _connArl = document.getElementById('deezer-connection-arl');

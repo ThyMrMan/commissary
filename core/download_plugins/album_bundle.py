@@ -1315,6 +1315,8 @@ def _candidate_download_roots(config_get: Callable[..., Any]) -> list:
     (e.g. ``./downloads``) resolve against the process CWD — the
     container's ``/app`` — which is exactly where those mounts live.
     """
+    # Commissary: a setting may hold several folders (list, or ';'-separated).
+    from core.commissary.paths import split_paths
     roots: list = []
     for key in (
         'download_source.usenet_download_path',
@@ -1326,7 +1328,7 @@ def _candidate_download_roots(config_get: Callable[..., Any]) -> list:
     ):
         value = config_get(key, None)
         if value:
-            roots.append(str(value))
+            roots.extend(split_paths(value))
     seen: set = set()
     out: list = []
     for root in roots:

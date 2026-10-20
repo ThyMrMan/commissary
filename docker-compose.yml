@@ -6,7 +6,7 @@
 
 services:
   soulsync:
-    image: boulderbadgedad/soulsync:latest
+    image: ghcr.io/thymrman/commissary:latest
     container_name: soulsync-webui
     environment:
       # User/Group ID configuration

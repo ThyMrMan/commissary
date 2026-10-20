@@ -19,16 +19,19 @@ Reference the old code with `git show legacy-2.4.3:<path>`.
 - **Never mass-edit "SoulSync"** again. Branding goes through a display-name
   constant.
 
-## Phase 0 — foundation (do first)
+## Phase 0 — foundation (done)
 
-| Item | Approach |
+Fork code lives in `core/commissary/` and `tests/commissary/`; upstream files
+only carry small hooks marked `Commissary:`.
+
+| Item | Where |
 |---|---|
-| Publish workflow | New `commissary-publish.yml` (from legacy `docker-publish.yml`, guard `ThyMrMan/commissary`, ghcr.io/thymrman/commissary). Leave upstream workflow files untouched; theirs are guarded to `Nezreka/SoulSync` and skip here. |
-| Version + update check | `_SOULSYNC_BASE_VERSION` = upstream version + `-c.N`; repoint `_GITHUB_REPO` (web_server.py) so the update banner compares against our releases. |
-| Branding | `APP_DISPLAY_NAME` constant exposed to Jinja/JS/TS; change only user-facing surfaces (title, sidebar logo, login, help header, contact/UA strings), copy `templates/commissary.*`. Port `tests/test_branding.py` to pin the never-rename list (`SOULSYNC_*` env, `soulsync_database` volume, Subsonic client name, `::soulsync` ids). |
-| Chat + donation | A feature flag that skips chat blueprint/push loop and hides nav/support — not deletion. |
-| Config compatibility | One-time normaliser for a legacy config: `download_source.torrent_download_path`/`usenet_download_path` are lists in the fork but strings upstream (`str(list)` would produce a bogus path); fork-only keys `download_source.sources`, `import_search_depth`, `settings.min_free_disk_gb`. |
-| DB compatibility | Verify upstream migrations boot cleanly on a copy of a legacy music.db / video.db (fork-only tables/columns: `music_root_folders`, `tracks.to_be_purchased`/`purchased_at`, video `root_folders` extra columns, `video_title_overrides`, `import_locked`, approval columns; chat table dropped). |
+| Publish workflow | `.github/workflows/commissary-publish.yml`: manual, guarded to `ThyMrMan/commissary`, ghcr.io/thymrman/commissary, tag read from `_SOULSYNC_BASE_VERSION` when left blank. Upstream workflows untouched (guarded to Nezreka, they skip). |
+| Version + update check | `_SOULSYNC_BASE_VERSION = "3.5.7-c.1"`; `core/commissary/update_check.py` compares the `-c.N` counter; `_GITHUB_REPO` from `core/commissary/brand.py`. |
+| Branding | `core/commissary/brand.py` + `web.py` (Jinja `app_name`, `commissary_head`, `window.COMMISSARY`): title, sidebar, sign-in/lock screens, manifest, compose image, `templates/commissary.*`, README notice, MusicBrainz/Discogs contact, bug-report link. Prose stays "SoulSync". Never-rename identifiers pinned in `tests/commissary/test_branding.py`. |
+| Chat + donation | `commissary.chat_enabled` / `commissary.support_button` (default off): chat blueprint and its two slskd loops not started; nav/page/support hidden by CSS. |
+| Download paths | `core/commissary/paths.split_paths`: torrent/usenet completed-download settings accept a list (legacy) or `;`-separated string; every folder is a resolver root. |
+| DB compatibility | Verified on copies of the live DBs (see Dev data). |
 
 ## Phase 1 — small, high-value backend fixes (several fix live upstream bugs)
 

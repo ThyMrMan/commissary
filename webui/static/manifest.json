@@ -1,6 +1,6 @@
 {
-    "name": "SoulSync",
-    "short_name": "SoulSync",
+    "name": "Commissary",
+    "short_name": "Commissary",
     "description": "Music download & sync app — playlists, watchlist, library management.",
     "start_url": "../",
     "scope": "../",

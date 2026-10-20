@@ -45,7 +45,8 @@ logger = setup_logging(_log_level, _log_path)
 
 # App version — single source of truth for backup metadata, system-info, update check, etc.
 # Semver: MAJOR.MINOR.PATCH. Bump at each dev→main release.
-_SOULSYNC_BASE_VERSION = "3.5.7"
+# Commissary: upstream version + fork counter (see core/commissary/update_check.py).
+_SOULSYNC_BASE_VERSION = "3.5.7-c.1"
 
 def _build_version_string():
     """Append short commit hash to version when available (e.g. 2.35+abc1234)."""
@@ -449,6 +450,10 @@ def _inject_soulsync_version():
     `_SOULSYNC_BASE_VERSION`; bumping that single constant updates the UI
     everywhere it's rendered."""
     return {'soulsync_version': SOULSYNC_VERSION, 'soulsync_base_version': _SOULSYNC_BASE_VERSION}
+
+# Commissary: fork template context (brand name, switched-off features).
+from core.commissary.web import install as _install_commissary
+_install_commissary(app)
 
 # --- Flask Session Setup (for multi-profile support) ---
 import secrets as _secrets
@@ -15506,7 +15511,8 @@ def _automatic_wishlist_cleanup_after_db_update():
     return _cleanup_wishlist_after_db_update(logger=logger)
 
 # ── Update detection ─────────────────────────────────────────────
-_GITHUB_REPO = "Nezreka/SoulSync"
+# Commissary: check the fork's own releases, not upstream's.
+from core.commissary.brand import GITHUB_REPO as _GITHUB_REPO
 _update_cache = {'latest_sha': None, 'last_check': 0, 'error': None}
 _UPDATE_CHECK_INTERVAL = 3600  # 1 hour
 
@@ -15541,6 +15547,7 @@ def _check_for_updates():
     # yellow major / red critical) and gives the user a number, not a hash.
     try:
         from core.update_check import evaluate_update, fetch_releases
+        from core.commissary.update_check import evaluate_update  # noqa: F811 - Commissary: -c.N aware
         releases = fetch_releases(_GITHUB_REPO)
         _update_cache['release_info'] = evaluate_update(_SOULSYNC_BASE_VERSION, releases)
         _update_cache['error'] = None
@@ -23346,7 +23353,9 @@ _configure_chat_api(
     db_getter=get_database,
     youtube_search=_chat_youtube_search,
 )
-app.register_blueprint(_create_chat_blueprint())
+from core.commissary.features import chat_enabled as _commissary_chat_enabled
+if _commissary_chat_enabled():  # Commissary: chat is off by default
+    app.register_blueprint(_create_chat_blueprint())
 
 # Record-label watchlist (search labels / browse a label's catalog / follow) —
 # purely additive, self-contained blueprint reading only watchlist_labels + the
@@ -24748,8 +24757,9 @@ def start_runtime_services():
         socketio.start_background_task(_emit_service_status_loop)
         socketio.start_background_task(_emit_watchlist_count_loop)
         socketio.start_background_task(_emit_download_status_loop)
-        socketio.start_background_task(_emit_chat_push_loop)
-        socketio.start_background_task(_chat_auto_prove_loop)
+        if _commissary_chat_enabled():  # Commissary: chat is off by default
+            socketio.start_background_task(_emit_chat_push_loop)
+            socketio.start_background_task(_chat_auto_prove_loop)
         # Server Activity — subscriber-gated live push (idle when no drawer open)
         socketio.start_background_task(_emit_server_activity_loop)
         # Phase 2: Dashboard pollers

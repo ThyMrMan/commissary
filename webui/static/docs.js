@@ -867,7 +867,7 @@
         else out.push('(no log lines)');
         out.push('');
         out.push('---');
-        out.push('Paste this output into your GitHub issue at https://github.com/Nezreka/SoulSync/issues');
+        out.push('Paste this output into your GitHub issue at ' + ((window.COMMISSARY && window.COMMISSARY.issuesUrl) || 'https://github.com/Nezreka/SoulSync/issues'));
         return out.join('\n');
     }
 

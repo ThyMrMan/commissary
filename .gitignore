@@ -44,5 +44,8 @@ Transfer/
 # Any hidden folders
 **/.*/
 
+# Commissary: "**/.*/" above also hides .github, so new workflow files were never added
+!.github/
+
 # Commissary: local data for running a dev copy against real libraries
 /data/
