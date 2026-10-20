@@ -165,3 +165,65 @@ def register_routes(bp):
                                             {key: tmpl}, ext)
             out[scope] = dest["path"].replace("\\", "/").lstrip("/")
         return jsonify(out)
+
+    # ── Rename Files for one title (core/video/mass_rename, scoped) ─────────
+    def _rename_scope(kind, item_id):
+        if kind not in ("movie", "show"):
+            return None
+        return (kind, int(item_id))
+
+    @bp.route("/libraries/rename/<kind>/<int:item_id>", methods=["GET"])
+    def commissary_rename_preview(kind, item_id):
+        """Every file of this title whose name differs from the template - the
+        saved one, or ?template= typed in the panel (never saved). Plus the
+        variables with their values for this title."""
+        from . import get_video_db
+        from core.commissary import naming
+        from core.video import mass_rename, organization
+        scope = _rename_scope(kind, item_id)
+        if not scope:
+            return jsonify({"error": "kind must be movie|show"}), 400
+        db = get_video_db()
+        settings = organization.load(db)
+        saved = settings.get("movie_template" if kind == "movie" else "episode_template")
+        template = request.args.get("template") or None
+        res = mass_rename.preview(scope=scope, template=template)
+        movies, episodes = naming.scope_rows(db, db.repair_owned_movie_files(),
+                                             db.rename_owned_episode_files(), scope)
+        rows = naming.with_library_facts(db, (movies or episodes)[:1],
+                                         "movie" if kind == "movie" else "episode")
+        fields = ((mass_rename._movie_fields if kind == "movie" else mass_rename._episode_fields)(rows[0])
+                  if rows else {})
+        used = template or saved
+        return jsonify({**res, "template": saved, "rendered_with": used,
+                        "import_only": naming.template_uses_unavailable_tokens(used),
+                        "tokens": naming.tokens_for(kind, fields)})
+
+    @bp.route("/libraries/rename/<kind>/<int:item_id>", methods=["POST"])
+    def commissary_rename_apply(kind, item_id):
+        """Rename the picked files. The plan is rebuilt server-side with the SAME
+        scope and template the panel previewed, never trusted from the browser."""
+        from core.video import mass_rename
+        scope = _rename_scope(kind, item_id)
+        if not scope:
+            return jsonify({"error": "kind must be movie|show"}), 400
+        body = request.get_json(silent=True) or {}
+        keys = body.get("keys")
+        if keys is not None and not isinstance(keys, list):
+            return jsonify({"error": "keys must be a list"}), 400
+        res = mass_rename.apply(keys or None, scope=scope, template=body.get("template") or None)
+        if res.get("status") == "skipped":
+            return jsonify({**res, "error": "Another rename is running - try again in a moment."}), 409
+        return jsonify(res)
+
+    @bp.route("/libraries/naming/rename-first", methods=["GET", "POST"])
+    def commissary_rename_first():
+        from . import get_video_db
+        from core.commissary import naming
+        db = get_video_db()
+        if request.method == "POST":
+            body = request.get_json(silent=True) or {}
+            if not isinstance(body.get("enabled"), bool):
+                return jsonify({"error": "enabled true|false is required"}), 400
+            naming.set_rename_before_import(db, body["enabled"])
+        return jsonify({"enabled": naming.rename_before_import_enabled(db)})

@@ -106,7 +106,11 @@ def _inverse_reroot(new_local: str, old_local: str, stored: str) -> str:
     return stored_base + nl[len(local_base):]
 
 
-def preview(progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, Any]:
+def preview(progress: Optional[Callable[[int, int], None]] = None, *,
+            scope: Optional[tuple] = None,
+            template: Optional[str] = None) -> Dict[str, Any]:
+    # Commissary: ``scope`` = ('show', id) | ('movie', id) narrows the pass to one
+    # title; ``template`` previews a typed template without saving it.
     """Every file whose on-disk name differs from the current template.
     {status, entries: [{key, kind, title, current, proposed, reason?}],
     unresolved: int}.
@@ -118,6 +122,8 @@ def preview(progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, 
     from core.video.path_resolver import resolve_video_file_path, video_base_dirs
     db = get_video_db()
     settings = organization.load(db)
+    from core.commissary.naming import with_template  # Commissary
+    settings = with_template(settings, scope, template)
     base_dirs = video_base_dirs(db)
     entries: List[Dict[str, Any]] = []
     unresolved = 0
@@ -148,7 +154,8 @@ def preview(progress: Optional[Callable[[int, int], None]] = None) -> Dict[str, 
     episodes = db.rename_owned_episode_files()
     # Commissary: ids, air date and file facts, so a rename names a file exactly
     # as its import did - never a shorter name that strips them off disk
-    from core.commissary.naming import with_library_facts
+    from core.commissary.naming import scope_rows, with_library_facts
+    movies, episodes = scope_rows(db, movies, episodes, scope)
     movies = with_library_facts(db, movies, "movie")
     episodes = with_library_facts(db, episodes, "episode")
     total = len(movies) + len(episodes)
@@ -232,7 +239,11 @@ def preview_state() -> Dict[str, Any]:
     return _snapshot()
 
 
-def apply(keys: Optional[List[str]] = None) -> Dict[str, Any]:
+def apply(keys: Optional[List[str]] = None, *, scope: Optional[tuple] = None,
+          template: Optional[str] = None) -> Dict[str, Any]:
+    # Commissary: scope/template MUST match what was previewed - the plan is
+    # rebuilt here, and without them a per-title apply would rebuild it from the
+    # whole library under the saved template and rename files nobody saw.
     """Perform the renames from a fresh preview (optionally only the picked
     ``keys``). Collision-safe; DB stored paths follow each move."""
     global _running
@@ -241,16 +252,16 @@ def apply(keys: Optional[List[str]] = None) -> Dict[str, Any]:
             return {"status": "skipped", "reason": "already_running"}
         _running = True
     try:
-        return _apply_inner(set(keys) if keys else None)
+        return _apply_inner(set(keys) if keys else None, scope=scope, template=template)
     finally:
         with _lock:
             _running = False
 
 
-def _apply_inner(keys) -> Dict[str, Any]:
+def _apply_inner(keys, *, scope=None, template=None) -> Dict[str, Any]:
     from api.video import get_video_db
     db = get_video_db()
-    plan = preview()
+    plan = preview(scope=scope, template=template)   # Commissary
     renamed = skipped = 0
     failures: List[Dict[str, str]] = []
     for e in plan["entries"]:
@@ -289,6 +300,8 @@ def _apply_inner(keys) -> Dict[str, Any]:
             _move_sidecars(src, dst)
             _update_stored_path(db, e["key"], src, dst)
             _sweep_empty_dir(os.path.dirname(src))
+            from core.commissary.naming import sweep_empty_parents  # Commissary: the old show folder too
+            sweep_empty_parents(db, os.path.dirname(src))
             renamed += 1
         except OSError as ex:
             failures.append({"key": e["key"], "reason": str(ex)})

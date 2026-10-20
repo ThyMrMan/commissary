@@ -834,6 +834,10 @@
             // Commissary: a title not owned yet can still have its search set up
             more += CommissaryTitleSetup.buttonHtml();
         }
+        // Commissary: rename one owned title's files to a naming template
+        if (typeof CommissaryRename !== 'undefined' && CommissaryRename.applies(d)) {
+            more += CommissaryRename.buttonHtml();
+        }
         // Synchronize — a deep scan scoped to THIS show: re-reads it from the
         // server and reconciles episodes (adds + removals) without waiting for
         // a full library scan. Library shows only (needs a local row).
@@ -3377,6 +3381,7 @@
             else if (which === 'poster') openPosterModal();
             else if (which === 'manage') openManagePanel();
             else if (which === 'commissary-title-setup') CommissaryTitleSetup.open(data);  // Commissary
+            else if (which === 'commissary-rename') CommissaryRename.open(data);  // Commissary
             else if (which === 'sync-show') syncShowNow(act);
             else if (which === 'sync-movie') syncMovieNow(act);
             else if (which === 'watched-toggle') toggleWatchedState(act);

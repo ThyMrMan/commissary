@@ -474,3 +474,216 @@ def with_naming(row: dict, fields: dict) -> dict:
         if out.get(k) in (None, ""):
             out[k] = v
     return out
+
+
+# ── one title, and a one-off template ───────────────────────────────────────
+
+def with_template(settings: dict, scope, template) -> dict:
+    """The settings with a typed template in place of the saved one, for the
+    kind being previewed. Never written back: the global template stays."""
+    if not template or not str(template).strip():
+        return settings
+    out = dict(settings or {})
+    kind = (scope or (None,))[0]
+    out["movie_template" if kind == "movie" else "episode_template"] = str(template)
+    return out
+
+
+def scope_rows(db, movies, episodes, scope):
+    """Upstream's whole-library rows narrowed to one title: ('show', id) or
+    ('movie', id). None keeps everything."""
+    if not scope:
+        return movies, episodes
+    kind, item_id = scope[0], scope[1]
+    try:
+        item_id = int(item_id)
+    except (TypeError, ValueError):
+        return [], []
+    if kind == "movie":
+        return [r for r in movies or [] if int(r.get("movie_id") or 0) == item_id], []
+    try:
+        conn = db._get_connection()
+        try:
+            ids = {r[0] for r in conn.execute("SELECT id FROM episodes WHERE show_id=?", (item_id,))}
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        logger.exception("scoping a rename to show %s failed", item_id)
+        return [], []
+    return [], [r for r in episodes or [] if r.get("episode_id") in ids]
+
+
+# ── rename before import ────────────────────────────────────────────────────
+# The fork's own setting: upstream's organization.normalize() drops keys it
+# doesn't know, so the old fork's 'rename_before_import' inside that blob
+# would vanish on the next settings save. Seeded from it, default on.
+RENAME_FIRST_KEY = "commissary_rename_before_import"
+
+
+def rename_before_import_enabled(db) -> bool:
+    try:
+        v = db.get_setting(RENAME_FIRST_KEY)
+        if v is not None and str(v) != "":
+            return str(v) == "1"
+        import json
+        blob = json.loads(db.get_setting("organization") or "{}")
+        return bool(blob.get("rename_before_import", True))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def set_rename_before_import(db, on: bool) -> None:
+    db.set_setting(RENAME_FIRST_KEY, "1" if on else "0")
+
+
+_RENAMED_PACKS: set = set()
+
+
+def rename_before_import(db, dl: dict) -> None:
+    """Bring this title's EXISTING files up to the current template before the
+    new one is placed beside them. Templates apply at import, so changing one
+    forked a show across two naming eras - the new episode in a folder named
+    the new way, every earlier season in the old one, two shows on the server.
+
+    Scoped to the one title; a title not in the library has nothing to rename,
+    and one already matching renames nothing. Failures are ignored: a rename
+    that couldn't happen leaves the split this tries to avoid, no worse than
+    not trying, while refusing the import would strand a good download."""
+    if not rename_before_import_enabled(db):
+        return
+    if (dl or {}).get("pack_episode"):
+        # every member of a pack comes through here; the first one's pass covers the show
+        key = (dl.get("id"), dl.get("media_id"))
+        if key in _RENAMED_PACKS:
+            return
+        _RENAMED_PACKS.add(key)
+        if len(_RENAMED_PACKS) > 500:
+            _RENAMED_PACKS.clear()
+    try:
+        from core.commissary.import_lock import refusal
+        if refusal(db, dl):
+            return                      # a locked title takes no automatic edits at all
+        from core.commissary.title_overrides import library_row
+        from core.video import mass_rename
+        from core.video.download_monitor import _wishlist_ids
+        kind, tmdb_id, _s, _e, _ctx = _wishlist_ids(db, dl)
+        if kind not in ("movie", "episode") or not tmdb_id:
+            return
+        scope_kind = "movie" if kind == "movie" else "show"
+        row_id = library_row(db, scope_kind, tmdb_id)
+        if not row_id:
+            return                      # nothing on disk yet: this IS the first file
+        res = mass_rename.apply(scope=(scope_kind, row_id)) or {}
+        if res.get("status") == "skipped":
+            logger.debug("rename-before-import skipped (%s), importing as-is", res.get("reason"))
+            return
+        if res.get("renamed"):
+            logger.info("Renamed %d existing file(s) for %s to the current template before "
+                        "importing", res["renamed"], dl.get("title") or tmdb_id)
+        if res.get("failures"):
+            logger.warning("rename-before-import could not rename %d file(s) for %s: %s - "
+                           "importing anyway", len(res["failures"]),
+                           dl.get("title") or tmdb_id, res["failures"][:3])
+    except Exception:  # noqa: BLE001 - a tidy-up must never cost the import
+        logger.debug("rename-before-import failed, importing as-is", exc_info=True)
+
+
+# ── the per-title Rename Files panel's variable list ───────────────────────
+
+TOKEN_HELP = {
+    "series": "Show title", "season": "Season number, zero-padded (01)",
+    "seasonraw": "Season number, unpadded (1)",
+    "episode": "Episode number, zero-padded; a multi-episode file renders its span (01-E02)",
+    "episodetitle": "Episode title", "airdate": "Air date, YYYY-MM-DD, for daily shows",
+    "tvdbid": "TheTVDB id", "title": "Movie title",
+    "titlefirst": "First letter of the title, for A/B/C folders",
+    "edition": "Edition (Director's Cut, Extended)", "tmdbid": "TMDB id", "imdbid": "IMDb id",
+    "year": "Release year", "quality": "Quality label (WEBDL-1080p)", "resolution": "Resolution",
+    "source": "Release source (BluRay, WEB-DL)", "codec": "Video codec, uppercased (H264, HEVC)",
+    "Series Title": "Show title, as stored",
+    "Series CleanTitle": "Show title with filename-hostile characters removed",
+    "Series CleanTitleWithoutYear": "Clean show title without a trailing '(2019)', so "
+                                    "'{(Series Year)}' doesn't print it twice",
+    "Series TitleThe": "Show title with a leading article moved to the end (Expanse, The)",
+    "Series TitleYear": "Clean show title followed by its year", "Series Year": "Premiere year",
+    "Movie Title": "Movie title, as stored",
+    "Movie CleanTitle": "Movie title with filename-hostile characters removed",
+    "Movie TitleThe": "Movie title with a leading article moved to the end",
+    "Movie OriginalTitle": "Original title, falling back to the stored one",
+    "Movie Year": "Release year", "Release Year": "Release year",
+    "absolute": "Absolute episode number, for anime ({absolute:000})",
+    "Episode Title": "Episode title",
+    "Episode CleanTitle": "Episode title, filename-safe; ':90' caps the length",
+    "Air-Date": "Air date, 2026-07-08", "AirDate": "Air date, dotted: 2026.07.08",
+    "Quality Full": "Full quality name (WEBDL-1080p)", "Quality Title": "Resolution only (1080p)",
+    "MediaInfo VideoCodec": "Video codec as the schemes write it (x265, x264)",
+    "MediaInfo AudioCodec": "Audio codec (EAC3, TrueHD, DTS)",
+    "MediaInfo AudioChannels": "Channel layout (5.1, 7.1)",
+    "MediaInfo AudioLanguages": "Audio track languages (EN+JA)",
+    "MediaInfo VideoBitDepth": "Bit depth (8, 10, 12)",
+    "MediaInfo VideoDynamicRange": "'HDR' when the file has any HDR format",
+    "MediaInfo VideoDynamicRangeType": "Exact HDR format (DV, HDR10, HDR10+, HLG)",
+    "MediaInfo 3D": "'3D' for a 3D release", "Release Group": "Release group",
+    "Custom Formats": "Custom formats the file's name matches",
+    "Edition Tags": "Edition (Directors Cut, IMAX, Extended)",
+    "Original Title": "The release name the file was grabbed under",
+    "Original Filename": "The file's name at import", "ImdbId": "IMDb id", "TmdbId": "TMDB id",
+    "TvdbId": "TheTVDB id",
+}
+
+
+def tokens_for(kind: str, fields: dict) -> List[Dict[str, str]]:
+    """Both vocabularies for a title, each with its meaning and the value it
+    takes for THIS file. Import-only tokens are listed but marked, so a template
+    that uses one explains itself instead of quietly losing content."""
+    from core.video import organization
+    scope = "movie" if kind == "movie" else "episode"
+    values = (organization._movie_values(fields) if scope == "movie"
+              else organization._episode_values(fields))
+    brace = movie_tokens(fields) if scope == "movie" else episode_tokens(fields)
+    import_only = {naming_tokens.canonical(n) for n in LIBRARY_UNAVAILABLE_TOKENS}
+    out = [{"token": "$" + n, "style": "dollar", "description": TOKEN_HELP.get(n, ""),
+            "example": _str(values.get(n))} for n in sorted(values)]
+    for n in sorted(brace, key=str.lower):
+        only = naming_tokens.canonical(n) in import_only
+        note = TOKEN_HELP.get(n, "")
+        if only:
+            note = (note + " - " if note else "") + "only available at import; empty when renaming"
+        out.append({"token": "{" + n + "}", "style": "brace", "description": note,
+                    "example": "" if only else _str(brace.get(n)), "import_only": only})
+    return out
+
+
+def sweep_empty_parents(db, folder: str, levels: int = 3) -> None:
+    """After a rename, remove the old folders it emptied - the season folder,
+    then the show folder - stopping at (and never touching) a library root.
+    Upstream removes only the file's own folder, which left an empty
+    old-style show folder beside the renamed one."""
+    try:
+        from core.video.library_roots import library_roots
+        from core.video.path_resolver import video_base_dirs
+        stops = set()
+        for p in list(video_base_dirs(db) or []) + library_roots(db, "movie") + library_roots(db, "episode"):
+            if p:
+                stops.add(os.path.normcase(os.path.normpath(str(p))))
+    except Exception:  # noqa: BLE001 - no roots known: don't sweep at all
+        logger.debug("rename sweep: library roots unavailable", exc_info=True)
+        return
+    d = folder
+    for _ in range(levels):
+        if not d:
+            return
+        norm = os.path.normcase(os.path.normpath(d))
+        parent = os.path.dirname(norm)
+        if norm in stops or parent == norm:
+            return
+        if not os.path.isdir(d):        # upstream's own sweep already took it
+            d = os.path.dirname(d)
+            continue
+        try:
+            if os.listdir(d):
+                return
+            os.rmdir(d)
+        except OSError:
+            return
+        d = os.path.dirname(d)

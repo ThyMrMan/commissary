@@ -90,7 +90,11 @@ failed rows, album release picker).
    Legacy 2.0.2 part B (rename existing files before an import) belongs with item 8.
    Found on the way: upstream fetch-dedupe.js reuses an identical /api GET for 2.5s, so every fork re-read after a
    write now uses a unique `?t=` URL.
-8. Sonarr/Radarr `{Token}` naming + rename panel (L).
+8. Sonarr/Radarr `{Token}` naming + rename panel (L) — **done**. Engine core/commissary/naming_tokens.py, vocabulary
+   + import/rename/conformance suppliers core/commissary/naming.py; settings chips/TRaSH preset/server preview
+   (commissary-naming-settings.js); per-title Rename Files (commissary-rename-panel.js, mass_rename scope +
+   one-off template); rename-before-import (fork key `commissary_rename_before_import`, since upstream's
+   organization.normalize drops unknown keys) - skipped for a locked title, once per pack.
 9. Manual import any file/folder on upstream `season_pack.py` claim model (L).
 10. RAR-only refusal + `list_files` on torrent adapters (M).
 11. Retries on the row's own client (M); TMDB search paging/certainty ladder (M).

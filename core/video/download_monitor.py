@@ -262,6 +262,11 @@ def _make_organizer(db):
         except Exception:   # noqa: BLE001 - a probe crash must not block the import
             probe_info = None
         from core.commissary.naming_identity import library_identity  # Commissary
+        # Commissary: bring this title's existing files up to the template first, so
+        # one show isn't split across two naming eras (and the plan below resolves
+        # the renamed folder). Skipped for a locked title; never blocks the import.
+        from core.commissary.naming import rename_before_import
+        rename_before_import(db, dl)
         from core.commissary.naming import custom_formats_for          # Commissary: {Custom Formats}
         dl = {**dl, "_custom_formats": custom_formats_for(db, dl)}
         plan = plan_import(dl, src, list_dir=fs.list_dir, probe=probe_info,

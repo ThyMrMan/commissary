@@ -132,9 +132,43 @@
         });
     }
 
+    // "Rename existing files before importing" - the fork's own setting (upstream's
+    // organization settings drop keys they don't know), after "Replace an existing copy"
+    function renameFirst() {
+        var replace = document.getElementById('vo-replace');
+        if (!replace || document.getElementById('commissary-rename-first')) return;
+        var group = el('div', 'form-group');
+        var label = el('label', 'checkbox-label');
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.id = 'commissary-rename-first';
+        cb.disabled = true;
+        label.appendChild(cb);
+        label.appendChild(el('span', null, 'Rename a title’s existing files before importing into it'));
+        group.appendChild(label);
+        group.appendChild(el('small', 'settings-hint', 'Brings a show’s earlier files up to the '
+            + 'current template first, so a template change doesn’t split it across two folder '
+            + 'names. Skipped for a locked title; a rename that fails never blocks the import.'));
+        var after = replace.closest('.form-group');
+        after.parentNode.insertBefore(group, after.nextSibling);
+        fetch(API + 'rename-first?t=' + Date.now(), { headers: { 'Accept': 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) { if (d) { cb.checked = !!d.enabled; cb.disabled = false; } });
+        cb.addEventListener('change', function () {
+            fetch(API + 'rename-first', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                         body: JSON.stringify({ enabled: cb.checked }) })
+                .then(function (r) { if (!r.ok) throw new Error(); toast('Library organization saved', 'success'); })
+                .catch(function () {
+                    cb.checked = !cb.checked;
+                    toast('Could not save library organization', 'error');
+                });
+        });
+    }
+
     function attach() {
         if (!box('movie')) return false;
         ['movie', 'episode'].forEach(decorate);
+        renameFirst();
         // upstream rewrites the Example lines on every keystroke and on load;
         // follow each of its writes with the server's rendering
         ['movie', 'episode', 'youtube'].forEach(function (s) {

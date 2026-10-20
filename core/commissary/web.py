@@ -81,6 +81,8 @@ _NAMING_CSS = (
     ".commissary-link-btn:hover{filter:brightness(1.2)}"
     ".commissary-token-list{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px;padding:10px;"
     "border:1px solid var(--white-a12,rgba(255,255,255,.12));border-radius:8px}"
+    # display:flex above would otherwise beat the hidden attribute
+    ".commissary-token-list[hidden]{display:none}"
     ".commissary-token{padding:2px 7px;border-radius:5px;background:var(--white-a08,rgba(255,255,255,.08));"
     "border:1px solid transparent;font-size:12px;white-space:nowrap;cursor:pointer;color:inherit;"
     "font-family:inherit}"
