@@ -122,6 +122,8 @@ def rss_items(items: List[Dict[str, Any]], active: set, media_type: str,
     the caller grabs it (adding its season key) or doesn't, and only then are
     its episodes released - or held, for a finished 'only' season."""
     from core.automation.handlers import video_process_wishlist as vpw
+    from core.commissary.import_lock import unlocked
+    items = unlocked(items, media_type, db)        # a lock refuses what RSS would grab
     if media_type == "movie":
         yield from items
         return

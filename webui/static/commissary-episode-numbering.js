@@ -101,7 +101,9 @@
         var asked = 0;      // only the newest answer may write the note
         function refreshNote() {
             var mine = ++asked;
-            fetch(API + id + '/numbering', { headers: { 'Accept': 'application/json' } })
+            // unique URL: upstream's fetch-dedupe.js would answer a re-read made
+            // within 2.5s of the last one (e.g. right after a save) with the old answer
+            fetch(API + id + '/numbering?t=' + Date.now(), { headers: { 'Accept': 'application/json' } })
                 .then(function (r) { return r.json(); })
                 .then(function (d) {
                     if (mine !== asked) return;
@@ -154,7 +156,7 @@
 
         check.addEventListener('click', function () {
             busy(check, true, 'Checking…');
-            fetch(API + id + '/out-of-place', { headers: { 'Accept': 'application/json' } })
+            fetch(API + id + '/out-of-place?t=' + Date.now(), { headers: { 'Accept': 'application/json' } })
                 .then(function (r) { return r.json(); })
                 .then(function (d) {
                     if (!d || !d.success) { result.textContent = (d && d.error) || 'Couldn’t check.'; return; }

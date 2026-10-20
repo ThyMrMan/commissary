@@ -85,7 +85,11 @@ failed rows, album release picker).
    (core/commissary/episode_numbering.py, api/video/commissary_episodes.py, commissary-episode-numbering.js in Manage).
    Only the owning provider creates episodes (refresh_show_art, the worker's match cascade and episode-sync queue);
    TVDB pages fully. Not ported: the legacy duplicate-episode tool (1.8.2/2.0.3) and tools/diagnose_show.py.
-7. Import lock (M).
+7. Import lock (M) — **done** (core/commissary/import_lock.py, commissary-import-lock.js: Manage toggle + season-bar
+   button). Gate in the monitor's organize() after planning; the drain's default fetch and RSS skip locked targets.
+   Legacy 2.0.2 part B (rename existing files before an import) belongs with item 8.
+   Found on the way: upstream fetch-dedupe.js reuses an identical /api GET for 2.5s, so every fork re-read after a
+   write now uses a unique `?t=` URL.
 8. Sonarr/Radarr `{Token}` naming + rename panel (L).
 9. Manual import any file/folder on upstream `season_pack.py` claim model (L).
 10. RAR-only refusal + `list_files` on torrent adapters (M).

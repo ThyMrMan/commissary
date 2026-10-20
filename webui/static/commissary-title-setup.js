@@ -151,7 +151,8 @@
         if (state) close();
         if (window.VideoManage && window.VideoManage.ensureStyles) window.VideoManage.ensureStyles();
         var kind = d.kind, tmdbId = d.tmdb_id;
-        fetch('/api/video/commissary/title/' + kind + '/' + encodeURIComponent(tmdbId) + '/overrides')
+        // ?t: upstream's fetch-dedupe.js would hand a reopen within 2.5s of a save the old answer
+        fetch('/api/video/commissary/title/' + kind + '/' + encodeURIComponent(tmdbId) + '/overrides?t=' + Date.now())
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (s) {
                 if (!s) { toast('Couldn’t load item', 'error'); return; }

@@ -266,6 +266,15 @@ def _make_organizer(db):
                            settings=settings, library_dir=_owned_library_dir(db, dl),
                            expected_duration_sec=_expected_duration_sec(db, dl),
                            identity=library_identity(db, dl))
+        # Commissary: "Lock automatic edits" refuses an unattended import into a locked
+        # show, season or movie (manual import never comes through here). Not a bad
+        # release: it may be fine, just aimed at protected content.
+        if plan["action"] in ("import", "upgrade"):
+            from core.commissary.import_lock import refusal as _lock_refusal
+            _locked = _lock_refusal(db, dl)
+            if _locked:
+                plan = {"action": "reject", "bad_release": False,
+                        "reason": _locked + ". Place it by hand once you have checked it."}
         if _pre_persist_dest and plan["action"] in ("import", "upgrade") and plan.get("dest"):
             try:
                 db.update_video_download(dl["id"], dest_path=plan["dest"]["path"])

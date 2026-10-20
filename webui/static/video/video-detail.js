@@ -2273,7 +2273,9 @@
         var seasonManage = !isYt && !!data && data.kind === 'show' && data.source !== 'tmdb';
         var monitored = (Number(season.episode_monitored) || 0) > 0;
         return (canAcquire || seasonManage)
-            ? '<div class="vd-season-actions">' +
+            // Commissary: which show + season this bar is for (the season import lock)
+            ? '<div class="vd-season-actions"' + (seasonManage && data.id != null
+                ? ' data-commissary-season="' + data.id + ':' + season.season_number + '"' : '') + '>' +
                 (canAcquire ? '<span class="vd-season-actions-count">' + seasonMissing.length + ' missing</span>' : '') +
                 (canAcquire ?
                 '<button class="discog-download-btn discog-btn-compact" type="button" data-vd-season-grab ' +

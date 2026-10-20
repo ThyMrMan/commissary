@@ -9,6 +9,10 @@ POST /libraries/assign/wishlist     {kind, tmdb_id, root_folder_id} send a wishe
 POST /libraries/assign/watchlist    {tmdb_id, root_folder_id} send a followed show
 GET  /libraries/assignments         library choices + current wished/followed choices
 POST /libraries/assign/title        {kind, library_id, root_folder_id} move an owned title
+
+GET  /libraries/<kind>/<id>/import-lock                 {locked, seasons}
+POST /libraries/<kind>/<id>/import-lock                 {locked} lock a movie or show
+POST /libraries/show/<id>/season/<n>/import-lock        {locked} lock one season
 """
 
 from __future__ import annotations
@@ -101,3 +105,36 @@ def register_routes(bp):
             return jsonify({"error": "tmdb_id is required"}), 400
         n = vl.set_watchlist_library(get_video_db(), body["tmdb_id"], body.get("root_folder_id"))
         return jsonify({"status": "saved", "updated": n})
+
+    # ── Lock automatic edits (core/commissary/import_lock.py) ────────────────
+    @bp.route("/libraries/<kind>/<int:item_id>/import-lock", methods=["GET"])
+    def commissary_import_lock_state(kind, item_id):
+        from . import get_video_db
+        from core.commissary import import_lock
+        st = import_lock.state(get_video_db(), kind, item_id)
+        if st is None:
+            return jsonify({"error": "not found"}), 404
+        return jsonify(st)
+
+    @bp.route("/libraries/<kind>/<int:item_id>/import-lock", methods=["POST"])
+    def commissary_import_lock_set(kind, item_id):
+        from . import get_video_db
+        from core.commissary import import_lock
+        body = request.get_json(silent=True) or {}
+        if kind not in ("movie", "show") or not isinstance(body.get("locked"), bool):
+            return jsonify({"error": "kind movie|show and locked true|false are required"}), 400
+        if not import_lock.set_lock(get_video_db(), kind, item_id, body["locked"]):
+            return jsonify({"error": "not found"}), 404
+        return jsonify({"status": "saved", "locked": body["locked"]})
+
+    @bp.route("/libraries/show/<int:show_id>/season/<int:season_number>/import-lock",
+              methods=["POST"])
+    def commissary_season_import_lock_set(show_id, season_number):
+        from . import get_video_db
+        from core.commissary import import_lock
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body.get("locked"), bool):
+            return jsonify({"error": "locked true|false is required"}), 400
+        if not import_lock.set_season_lock(get_video_db(), show_id, season_number, body["locked"]):
+            return jsonify({"error": "no such season"}), 404
+        return jsonify({"status": "saved", "season": season_number, "locked": body["locked"]})

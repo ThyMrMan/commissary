@@ -32,7 +32,8 @@
     function load(force) {
         if (denied) return Promise.resolve(null);
         if (loading && !force) return loading;
-        loading = fetch(API + 'assignments', { headers: { 'Accept': 'application/json' } })
+        // ?t: upstream's fetch-dedupe.js would hand load(true) right after an assign the old answer
+        loading = fetch(API + 'assignments?t=' + Date.now(), { headers: { 'Accept': 'application/json' } })
             .then(function (r) {
                 if (r.status === 403 || r.status === 401) { denied = true; return null; }
                 return r.ok ? r.json() : null;
@@ -192,7 +193,8 @@
         if (!field) return;
         load().then(function () {
             if (!hasChoice(kind) || document.querySelector('[data-commissary-vmg-library]')) return;
-            fetch(API + 'assignments?kind=' + kind + '&library_id=' + encodeURIComponent(lastManage.id))
+            fetch(API + 'assignments?kind=' + kind + '&library_id=' + encodeURIComponent(lastManage.id) +
+                  '&t=' + Date.now())
                 .then(function (r) { return r.ok ? r.json() : null; })
                 .then(function (d) {
                     if (!d || document.querySelector('[data-commissary-vmg-library]')) return;

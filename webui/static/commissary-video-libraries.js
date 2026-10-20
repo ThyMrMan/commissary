@@ -153,7 +153,8 @@
 
     function load() {
         setStatus('Loading…');
-        return fetch(API, { headers: { 'Accept': 'application/json' } })
+        // ?t: upstream's fetch-dedupe.js would hand a reload within 2.5s of a save the old answer
+        return fetch(API + '?t=' + Date.now(), { headers: { 'Accept': 'application/json' } })
             .then(function (resp) { return resp.ok ? resp.json() : null; })
             .then(function (d) {
                 if (!d) { setStatus('Could not load libraries'); return; }

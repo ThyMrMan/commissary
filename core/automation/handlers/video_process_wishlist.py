@@ -584,11 +584,12 @@ def build_download_record(item: Dict[str, Any], best: Dict[str, Any], candidates
 # ── production seams ──────────────────────────────────────────────────────────
 def _default_fetch_items(media_type: str) -> List[Dict[str, Any]]:
     from api.video import get_video_db
+    from core.commissary.import_lock import unlocked   # Commissary: a lock refuses what it would grab
     db = get_video_db()
     if media_type == "movie":
-        return db.movie_wishlist_to_download()
+        return unlocked(db.movie_wishlist_to_download(), media_type, db)
     from core.video.numbering import annotate
-    return annotate(db.episode_wishlist_to_download(), db=db)
+    return annotate(unlocked(db.episode_wishlist_to_download(), media_type, db), db=db)
 
 
 def _backfill_movie_available_dates(limit: int = 25) -> None:
