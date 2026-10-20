@@ -81,7 +81,10 @@ failed rows, album release picker).
 5. Season-pack "only" mode + RSS packs (M) — **done** (core/commissary/season_packs.py). Per-show only; upstream's
    global switch is the automation's `season_pack_first` (no UI), which RSS doesn't read (packs on, as its default).
    Also: an episode whose season pack is in flight is no longer grabbed alone (drain and RSS).
-6. Per-show TMDB/TVDB numbering provider + episode repair (M–L); skip 3.5.7 scene mapping when `episode_source='tvdb'`.
+6. Per-show TMDB/TVDB numbering provider + episode repair (M–L); skip 3.5.7 scene mapping when `episode_source='tvdb'` — **done**
+   (core/commissary/episode_numbering.py, api/video/commissary_episodes.py, commissary-episode-numbering.js in Manage).
+   Only the owning provider creates episodes (refresh_show_art, the worker's match cascade and episode-sync queue);
+   TVDB pages fully. Not ported: the legacy duplicate-episode tool (1.8.2/2.0.3) and tools/diagnose_show.py.
 7. Import lock (M).
 8. Sonarr/Radarr `{Token}` naming + rename panel (L).
 9. Manual import any file/folder on upstream `season_pack.py` claim model (L).

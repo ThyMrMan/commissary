@@ -270,21 +270,16 @@ class VideoEnrichmentEngine:
         # Backfills season posters + show metadata gaps (never clobbers).
         self.db.enrichment_apply("tmdb", "show", show_id, matched=True,
                                  external_id=result["id"], metadata=result.get("metadata"))
-        nums = []
+        # Commissary: only the provider that owns this show's numbering creates
+        # episodes (TMDB's season 2 is not TVDB's); the other may only fill in
+        # existing ones. core/commissary/episode_numbering.py
+        from core.commissary import episode_numbering as _numbering
         try:
             nums = [s["season_number"] for s in (result.get("metadata") or {}).get("seasons") or []]
-            if recent_seasons_only:
-                nums = _latest_seasons(nums)    # current season(s) + specials gain new episodes
-            # mark_synced only when we pulled the FULL season list — a scoped refresh must
-            # not claim the show is fully synced (the background pass finishes the rest).
-            w._cascade_episodes(show_id, result["id"], nums,
-                                mark_synced=not recent_seasons_only)
+            _numbering.cascade(self, show_id, info, result["id"], nums,
+                               recent_only=recent_seasons_only, latest=_latest_seasons)
         except Exception:
             logger.exception("refresh_show_art: episode cascade failed for show %s", show_id)
-        # TVDB episode GAP-FILL — TMDB is often slow on just-aired / reality-TV episode
-        # overviews + titles; TVDB frequently has them first. backfill_episodes is COALESCE
-        # gap-fill, so this only fills what TMDB left blank and never clobbers.
-        self._cascade_tvdb_episodes(show_id, info.get("tvdb_id"), nums)
         if with_ratings:
             self._backfill_ratings("show", show_id)
         return {"ok": True}

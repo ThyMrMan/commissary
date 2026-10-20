@@ -628,6 +628,8 @@ class VideoDatabase:
             from core.commissary.video_libraries import ensure_columns as _vlib_columns
             _vlib_columns(conn)
             _title_ovr.ensure_table(conn)   # Commissary: overrides before owning a title
+            from core.commissary.episode_numbering import ensure_columns as _numbering_columns
+            _numbering_columns(conn)        # Commissary: per-show TMDB/TVDB numbering
             conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
             conn.commit()
             logger.info(

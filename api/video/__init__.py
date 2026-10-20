@@ -187,6 +187,8 @@ def create_video_blueprint() -> Blueprint:
     reg_commissary_libraries(bp)
     from .commissary_titles import register_routes as reg_commissary_titles  # Commissary
     reg_commissary_titles(bp)
+    from .commissary_episodes import register_routes as reg_commissary_episodes  # Commissary
+    reg_commissary_episodes(bp)
     reg_poster(bp)
     reg_enrichment(bp)
     reg_detail(bp)

@@ -149,6 +149,10 @@ def scene_info(item: Dict[str, Any], db: Any = None, client: Any = None,
             db = get_video_db()
         except Exception:   # noqa: BLE001
             return None
+    # Commissary: a show set to TVDB numbering is already numbered the scene way
+    from core.commissary.episode_numbering import uses_tvdb as _tvdb_numbered
+    if _tvdb_numbered(db, item.get("show_tmdb_id")):
+        return None
     if client is None:
         client = (client_factory or _default_client)(db)
     if same_day_wanted is None:

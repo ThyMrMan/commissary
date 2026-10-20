@@ -152,7 +152,10 @@ class VideoEnrichmentWorker:
             # with their show instead of being a separate (huge) queue.
             if item["kind"] == "show" and hasattr(self.client, "season_episodes"):
                 nums = [s["season_number"] for s in (result.get("metadata") or {}).get("seasons") or []]
-                self._cascade_episodes(item["id"], result["id"], nums)
+                # Commissary: only the provider that owns the show's numbering creates episodes
+                from core.commissary.episode_numbering import owns as _owns_numbering
+                if _owns_numbering(self, item["id"], nums):
+                    self._cascade_episodes(item["id"], result["id"], nums)
         else:
             self.db.enrichment_apply(self.service, item["kind"], item["id"], matched=False)
             self.stats["not_found"] += 1
@@ -234,8 +237,16 @@ class VideoEnrichmentWorker:
                 self.db.enrichment_apply("tmdb", "show", show["id"], matched=True,
                                          external_id=result["id"], metadata=result.get("metadata"))
                 nums = [s["season_number"] for s in (result.get("metadata") or {}).get("seasons") or []]
-                self._cascade_episodes(show["id"], result["id"], nums)   # marks synced
-                logger.info("Synced full episode list for show '%s'", show["title"])
+                # Commissary: another provider owns this show's numbering. This pass is
+                # unattended, so writing ours would quietly undo the out-of-place clean-up.
+                from core.commissary.episode_numbering import owns as _owns_numbering
+                if _owns_numbering(self, show["id"], nums):
+                    self._cascade_episodes(show["id"], result["id"], nums)   # marks synced
+                    logger.info("Synced full episode list for show '%s'", show["title"])
+                else:
+                    self.db.mark_episodes_synced(show["id"])
+                    logger.info("Skipped episode sync for '%s' — another provider owns its "
+                                "season numbering", show["title"])
             else:
                 self.db.mark_episodes_synced(show["id"])     # no match → don't re-pick
         except Exception:

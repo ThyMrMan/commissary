@@ -1191,6 +1191,9 @@ class TVDBClient:
         defensively in case the API's ``season`` param is loose. Best-effort — [] on any error."""
         if not self.api_key or series_id is None:
             return []
+        # Commissary: every page, not just page 0 (a long show's later seasons came back empty)
+        from core.commissary.episode_numbering import tvdb_season_episodes
+        return tvdb_season_episodes(self, series_id, season_number)
         try:
             sn = int(season_number)
         except (TypeError, ValueError):
