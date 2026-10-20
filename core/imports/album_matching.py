@@ -543,6 +543,12 @@ def _track_duration_ms(track: Dict[str, Any]) -> int:
     source = (track.get('source') or track.get('_source') or track.get('provider') or '').strip().lower()
 
     if source in _SECONDS_DURATION_SOURCES:
+        # Commissary: only a bare ``duration`` is seconds. A value under
+        # ``duration_ms`` is already ms for every source (the Discogs client
+        # turns "3:25" into 205000, MusicBrainz ``length`` is ms); x1000 made a
+        # track "last" ~57 hours and the duration gate rejected every file.
+        if track.get('duration_ms'):
+            return value
         return value * 1000
     if source in _MS_DURATION_SOURCES:
         return value

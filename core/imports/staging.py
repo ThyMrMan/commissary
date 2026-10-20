@@ -192,6 +192,10 @@ def read_staging_file_metadata(file_path: str, filename: Optional[str] = None) -
         size = os.path.getsize(file_path)
     except OSError:
         size = 0
+    # Commissary: exact identifiers, in the auto-import worker's conventions, so
+    # the album matcher's MBID / ISRC phase has something to compare.
+    isrc = _first_tag("isrc").upper()
+    mbid = _first_tag("musicbrainz_trackid").lower()
 
     return {
         "title": title,
@@ -203,6 +207,8 @@ def read_staging_file_metadata(file_path: str, filename: Optional[str] = None) -
         "duration_ms": duration_ms,
         "bitrate": bitrate,
         "size": size,
+        "isrc": isrc,  # Commissary
+        "mbid": mbid,  # Commissary
     }
 
 
@@ -673,6 +679,8 @@ def collect_staging_files(file_paths: Optional[Iterable[str]] = None,
                     "duration_ms": meta.get("duration_ms", 0),
                     "bitrate": meta.get("bitrate", 0),
                     "size": meta.get("size", 0),
+                    "isrc": meta.get("isrc", ""),  # Commissary
+                    "mbid": meta.get("mbid", ""),  # Commissary
                 }
             )
 

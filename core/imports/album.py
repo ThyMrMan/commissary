@@ -385,6 +385,11 @@ def build_album_import_match_payload(
             "album": sf.get("album") or "",
             "track_number": sf.get("track_number") or 0,
             "disc_number": sf.get("disc_number") or 1,
+            # Commissary: without these the matcher's duration gate (a 0 always
+            # passes) and its exact MBID / ISRC phase were inert on this page.
+            "duration_ms": sf.get("duration_ms") or 0,
+            "isrc": sf.get("isrc") or "",
+            "mbid": sf.get("mbid") or "",
         }
         for sf in staging_files
     }

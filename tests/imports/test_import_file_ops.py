@@ -120,6 +120,9 @@ def test_read_staging_file_metadata_reads_tags(monkeypatch, tmp_path):
         "duration_ms": 0,
         "bitrate": 0,
         "size": 4,
+        # Commissary: exact ids for the album matcher, empty without the tags
+        "isrc": "",
+        "mbid": "",
     }
 
 
@@ -193,6 +196,9 @@ def test_read_staging_file_metadata_uses_filename_fallbacks_when_tags_are_invali
         "duration_ms": 0,
         "bitrate": 0,
         "size": 4,
+        # Commissary: exact ids for the album matcher, empty without the tags
+        "isrc": "",
+        "mbid": "",
     }
 
 
