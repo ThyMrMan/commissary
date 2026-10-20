@@ -85,6 +85,7 @@ _SCHEMA_FILE = Path(__file__).resolve().parent / "video_schema.sql"
 _init_lock = threading.Lock()
 # Commissary: SQL fragments for video Library destinations on wishlist rows.
 from core.commissary import video_libraries as _vlib_sql  # noqa: E402
+from core.commissary import title_overrides as _title_ovr  # noqa: E402  Commissary
 _initialized_paths: set[str] = set()
 
 # Sort/letter key: title without a leading article, lowercased (so "The Matrix"
@@ -626,6 +627,7 @@ class VideoDatabase:
             # migrations (v49 rebuilds video_watchlist with a fixed column list).
             from core.commissary.video_libraries import ensure_columns as _vlib_columns
             _vlib_columns(conn)
+            _title_ovr.ensure_table(conn)   # Commissary: overrides before owning a title
             conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
             conn.commit()
             logger.info(
@@ -6078,7 +6080,8 @@ class VideoDatabase:
             "kind": "show", "id": show["id"], "title": show["title"], "year": show["year"],
             "sort_title": show["sort_title"],
             "quality_profile_id": show["quality_profile_id"] or 0,
-            "series_type": show["series_type"] or "standard",
+            "series_type": (show["series_type"]   # Commissary: or the one set before owning it
+                            or _title_ovr.series_type(self, show["tmdb_id"]) or "standard"),
             # per-title acquisition overrides, so the manage panel renders what
             # is actually set rather than a blank form
             **self.title_overrides("show", show["id"]),
@@ -7893,6 +7896,7 @@ class VideoDatabase:
                 # absolute number). NULL for shows not in the library = standard.
                 # MAX = a type set on ANY server's row wins over a NULL sibling.
                 "COALESCE((SELECT MAX(s.series_type) FROM shows s WHERE s.tmdb_id = w.tmdb_id), "
+                + _title_ovr.WISHLIST_SERIES_TYPE_SQL + ", "  # Commissary
                 # no type set: a show tagged Anime is numbered the anime way
                 # (One Piece S23E1177 is 'One Piece - 1177'). a type set by hand wins.
                 "  (SELECT 'anime' FROM shows s JOIN show_genres sg ON sg.show_id = s.id "
@@ -7988,6 +7992,7 @@ class VideoDatabase:
                 + _vlib_sql.wishlist_profile_default_sql("shows") + ") AS quality_profile_id, "  # Commissary
                 + _vlib_sql.wishlist_library_sql("shows") + " AS root_folder_id, "  # Commissary
                 "COALESCE((SELECT MAX(s.series_type) FROM shows s WHERE s.tmdb_id = w.tmdb_id), "
+                + _title_ovr.WISHLIST_SERIES_TYPE_SQL + ", "  # Commissary
                 # no type set: a show tagged Anime is numbered the anime way
                 # (One Piece S23E1177 is 'One Piece - 1177'). a type set by hand wins.
                 "  (SELECT 'anime' FROM shows s JOIN show_genres sg ON sg.show_id = s.id "
@@ -8479,7 +8484,7 @@ class VideoDatabase:
             if kind == "show":
                 pref = (row["pack_preference"] or "auto").strip().lower()
                 out["pack_preference"] = pref if pref in self._PACK_PREFS else "auto"
-            return out
+            return _title_ovr.fill(self, kind, out, library_id=library_id)  # Commissary
         except sqlite3.Error:
             logger.exception("title_overrides failed")
             return out
@@ -8509,6 +8514,8 @@ class VideoDatabase:
             cur = conn.execute("UPDATE %s SET %s WHERE id=?" % (tbl, ", ".join(sets)),
                                args + [int(library_id)])
             conn.commit()
+            if cur.rowcount > 0:
+                _title_ovr.mirror(self, kind, library_id, values)  # Commissary
             return cur.rowcount > 0
         except sqlite3.Error:
             logger.exception("set_title_overrides failed")
@@ -8538,6 +8545,7 @@ class VideoDatabase:
                 conn.close()
             if row:
                 return self.title_overrides(kind, row["id"])
+            return _title_ovr.fill(self, kind, out, tmdb_id=tmdb_id)  # Commissary
         return out
 
     def set_title_quality_profile(self, kind: str, library_id, profile_id) -> bool:
@@ -8573,6 +8581,8 @@ class VideoDatabase:
             cur = conn.execute("UPDATE shows SET series_type=? WHERE id=?",
                                (None if st == "standard" else st, int(library_id)))
             conn.commit()
+            if cur.rowcount > 0:
+                _title_ovr.mirror(self, "show", library_id, {"series_type": st})  # Commissary
             return cur.rowcount > 0
         except sqlite3.Error:
             logger.exception("set_show_series_type failed")

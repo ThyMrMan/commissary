@@ -75,7 +75,9 @@ failed rows, album release picker).
 2. Fansub/anime/arc release parsing (M) — **done** (core/commissary/release_titles.py).
 3. Manual search knows the title: aliases, AKAs, episode hints, absolute numbers (M) — **done**
    (core/commissary/search_identity.py + commissary-search-identity.js).
-4. tmdb-keyed title overrides before owning the show (S–M), mapped onto upstream `manual_aliases`/`pack_preference`/`series_type`.
+4. tmdb-keyed title overrides before owning the show (S–M), mapped onto upstream `manual_aliases`/`pack_preference`/`series_type` — **done**
+   (core/commissary/title_overrides.py, the legacy `video_title_overrides` table kept as-is; Manage on an
+   unowned TMDB page via commissary-title-setup.js). Legacy `season_pack_mode='only'` reads as 'prefer' until item 5.
 5. Season-pack "only" mode + RSS packs (M).
 6. Per-show TMDB/TVDB numbering provider + episode repair (M–L); skip 3.5.7 scene mapping when `episode_source='tvdb'`.
 7. Import lock (M).

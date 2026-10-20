@@ -887,5 +887,5 @@
             .catch(function () { toast('Couldn’t load item', 'error'); });
     }
 
-    window.VideoManage = { open: open };
+    window.VideoManage = { open: open, ensureStyles: ensureStyles };  // Commissary: styles for the pre-owned panel
 })();

@@ -490,13 +490,16 @@ def apply_default_series_type(db, root_folder_id=None) -> int:
     if root_folder_id is not None:
         sql += " AND shows.root_folder_id = ?"
         params = (int(root_folder_id),)
+    from core.commissary.title_overrides import adopt_series_types
     conn = db._get_connection()
     try:
+        # a type chosen before the show was owned is a hand-set type
+        adopted = adopt_series_types(conn)
         cur = conn.execute(sql, params)
         conn.commit()
         if cur.rowcount:
             logger.info("[Libraries] applied library default series type to %s show(s)", cur.rowcount)
-        return cur.rowcount
+        return cur.rowcount + adopted
     except sqlite3.Error:
         logger.exception("apply_default_series_type failed")
         return 0

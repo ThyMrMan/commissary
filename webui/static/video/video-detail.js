@@ -830,6 +830,9 @@
                 (d.source !== 'tmdb' || d.library_id != null)) {
             more += '<button class="vd-manage-btn" type="button" data-vd-act="manage" title="Edit metadata">' +
                 '<span class="vd-manage-ic">✎</span> Manage</button>';
+        } else if (typeof CommissaryTitleSetup !== 'undefined' && CommissaryTitleSetup.applies(d)) {
+            // Commissary: a title not owned yet can still have its search set up
+            more += CommissaryTitleSetup.buttonHtml();
         }
         // Synchronize — a deep scan scoped to THIS show: re-reads it from the
         // server and reconciles episodes (adds + removals) without waiting for
@@ -3371,6 +3374,7 @@
             else if (which === 'wishlist-missing') wishlistAllMissing(act);
             else if (which === 'poster') openPosterModal();
             else if (which === 'manage') openManagePanel();
+            else if (which === 'commissary-title-setup') CommissaryTitleSetup.open(data);  // Commissary
             else if (which === 'sync-show') syncShowNow(act);
             else if (which === 'sync-movie') syncMovieNow(act);
             else if (which === 'watched-toggle') toggleWatchedState(act);

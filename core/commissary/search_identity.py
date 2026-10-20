@@ -86,7 +86,10 @@ def series_type(db, tmdb_id) -> Optional[str]:
         return None
     value = _one(db, "SELECT series_type FROM shows WHERE tmdb_id=? ORDER BY id LIMIT 1",
                  (int(tmdb_id),))
-    return str(value).strip().lower() or None if value else None
+    if value and str(value).strip():
+        return str(value).strip().lower()
+    from core.commissary.title_overrides import series_type as stored
+    return stored(db, tmdb_id)       # set before the show was owned
 
 
 def episode_hints(db, body, season=None, episode=None):
