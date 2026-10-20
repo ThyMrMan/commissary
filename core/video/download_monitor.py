@@ -182,6 +182,11 @@ def _sweep_import_temps(db) -> int:
             v = None
         if v:
             roots.add(os.path.abspath(str(v)))
+    try:  # Commissary: video Library folders hold import temp files too
+        from core.commissary.video_libraries import paths as _vlib_paths
+        roots.update(os.path.abspath(p) for p in _vlib_paths(db))
+    except Exception:   # noqa: BLE001
+        pass
     try:
         from core.settings import config_manager
         dl_dir = str(config_manager.get("soulseek.download_path", "") or "")

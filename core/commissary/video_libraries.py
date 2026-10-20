@@ -182,6 +182,48 @@ def for_path(db, path) -> dict | None:
     return best
 
 
+_ROOT_KIND = {"movie": "movie", "episode": "show", "show": "show", "youtube": "youtube"}
+
+
+def root_paths(db, kind=None) -> list:
+    """Library folders for upstream's library_roots(kind) ('movie', 'episode',
+    'youtube' or None for all)."""
+    return paths(db, _ROOT_KIND.get(kind, kind) if kind else None)
+
+
+def health_checks(db, min_free_gb=0) -> list:
+    """Upstream's health check for movies_path/tv_path, for every library
+    folder: unreachable = error, under the free-space floor = warning."""
+    import os
+
+    from core.video.disk_guard import free_gb
+
+    out = []
+    for r in all_rows(db):
+        path = str(r.get("path") or "").strip()
+        if not path:
+            continue
+        cid = f"video_library_{r['id']}"
+        label = f"{r.get('label') or r.get('server_title') or 'Video'} library"
+        if not os.path.isdir(path):
+            out.append({"id": cid, "label": label, "status": "error",
+                        "detail": f"{path} is unreachable — a drive or mount may be down"})
+            continue
+        free = free_gb(path)
+        try:
+            floor = float(min_free_gb or 0)
+        except (TypeError, ValueError):
+            floor = 0
+        if free is not None and floor and free < floor:
+            out.append({"id": cid + "_space", "label": label, "status": "warning",
+                        "detail": "%.1f GB free — under your %.0f GB minimum; new grabs are paused"
+                                  % (free, floor)})
+        elif free is not None and free < 2:
+            out.append({"id": cid + "_space", "label": label, "status": "warning",
+                        "detail": "%.1f GB free — the drive is nearly full" % free})
+    return out
+
+
 # ── which library a title belongs to ─────────────────────────────────────────
 
 def owned_root_folder_id(db, kind, tmdb_id) -> int | None:

@@ -312,6 +312,10 @@ def collect(db) -> dict:
                 checks.append(_check(key + "_space", label, "warning",
                                      "%.1f GB free — the drive is nearly full" % free))
 
+    # Commissary: the same checks for every video Library's folder.
+    from core.commissary.video_libraries import health_checks as _vlib_health
+    checks.extend(_vlib_health(db, settings.get("min_free_disk_gb")))
+
     from core.video.library_roots import ADDITIONAL_KEYS, additional_paths
     for key in ADDITIONAL_KEYS:
         for index, path in enumerate(additional_paths(db, key)):

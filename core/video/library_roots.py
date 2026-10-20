@@ -41,6 +41,9 @@ def library_roots(db, kind=None):
             roots.append(str(primary))
         if item != "youtube":
             roots.extend(additional_paths(db, key.replace("_path", "_additional_paths")))
+        # Commissary: every video Library's folder is a library root too.
+        from core.commissary.video_libraries import root_paths
+        roots.extend(root_paths(db, item))
     return normalize_paths(roots)
 
 
