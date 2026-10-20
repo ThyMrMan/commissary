@@ -32,35 +32,34 @@ only carry small hooks marked `Commissary:`.
 | Download paths | `core/commissary/paths.split_paths`: torrent/usenet completed-download settings accept a list (legacy) or `;`-separated string; every folder is a resolver root. |
 | DB compatibility | Verified on copies of the live DBs (see Dev data). |
 
-## Phase 1 — small, high-value backend fixes (several fix live upstream bugs)
+## Phase 1 — small, high-value backend fixes (done)
 
-Security / Plex:
-- CSRF Origin/Referer check (`core/security/csrf.py`) — fit to upstream CORS, `/api/v1` keys, URL base path, Plex sign-in callback.
-- Plex device identity (`core/plex_identity.py`), reusing `plex_signin.client_id`.
-- Persistent sessions (`security.session_days` sliding window only).
-- Video Plex/Jellyfin credentials out of video.db plaintext into encrypted config.
-- `auth-hold.js` boot fetch hold, allowlist rebuilt from 3.5.7 `login_gate`.
+Security (core/commissary/): Plex device identity (`plex_identity.py`), CSRF
+Origin/Referer guard (`csrf.py`, API-key callers exempt), 30-day sliding
+sessions (`sessions.py`), video Plex/Jellyfin credentials encrypted in video.db
+(`video_secrets.py`; also never exported), boot-time request hold while
+signed out (`webui/static/commissary-auth-hold.js`, open endpoints injected from
+upstream's gate lists).
 
-Imports (each S):
-- Re-identify hint copies grouped by album tag → hints ignored (breaks upstream's own album reassign for 2+ tracks).
-- Re-identify retry no-op.
-- `_track_duration_ms` ×1000 for Discogs/MusicBrainz + ISRC/MBID/duration in staging tags.
-- Failed manual import reported as success.
-- "Album 01 Title" filename prefix stripping.
-- Auto-import threshold (re-check upstream score first).
+Imports: re-identify hint copies get their own candidates (fixes upstream's
+album reassign of 2+ tracks), re-identify retry, Discogs/MusicBrainz duration
+x1000 + ISRC/MBID in Import-page tags, failed manual import no longer reported
+as success, "Album NN Title" filenames. Auto-import threshold kept at 0.9
+(one shared constant): upstream's settings UI has a 70% review band floor.
 
-Downloads (each S–M):
-- Usenet `add_nzb()` category defaults to literal `"soulsync"`.
-- Deluge/aria2 adopt an already-held torrent (use upstream hash helper).
-- Batch worker clamp / `<= 0` gate / retry-slot release (1.9.16). Do NOT port 2.1.1 `task_is_active` alone.
-- Video torrent/usenet retries calling slskd.
-- Tracker name/link in candidate picker.
+Downloads: usenet category honoured, Deluge/aria2 adopt held torrents, batch
+worker counter clamp + retry/slot release, tracker name/link in the picker
+(`safe_info_url` keeps indexer download URLs out of the browser). Follow-up:
+"dispatched but still pending" counts as a busy slot (2.3.7 rule). Not done
+on purpose: torrent adapters' "soulsync" default category (nothing calls them
+without one).
 
-Video (each S):
-- Torrent "100% but still moving" stability gate.
-- Wishlist audit fixes.
-- Importer naming identity (premiere year, real tmdb/tvdb ids, empty `(tmdb-)`).
-- Configurable manual-search caps.
+Video: 100%-but-still-moving stability gate, Wishlist Audit fixes, importer
+naming from the library's identity, configurable manual-search caps, import
+failure logging. Retries already stay on their own transport upstream.
+
+Deferred to Phase 3: rest of 1.9.8 (picker open by default, Sources button on
+failed rows, album release picker).
 
 ## Phase 2 — video features (dependency order)
 
