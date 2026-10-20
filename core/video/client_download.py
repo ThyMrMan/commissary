@@ -36,7 +36,8 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
                             resolve_path: Callable[[Any], Any],
                             find_video: Callable[[Any, Any], Any],
                             organizer: Optional[Callable] = None,
-                            import_pack: Optional[Callable] = None) -> dict:
+                            import_pack: Optional[Callable] = None,
+                            settled: Optional[Callable[[dict, str], bool]] = None) -> dict:
     """Next-state patch for a torrent/usenet download. ``get_status(source, ref)`` returns the
     client's status object (or None if it forgot the job), ``resolve_path`` maps its reported
     save_path to a locally-readable one, ``find_video(root, name)`` returns the main video file
@@ -47,7 +48,10 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
     ``find_video`` is the wrong shape for it: a pack finishes as a FOLDER of episodes, and
     narrowing it to one file means one episode is judged and the rest are abandoned on disk.
     It returns None when the job turns out not to be a folder after all (some 'packs' are a
-    single file), so the ordinary path still runs."""
+    single file), so the ordinary path still runs.
+
+    Commissary: ``settled(dl, path)`` holds the import until the content stops
+    changing (core.commissary.settle); None keeps importing on sight."""
     ref = dl.get("client_ref")
     if not ref:
         return {"_missing": True}
@@ -107,6 +111,10 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
     # and since a pack row carries no single episode identity, the importer then rejects it
     # outright ("Season/complete packs need manual import"), stranding the whole download.
     if save and import_pack is not None and is_pack_download(dl):
+        # Commissary: a pack folder still being moved/unpacked is not finished.
+        folder = find_content_dir(save, name) if settled is not None else None
+        if folder and not settled(dl, folder):
+            return {"progress": 100.0}
         packed = import_pack(dl, save, name)
         if packed is not None:
             return packed
@@ -115,6 +123,9 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
         if dl.get("dest_path"):
             return {"status": "completed", "progress": 100.0, "dest_path": dl.get("dest_path")}
         return {"progress": 100.0}   # complete but the file isn't visible yet — keep polling
+    # Commissary: visible is not finished — a 'moving' torrent reads 100%.
+    if settled is not None and not settled(dl, src):
+        return {"progress": 100.0}   # still being written — keep polling
     if organizer is not None:
         return organizer(dl, src)
     return {"status": "completed", "progress": 100.0, "dest_path": src}
@@ -214,6 +225,7 @@ def find_content_dir(root, name=None) -> Optional[str]:
 
 def process_active_client_download(dl: dict, organizer=None, import_pack=None) -> dict:
     """Production entry: poll the real client + resolve + find the video for one torrent/usenet row."""
+    from core.commissary.settle import content_has_settled  # Commissary: settle gate
     return process_client_download(dl, get_status=_get_status, resolve_path=_resolve_path,
                                    find_video=find_video_file, organizer=organizer,
-                                   import_pack=import_pack)
+                                   import_pack=import_pack, settled=content_has_settled)
