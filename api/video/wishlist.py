@@ -116,7 +116,8 @@ def register_routes(bp):
                 res = db.query_wishlist(
                     kind, search=request.args.get("search", ""), sort=request.args.get("sort", "added"),
                     page=request.args.get("page", 1), limit=request.args.get("limit", 60),
-                    profile_id=_profile())
+                    profile_id=_profile(),
+                    library=request.args.get("library") or None)   # Commissary: a Library tab
                 _annotate_live_state(db, kind, res.get("items") or [])
                 from .kids import filter_tmdb_items, video_cap
                 cap = video_cap()

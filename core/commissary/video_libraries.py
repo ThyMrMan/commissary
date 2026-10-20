@@ -229,11 +229,37 @@ def health_checks(db, min_free_gb=0) -> list:
     return out
 
 
-def wishlist_library_sql(title_table) -> str:
-    """SQL for the library a wishlist row ``w`` is destined for: the row's own
-    choice, else the owned title's library. ``title_table`` is movies/shows."""
-    return ("COALESCE(w.root_folder_id, (SELECT x.root_folder_id FROM " + title_table + " x "
-            "WHERE x.tmdb_id = w.tmdb_id AND x.root_folder_id IS NOT NULL LIMIT 1))")
+def wishlist_library_sql(title_table, alias: str = "w") -> str:
+    """SQL for the library a wishlist row ``alias`` is destined for: the row's
+    own choice, else the owned title's library. ``title_table`` is movies/shows."""
+    return ("COALESCE(" + alias + ".root_folder_id, (SELECT x.root_folder_id FROM " + title_table +
+            " x WHERE x.tmdb_id = " + alias + ".tmdb_id AND x.root_folder_id IS NOT NULL LIMIT 1))")
+
+
+def wishlist_library_where(where: list, args: list, title_table, library) -> None:
+    """Narrow upstream's unaliased wishlist query to one Library (the
+    Wishlist page's Library tabs). Nothing chosen, or junk: unchanged."""
+    if library in (None, ""):
+        return
+    try:
+        lib = int(library)
+    except (TypeError, ValueError):
+        return
+    where.append(wishlist_library_sql(title_table, "video_wishlist") + " = ?")
+    args.append(lib)
+
+
+def wishlist_tab_counts(db, profile_id=1) -> dict:
+    """{movie: {lib_id: n}, show: {lib_id: n}} - shows count DISTINCT SHOWS,
+    the unit the All TV tab counts, so the badges compare directly."""
+    out = {}
+    for kind, row_kind, table, unit in (("movie", "movie", "movies", "COUNT(*)"),
+                                        ("show", "episode", "shows", "COUNT(DISTINCT tmdb_id)")):
+        lib = wishlist_library_sql(table, "video_wishlist")
+        out[kind] = {r["lib"]: r["n"] for r in _rows(
+            db, f"SELECT {lib} AS lib, {unit} AS n FROM video_wishlist WHERE kind=? AND profile_id=? "
+                "GROUP BY lib", (row_kind, int(profile_id))) if r["lib"] is not None}
+    return out
 
 
 def wishlist_profile_default_sql(title_table) -> str:
@@ -679,3 +705,30 @@ def _checked_id(db, kind, root_folder_id):
     if not row or row.get("content_kind") != content_kind(kind):
         return False
     return int(row["id"])
+
+
+# ── Library tabs (the Library page, Wishlist, History) ─────────────────────
+
+def tabs(db, server=None) -> dict:
+    """{"movie": [{id, label, count}], "show": [...]} for a kind's tab bar.
+    No folder paths: every profile that can see the video side reads this
+    (the admin-only registry carries paths). Only kinds with two or more
+    Libraries get tabs - one Library has nothing to split."""
+    out = {}
+    for kind, table in (("movie", "movies"), ("show", "shows")):
+        where, params = "content_kind=?", [kind]
+        if server:
+            where += " AND server=?"
+            params.append(server)
+        rows = _rows(db, "SELECT id, COALESCE(NULLIF(label,''), server_title, path) AS label "
+                         "FROM root_folders WHERE " + where + " ORDER BY sort_order, id", tuple(params))
+        if len(rows) < 2:
+            out[kind] = []
+            continue
+        counts = {r["root_folder_id"]: r["n"] for r in _rows(
+            db, f"SELECT root_folder_id, COUNT(*) AS n FROM {table} WHERE root_folder_id IS NOT NULL"
+                + (" AND server_source=?" if server else "") + " GROUP BY root_folder_id",
+            (server,) if server else ())}
+        out[kind] = [{"id": r["id"], "label": r["label"], "count": counts.get(r["id"], 0)}
+                     for r in rows]
+    return out

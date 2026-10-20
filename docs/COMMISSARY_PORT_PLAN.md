@@ -109,7 +109,11 @@ failed rows, album release picker).
     re-searched at once as the background drain would, at most 3 times a day. TMDB: 3 pages + trailing-year
     fallback (tmdb_search.py); match certainty ladder - /find by the row's TVDB/IMDb id, then a title search
     that must carry the title, never results[0] on trust (tmdb_match.py).
-12. Per-Library UI surfaces (L, rebuild; history is React now).
+12. Per-Library UI surfaces (L, rebuild; history is React now) — **Library page + Wishlist done**
+    (commissary-library-tabs.js; `?library=` on /api/video/library and /api/video/wishlist; member-readable
+    /api/video/commissary/library-tabs with counts, no paths). Not done: Download History (a compiled React
+    bundle - a fork change means rebuilding/committing static/dist, which conflicts on every upstream UI
+    update), Library dashboard tiles, per-Library enrichment priority.
 
 ## Phase 3 — music features
 

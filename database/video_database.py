@@ -8252,6 +8252,7 @@ class VideoDatabase:
 
 
     def query_wishlist(self, kind: str, *, search=None, sort="added", page=1, limit=60,
+                       library=None,   # Commissary: one video Library's rows
                          profile_id: int = 1) -> dict:
         """One paged slice of the wishlist. kind='movie' → movie cards; kind='show'
         → shows grouped show→season→episode with wanted/done roll-ups. ``sort`` ∈
@@ -8269,6 +8270,7 @@ class VideoDatabase:
                 where, args = ["kind='movie'", "profile_id=?"], [int(profile_id)]
                 if s:
                     where.append("title LIKE ? COLLATE NOCASE"); args.append("%" + s + "%")
+                _vlib_sql.wishlist_library_where(where, args, "movies", library)  # Commissary
                 wsql = " WHERE " + " AND ".join(where)
                 order = {"title": "title COLLATE NOCASE", "oldest": "date_added ASC, id ASC",
                          "added": "date_added DESC, id DESC"}.get(sort, "date_added DESC, id DESC")
@@ -8290,6 +8292,7 @@ class VideoDatabase:
                 where, args = ["kind='episode'", "profile_id=?"], [int(profile_id)]
                 if s:
                     where.append("title LIKE ? COLLATE NOCASE"); args.append("%" + s + "%")
+                _vlib_sql.wishlist_library_where(where, args, "shows", library)  # Commissary
                 wsql = " WHERE " + " AND ".join(where)
                 total = conn.execute(
                     "SELECT COUNT(DISTINCT tmdb_id) c FROM video_wishlist" + wsql, args).fetchone()["c"]
@@ -10218,7 +10221,7 @@ class VideoDatabase:
     def query_library(self, kind: str, *, search=None, letter=None, sort="title",
                       include_size=True,
                       status="all", genre=None, resolution=None, page=1, limit=75,
-                      server_source=None) -> dict:
+                      server_source=None, library=None) -> dict:   # Commissary: + library
         """One page of movies/shows with search + A–Z + sort + owned/wanted/
         watched + genre filtering done in SQL. Scoped to ``server_source`` (the
         active video server) so Plex and Jellyfin libraries never commingle —
@@ -10243,6 +10246,13 @@ class VideoDatabase:
         if server_source:
             where.append(f"{alias}.server_source = ?")
             params.append(server_source)
+        # Commissary: one video Library's titles (the Library page's Library tabs)
+        if library not in (None, ""):
+            try:
+                where.append(f"{alias}.root_folder_id = ?")
+                params.append(int(library))
+            except (TypeError, ValueError):
+                where.pop()
         if search:
             where.append(f"{alias}.title LIKE ? COLLATE NOCASE")
             params.append("%" + search + "%")

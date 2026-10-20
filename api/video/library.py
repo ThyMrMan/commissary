@@ -88,6 +88,7 @@ def register_routes(bp):
                 page=request.args.get("page", 1),
                 limit=request.args.get("limit", 75),
                 server_source=resolve_video_server(),
+                library=request.args.get("library") or None,   # Commissary: a Library tab
             ))
         except Exception:
             logger.exception("Failed to query video library")

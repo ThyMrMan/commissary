@@ -241,6 +241,8 @@
             kind: apiKind, search: state.search, letter: state.letter, sort: state.sort,
             status: state.status, genre: state.genre, page: state.page, limit: state.limit });
         if (state.resolution && apiKind === 'movies') params.set('resolution', state.resolution);
+        // Commissary: the picked video Library tab, if any
+        if (typeof CommissaryLibraryTabs !== 'undefined') CommissaryLibraryTabs.apply(params, apiKind);
         fetch(LIBRARY_URL + '?' + params.toString(), { headers: { 'Accept': 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {

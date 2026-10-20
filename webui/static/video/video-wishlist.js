@@ -869,6 +869,8 @@
         if (state.tab === 'youtube') { loadYoutube(); return; }
         var ld = $('[data-vwsh-loading]'); if (ld) ld.classList.remove('hidden');
         var params = new URLSearchParams({ kind: state.tab, search: state.search, sort: state.sort, page: state.page, limit: LIMIT });
+        // Commissary: the picked video Library tab, if any
+        if (typeof CommissaryLibraryTabs !== 'undefined') CommissaryLibraryTabs.applyWishlist(params, state.tab);
         fetch('/api/video/wishlist?' + params.toString(), { headers: { Accept: 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {

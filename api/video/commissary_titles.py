@@ -77,3 +77,26 @@ def register_routes(bp):
         if not ok:
             return jsonify({"success": False, "error": "Couldn't save."}), 500
         return jsonify(_state(db, kind, tmdb_id))
+
+    @bp.route("/commissary/library-tabs", methods=["GET"])
+    def commissary_library_tabs():
+        """The video Libraries each kind can be split into, with title counts -
+        for the Library page's tabs. Readable by every profile on the video side
+        (no folder paths in it), unlike the admin-only registry."""
+        from . import get_video_db
+        from core.commissary.video_libraries import tabs, wishlist_tab_counts
+        from core.video.sources import resolve_video_server
+        db = get_video_db()
+        out = tabs(db, resolve_video_server())
+        if request.args.get("scope") == "wishlist":
+            # this profile's wished titles per Library, instead of owned titles
+            try:
+                from core.profile_context import get_current_profile_id
+                pid = int(get_current_profile_id() or 1)
+            except Exception:  # noqa: BLE001
+                pid = 1
+            counts = wishlist_tab_counts(db, pid)
+            for kind, libs in out.items():
+                for lib in libs:
+                    lib["count"] = counts.get(kind, {}).get(lib["id"], 0)
+        return jsonify(out)
