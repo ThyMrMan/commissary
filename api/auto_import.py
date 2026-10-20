@@ -69,11 +69,14 @@ def auto_import_settings():
         return profile_id if profile_id > 0 else None
 
     if request.method == 'GET':
+        # Commissary: the worker's own default, so the screen never shows another.
+        from core.commissary.auto_import_defaults import DEFAULT_CONFIDENCE_THRESHOLD
         return jsonify({
             "success": True,
             "enabled": config_manager.get('auto_import.enabled', False),
             "scan_interval": config_manager.get('auto_import.scan_interval', 60),
-            "confidence_threshold": config_manager.get('auto_import.confidence_threshold', 0.9),
+            "confidence_threshold": config_manager.get('auto_import.confidence_threshold',
+                                                        DEFAULT_CONFIDENCE_THRESHOLD),
             "auto_process": config_manager.get('auto_import.auto_process', True),
             # Per-context quality profile override (see core/_auto_import_worker().py
             # _process_matches) — None/0 means "use the app-wide default profile",

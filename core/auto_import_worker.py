@@ -648,9 +648,12 @@ class AutoImportWorker:
         self._register_active(candidate, status='identifying')
         logger.info(f"[Auto-Import] Processing folder: {candidate.name} ({len(candidate.audio_files)} files)")
 
-        threshold = 0.9
+        # Commissary: one default shared with the settings endpoint.
+        from core.commissary.auto_import_defaults import DEFAULT_CONFIDENCE_THRESHOLD
+        threshold = DEFAULT_CONFIDENCE_THRESHOLD
         if self._config_manager:
-            threshold = self._config_manager.get('auto_import.confidence_threshold', 0.9)
+            threshold = self._config_manager.get('auto_import.confidence_threshold',
+                                                 DEFAULT_CONFIDENCE_THRESHOLD)
 
         auto_process = True
         if self._config_manager:
