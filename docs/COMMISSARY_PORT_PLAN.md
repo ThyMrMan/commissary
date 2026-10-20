@@ -58,8 +58,7 @@ Video: 100%-but-still-moving stability gate, Wishlist Audit fixes, importer
 naming from the library's identity, configurable manual-search caps, import
 failure logging. Retries already stay on their own transport upstream.
 
-Still open (security): legacy 2.4.2 redacted API keys/tokens from log lines in the
-log formatter (a keyed URL in a traceback leaked the key into app.log).
+Security: legacy 2.4.2's log API-key redaction — now done, see "Security" under Phase 2.
 
 Deferred to Phase 3: rest of 1.9.8 (picker open by default, Sources button on
 failed rows, album release picker).
@@ -114,6 +113,10 @@ failed rows, album release picker).
     /api/video/commissary/library-tabs with counts, no paths). Not done: Download History (a compiled React
     bundle - a fork change means rebuilding/committing static/dist, which conflicts on every upstream UI
     update), Library dashboard tiles, per-Library enrichment priority.
+
+Security: log API-key redaction (legacy 2.4.2) — **done** (core/commissary/log_redaction.py, installed when
+utils/logging_config is imported; wraps logging.Formatter.format so every formatter redacts, side logs and
+AcoustID's `client=` included).
 
 ## Phase 3 — music features
 

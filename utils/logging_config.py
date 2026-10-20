@@ -8,6 +8,11 @@ from typing import Optional
 
 LOGGER_NAMESPACE = "soulsync"
 
+# Commissary: API keys out of every log line, tracebacks included - wraps
+# logging.Formatter.format for all formatters (core/commissary/log_redaction.py)
+from core.commissary.log_redaction import install as _install_log_redaction  # noqa: E402
+_install_log_redaction()
+
 class SafeFormatter(logging.Formatter):
     """Formatter that handles Unicode characters safely on Windows"""
     
