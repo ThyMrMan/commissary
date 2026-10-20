@@ -576,8 +576,11 @@ class AutoImportWorker:
         # included) are only listed, never re-run. count them apart so the log
         # doesn't read like the same folders are imported every minute.
         settled, fresh = [], []
+        # Commissary: unless it is a Re-identify the user has asked for again since.
+        from core.commissary.rematch_grouping import is_rematch_retry
         for c in candidates:
-            (settled if self._is_already_processed(c) else fresh).append(c)
+            (settled if self._is_already_processed(c) and not is_rematch_retry(self.database, c)
+             else fresh).append(c)
         summary = f"{len(candidates)} candidates in {staging}"
         if settled:
             summary += (f" ({len(settled)} already handled, left alone until you"
@@ -645,9 +648,12 @@ class AutoImportWorker:
         self._register_active(candidate, status='identifying')
         logger.info(f"[Auto-Import] Processing folder: {candidate.name} ({len(candidate.audio_files)} files)")
 
-        threshold = 0.9
+        # Commissary: one default shared with the settings endpoint.
+        from core.commissary.auto_import_defaults import DEFAULT_CONFIDENCE_THRESHOLD
+        threshold = DEFAULT_CONFIDENCE_THRESHOLD
         if self._config_manager:
-            threshold = self._config_manager.get('auto_import.confidence_threshold', 0.9)
+            threshold = self._config_manager.get('auto_import.confidence_threshold',
+                                                 DEFAULT_CONFIDENCE_THRESHOLD)
 
         auto_process = True
         if self._config_manager:
@@ -966,7 +972,7 @@ class AutoImportWorker:
                        f"folder's owner against the container's PUID/PGID.")
 
     def _scan_directory(self, directory: str, candidates: List[FolderCandidate], staging_root: str = '',
-                        problems: Optional[List[Dict[str, str]]] = None):
+                        problems: Optional[List[Dict[str, str]]] = None, rematch_keys=None):
         """Recursively scan a directory for album folders and loose audio files.
 
         Loose-file handling:
@@ -991,6 +997,10 @@ class AutoImportWorker:
         """
         if problems is None:
             problems = []
+        # Commissary: pending Re-identify hints, read once per scan (see core/commissary/rematch_grouping.py).
+        if rematch_keys is None:
+            from core.commissary.rematch_grouping import pending_rematch_keys
+            rematch_keys = pending_rematch_keys(getattr(self, 'database', None))
         try:
             entries = sorted(os.listdir(directory))
         except OSError as e:
@@ -1026,6 +1036,13 @@ class AutoImportWorker:
             if disc_files:
                 disc_files_by_num[disc_num] = disc_files
 
+        # Commissary: a hinted Re-identify copy is its own candidate, never part of an album-tag group.
+        from core.commissary.rematch_grouping import split_rematch_copies
+        loose_files, rematch_copies = split_rematch_copies(loose_files, rematch_keys)
+        for copy_path in rematch_copies:
+            is_root = bool(staging_root) and os.path.normpath(directory) == os.path.normpath(staging_root)
+            self._build_loose_file_candidates(directory, [copy_path], {}, candidates, is_root=is_root)
+
         if loose_files:
             is_root = bool(staging_root) and os.path.normpath(directory) == os.path.normpath(staging_root)
             self._build_loose_file_candidates(
@@ -1056,7 +1073,8 @@ class AutoImportWorker:
         # beside loose tracks get silently ignored (the bug a chaotic
         # staging root surfaced on 2026-05-09).
         for _sub_name, sub_path in non_disc_subdirs:
-            self._scan_directory(sub_path, candidates, staging_root=staging_root, problems=problems)
+            self._scan_directory(sub_path, candidates, staging_root=staging_root, problems=problems,
+                                 rematch_keys=rematch_keys)  # Commissary: hints read once per scan
 
     def _build_loose_file_candidates(
         self,

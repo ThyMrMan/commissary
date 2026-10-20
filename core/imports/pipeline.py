@@ -365,6 +365,11 @@ def import_rejection_reason(context: dict) -> str | None:
         return "rejected by audio guard (incomplete or silent audio)"
     if context.get('_race_guard_failed'):
         return "source file disappeared before import completed"
+    # Commissary: an exception the outer handler swallowed (it returns normally
+    # so the download monitor can retry; a manual import has no monitor and read
+    # that as success). Checked LAST so a precisely worded outcome above wins.
+    if context.get('_post_process_error'):
+        return f"import failed: {context['_post_process_error']}"
     return None
 
 
@@ -777,6 +782,9 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
 
     file_lock.acquire()
     try:
+        # Commissary: a retried context starts without the last attempt's error.
+        if isinstance(context, dict):
+            context.pop('_post_process_error', None)
         if not os.path.exists(file_path):
             existing_final = context.get('_final_processed_path')
             if existing_final and os.path.exists(existing_final):
@@ -1823,6 +1831,9 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
         pp_logger.info(traceback.format_exc())
         logger.error(f"\nCRITICAL ERROR in post-processing for {context_key}: {e}")
         traceback.print_exc()
+        # Commissary: tell the caller it failed (see import_rejection_reason).
+        if isinstance(context, dict):
+            context['_post_process_error'] = str(e) or e.__class__.__name__
 
         source_exists = os.path.exists(file_path) if file_path else False
         if source_exists:
