@@ -83,6 +83,8 @@ _SCHEMA_FILE = Path(__file__).resolve().parent / "video_schema.sql"
 
 # Init runs once per database path per process (same guard style as music).
 _init_lock = threading.Lock()
+# Commissary: SQL fragments for video Library destinations on wishlist rows.
+from core.commissary import video_libraries as _vlib_sql  # noqa: E402
 _initialized_paths: set[str] = set()
 
 # Sort/letter key: title without a leading article, lowercased (so "The Matrix"
@@ -7734,7 +7736,9 @@ class VideoDatabase:
                 "  JOIN media_files f ON f.movie_id=m.id "
                 "  WHERE m.tmdb_id=w.tmdb_id AND m.has_file=1) AS owned_resolutions, "
                 "COALESCE(w.quality_profile_id, (SELECT m.quality_profile_id FROM movies m "
-                "  WHERE m.tmdb_id=w.tmdb_id)) AS quality_profile_id, "
+                "  WHERE m.tmdb_id=w.tmdb_id), "
+                + _vlib_sql.wishlist_profile_default_sql("movies") + ") AS quality_profile_id, "  # Commissary
+                + _vlib_sql.wishlist_library_sql("movies") + " AS root_folder_id, "  # Commissary
                 # External ids for the indexer search. Prowlarr routes an imdbid to
                 # the indexers that can resolve it exactly, which is how the *arrs
                 # avoid title-matching entirely; without them every search is a
@@ -7882,7 +7886,9 @@ class VideoDatabase:
                 "  AND e.episode_number = w.episode_number AND e.has_file = 1) "
                 "  AS owned_resolutions, "
                 "COALESCE(w.quality_profile_id, (SELECT s.quality_profile_id FROM shows s "
-                "  WHERE s.tmdb_id = w.tmdb_id)) AS quality_profile_id, "
+                "  WHERE s.tmdb_id = w.tmdb_id), "
+                + _vlib_sql.wishlist_profile_default_sql("shows") + ") AS quality_profile_id, "  # Commissary
+                + _vlib_sql.wishlist_library_sql("shows") + " AS root_folder_id, "  # Commissary
                 # series type (P8): daily/anime shows QUERY differently (air date /
                 # absolute number). NULL for shows not in the library = standard.
                 # MAX = a type set on ANY server's row wins over a NULL sibling.
@@ -7953,7 +7959,9 @@ class VideoDatabase:
                     "  JOIN media_files f ON f.movie_id=m.id "
                     "  WHERE m.tmdb_id=w.tmdb_id AND m.has_file=1) AS owned_resolutions, "
                     "COALESCE(w.quality_profile_id, (SELECT m.quality_profile_id FROM movies m "
-                    "  WHERE m.tmdb_id=w.tmdb_id)) AS quality_profile_id, "
+                    "  WHERE m.tmdb_id=w.tmdb_id), "
+                    + _vlib_sql.wishlist_profile_default_sql("movies") + ") AS quality_profile_id, "  # Commissary
+                    + _vlib_sql.wishlist_library_sql("movies") + " AS root_folder_id, "  # Commissary
                     "(SELECT m.imdb_id FROM movies m WHERE m.tmdb_id=w.tmdb_id) AS imdb_id "
                     "FROM video_wishlist w "
                     "WHERE w.profile_id=? AND w.kind='movie' AND w.tmdb_id=?", (int(profile_id), int(tmdb_id),))]
@@ -7976,7 +7984,9 @@ class VideoDatabase:
                 "  AND e.episode_number = w.episode_number AND e.has_file = 1) "
                 "  AS owned_resolutions, "
                 "COALESCE(w.quality_profile_id, (SELECT s.quality_profile_id FROM shows s "
-                "  WHERE s.tmdb_id = w.tmdb_id)) AS quality_profile_id, "
+                "  WHERE s.tmdb_id = w.tmdb_id), "
+                + _vlib_sql.wishlist_profile_default_sql("shows") + ") AS quality_profile_id, "  # Commissary
+                + _vlib_sql.wishlist_library_sql("shows") + " AS root_folder_id, "  # Commissary
                 "COALESCE((SELECT MAX(s.series_type) FROM shows s WHERE s.tmdb_id = w.tmdb_id), "
                 # no type set: a show tagged Anime is numbered the anime way
                 # (One Piece S23E1177 is 'One Piece - 1177'). a type set by hand wins.

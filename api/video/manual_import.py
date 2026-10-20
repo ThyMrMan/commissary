@@ -105,6 +105,7 @@ def register_routes(bp):
         paths = {k: db.get_setting(k) or "" for k in ("movies_path", "tv_path", "youtube_path")}
         if not paths["movies_path"]:
             paths["movies_path"] = db.get_setting("transfer_path") or ""
+        from core.commissary.video_libraries import manual_target as _vlib_target  # Commissary
         override = {
             "scope": scope,
             "title": body.get("title"),
@@ -113,7 +114,9 @@ def register_routes(bp):
             "episode": body.get("episode"),
             "episode_title": body.get("episode_title"),
             "media_id": body.get("media_id"),
-            "target_dir": target_dir_for(_KIND_FOR_SCOPE[scope], paths),
+            # Commissary: the title's video Library when libraries are configured
+            "target_dir": (_vlib_target(db, _KIND_FOR_SCOPE[scope], body)
+                           or target_dir_for(_KIND_FOR_SCOPE[scope], paths)),
         }
         settings = organization.load(db)
         prober = probe if settings.get("verify_with_ffprobe", True) else None

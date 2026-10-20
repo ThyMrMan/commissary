@@ -1112,7 +1112,8 @@ def register_routes(bp):
         paths = {k: db.get_setting(k) or "" for k in ("movies_path", "tv_path", "youtube_path")}
         if not paths["movies_path"]:
             paths["movies_path"] = db.get_setting("transfer_path") or ""
-        target = target_dir_for(body.get("kind"), paths)
+        from core.commissary.video_libraries import manual_target as _vlib_target  # Commissary
+        target = _vlib_target(db, body.get("kind"), body) or target_dir_for(body.get("kind"), paths)
         from core.video import disk_guard, organization
         room = disk_guard.check_room(
             target, organization.load(db),
@@ -1176,8 +1177,11 @@ def register_routes(bp):
             # torrent / usenet — hand the magnet/NZB to the SHARED download client; the monitor
             # tracks progress + completion by client_ref. No Soulseek-style alternate requery.
             from core.video.client_grab import grab
+            from core.commissary.video_libraries import manual_category  # Commissary
+            from core.video.client_grab import _category_kw
             res = grab(source, body.get("download_url"),
-                       fallback_magnet=body.get("magnet_uri"))
+                       fallback_magnet=body.get("magnet_uri"),
+                       **_category_kw(manual_category(db, body.get("kind"), body)))
             if not res.get("ok"):
                 return jsonify({"ok": False, "error": res.get("error") or "The download client refused it."}), 502
             dl_id = _add_client_row(db, common, body, source, res["ref"])
@@ -1260,7 +1264,8 @@ def register_routes(bp):
         paths = {k: db.get_setting(k) or "" for k in ("movies_path", "tv_path", "youtube_path")}
         if not paths["movies_path"]:
             paths["movies_path"] = db.get_setting("transfer_path") or ""
-        target = target_dir_for(kind, paths)
+        from core.commissary.video_libraries import manual_target as _vlib_target  # Commissary
+        target = _vlib_target(db, kind, body) or target_dir_for(kind, paths)
         if not target:
             return jsonify({"ok": False, "error": "Set the library folder for this type on Settings → Downloads."}), 400
 
@@ -1363,7 +1368,8 @@ def register_routes(bp):
 
         db = get_video_db()
         paths = {k: db.get_setting(k) or "" for k in ("movies_path", "tv_path", "youtube_path")}
-        target = target_dir_for("show", paths)
+        from core.commissary.video_libraries import manual_target as _vlib_target  # Commissary
+        target = _vlib_target(db, "show", body) or target_dir_for("show", paths)
         from core.video import disk_guard, organization
         room = disk_guard.check_room(target, organization.load(get_video_db()))
         if not room["ok"]:

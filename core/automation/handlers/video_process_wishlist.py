@@ -615,10 +615,12 @@ def _default_active_keys(media_type: str) -> set:
 
 def _default_target_dir(media_type: str) -> str:
     from api.video import get_video_db
+    from core.commissary.video_libraries import target_dir as _vlib_target  # Commissary
     db = get_video_db()
     if media_type == "movie":
-        return db.get_setting("movies_path") or db.get_setting("transfer_path") or ""
-    return db.get_setting("tv_path") or ""
+        return (db.get_setting("movies_path") or db.get_setting("transfer_path")
+                or _vlib_target(db, media_type) or "")
+    return db.get_setting("tv_path") or _vlib_target(db, media_type) or ""
 
 
 def _extto_hits_for_context(ctx: Dict[str, Any]) -> tuple:
@@ -843,6 +845,10 @@ def _default_enqueue(item: Dict[str, Any], best: Dict[str, Any], candidates: Lis
     from core.video.download_monitor import ensure_started
     from core.video.slskd_search import build_query
     name = display_name(item, media_type)
+    # Commissary: file the grab into the title's video Library, with its category.
+    from core.commissary.video_libraries import category as _vlib_category
+    from core.commissary.video_libraries import target_dir as _vlib_target
+    target_dir = _vlib_target(get_video_db(), media_type, item=item) or target_dir
     room = disk_guard.check_room(target_dir, organization.load(get_video_db()))
     if not room["ok"]:
         msg = disk_guard.shortfall_message(room, target_dir)
@@ -864,9 +870,10 @@ def _default_enqueue(item: Dict[str, Any], best: Dict[str, Any], candidates: Lis
                 return {"ok": False, "error": resolved.get("error")
                         or "EXT.to would not hand over a magnet for this release."}
             best = {**best, "download_url": resolved["magnet"], "magnet_uri": resolved["magnet"]}
-        from core.video.client_grab import grab
+        from core.video.client_grab import _category_kw, grab
         res = grab(transport_source, best.get("download_url"),
-                   fallback_magnet=best.get("magnet_uri"))
+                   fallback_magnet=best.get("magnet_uri"),
+                   **_category_kw(_vlib_category(get_video_db(), media_type, item=item)))  # Commissary
         if not res.get("ok"):
             logger.warning("video hybrid: %s grab refused for %s: %s", source, name, res.get("error"))
             return {"ok": False, "error": res.get("error") or "the download client refused it"}

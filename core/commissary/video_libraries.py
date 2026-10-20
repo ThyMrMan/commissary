@@ -86,7 +86,12 @@ def norm_indexer_ids(raw) -> str | None:
 
 
 def _rows(db, sql, params=()):
-    conn = db._get_connection()
+    """Query rows; a DB that can't be queried (a stub, a closed handle) counts
+    as having no libraries, so callers fall through to upstream."""
+    try:
+        conn = db._get_connection()
+    except Exception:  # noqa: BLE001
+        return []
     try:
         conn.row_factory = sqlite3.Row
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
@@ -224,6 +229,22 @@ def health_checks(db, min_free_gb=0) -> list:
     return out
 
 
+def wishlist_library_sql(title_table) -> str:
+    """SQL for the library a wishlist row ``w`` is destined for: the row's own
+    choice, else the owned title's library. ``title_table`` is movies/shows."""
+    return ("COALESCE(w.root_folder_id, (SELECT x.root_folder_id FROM " + title_table + " x "
+            "WHERE x.tmdb_id = w.tmdb_id AND x.root_folder_id IS NOT NULL LIMIT 1))")
+
+
+def wishlist_profile_default_sql(title_table) -> str:
+    """SQL for the destination library's default quality profile: the last
+    fallback after the row's and the title's own profile. Judging a grab under
+    one library's profile and filing it in another's would be worse than no
+    library default, so it reads the same library the row is filed into."""
+    return ("(SELECT rf.default_quality_profile_id FROM root_folders rf WHERE rf.id = "
+            + wishlist_library_sql(title_table) + ")")
+
+
 # ── which library a title belongs to ─────────────────────────────────────────
 
 def owned_root_folder_id(db, kind, tmdb_id) -> int | None:
@@ -291,6 +312,28 @@ def indexer_ids(db, kind, **kw) -> list | None:
     row = library_for_item(db, kind, **kw)
     ids = norm_indexer_ids(row.get("preferred_indexer_ids")) if row else None
     return [int(x) for x in ids.split(",")] if ids else None
+
+
+def _body_kw(body) -> dict:
+    """Library lookup arguments from a manual grab / match / import request."""
+    body = body or {}
+    source = str(body.get("media_source") or "tmdb").lower()
+    tmdb = body.get("tmdb_id") or (body.get("media_id") if source == "tmdb" else None)
+    return {"tmdb_id": tmdb, "root_folder_id": body.get("root_folder_id")}
+
+
+def manual_target(db, kind, body) -> str:
+    """Folder for a manual grab/match/import, or '' when there are no libraries
+    (the caller then uses upstream's movies_path / tv_path)."""
+    if not has_libraries(db):
+        return ""
+    return target_dir(db, kind, **_body_kw(body))
+
+
+def manual_category(db, kind, body) -> str | None:
+    if not has_libraries(db):
+        return None
+    return category(db, kind, **_body_kw(body))
 
 
 # ── scanning ─────────────────────────────────────────────────────────────────
