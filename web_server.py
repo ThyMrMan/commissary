@@ -65,6 +65,10 @@ def _build_version_string():
 
 SOULSYNC_VERSION = _build_version_string()
 
+# Commissary: one stable Plex client id, so a container restart isn't a new Plex device.
+from core.commissary.plex_identity import apply_plex_identity as _apply_plex_identity
+_apply_plex_identity(config_manager, SOULSYNC_VERSION.split('+')[0])
+
 # Dedicated source reuse logger — writes alongside app.log in the configured log directory
 import logging as _logging
 import logging.handlers as _logging_handlers
