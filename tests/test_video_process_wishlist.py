@@ -143,9 +143,13 @@ def test_build_record_episode_shape():
     # no show year known: no year at all. the air year is not the show's year
     # (it named S03 folders "Breaking Bad (2010)" and rejected year-tagged releases)
     assert rec["kind"] == "episode" and rec["media_id"] == "9" and rec["year"] is None
+    # Commissary: an untyped show's season-1 episode carries its absolute number
+    # (== the episode number in season 1 for every show; accept-only), so a new
+    # anime not yet tagged can match '[Group] Show - 03'.
     assert json.loads(rec["search_ctx"]) == {"scope": "episode", "title": "Breaking Bad",
                                              "season": 1, "episode": 3, "year": None,
-                                             "air_date": "2008-02-10", "tmdb_id": 9}
+                                             "air_date": "2008-02-10", "tmdb_id": 9,
+                                             "absolute": 3}
     rec = build_download_record(dict(item, show_year=2008), best, [best], media_type="episode",
                                 target_dir="/tv", query="q")
     assert rec["year"] == "2008" and json.loads(rec["search_ctx"])["year"] == "2008"

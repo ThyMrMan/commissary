@@ -96,7 +96,8 @@
         opts = opts || {};
         var src = opts.source || 'soulseek';
         var params = { scope: 'episode', title: opts.title, season: opts.season,
-            episode: opts.episode, source: src };
+            episode: opts.episode, source: src,
+            media_id: opts.mediaId, media_source: opts.mediaSource };   // Commissary: which title
         return runSearch(params).then(function (rows) {
             var best = bestRow(rows);
             if (!best) return { ok: false, error: 'no release found' };
@@ -135,7 +136,8 @@
     // scope 'season' is what rides into search_ctx and tells the monitor this lands
     // as a FOLDER to be mapped onto episodes, not a file to be narrowed to one.
     function seasonPack(opts, src) {
-        return runSearch({ scope: 'season', title: opts.title, season: opts.season, source: src })
+        return runSearch({ scope: 'season', title: opts.title, season: opts.season, source: src,
+                           media_id: opts.mediaId, media_source: opts.mediaSource })   // Commissary
             .then(function (rows) {
                 var best = bestRow(rows);
                 if (!best) return { ok: false };

@@ -510,6 +510,18 @@ def search_context(item: Dict[str, Any], media_type: str) -> Dict[str, Any]:
                     item.get("episode_number"))
             except Exception:   # noqa: BLE001 - a numbering assist must never break a grab
                 ctx["absolute"] = None
+        # Commissary: a NEW anime has no shows row to be tagged anime or counted, so
+        # its first grab - the one that decides its library - could never match a
+        # '[Group] Show - 03' release. In season 1 the absolute number IS the
+        # episode number for every show; for anime and untyped shows use that when
+        # the library can't answer. Never for a later season or a standard show:
+        # the hint only accepts, and 'Show - 05' must not satisfy S02E05.
+        if ctx.get("absolute") is None and stype in ("anime", ""):
+            try:
+                if int(item.get("season_number")) == 1 and int(item.get("episode_number")) >= 1:
+                    ctx["absolute"] = int(item.get("episode_number"))
+            except (TypeError, ValueError):
+                pass
         tmdb_id, kind = item.get("show_tmdb_id"), "show"
     titles = _acceptable_titles(ctx["title"], kind, tmdb_id)
     if len(titles) > 1:

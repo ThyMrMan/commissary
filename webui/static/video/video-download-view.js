@@ -384,6 +384,8 @@
     // results trickle in over ~30s, so a single short wait misses them).
     function searchInto(container, resultsEl, params, triggerRows, onDone) {
         if (!resultsEl) return;
+        // Commissary: which title this is (aliases, air date, absolute number)
+        if (window.CommissarySearchIdentity) window.CommissarySearchIdentity.apply(container, params);
         triggerRows = (triggerRows || []).filter(Boolean);
         if (resultsEl._poll) { clearTimeout(resultsEl._poll); resultsEl._poll = null; }
         resultsEl._rows = null;   // drop any prior search's rows so Auto can't grab a stale hit

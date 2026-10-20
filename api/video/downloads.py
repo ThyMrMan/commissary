@@ -138,6 +138,14 @@ def _search_queries(body, source: str, scope: str, title: str, season, episode) 
         return []
 
 
+def _search_identity(body, season=None, episode=None):
+    """Commissary: the title's identity for a manual search (aliases, air date,
+    absolute number, series type); see core/commissary/search_identity.py."""
+    from . import get_video_db
+    from core.commissary.search_identity import Identity
+    return Identity(get_video_db(), body, season, episode)
+
+
 def _torrent_lane_hits(body, scope, title, want_season, want_episode, source):
     """The torrent/usenet lane, in ONE place.
 
@@ -168,7 +176,8 @@ def _torrent_lane_hits(body, scope, title, want_season, want_episode, source):
                            max_wait_seconds=MANUAL_SEARCH_MAX_WAIT_SECONDS,
                            indexer_names=_basic_indexer_names(body),
                            **_external_ids(body),
-                           **({"indexer_ids": lib_ids} if lib_ids else {}))
+                           **({"indexer_ids": lib_ids} if lib_ids else {}),
+                           **_search_identity(body, want_season, want_episode).query())  # Commissary
     prowlarr_error = None
     if not pres.get("configured"):
         prowlarr_error = ("Prowlarr isn't configured — set its URL + key on "
@@ -969,13 +978,15 @@ def register_routes(bp):
         source = str(body.get("source") or "").lower()
         want_season, want_episode, season_end = _search_ints(body)
         profile, _pid = _profile_for_request(get_video_db(), body)
+        _ident = _search_identity(body, want_season, want_episode)  # Commissary
         live = False
         partial_note = None
         queries = _search_queries(body, source, scope, title, want_season, want_episode)
         if source == "soulseek":
             from core.video.slskd_search import build_query, slskd_search
             sres = slskd_search(build_query(scope, title, year=body.get("year"),
-                                            season=want_season, episode=want_episode))
+                                            season=want_season, episode=want_episode,
+                                            **_ident.query()))  # Commissary
             if not sres.get("configured"):
                 return jsonify({"scope": scope, "results": [], "queries": queries, "error": "slskd isn't configured — set its URL on Settings → Downloads."})
             if sres.get("error"):
@@ -1003,7 +1014,7 @@ def register_routes(bp):
         payload = {"scope": scope, "live": live, "queries": queries,
                    "results": _evaluate_hits(raw, profile, scope, want_season, want_episode,
                                              want_year=body.get("year"),
-                                             want_title=body.get("title"))}
+                                             **_ident.judge())}  # Commissary
         # One half of the lane was down but the other answered: show the results
         # AND say what is missing, rather than silently returning a short list.
         if partial_note:
@@ -1023,17 +1034,22 @@ def register_routes(bp):
         source = str(body.get("source") or "").lower()
         want_season, want_episode, season_end = _search_ints(body)
         queries = _search_queries(body, source, scope, title, want_season, want_episode)
+        _ident = _search_identity(body, want_season, want_episode)  # Commissary
 
         if source == "soulseek":
             from core.video.slskd_search import (
                 _INTERACTIVE_MAX_WAIT_SECONDS, build_query, search_timeout_ms, start_search)
             res = start_search(build_query(scope, title, year=body.get("year"),
-                                           season=want_season, episode=want_episode),
+                                           season=want_season, episode=want_episode,
+                                           **_ident.query()),  # Commissary
                                max_throttle_wait=_INTERACTIVE_MAX_WAIT_SECONDS)
             if not res.get("configured"):
                 return jsonify({"queries": queries, "error": "slskd isn't configured — set its URL on Settings → Downloads."})
             if res.get("error"):
                 return jsonify({"queries": queries, "error": "slskd: " + str(res["error"])})
+            # Commissary: the poll carries no identity; remember what this search is for
+            from core.commissary.search_identity import remember
+            remember(res["id"], body)
             # how long the client should keep polling (slskd keeps searching this long).
             return jsonify({"id": res["id"], "live": True, "complete": False, "queries": queries,
                             "poll_ms": search_timeout_ms() + 8000})
@@ -1047,7 +1063,7 @@ def register_routes(bp):
             if eres.get("error"):
                 return jsonify({"queries": queries, "error": "EXT.to: " + str(eres["error"])})
             return jsonify({"id": None, "live": True, "complete": True, "queries": queries,
-                            "results": _evaluate_hits(eres["hits"], profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=body.get("title"))})
+                            "results": _evaluate_hits(eres["hits"], profile, scope, want_season, want_episode, want_year=body.get("year"), **_ident.judge())})  # Commissary
         if source in ("torrent", "usenet"):
             # Prowlarr is synchronous — like the old mock, results come back in one shot
             # (no polling id), so the client renders immediately. Shares the lane
@@ -1060,7 +1076,7 @@ def register_routes(bp):
             out = {"id": None, "live": True, "complete": True, "queries": queries,
                    "results": _evaluate_hits(hits, profile, scope, want_season, want_episode,
                                              want_year=body.get("year"),
-                                             want_title=body.get("title"))}
+                                             **_ident.judge())}  # Commissary
             if note:
                 out["note"] = note
             return jsonify(out)
@@ -1068,7 +1084,7 @@ def register_routes(bp):
         raw = mock_search(scope, title, year=body.get("year"), season=want_season,
                           episode=want_episode, season_end=season_end, source=source)
         return jsonify({"id": None, "live": False, "complete": True, "queries": queries,
-                        "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=body.get("title"))})
+                        "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), **_ident.judge())})  # Commissary
 
     @bp.route("/downloads/search/poll", methods=["GET"])
     def video_downloads_search_poll():
@@ -1076,6 +1092,7 @@ def register_routes(bp):
         title, season?, episode?. The client polls until it stops growing or times out."""
         from . import get_video_db
         from core.video.slskd_search import poll_search
+        from core.commissary.search_identity import recall as _recall  # Commissary
         sid = request.args.get("id")
         scope = str(request.args.get("scope") or "movie").lower()
         want_season, want_episode, _ = _search_ints(request.args)
@@ -1084,7 +1101,10 @@ def register_routes(bp):
         profile, _pid = _profile_for_request(get_video_db(), request.args)
         polled = poll_search(sid)
         return jsonify({"live": True, "total_files": polled["total_files"],
-                        "results": _evaluate_hits(polled["hits"], profile, scope, want_season, want_episode, want_year=request.args.get("year"), want_title=request.args.get("title"))})
+                        "results": _evaluate_hits(polled["hits"], profile, scope, want_season, want_episode, want_year=request.args.get("year"),
+                                                  # Commissary: judged by what the search was started for
+                                                  **_search_identity(_recall(sid, request.args),
+                                                                     want_season, want_episode).judge())})
 
     @bp.route("/downloads/grab", methods=["POST"])
     def video_downloads_grab():
@@ -1201,6 +1221,10 @@ def register_routes(bp):
         import json as _json
         ctx = body.get("search_ctx") if isinstance(body.get("search_ctx"), dict) else {}
         ctx = {**ctx, "user_initiated": True, "import_policy": "user_replace"}
+        # Commissary: the air date and absolute number the search judged by, so the
+        # importer accepts what the search accepted (and {absolute} naming works).
+        ctx = {**_search_identity({**body, **ctx}, ctx.get("season"), ctx.get("episode")).ctx(),
+               **ctx}
         _prof, _pid = _profile_for_request(db, body)
         common = {
             "kind": str(body.get("kind") or "movie"), "title": body.get("title"),
