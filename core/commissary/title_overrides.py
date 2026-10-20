@@ -34,11 +34,8 @@ TABLE_SQL = (
     " PRIMARY KEY (kind, tmdb_id))")
 
 SERIES_TYPES = ("standard", "daily", "anime")
-PACK_PREFS = ("auto", "prefer", "never")
-# The old fork also had 'only' (packs and nothing else). Until that mode is
-# ported it reads as 'prefer', the nearest upstream setting; the stored value
-# is left alone so the port can pick it up.
-_PACK_READ = {"only": "prefer"}
+# 'only' is the fork's: wait for a pack (core/commissary/season_packs.py)
+PACK_PREFS = ("auto", "prefer", "never", "only")
 
 
 def ensure_table(conn) -> None:
@@ -107,7 +104,6 @@ def get(db, kind, tmdb_id) -> dict:
     st = str(row[1] or "").strip().lower()
     out["series_type"] = st if (k == "show" and st in SERIES_TYPES) else None
     pack = str(row[2] or "").strip().lower()
-    pack = _PACK_READ.get(pack, pack)
     out["pack_preference"] = pack if (k == "show" and pack in PACK_PREFS) else "auto"
     return out
 
@@ -130,7 +126,7 @@ def set_values(db, kind, tmdb_id, **values) -> bool:
         cols["series_type"] = st if st in SERIES_TYPES else None
     if k == "show" and "pack_preference" in values:
         pack = str(values["pack_preference"] or "").strip().lower()
-        cols["season_pack_mode"] = pack if pack in ("prefer", "never") else None
+        cols["season_pack_mode"] = pack if pack in ("prefer", "never", "only") else None
     if not cols:
         return False
     conn = db._get_connection()

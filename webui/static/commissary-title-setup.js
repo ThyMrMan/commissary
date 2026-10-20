@@ -24,7 +24,8 @@
     var SERIES = [['standard', 'Standard'], ['daily', 'Daily (releases by air date)'],
                   ['anime', 'Anime (absolute numbering)']];
     var PACKS = [['auto', 'Follow the global setting'], ['prefer', 'Always try a season pack first'],
-                 ['never', 'Never grab season packs']];
+                 ['never', 'Never grab season packs'],
+                 ['only', 'Season packs only — wait for one']];
 
     var state = null;   // {kind, tmdbId, overlay, saved}
 

@@ -77,8 +77,10 @@ failed rows, album release picker).
    (core/commissary/search_identity.py + commissary-search-identity.js).
 4. tmdb-keyed title overrides before owning the show (S–M), mapped onto upstream `manual_aliases`/`pack_preference`/`series_type` — **done**
    (core/commissary/title_overrides.py, the legacy `video_title_overrides` table kept as-is; Manage on an
-   unowned TMDB page via commissary-title-setup.js). Legacy `season_pack_mode='only'` reads as 'prefer' until item 5.
-5. Season-pack "only" mode + RSS packs (M).
+   unowned TMDB page via commissary-title-setup.js).
+5. Season-pack "only" mode + RSS packs (M) — **done** (core/commissary/season_packs.py). Per-show only; upstream's
+   global switch is the automation's `season_pack_first` (no UI), which RSS doesn't read (packs on, as its default).
+   Also: an episode whose season pack is in flight is no longer grabbed alone (drain and RSS).
 6. Per-show TMDB/TVDB numbering provider + episode repair (M–L); skip 3.5.7 scene mapping when `episode_source='tvdb'`.
 7. Import lock (M).
 8. Sonarr/Radarr `{Token}` naming + rename panel (L).

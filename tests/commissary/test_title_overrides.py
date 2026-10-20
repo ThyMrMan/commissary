@@ -52,7 +52,7 @@ def test_the_old_forks_rows_read_back(db):
     conn.close()
     got = to.get(db, "show", NEW_SHOW)
     assert got == {"manual_aliases": ["Tenkou-saki", "Osananajimi"], "series_type": "anime",
-                   "pack_preference": "prefer"}
+                   "pack_preference": "only"}
 
 
 def test_clearing_everything_removes_the_row(db):

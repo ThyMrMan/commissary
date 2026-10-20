@@ -8449,7 +8449,7 @@ class VideoDatabase:
     # ── per-title acquisition overrides (P2) ─────────────────────────────────
     _OVERRIDE_LISTS = ("preferred_sources", "release_group_allow", "release_group_block",
                        "manual_aliases")
-    _PACK_PREFS = ("auto", "prefer", "never")
+    _PACK_PREFS = ("auto", "prefer", "never", "only")   # Commissary: + only
 
     @staticmethod
     def _load_override_list(raw) -> list:

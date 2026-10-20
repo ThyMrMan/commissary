@@ -625,6 +625,11 @@ def _default_active_keys(media_type: str) -> set:
     return active_download_keys(get_video_db().get_active_video_downloads())
 
 
+def _default_db():   # Commissary
+    from api.video import get_video_db
+    return get_video_db()
+
+
 def _default_target_dir(media_type: str) -> str:
     from api.video import get_video_db
     from core.commissary.video_libraries import target_dir as _vlib_target  # Commissary
@@ -1095,15 +1100,17 @@ def auto_video_process_wishlist(
                 it.get("quality_profile_id") for it in items) else None
             items = annotate_upgrades(items, cutoff_rank, cutoff_for=per_item)
         active = set(active_keys(media_type) or set())
-        todo = [it for it in items if item_key(it, media_type) not in active]
+        from core.commissary import season_packs as _season_packs   # Commissary
+        # Commissary: an episode whose season pack is downloading is in flight too
+        todo = [it for it in items if item_key(it, media_type) not in active
+                and not _season_packs.under_active_pack(it, media_type, active)]
         if media_type == "episode":
             # Global setting, overridable per show: 'never' keeps that show on the
             # per-episode path even when packs are on, 'prefer' reaches for a pack
             # even when they are globally off.
             pack_on = config.get("season_pack_first", True) is not False
-            packable = [it for it in todo
-                        if _pack_preference_for(it) == "prefer"
-                        or (pack_on and _pack_preference_for(it) != "never")]
+            packable = [it for it in todo   # Commissary: 'only' reaches for a pack too
+                        if _season_packs.wants_pack(_pack_preference_for(it), pack_on)]
         else:
             packable = []
         if packable:
@@ -1281,6 +1288,14 @@ def auto_video_process_wishlist(
             # so a season with plenty of single-episode releases sat untouched.
             fall_back = (it.get("_pack_rows") and not ok and not didnt_run
                          and not budget_deferred and not stop_requested(gen))
+            # Commissary: 'Season packs: only' waits for a pack once the season has aired
+            if fall_back and _season_packs.hold(_default_db(), it):
+                fall_back = False
+                for row in it["_pack_rows"]:
+                    record_note(row, media_type, _season_packs.HOLD_NOTE)
+                deps.update_progress(automation_id, log_type='info',
+                                     log_line="No season pack for '%s' yet — holding its %d episode(s) "
+                                              "(Season packs: only)" % (name, len(it["_pack_rows"])))
             if fall_back:
                 rows = list(it["_pack_rows"])
                 with lock:

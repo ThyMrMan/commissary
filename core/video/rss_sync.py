@@ -247,7 +247,9 @@ def _rss_pass_inner(*, fetch, log, extto=None) -> Dict[str, Any]:
         target = vpw._default_target_dir(media_type)
         if not target:
             continue
-        for item in items:
+        # Commissary: season packs first, then the episodes no grabbed pack covers
+        from core.commissary.season_packs import rss_items
+        for item in rss_items(items, active, media_type, db=db):
             if vpw.item_key(item, media_type) in active:
                 continue
             titles = [item.get("title") or item.get("show_title")]

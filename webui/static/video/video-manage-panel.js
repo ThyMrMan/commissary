@@ -308,6 +308,7 @@
         ['auto', 'Follow the global setting'],
         ['prefer', 'Always try a season pack first'],
         ['never', 'Never grab season packs'],
+        ['only', 'Season packs only \u2014 wait for one'],   // Commissary
     ];
     // Like inputHtml but for the override fields, which are not lockable metadata
     // (there is no server-side field to hand back, so no lock badge).

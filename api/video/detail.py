@@ -48,9 +48,9 @@ def register_routes(bp):
                     return jsonify({"success": False, "error": "%s must be a list" % key}), 400
                 fields[key] = body[key]
         if kind == "show" and "pack_preference" in body:
-            if str(body["pack_preference"]) not in ("auto", "prefer", "never"):
+            if str(body["pack_preference"]) not in ("auto", "prefer", "never", "only"):  # Commissary
                 return jsonify({"success": False,
-                                "error": "pack_preference must be auto|prefer|never"}), 400
+                                "error": "pack_preference must be auto|prefer|never|only"}), 400
             fields["pack_preference"] = body["pack_preference"]
         if not fields:
             return jsonify({"success": False, "error": "nothing to set"}), 400
