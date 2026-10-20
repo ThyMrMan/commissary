@@ -281,11 +281,12 @@ def score_file_against_track(
     # Title similarity (TITLE_WEIGHT). Falls back to filename stem when
     # the file has no title tag — strip a leading track-number prefix off that
     # stem (#890) so "01 - Sun It Rises" scores against "Sun It Rises".
-    title = file_tags.get('title') or os.path.splitext(os.path.basename(file_path))[0]
-    from core.imports.paths import strip_leading_track_number
-    title = strip_leading_track_number(title)
+    # Commissary: also try a filename without a leading album name
+    # ("<Album> <NN> <Title>" rips) and keep the better reading.
+    from core.commissary.title_candidates import title_candidates
     track_name = track.get('name', '')
-    score += title_sim(title, track_name) * TITLE_WEIGHT
+    score += max(title_sim(title, track_name)
+                 for title in title_candidates(file_path, file_tags, target_album)) * TITLE_WEIGHT
 
     # Artist similarity (ARTIST_WEIGHT). Partial credit when either side
     # lacks an artist tag so title-only pairs can still clear threshold.
