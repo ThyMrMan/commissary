@@ -63,7 +63,12 @@ failed rows, album release picker).
 
 ## Phase 2 — video features (dependency order)
 
-1. Multi-library registry (L) — extend upstream `library_roots.py`/`libraries.py`; foundation for everything "per-Library".
+1. Multi-library registry (L) — **done** (core/commissary/video_libraries.py): scan every library's
+   section and stamp titles; library folders as roots (health, recycle, resolver, temp sweep);
+   grabs filed into the title's library with its client category; library default quality
+   profile + series type; Prowlarr searches limited to the library's trackers (unassigned titles
+   unrestricted); Settings editor + assign endpoints. Still to do: wishlist/watchlist library
+   pickers in the UI (endpoints exist), Library page tabs (item 12).
 2. Fansub/anime/arc release parsing (M) — merge into upstream `release_parse`.
 3. Manual search knows the title: aliases, AKAs, episode hints, absolute numbers (M).
 4. tmdb-keyed title overrides before owning the show (S–M), mapped onto upstream `manual_aliases`/`pack_preference`/`series_type`.
