@@ -73,9 +73,23 @@ _VLIB_CSS = (
     ".commissary-vlib-btn--set{color:rgb(var(--accent-rgb))}"
 )
 
+# {Token} naming on the Library settings card (commissary-naming-settings.js):
+# the old fork's token chips, and inline text buttons inside a settings-hint.
+_NAMING_CSS = (
+    ".commissary-link-btn{background:none;border:0;padding:0;font:inherit;cursor:pointer;"
+    "color:rgb(var(--accent-rgb));text-decoration:underline;text-underline-offset:2px}"
+    ".commissary-link-btn:hover{filter:brightness(1.2)}"
+    ".commissary-token-list{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px;padding:10px;"
+    "border:1px solid var(--white-a12,rgba(255,255,255,.12));border-radius:8px}"
+    ".commissary-token{padding:2px 7px;border-radius:5px;background:var(--white-a08,rgba(255,255,255,.08));"
+    "border:1px solid transparent;font-size:12px;white-space:nowrap;cursor:pointer;color:inherit;"
+    "font-family:inherit}"
+    ".commissary-token:hover{border-color:rgb(var(--accent-rgb));color:rgb(var(--accent-rgb))}"
+)
+
 
 def head_html(config_get=None) -> Markup:
-    rules = [_VLIB_CSS]
+    rules = [_VLIB_CSS, _NAMING_CSS]
     if not features.chat_enabled(config_get):
         rules.append(_HIDE_CHAT)
     if not features.support_button_enabled(config_get):

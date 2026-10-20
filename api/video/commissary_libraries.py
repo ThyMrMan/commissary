@@ -138,3 +138,30 @@ def register_routes(bp):
         if not import_lock.set_season_lock(get_video_db(), show_id, season_number, body["locked"]):
             return jsonify({"error": "no such season"}), 404
         return jsonify({"status": "saved", "season": season_number, "locked": body["locked"]})
+
+    # ── {Token} naming: the settings preview, rendered by the real engine ────
+    @bp.route("/libraries/naming/tokens", methods=["GET"])
+    def commissary_naming_tokens():
+        from core.commissary import naming
+        return jsonify({"movie": naming.brace_token_names("movie"),
+                        "episode": naming.brace_token_names("episode"),
+                        "import_only": list(naming.LIBRARY_UNAVAILABLE_TOKENS)})
+
+    @bp.route("/libraries/naming/preview", methods=["POST"])
+    def commissary_naming_preview():
+        """What each template names the sample title, through the same
+        render_path an import uses - not a JavaScript copy of the engine."""
+        from core.commissary import naming
+        from core.video import organization
+        body = request.get_json(silent=True) or {}
+        out = {}
+        for scope, key, ext in (("movie", "movie_template", ".mkv"),
+                                ("episode", "episode_template", ".mkv"),
+                                ("youtube", "youtube_template", ".mp4")):
+            tmpl = str(body.get(key) or "").strip()
+            if not tmpl:
+                continue
+            dest = organization.render_path(scope, "", naming.PREVIEW_SAMPLES[scope],
+                                            {key: tmpl}, ext)
+            out[scope] = dest["path"].replace("\\", "/").lstrip("/")
+        return jsonify(out)
