@@ -21,13 +21,27 @@ _HIDE_CHAT = ('.nav-button[data-page="chat"], .nav-button[data-video-page="video
 _HIDE_SUPPORT = '.support-section, #support-modal-overlay { display: none !important; }'
 
 
+def auth_open_paths() -> dict:
+    """Endpoints the sign-in, launch-PIN and profile-picker screens reach before
+    authentication: the union of upstream's own gate lists, so
+    commissary-auth-hold.js never holds one (holding /api/profiles/current
+    would deadlock; holding a sign-in call would break the lock screen)."""
+    from core.security import launch_lock, login_gate, session_profile
+
+    gates = (login_gate, launch_lock, session_profile)
+    return {
+        "get": sorted(set().union(*(g._ALLOWED_GET for g in gates))),
+        "post": sorted(set().union(*(g._ALLOWED_POST for g in gates))),
+    }
+
+
 def head_html(config_get=None) -> Markup:
     rules = []
     if not features.chat_enabled(config_get):
         rules.append(_HIDE_CHAT)
     if not features.support_button_enabled(config_get):
         rules.append(_HIDE_SUPPORT)
-    info = {"chatEnabled": features.chat_enabled(config_get)}
+    info = {"chatEnabled": features.chat_enabled(config_get), "authOpen": auth_open_paths()}
     payload = json.dumps(info).replace("</", "<\\/")
     parts = []
     if rules:
