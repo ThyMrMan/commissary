@@ -1506,6 +1506,12 @@ class WebUIDownloadMonitor:
                                 # These are orphaned tasks - they're done but still in active queue
                                 orphaned_tasks.append(task_id)
 
+                    # Commissary: busy = dispatched and unfinished, ONE definition
+                    # shared with the healer in web_server.py. The status list above
+                    # left out 'pending', so a just-started worker read as free.
+                    from core.commissary.batch_slots import count_active_workers
+                    actually_active = count_active_workers(batch, download_tasks)
+
                     # Check for discrepancies
                     if reported_active != actually_active or orphaned_tasks:
                         logger.warning(f"[Worker Validation] Batch {batch_id}: reported={reported_active}, actual={actually_active}, orphaned={len(orphaned_tasks)}")
