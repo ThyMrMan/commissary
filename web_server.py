@@ -478,6 +478,9 @@ app.secret_key = _init_flask_secret_key()
 # so another app on the same host using "session" overwrote this one, dropping the
 # selected profile and falling back to profile 1 (admin).
 app.config["SESSION_COOKIE_NAME"] = "soulsync_session"
+# Commissary: sliding 30-day session instead of a cookie that dies with the browser.
+from core.commissary.sessions import install as _install_persistent_sessions
+_install_persistent_sessions(app, config_manager.get)
 
 # --- Reverse-proxy mode (opt-in, default OFF) ---
 # OFF by default → a strict no-op, so direct/LAN installs are unchanged. Only when
