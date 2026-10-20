@@ -1256,6 +1256,11 @@ def _fail_or_retry(db, dl, error_msg, *, allow_retry: bool = True) -> None:
         publish("video_download_failed", {**_event_payload(dl), "error": err})
     except Exception:
         logger.exception("video download %s: failed-event publish failed", dl.get("id"))
+    # Commissary: a torrent/usenet release that failed is remembered (so no search
+    # grabs it again this week) and the title is searched again now
+    if allow_retry:
+        from core.commissary.client_retry import after_failure as _client_retry
+        _client_retry(db, {**dl, "error": err})
 
 
 def _search_for_retry(query, max_seconds=55):

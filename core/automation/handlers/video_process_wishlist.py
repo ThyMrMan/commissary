@@ -743,7 +743,9 @@ def _search_one_source(source: str, item: Dict[str, Any], media_type: str):
             c["source"] = "extto"
         else:
             c["source"] = source
-    return cands, "; ".join(source_notes) or None
+    # Commissary: a release that just failed on its client isn't grabbed again
+    from core.commissary.client_retry import mark_failed as _mark_failed
+    return _mark_failed(item, media_type, cands), "; ".join(source_notes) or None
 
 
 # How many individual releases a snapshot keeps per source. Enough to answer

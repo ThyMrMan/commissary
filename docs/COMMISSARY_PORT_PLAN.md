@@ -100,8 +100,15 @@ failed rows, album release picker).
    add file/folder, folder Place with "Import as season" renumber (span kept via importer ctx
    `renumbered_from`), fansub absolute folders, background placement + status. Also fixed upstream's
    unsized Import search icon (fork CSS).
-10. RAR-only refusal + `list_files` on torrent adapters (M).
-11. Retries on the row's own client (M); TMDB search paging/certainty ladder (M).
+10. RAR-only refusal + `list_files` on torrent adapters (M) — **done** (core/commissary/packed_release.py; the
+    adapters are asked through their own RPC helpers, no adapter file touched). Upstream already names the
+    client for a vanished torrent, and duplicate-add adoption was ported in Phase 1.
+11. Retries on the row's own client (M); TMDB search paging/certainty ladder (M). — **done** (core/commissary/client_retry.py, tmdb_search.py). Differs from
+    the old fork: upstream already refuses to retry a client download through Soulseek, so instead a failed
+    torrent/usenet release is remembered for a week (every search marks it rejected) and the title is
+    re-searched at once as the background drain would, at most 3 times a day. TMDB: 3 pages + trailing-year
+    fallback (tmdb_search.py); match certainty ladder - /find by the row's TVDB/IMDb id, then a title search
+    that must carry the title, never results[0] on trust (tmdb_match.py).
 12. Per-Library UI surfaces (L, rebuild; history is React now).
 
 ## Phase 3 — music features

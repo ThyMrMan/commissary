@@ -336,6 +336,9 @@ def _rank(pool: List[Dict[str, Any]], item: Dict[str, Any], media_type: str) -> 
                            want_alt=ctx_alt(ctx))
     for c in cands:
         c["source"] = "usenet" if str(c.get("protocol") or "") == "usenet" else "torrent"
+    # Commissary: a release that just failed on its client isn't grabbed again
+    from core.commissary.client_retry import mark_failed as _mark_failed
+    cands = _mark_failed(item, media_type, cands)
     # Full ranked list, not just accepted: rejected candidates ride along into
     # the download row as the auto-retry ladder, exactly like the drain.
     return cands

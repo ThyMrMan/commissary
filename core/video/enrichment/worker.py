@@ -129,8 +129,13 @@ class VideoEnrichmentWorker:
         try:
             # Prefer the provider id the server already gave us (enrich BY ID, no
             # re-search); the client falls back to a title/year search if it's None.
+            # Commissary: the row's TVDB/IMDb ids, for TMDB's exact /find
+            from core.commissary.tmdb_match import external_ids_for as _ext_ids
+            _ids = (_ext_ids(self.db, item["kind"], item["id"])
+                    if self.service == "tmdb" and not item.get("known_id") else {})
+            _ext = {"external_ids": _ids} if _ids else {}
             result = self.client.match(item["kind"], item["title"], item.get("year"),
-                                       known_id=item.get("known_id"))
+                                       known_id=item.get("known_id"), **_ext)
         except Exception:
             logger.exception("video enrichment %s match failed for %s", self.service, item["title"])
             self.stats["errors"] += 1

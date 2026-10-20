@@ -73,7 +73,7 @@ class TMDBClient:
             logger.exception("TMDB test failed")
             return False, "Could not reach TMDB"
 
-    def match(self, kind, title, year, known_id=None):
+    def match(self, kind, title, year, known_id=None, external_ids=None):  # Commissary: + external_ids
         if not self.api_key:
             return None
         import requests
@@ -82,24 +82,14 @@ class TMDBClient:
         tmdb_id = _int(known_id)
         meta = {}
         if tmdb_id is None:
-            if not title:
-                return None
-            path = "/search/movie" if kind == "movie" else "/search/tv"
-            params = {"api_key": self.api_key, "query": title}
-            if year:
-                params["year" if kind == "movie" else "first_air_date_year"] = year
-            resp = requests.get(self.BASE + path, params=params, timeout=15)
-            # A non-200 (429 rate-limit, 5xx, timeout-as-error) is a FAILED call,
-            # not "no match" — raise so the worker records 'error' (retried later)
-            # instead of burning the item to 'not_found'.
-            resp.raise_for_status()
-            results = (resp.json() or {}).get("results") or []
-            if not results:
-                return None
-            tmdb_id = results[0].get("id")
-            meta["overview"] = results[0].get("overview")
+            # Commissary: the server's TVDB/IMDb id resolved exactly through /find,
+            # then a title search that must PROVE itself - never results[0] on
+            # trust (how 'Silo' became an unrelated show). Failed calls still raise.
+            from core.commissary.tmdb_match import resolve as _resolve_tmdb
+            tmdb_id, _overview = _resolve_tmdb(self, kind, title, year, external_ids)
             if tmdb_id is None:
                 return None
+            meta["overview"] = _overview
         # A failed details CALL (429 rate-limit, 5xx, timeout) must PROPAGATE so the
         # backfill records an error and retries — not get swallowed into empty
         # metadata that then gets marked details_synced=1 forever (the bug that left
@@ -576,12 +566,11 @@ class TMDBClient:
         everything resolves back into SoulSync."""
         if not self.api_key or not (query or "").strip():
             return []
-        import requests
-        r = requests.get(self.BASE + "/search/multi", params={
-            "api_key": self.api_key, "query": query, "include_adult": "false"}, timeout=15)
-        r.raise_for_status()
+        # Commissary: up to three pages, and a trailing year retried without it
+        # when the exact query finds nothing (core/commissary/tmdb_search.py)
+        from core.commissary.tmdb_search import raw_results
         out = []
-        for it in ((r.json() or {}).get("results") or [])[:32]:
+        for it in raw_results(self, query)[:60]:
             mt, tid = it.get("media_type"), it.get("id")
             if not tid:
                 continue
