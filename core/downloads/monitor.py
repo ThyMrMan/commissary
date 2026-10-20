@@ -836,10 +836,14 @@ class WebUIDownloadMonitor:
         task_filename = task.get('filename') or ti.get('filename')
         task_username = task.get('username') or ti.get('username')
 
-        if not task_filename or not task_username:
-            return False
-
-        lookup_key = _make_context_key(task_username, task_filename)
+        # Commissary: a task with no username/filename used to return here,
+        # with no watchdog at all. That is exactly the state a REPLACEMENT
+        # passes through (the quarantine requeue clears both by design), so a
+        # stalled replacement sat on 'downloading' forever. Only tasks already
+        # 'downloading'/'queued' reach this, and claiming to download with no
+        # source is wrong already, so it gets the not-in-live-transfers ladder.
+        has_source = bool(task_filename and task_username)
+        lookup_key = _make_context_key(task_username, task_filename) if has_source else None
         live_info = _lookup_live_info(task, live_transfers_lookup)
 
         if not live_info:

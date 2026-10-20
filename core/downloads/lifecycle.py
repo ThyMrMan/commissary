@@ -1067,7 +1067,9 @@ def _on_download_completed(batch_id: str, task_id: str, success: bool, deps: Lif
 
             # Decrement active count
             old_active = download_batches[batch_id]['active_count']
-            download_batches[batch_id]['active_count'] -= 1
+            # Commissary: clamped — a count the validator already corrected
+            # down must not go negative on the late completions.
+            download_batches[batch_id]['active_count'] = max(0, old_active - 1)
             new_active = download_batches[batch_id]['active_count']
 
             logger.error(f"[Batch Manager] Task {task_id} completed ({'success' if success else 'failed/cancelled'}). Active workers: {old_active} → {new_active}/{download_batches[batch_id]['max_concurrent']}")
@@ -1079,7 +1081,7 @@ def _on_download_completed(batch_id: str, task_id: str, success: bool, deps: Lif
         # FIXED: Check if batch is truly complete (all tasks finished, not just workers freed)
         batch = download_batches[batch_id]
         all_tasks_started = batch['queue_index'] >= len(batch['queue'])
-        no_active_workers = batch['active_count'] == 0
+        no_active_workers = batch['active_count'] <= 0  # Commissary: a negative count never == 0
 
         # Count actually finished tasks (completed, failed, or cancelled)
         # CRITICAL: Don't include 'post_processing' as finished - it's still in progress (unless stuck)!
@@ -1224,7 +1226,7 @@ def check_batch_completion_v2(batch_id: str, deps: LifecycleDeps) -> Optional[bo
 
             batch = download_batches[batch_id]
             all_tasks_started = batch['queue_index'] >= len(batch['queue'])
-            no_active_workers = batch['active_count'] == 0
+            no_active_workers = batch['active_count'] <= 0  # Commissary: a negative count never == 0
 
             # Count actually finished tasks (completed, failed, or cancelled)
             finished_count = 0
