@@ -127,9 +127,14 @@ def register_routes(bp):
             probe_info = prober(src) if prober is not None else None
         except Exception:   # noqa: BLE001 - a probe crash must not block the import
             probe_info = None
+        # Commissary: the library's ids for the chosen title (the dialog's own
+        # title/year/numbering still win).
+        from core.commissary.naming_identity import naming_identity
         plan = plan_import(row, src, list_dir=fs.list_dir, probe=probe_info,
                            settings=settings, force=True, override=override,
-                           expected_duration_sec=_expected_duration_sec(db, row))
+                           expected_duration_sec=_expected_duration_sec(db, row),
+                           identity=naming_identity(db, _KIND_FOR_SCOPE[scope],
+                                                    body.get("media_id")))
         if plan["action"] in ("import", "upgrade") and plan.get("dest"):
             try:
                 db.update_video_download(dl_id, dest_path=plan["dest"]["path"])

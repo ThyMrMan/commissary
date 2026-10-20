@@ -273,10 +273,13 @@ def prowlarr_search(scope: str, title: Any, *, year: Any = None, season: Any = N
     if not strategies:
         return {"configured": True, "hits": []}
 
+    from core.commissary.search_caps import prowlarr_limit   # Commissary: was 100
+    limit = prowlarr_limit()
+
     def _run(strat):
         st_type, q, extra = strat
         try:
-            return client._search_sync(q, cats, ids, 100, search_type=st_type,
+            return client._search_sync(q, cats, ids, limit, search_type=st_type,
                                        extra_params=extra,
                                        max_wait_seconds=max_wait_seconds)
         except Exception as e:   # noqa: BLE001 - one strategy failing shouldn't sink the rest

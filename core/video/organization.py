@@ -17,7 +17,7 @@ Template tokens
   Movies:   $title $titlefirst $year $quality $resolution $source $codec $edition
             $tmdbid $imdbid
   Episodes: $series $season $seasonraw $episode $episodetitle $year $quality
-            $resolution $source $codec $tvdbid $airdate
+            $resolution $source $codec $tvdbid $tmdbid $imdbid $airdate
   ($season/$episode are zero-padded to 2; $seasonraw is the bare number; a
   multi-episode file renders its span through $episode — 'S01E01-E02'; $airdate
   is the episode's YYYY-MM-DD air date, for daily-show naming.)
@@ -300,6 +300,8 @@ def _episode_values(f: dict) -> dict:
         "source": source_label(f.get("source")),
         "codec": _str(f.get("codec")).upper(),
         "tvdbid": _str(f.get("tvdbid")),
+        "tmdbid": _str(f.get("tmdbid")),    # Commissary: all three ids for episodes
+        "imdbid": _str(f.get("imdbid")),
     }
 
 
@@ -339,16 +341,25 @@ def render_template(template: Any, values: dict) -> str:
     return out
 
 
+# Commissary: '(tmdb-)' / '[tvdb-]' — an id tag whose token rendered empty. The
+# brackets are literal template text, so unlike '($year)' the tag doesn't vanish
+# and the folder claims an id it hasn't got. '(tmdb-30984)' is untouched.
+_EMPTY_ID_TAG = re.compile(
+    r"[\(\[\{]\s*(?:tmdb|tvdb|imdb|tvmaze|anidb|tvrage)(?:id)?\s*-\s*[\)\]\}]", re.I)
+
+
 def _tidy_component(part: str) -> str:
     """Clean one path segment: drop a ' - ' left dangling by an empty token, remove
     empty ()/[] left by an empty $year, collapse whitespace, trim stray dashes and
     Windows-hostile trailing dots/spaces."""
-    p = re.sub(r"\s+-\s+(?=(\s|$))", " ", part)   # ' - ' before an empty token
+    p = _EMPTY_ID_TAG.sub("", part)              # Commissary: '(tmdb-)' with no id
+    p = re.sub(r"\s+-\s+(?=(\s|$))", " ", p)      # ' - ' before an empty token
     p = re.sub(r"\(\s*\)", "", p)                 # empty ( ) from a missing $year
     p = re.sub(r"\[\s*\]", "", p)
     p = re.sub(r"\s+", " ", p).strip()
     p = p.strip("-").strip()
-    return p.rstrip(". ")
+    # Commissary: a LEADING dot hides the folder on Unix (and from media servers).
+    return p.rstrip(". ").lstrip(". ")
 
 
 def render_path(scope: Any, root: Any, fields: dict, settings: Any, ext: Any) -> dict:

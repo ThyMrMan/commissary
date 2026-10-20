@@ -335,7 +335,9 @@ def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None,
     # rejects stay visible (with their reason) for a deliberate manual override.
     accepted = [r for r in results if r["accepted"]]
     rejected = [r for r in results if not r["accepted"]]
-    return (accepted[:40] + rejected[:15])
+    # Commissary: the caps are settings (core.commissary.search_caps), defaults 40/15.
+    from core.commissary.search_caps import max_accepted, max_rejected
+    return (accepted[:max_accepted()] + rejected[:max_rejected()])
 
 
 def _active_episode_keys(db, title) -> set:
