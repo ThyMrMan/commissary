@@ -27,6 +27,9 @@ from datetime import datetime
 
 from utils.logging_config import get_logger
 
+# Commissary: records which video Library each scanned movie/show is in.
+from core.commissary.video_libraries import ScanTracker as _VlibTracker
+
 logger = get_logger("video_scanner")
 
 VALID_MODES = ("incremental", "full", "deep")
@@ -221,7 +224,8 @@ class VideoLibraryScanner:
             if do_movies:
                 self._set(phase="scanning movies", total=total, percent=pct())
                 consec = 0
-                for item in source.iter_movies(incremental=incremental, since=since):
+                _vlib_movies = _VlibTracker()  # Commissary: record each item's library
+                for item in _vlib_movies.track(source.iter_movies(incremental=incremental, since=since)):
                     if self._cancel:
                         return self._finish_cancelled(movies, 0, 0)
                     sid = str(item["server_id"])
@@ -253,6 +257,7 @@ class VideoLibraryScanner:
                     if movies % 10 == 0:
                         self._set(movies=movies, percent=pct())
                 self._set(movies=movies, percent=pct())
+                _vlib_movies.stamp(self.db, server, "movie")  # Commissary
                 # Prune ONLY on a deep scan, and only when we actually saw items —
                 # so a transient empty response can never wipe the library. The prune
                 # runs AFTER the bar fills, and a big cleanup (many orphaned rows +
@@ -271,7 +276,8 @@ class VideoLibraryScanner:
             if do_shows:
                 self._set(phase="scanning shows")
                 consec = 0
-                for show in source.iter_shows(incremental=incremental, since=since):
+                _vlib_shows = _VlibTracker()  # Commissary: record each item's library
+                for show in _vlib_shows.track(source.iter_shows(incremental=incremental, since=since)):
                     if self._cancel:
                         return self._finish_cancelled(movies, shows, episodes)
                     sid = str(show["server_id"])
@@ -301,6 +307,7 @@ class VideoLibraryScanner:
                     episodes += sum(len(s.get("episodes", [])) for s in show.get("seasons", []))
                     processed += 1
                     self._set(shows=shows, episodes=episodes, percent=pct())
+                _vlib_shows.stamp(self.db, server, "show")  # Commissary
                 # Final prune (the one that delays "done" on a deep scan) — show it.
                 if do_prune and seen_shows:
                     self._set(phase="cleaning up removed shows", percent=100)

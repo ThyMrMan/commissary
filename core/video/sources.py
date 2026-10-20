@@ -292,6 +292,12 @@ def _build_source(movies_lib=None, tv_lib=None, *, interactive=False):
     return None
 
 
+def _vlib_tag(item, section_title):
+    """Commissary: remember which server section a scanned item came from."""
+    from core.commissary.video_libraries import tag
+    return tag(item, section_title)
+
+
 def _load_selection():
     """The user's Movies/TV library choice for the VIDEO server (or {})."""
     try:
@@ -299,7 +305,10 @@ def _load_selection():
         server = resolve_video_server()
         if not server:
             return {}
-        return VideoDatabase().get_library_selection(server)
+        db = VideoDatabase()
+        # Commissary: with video Libraries, scan every library's section.
+        from core.commissary.video_libraries import scan_selection
+        return scan_selection(db, server, db.get_library_selection(server))
     except Exception:
         logger.exception("video sources: could not load library selection")
         return {}
@@ -543,7 +552,8 @@ class PlexVideoSource:
     def _sections(self, kind: str, name=None):
         secs = [s for s in self._server.library.sections() if s.type == kind]
         if name:
-            secs = [s for s in secs if s.title == name]
+            from core.commissary.video_libraries import matches_name  # Commissary: lists
+            secs = [s for s in secs if matches_name(s.title, name)]
         return secs
 
     def _scan_sections(self, kind: str, name):
@@ -638,7 +648,7 @@ class PlexVideoSource:
                 items = section.search(sort="addedAt:desc", maxresults=100)   # first run: recent window
             for m in items:
                 try:
-                    yield self._movie(m)
+                    yield _vlib_tag(self._movie(m), section.title)  # Commissary
                 except Exception:
                     logger.exception("Plex: skipping movie %s", getattr(m, "title", "?"))
 
@@ -696,7 +706,7 @@ class PlexVideoSource:
                 items = section.search(sort="addedAt:desc", maxresults=200)
             for sh in items:
                 try:
-                    yield self._show(sh)
+                    yield _vlib_tag(self._show(sh), section.title)  # Commissary
                 except Exception:
                     logger.exception("Plex: skipping show %s", getattr(sh, "title", "?"))
 
@@ -1305,7 +1315,8 @@ class JellyfinVideoSource:
         views = [v for v in resp.get("Items", [])
                  if (v.get("CollectionType") or "mixed").lower() in (collection_type, "mixed")]
         if name:
-            views = [v for v in views if v.get("Name") == name]
+            from core.commissary.video_libraries import matches_name  # Commissary: lists
+            views = [v for v in views if matches_name(v.get("Name"), name)]
         return views
 
     def _scan_views(self, collection_type: str, name):
@@ -1761,7 +1772,7 @@ class JellyfinVideoSource:
                 items = self._paged(path, params)
             for it in items:
                 try:
-                    yield self._movie(it)
+                    yield _vlib_tag(self._movie(it), view.get("Name"))  # Commissary
                 except Exception:
                     logger.exception("Jellyfin: skipping movie %s", it.get("Name", "?"))
 
@@ -1853,7 +1864,7 @@ class JellyfinVideoSource:
                 items = self._paged(path, params)
             for it in items:
                 try:
-                    yield self._show(it)
+                    yield _vlib_tag(self._show(it), view.get("Name"))  # Commissary
                 except Exception:
                     logger.exception("Jellyfin: skipping show %s", it.get("Name", "?"))
 

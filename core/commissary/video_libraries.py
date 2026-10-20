@@ -251,6 +251,94 @@ def indexer_ids(db, kind, **kw) -> list | None:
     return [int(x) for x in ids.split(",")] if ids else None
 
 
+# ── scanning ─────────────────────────────────────────────────────────────────
+#
+# Upstream scans one section per kind. With libraries, the sources are handed
+# every library's section title (``scan_selection``), each scanned item is
+# tagged with the section it came from (``tag``), and the scanner records the
+# library for everything it saw in one batch (``ScanTracker``). Without that,
+# a deep scan of only "Movies" would prune every Anime-Movies row as missing.
+
+SECTION_KEY = "_section_title"
+
+
+def scan_selection(db, server, selection) -> dict:
+    """Upstream's {movies, tv} selection, or every library's sections when the
+    registry has libraries for this server."""
+    if not server or not has_libraries(db, server):
+        return selection
+    out = dict(selection or {})
+    for ui_kind in ("movies", "tv"):
+        titles = section_titles(db, server, ui_kind)
+        if titles:
+            out[ui_kind] = titles
+    return out
+
+
+def matches_name(title, name) -> bool:
+    """A section matches a selection that is one title or a list of titles."""
+    if isinstance(name, (list, tuple, set)):
+        return title in name
+    return title == name
+
+
+def tag(item, section_title):
+    if isinstance(item, dict) and section_title:
+        item[SECTION_KEY] = section_title
+    return item
+
+
+class ScanTracker:
+    """Wraps a scan iterator, remembering which section each item came from,
+    then records each item's library in one UPDATE per library."""
+
+    def __init__(self):
+        self.sections = {}
+
+    def track(self, items):
+        for item in items:
+            try:
+                title = item.get(SECTION_KEY)
+                if title:
+                    self.sections[str(item["server_id"])] = title
+            except Exception:  # noqa: BLE001 - tracking must never break a scan
+                logger.debug("could not note the library of a scanned item", exc_info=True)
+            yield item
+
+    def stamp(self, db, server, kind) -> int:
+        if not self.sections or not server:
+            return 0
+        lookup = ids_by_section(db, server, kind)
+        if not lookup:
+            return 0
+        table = "movies" if content_kind(kind) == "movie" else "shows"
+        by_lib = {}
+        for sid, title in self.sections.items():
+            rid = lookup.get(title)
+            if rid:
+                by_lib.setdefault(rid, []).append(sid)
+        changed = 0
+        conn = db._get_connection()
+        try:
+            for rid, sids in by_lib.items():
+                for i in range(0, len(sids), 500):
+                    chunk = sids[i:i + 500]
+                    cur = conn.execute(
+                        f"UPDATE {table} SET root_folder_id=? WHERE server_source=? "
+                        f"AND server_id IN ({','.join('?' * len(chunk))}) "
+                        "AND COALESCE(root_folder_id, -1) <> ?",
+                        (rid, server, *chunk, rid))
+                    changed += cur.rowcount
+            conn.commit()
+        except sqlite3.Error:
+            logger.exception("recording scanned %s libraries failed", table)
+        finally:
+            conn.close()
+        if table == "shows":
+            apply_default_series_type(db)
+        return changed
+
+
 # ── writing ──────────────────────────────────────────────────────────────────
 
 def stamp(db, kind, row_id, root_folder_id) -> None:
