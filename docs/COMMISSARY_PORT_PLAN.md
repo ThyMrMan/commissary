@@ -95,7 +95,11 @@ failed rows, album release picker).
    (commissary-naming-settings.js); per-title Rename Files (commissary-rename-panel.js, mass_rename scope +
    one-off template); rename-before-import (fork key `commissary_rename_before_import`, since upstream's
    organization.normalize drops unknown keys) - skipped for a locked title, once per pack.
-9. Manual import any file/folder on upstream `season_pack.py` claim model (L).
+9. Manual import any file/folder on upstream `season_pack.py` claim model (L) — **done**
+   (core/commissary/manual_import.py, api/video/commissary_import.py, commissary-import.js). Browse + filter,
+   add file/folder, folder Place with "Import as season" renumber (span kept via importer ctx
+   `renumbered_from`), fansub absolute folders, background placement + status. Also fixed upstream's
+   unsized Import search icon (fork CSS).
 10. RAR-only refusal + `list_files` on torrent adapters (M).
 11. Retries on the row's own client (M); TMDB search paging/certainty ladder (M).
 12. Per-Library UI surfaces (L, rebuild; history is React now).

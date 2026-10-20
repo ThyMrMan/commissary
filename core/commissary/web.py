@@ -83,6 +83,14 @@ _NAMING_CSS = (
     "border:1px solid var(--white-a12,rgba(255,255,255,.12));border-radius:8px}"
     # display:flex above would otherwise beat the hidden attribute
     ".commissary-token-list[hidden]{display:none}"
+    # Upstream's Import dialog ships a search icon with no size rule, so it
+    # renders ~500px tall over the dialog; the fork's dialogs reuse that markup.
+    ".vimp-search{position:relative}"
+    ".vimp-search-icon{position:absolute;left:31px;top:11px;width:15px;height:15px;"
+    "color:var(--white-a40,rgba(255,255,255,.4));pointer-events:none}"
+    ".vimp-search-icon+.vimp-search-input{padding-left:34px}"
+    # the fork's Import dialogs: their body scrolls inside upstream's card
+    ".commissary-import-body{display:flex;flex-direction:column;flex:1;min-height:0;overflow-y:auto}"
     ".commissary-token{padding:2px 7px;border-radius:5px;background:var(--white-a08,rgba(255,255,255,.08));"
     "border:1px solid transparent;font-size:12px;white-space:nowrap;cursor:pointer;color:inherit;"
     "font-family:inherit}"

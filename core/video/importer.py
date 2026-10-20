@@ -152,6 +152,8 @@ def _ctx(dl: dict) -> dict:
         "alt_exclusive": sc.get("alt_exclusive"),
         # Commissary: the show's absolute episode number, for the numbering gate
         "absolute": sc.get("absolute"),
+        # Commissary: a manual folder placed as another season (core/commissary/manual_import)
+        "renumbered_from": sc.get("renumbered_from"),
     }
 
 
@@ -393,8 +395,9 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
     # A multi-episode file is NAMED by its full span (S01E01-E02, the Sonarr/Plex
     # convention) even though the download row's identity is one episode of it.
     ep, ep_end = ctx.get("episode"), None
+    # Commissary: a folder placed 'as season 7' keeps a file's S08E01-E02 span
     if scope == "episode" and parsed.get("episode_end") \
-            and parsed.get("season") == ctx.get("season"):
+            and parsed.get("season") in (ctx.get("season"), ctx.get("renumbered_from")):
         ep, ep_end = parsed.get("episode"), parsed.get("episode_end")
     if scope == "youtube":
         fields = {
