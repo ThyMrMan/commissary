@@ -413,6 +413,22 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
     if library_dir and not force:
         dest = {"dir": library_dir, "filename": dest["filename"],
                 "path": os.path.join(library_dir, dest["filename"])}
+    # Commissary: say where the file is going and on whose authority — a folder
+    # named from the grab rather than the library is how a show gets a second one.
+    try:
+        if library_dir and not force:
+            _why = "existing library copy"
+        elif force:
+            _why = "manual placement"
+        elif _ident:
+            _why = "library row (tmdb=%s tvdb=%s year=%s)" % (
+                _ident.get("tmdbid"), _ident.get("tvdbid"), _ident.get("year"))
+        else:
+            _why = "the grab alone — this title is not in the library yet"
+        logger.info("[Placement] %s %r -> %s  (naming from: %s)",
+                    scope, ctx.get("title") or "?", dest["path"], _why)
+    except Exception:   # noqa: BLE001, S110 - a log line must never cost an import
+        pass
     # Where poster.jpg goes: the movie folder, or the SHOW root for an episode
     # (parent of the Season folder) — so it isn't dropped per-season.
     artwork_dir = dest["dir"] if scope in ("movie", "youtube") else os.path.dirname(dest["dir"])
@@ -528,6 +544,11 @@ def run_import(dl: dict, src_path: str, *, fs: Any, prober: Callable | None = No
                            settings=settings, force=force, override=override,
                            library_dir=library_dir, expected_duration_sec=expected_duration_sec)
     if plan["action"] == "reject":
+        # Commissary: a refused import used to leave no trace in the log.
+        logger.info("[Import] %r refused: %s%s | file=%s",
+                    (dl or {}).get("title") or "?", plan.get("reason"),
+                    " (bad release — will be blocklisted)" if plan.get("bad_release") else "",
+                    src_path)
         # Leave the file where it is; remember WHERE so manual import can find it.
         # _bad_release is transient (stripped by update_video_download): it tells
         # the monitor to blocklist this exact release so it's never re-picked.
@@ -574,6 +595,9 @@ def run_import(dl: dict, src_path: str, *, fs: Any, prober: Callable | None = No
             except Exception:   # noqa: BLE001 - failing to delete the old file isn't fatal
                 pass
     except Exception as e:   # noqa: BLE001 - any copy/mkdir failure → manual import
+        logger.warning("[Import] %r failed placing %s -> %s: %s",   # Commissary
+                       (dl or {}).get("title") or "?", src_path, dest.get("path"), e,
+                       exc_info=True)
         return {"status": "import_failed", "progress": 100.0, "error": "Import failed: " + str(e),
                 "dest_path": src_path}
 
