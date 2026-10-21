@@ -58,6 +58,11 @@ def direct_source_match(
         if playlist_source in _BEATPORT_SOURCES:
             return _beatport_track(discovery_source, use_spotify, track_id,
                                    spotify_client, fallback_client)
+        # Commissary: a Qobuz track by its ISRC (core/commissary/qobuz_isrc.py)
+        if playlist_source == "qobuz":
+            from core.commissary.qobuz_isrc import qobuz_isrc_match
+            return qobuz_isrc_match(track_id, discovery_source, use_spotify,
+                                    spotify_client=spotify_client, fallback_client=fallback_client)
     except Exception as e:  # noqa: BLE001 - a failed lookup just means search
         logger.debug("direct lookup failed for %s track %s: %s",
                      playlist_source, track_id, e)

@@ -168,7 +168,12 @@ AcoustID's `client=` included).
   (shallowest wins, newest within a level), `download_source.import_search_depth` levels (default 3, 1..6, no
   UI - as in the old fork), 400 folders per root at most; and a client reporting only its save folder finds
   the category folder holding the release. Shared by music, video and audiobooks.
-- Qobuz ISRC into upstream `isrc_match` (M).
+- Qobuz ISRC into upstream `isrc_match` (M) — **done** (core/commissary/qobuz_isrc.py, one hook in
+  `core/discovery/direct_match.direct_source_match`): a mirrored Qobuz track's ISRC comes from Qobuz's own
+  `track/get` (cached per track, the running client only) and goes to upstream's `isrc_match` - Spotify or
+  Deezer, artist-checked - before the cache or any title search. Not ported: the old fork's "Deezer by ISRC
+  whatever the discovery source" for iTunes users (it stored a Deezer match under another provider and needed
+  its own album completion and drift exemptions); with iTunes as the source the title search runs as before.
 - Import from any download folder — new route + React import inbox UI (M).
 - Purchased tracking — `api/purchased.py` + React `routes/purchased` + artist-detail hooks (L).
 - Discovery: Fix dialog searching every source, suggestions/unavailable, match-quality chips (React, M–L).
